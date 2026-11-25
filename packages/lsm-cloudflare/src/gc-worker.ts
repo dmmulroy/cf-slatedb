@@ -56,7 +56,6 @@ export const gcWorkerLayer = (options: GcWorkerOptions) =>
     {
       main: options.main,
       workersDev: false,
-      // `nodejs_compat` is the default from 2026-08-04; workerd rejects it as an explicit flag here.
       compatibility: { date: "2026-10-15" },
       dev: { host: "127.0.0.1", port: options.devPort },
     },

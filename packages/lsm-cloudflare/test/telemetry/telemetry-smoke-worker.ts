@@ -56,7 +56,7 @@ export class TelemetrySmokeWorker extends Cloudflare.Worker<
 export const telemetrySmokeWorkerLayer = TelemetrySmokeWorker.make(
   {
     main: import.meta.url,
-    compatibility: { date: "2026-10-15", flags: ["nodejs_compat"] },
+    compatibility: { date: "2026-10-15" },
     dev: { host: "127.0.0.1", port: TELEMETRY_SMOKE_WORKER_PORT, strictPort: true },
   },
   Effect.gen(function* () {

@@ -77,4 +77,29 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
       },
     ],
   },
+  {
+    name: "gc-safety",
+    spec: "GcSafety.tla",
+    runs: [
+      { config: "GcSafety.cfg", broken: "none", expect: "pass", timeLimitSeconds: 150 },
+      {
+        config: "GcSafety.cfg",
+        broken: "noBoundaryCheck",
+        expect: "ReadableManifestsComplete",
+        timeLimitSeconds: 60,
+      },
+      {
+        config: "GcSafety.cfg",
+        broken: "ownUploadAge",
+        expect: "ReadableManifestsComplete",
+        timeLimitSeconds: 60,
+      },
+      {
+        config: "GcSafety.cfg",
+        broken: "ignorePins",
+        expect: "PinnedManifestsComplete",
+        timeLimitSeconds: 60,
+      },
+    ],
+  },
 ];

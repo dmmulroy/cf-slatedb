@@ -41,7 +41,7 @@ export const compactorWorkerLayer = (options: CompactorWorkerOptions) =>
     {
       main: options.main,
       workersDev: false,
-      compatibility: { date: "2026-10-15", flags: ["nodejs_compat"] },
+      compatibility: { date: "2026-10-15" },
       dev: { host: "127.0.0.1", port: options.devPort },
     },
     Effect.gen(function* () {

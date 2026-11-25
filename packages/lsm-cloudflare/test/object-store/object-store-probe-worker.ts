@@ -48,7 +48,7 @@ const handle = (n: number) => ({
 export const objectStoreProbeWorkerLayer = ObjectStoreProbeWorker.make(
   {
     main: import.meta.url,
-    compatibility: { date: "2026-10-15", flags: ["nodejs_compat"] },
+    compatibility: { date: "2026-10-15" },
     dev: { host: "127.0.0.1", port: OBJECT_STORE_PROBE_PORT, strictPort: true },
   },
   Effect.gen(function* () {

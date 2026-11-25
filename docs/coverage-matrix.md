@@ -21,7 +21,15 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   13 manifests, none lost), `test/object-store/object-store.workerd.ts` against Alchemy's local R2
   (Headers form; 16 concurrent flush commits). Real-R2 check needs approval. Formal: fencing/CAS
   model (in progress).
-- **Compaction in `CompactorServer` + Workflow** — pending (Phase 6).
+- **Compaction in `CompactorServer` + Workflow** — done. `compactor.ts` (fence once, poll on the
+  alarm, plan, lease, launch; idle with no work), `compactor-server.ts`, `compaction-workflow.ts`
+  (`CompactionWorkflow`: `prepare`, `output-<n>`, `commit` steps; results encoded with Schema),
+  `compaction-job.ts` (`runCompactionJob`, discard outcomes), `compaction-executor.ts`,
+  `compactor-worker.ts`; writers wake compactors (`compaction-trigger.ts`, `compactor-client.ts`).
+  Tests: `compactor.test.ts` (fence-once, idle, fencing, shared budget), `compaction-executor.test.ts`
+  (oracle property across flushes and compactions, key-ordered outputs, bottom deletes, inputs
+  changed, fenced), `writer.workerd.ts` (four flushes → compactor wake → Workflow → commit, reads at
+  every consistency, span assertions). D33–D36.
 - **Readers in any Worker; `Latest`/`AtLeast` through the writer** — done. `db-reader.ts` runs
   in the caller's isolate; `db-client.ts` builds `Latest` views from the writer's probe. Trace: the
   `Flushed` read assertion (no `WriterClient.probe`, no `ObjectStore.list`).
@@ -29,7 +37,10 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 ## §2 System
 
 - **Topology: API Worker, `WriterServer`, `BlockServer`, R2, `CompactorServer`, Workflow, GC cron** —
-  pending. `infra/cf-slatedb/alchemy.run.ts` currently runs only the telemetry probe.
+  done (sharding's `ShardDirectory` comes in Phase 8). `infra/cf-slatedb/alchemy.run.ts`: `DbApiWorker`
+  (hosts `WriterServer`, binds `CompactorServer` cross-script), `BlockServerWorker`, `CompactorWorker`
+  (`CompactorServer`, `CompactionWorkflow`, `CompactionBudgetServer`), `GcWorker` (cron), the bucket,
+  and the telemetry probe. `writer.workerd.ts` runs the same topology.
 
 ## §3 Write path
 
@@ -82,9 +93,10 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `lsm-cloudflare/src/manifest-reader.ts` (`loadLatest`; LIST only to recover when the hint names a
   collected manifest). `manifest-store.test.ts` covers a lagging hint and a collected hinted
   manifest. Trace assertion "no `ObjectStore.list` on a read path": Phase 5 scenarios.
-- **Compactor edit replaces exactly its inputs, else fails** — partial. `commitCompaction`
+- **Compactor edit replaces exactly its inputs, else fails** — done. `commitCompaction`
   (`manifest.test.ts`: replace, idempotent retry, `CompactionInputsChangedError`,
-  `CompactorFencedError`).
+  `CompactorFencedError`, `SstBelowGcBoundaryError`); `CompactionExecutor.prepare` re-checks the
+  inputs (`compaction-executor.test.ts`). Formal: `ManifestCasFencing` (`noInputsCheck`).
 - **Delete-after-commit; duplicate replay is deduplicated** — done. `flushNow` truncates only after
   the manifest commit; restart drops rows `<= lastL0Seq` (D22); `mergeRowStreams` drops exact
   duplicates. Tests: `db-writer.test.ts` (crash between commit and truncate), `merge-iterator.test.ts`.
@@ -129,7 +141,10 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   each other or a job in flight, have the right destination and `isBottom`; repeatedly committing
   planned jobs converges (fallback consolidation terminates). Shown failing with the size
   threshold ignored and with in-flight sources not reserved (D15).
-- **`DatabaseLifecycle`, `GarbageCollector`, `CompactionBudget`** — pending (Phases 6–7).
+- **`DatabaseLifecycle`, `GarbageCollector`, `CompactionBudget`** — `GarbageCollector` and
+  `CompactionBudget` done (`garbage-collector.ts`, `compaction-budget.ts`,
+  `compaction-budget-server.ts`, lsm-core `compaction-budget-ledger.ts`); `DatabaseLifecycle`
+  `create` done, `remove`/`seal`/`forkRange` in Phase 7.
 
 ## §8 Public API and semantics
 
@@ -140,13 +155,13 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   (`lsm-core-errors.ts`), `WriterFencedError`, `CompactorFencedError`, `DatabaseSealedError`,
   `CompactionInputsChangedError` (`manifest.ts`). Pending: `KeyOutOfRangeError`,
   `WriteStalledError`, `ManifestConflictError`, `ObjectStoreUnavailableError`, public HTTP errors.
-- **Merge operators and TTL during reads and compaction** — partial (wiring in Phases 4–6).
-  `lsm-core/src/row-resolution.ts` (D10, D11). `row-resolution.test.ts`: `resolveVisibleRow`
-  matches a plain oracle for puts, deletes, merges, and TTL at any snapshot and time (shown failing
-  with operands applied newest-first); earliest expiry and newest seq of merge results; `U64Add`;
-  `MergeOperatorMissingError`; compaction without an operator keeps raw operands.
-  `merge-iterator.test.ts` retention properties (newest-snapshot reads unchanged; versions above
-  the floor kept; shown failing when expired values are dropped instead of tombstoned).
+- **Merge operators and TTL during reads and compaction** — done. `lsm-core/src/row-resolution.ts`
+  (D10, D11) and `compaction-merge.ts` (`compactRowStreams`). Tests: `row-resolution.test.ts`
+  (oracle at any snapshot and time; earliest expiry; `U64Add`; `MergeOperatorMissingError`; raw
+  operands without an operator), `compaction-merge.test.ts` (any split of inputs over three keys,
+  with and without older data and an operator, matches the oracle; shown failing when deletes are
+  dropped above the bottom, an input is skipped, or expired operands are kept),
+  `compaction-executor.test.ts` (merges through real SSTs).
 - **Checkpoints, clones (forks), transactions** — partial (edits in `manifest.ts`); Phases 7, 9.
 
 ## §9 Effect audit and private gaps
@@ -166,16 +181,20 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 
 ## §10 Infrastructure
 
-- **Alchemy Stack with every Worker, DO, Workflow, and cron** — pending (grows each phase).
+- **Alchemy Stack with every Worker, DO, Workflow, and cron** — done for Phases 1–6
+  (`infra/cf-slatedb/alchemy.run.ts`); `ShardDirectory` joins in Phase 8.
 - **Layout `packages/lsm-core`, `packages/lsm-cloudflare`, `packages/lsm-sharding`,
   `infra/cf-slatedb`** — done. Enforced by `tools/workspace-boundaries` (D1, D2).
 
 ## §11 Trade-offs
 
-- **`maxUnflushedBytes` backpressure; 128 MB streaming; multipart parts ≥ 5 MiB** — partial.
-  `WriteStalledError` on `maxUnflushedBytes` and `l0MaxSsts` (`db-writer.test.ts`); flush streams
-  memtable pages into the SST builder and closed blocks into uniform multipart parts
-  (`ObjectStore.putMultipart`, test layer enforces the 5 MiB minimum). Compaction: Phase 6.
+- **`maxUnflushedBytes` backpressure; 128 MB streaming; multipart parts ≥ 5 MiB** — done.
+  `WriteStalledError` on `maxUnflushedBytes` and `l0MaxSsts` (`db-writer.test.ts`; an L0 stall also
+  wakes the compactor). Flushes and compaction steps stream rows into the SST builder and closed
+  blocks into uniform multipart parts (`ObjectStore.putMultipart`; `toUniformParts` copies each byte
+  once, `object-store.test.ts`); compaction reads inputs one block at a time with one block of
+  prefetch (`CompactionExecutor.sstRows`). Peak memory per compaction step: two blocks per input
+  plus one multipart part (D34).
 
 ## §12 Multi-tenancy primitives and sharding
 
@@ -188,9 +207,15 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   formal check 5: Phase 7.
 - **Zero-copy `forkRange` (SST views + external references)** — partial (`forkManifest`;
   `manifest.test.ts`) (D13).
-- **GC per database respecting fork checkpoints** — pending (Phase 6–7).
+- **GC per database respecting fork checkpoints** — done for checkpoints (fork release is Phase 7).
+  `garbage-collector.ts` lists only `db/<id>/`; checkpointed manifests and their SSTs are kept
+  (`garbage-collector.test.ts`). Formal: `GcSafety` (`PinnedManifestsComplete`, `ignorePins`).
 - **`DatabaseLifecycle.create`/`remove` (`DatabaseHasDependentsError`, purge `db:<id>`)** — pending.
-- **`CompactionBudget` by `budgetGroup`** — partial (`DatabaseOptions.budgetGroup`).
+- **`CompactionBudget` by `budgetGroup`** — done. lsm-core `compaction-budget-ledger.ts` (fair share
+  among holders and waiting groups, expiring leases; property test against capacity and share,
+  shown failing on four mutations), `compaction-budget.ts` (unlimited, ledger, test),
+  `compaction-budget-server.ts` (global `CompactionBudgetServer` Durable Object and client).
+  `compactor.test.ts`: a second database waits for the first job's lease (D35).
 - **Sharding: `ShardDirectory`, `ShardRouter`, `ShardSplit`** — pending (Phase 8).
 
 ## Brief requirements
@@ -204,6 +229,21 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 - **Formal checks 1–6** — partial. Check 1 (no acknowledged write lost or hidden): `NoAckedWriteLost.tla`, skill
   `.agents/skills/verify-no-acked-write-lost`. Check 2 (fencing) and 3 (manifest CAS linearizability):
   `tools/formal-verification/specs/ManifestCasFencing.tla`, skill
-  `.agents/skills/verify-manifest-cas-fencing`, run by `vp run verify`, each broken variant shown
-  failing. Checks 4, 5, 6 pending.
+  `.agents/skills/verify-manifest-cas-fencing`. Check 4 (GC safety): `GcSafety.tla`, skill
+  `.agents/skills/verify-gc-safety`. All run by `vp run verify`, each broken variant shown failing.
+  Checks 5 and 6 pending.
 - **Hardening scenarios** — pending (Phase 10).
+
+## Phase 6 additions
+
+- **GC boundaries (`gc/manifest.boundary`, `gcSstBoundary`)** — done. RFC 0026 manifest boundary in
+  `ManifestStore.create`/`advanceManifestBoundary` (`manifest-store.test.ts`: a stale create over a
+  collected id is a conflict, shown failing with `<` and without monotonicity); the SST boundary in
+  the manifest (`manifest.test.ts`; `garbage-collector.test.ts`: an old orphan is collected and its
+  late commit refused). Formal: `GcSafety` (`noBoundaryCheck`). D33.
+- **Manifest age measured from its successor** — done. `planManifestCollection`
+  (`garbage-collection-plan.test.ts`), found by the GC model (`ownUploadAge`). D33.
+- **Compaction status endpoint** — done. `GET /v1/databases/:id/compaction` (`db-http-api.ts`), used
+  by `writer.workerd.ts`.
+- **GC operator API and cron** — done. `gc-http-api.ts`, `gc-worker.ts` (`POST /v1/gc/databases/:id`,
+  `POST /v1/gc`, cron `*/5 * * * *`); `writer.workerd.ts` collects on demand. D36.

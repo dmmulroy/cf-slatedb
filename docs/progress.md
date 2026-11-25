@@ -2,16 +2,7 @@
 
 ## Current phase
 
-Phase 6: compaction and GC (in progress). Phases 0–5 are done.
-
-Phase 6 so far: `compactRowStreams` (lsm-core streaming compaction merge, property-tested against
-the oracle), GC planning (`planManifestCollection`, `planSstCollection`, `prepareGarbageCollection`),
-the manifest's `gcSstBoundary` (commits reject SSTs created before it), the RFC 0026 manifest
-boundary in `ManifestStore`, versioned and delimited `ObjectStore` operations (and a fix to
-multipart re-chunking, which copied the whole pending part on every block), and
-`CompactionExecutor` (prepare, one output SST per step, commit). Next: `CompactorServer`,
-`CompactionWorkflow`, `CompactionBudget`, `GarbageCollector`, the GC cron Worker, and formal
-check 4 (GC safety).
+Phase 7: lifecycle (starting). Phases 0–6 are done.
 
 ## Done
 
@@ -111,12 +102,23 @@ check 4 (GC safety).
   `vp run dev` the trace CLI shows a `Flushed` read with no writer call and no `LIST`, served
   through `BlockServer`, and the repeat read hitting L1. Decisions D27–D32.
 
+- **Phase 6 — compaction and GC.** lsm-core: `compactRowStreams` (streaming compaction merge),
+  GC planning (`planManifestCollection` by successor age, `planSstCollection`,
+  `prepareGarbageCollection`), `gcSstBoundary` with `SstBelowGcBoundaryError`, the compaction
+  budget ledger. lsm-cloudflare: `CompactionExecutor`, `runCompactionJob`, `CompactionWorkflow`,
+  `Compactor`/`CompactorServer`, `CompactionBudget` (+ global DO), `CompactionTrigger` (writers wake
+  compactors), `GarbageCollector` and `GcWorker` (cron + operator API), RFC 0026 manifest boundary,
+  versioned and delimited `ObjectStore` operations, `GET /v1/databases/:id/compaction`. Fixed: the
+  multipart re-chunker copied the whole pending part on every block. Formal check 4 (`GcSafety.tla`,
+  skill `verify-gc-safety`) found that manifest age must be measured from the successor. The workerd
+  integration test runs four flushes through a real compaction Workflow and an on-demand GC, with
+  its own OTLP collector (14 s). Decisions D33–D36.
+
 ## Next
 
-- Phase 6: `CompactorServer` DO (alarm, scheduler, `compactorEpoch`), compaction Workflow
-  (streaming merge, multipart output, TTL and merge resolution), `CompactionBudget`,
-  `GarbageCollector` (`minAge`, checkpoints, `gc/` boundary), GC cron Worker; formal check 4
-  (GC safety).
+- Phase 7: checkpoints API, `DatabaseLifecycle.remove` (`DatabaseHasDependentsError`, purge
+  `db:<id>`), `seal`, `forkRange`, fork checkpoint release once compaction rewrote every external
+  SST; formal check 5 (seal and split).
 
 ## Findings
 

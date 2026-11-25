@@ -283,3 +283,57 @@ invocation. A missing binding is a defect.
 entries, isolate-wide. Design §12 suggests a byte budget per `budgetGroup` (or a `LayerMap` per
 group); Effect's `Cache` bounds entries, not bytes, so this is a coarser global budget. Per-group
 budgets are a recorded gap.
+
+## D33. GC boundaries: RFC 0026 for manifests, an SST boundary in the manifest
+
+The design lists `gc/` boundary files without detail. Manifests follow SlateDB RFC 0026:
+`gc/manifest.boundary` holds the largest collected manifest id; GC advances it (by etag CAS) before
+deleting manifests, and `ManifestStore.create` re-reads it after create-if-absent succeeds and treats
+an id at or below it as a conflict, so a stalled writer cannot recreate a collected id.
+
+SSTs use a boundary _in the manifest_ (`gcSstBoundary`) instead of SlateDB's ULID-cutoff rules
+(RFC 0029): GC advances it by manifest CAS to `now - gcMinAge` before deleting, and `commitL0Flush`
+and `commitCompaction` reject new SSTs whose ULID time is below it (`SstBelowGcBoundaryError`).
+Because every commit is a manifest CAS, an uploaded but uncommitted SST is either newer than the
+boundary or can never be committed, with no clock bound needed beyond `gcMinAge` for readers. GC
+moves the boundary only when an old unreferenced SST exists, so an idle database is never written.
+
+Readers are protected by `gcMinAge` (the design's open choice; D29): GC keeps every manifest
+superseded less than `gcMinAge` ago, measured from the _next_ manifest's write time. Measuring from
+a manifest's own write time is wrong (a manifest can be the newest for hours); the GC model found
+it. The deletion bound is `min(boundary, cutoff)`; the model shows the `min` redundant with one GC
+at a time and it is kept for overlapping runs.
+
+## D34. Compaction runs one output SST per Workflow step
+
+`CompactionWorkflow` steps are `prepare` (resolve inputs in the newest manifest, fix `now` for TTL),
+`output-<n>` (re-open the inputs at the step's start key, merge, write one SST up to
+`compactionOutputSstSize`, closing only between keys), and `commit`. Each step's result is encoded
+with Schema (Workflow results must be plain data) and replayed on resume, so a resumed job merges
+the same inputs at the same time. Inputs are read straight from R2, one block at a time with one
+block of prefetch, never through the block caches. Discards (fenced, inputs changed, below the GC
+boundary, database gone) are step results, not failures, so Workflows does not retry them;
+storage failures retry five times with exponential backoff; a corrupted SST is a defect (no retry).
+The compactor notices finished jobs on its next poll rather than by a callback.
+
+## D35. Compactor: fence once, poll only with work, woken by the writer
+
+The compactor fences in (`compactorEpoch + 1`) on its first wake and keeps the epoch in Durable
+Object storage, so jobs it started stay valid across evictions; only a different compactor fences
+it. Its alarm polls every `compactorPollInterval` while jobs run or wait for budget, and stops
+otherwise. Writers wake it after a flush leaves at least `minCompactionSources` L0 SSTs, and again
+when a write stalls on `l0MaxSsts`. `CompactionBudget` is a global Durable Object (`compaction-budget`
+ledger: fair share among groups holding or waiting for leases, leases renewed on each poll and
+expiring after `compactionLeaseMs`). Settings added: `compactionBudgetCapacity` (32) and
+`compactionLeaseMs` (15 minutes).
+
+## D36. Workers: compactor and GC hosts; the test stack's own OTLP collector
+
+`CompactorWorker` hosts `CompactorServer`, `CompactionWorkflow`, and `CompactionBudgetServer`;
+`DbApiWorker` binds `CompactorServer` cross-script (`CompactorServer.from(CompactorWorker)`) so
+writers can wake compactors. `GcWorker` runs the cron and an operator API (`POST /v1/gc/...`).
+workerd rejects an explicit `nodejs_compat` flag when a Worker restarts (it is the default from
+2026-08-04: "does not need to be specified anymore"), so every Worker sets only the date. Test stages flush telemetry before each response, which
+waited out the 10-second flush timeout on every request when no collector listened; the integration
+test now starts its own collector on port 4320 (`test/writer/integration-ports.ts`) and asserts on
+the span names it records. The run dropped from minutes to 14 seconds.

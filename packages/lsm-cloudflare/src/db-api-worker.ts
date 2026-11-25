@@ -58,7 +58,7 @@ export const dbApiWorkerLayer = (options: DbApiWorkerOptions) =>
   DbApiWorker.make(
     {
       main: options.main,
-      compatibility: { date: "2026-10-15", flags: ["nodejs_compat"] },
+      compatibility: { date: "2026-10-15" },
       dev: { host: "127.0.0.1", port: options.devPort },
     },
     Effect.gen(function* () {
