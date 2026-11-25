@@ -4,7 +4,7 @@ import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Effect } from "effect";
 import { HttpClientRequest, HttpServerRequest, HttpServerResponse } from "effect/http";
 
-import { lsmTelemetryLayer, withEventTelemetryFlush } from "../../src/lsm-telemetry.ts";
+import { eventTelemetryFlushForStage, lsmTelemetryLayer } from "../../src/lsm-telemetry.ts";
 
 /** Port of the delayed OTLP collector the telemetry smoke test starts. */
 export const TELEMETRY_SMOKE_COLLECTOR_PORT = 54329;
@@ -30,6 +30,7 @@ export class TelemetrySmokeServer extends Cloudflare.DurableObject<
 export const telemetrySmokeServerLayer = TelemetrySmokeServer.make(
   Effect.gen(function* () {
     const state = yield* Cloudflare.DurableObjectState;
+    const withEventTelemetryFlush = yield* eventTelemetryFlushForStage;
     return Effect.succeed({
       fetch: Effect.gen(function* () {
         const request = yield* HttpServerRequest.HttpServerRequest;
@@ -60,6 +61,7 @@ export const telemetrySmokeWorkerLayer = TelemetrySmokeWorker.make(
   },
   Effect.gen(function* () {
     const namespace = yield* TelemetrySmokeServer;
+    const withEventTelemetryFlush = yield* eventTelemetryFlushForStage;
     return {
       fetch: Effect.gen(function* () {
         const request = yield* HttpServerRequest.HttpServerRequest;

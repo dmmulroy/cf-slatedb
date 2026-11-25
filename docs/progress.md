@@ -25,11 +25,11 @@ Phase 2: lsm-core (starting). Phase 3 (object storage and manifests) will overla
   - Review fix: `list` is one pass (summarize, filter, bounded binary-insert top-`limit`) and
     `summarizeTrace` is one pass over spans plus a pass over root candidates only.
   - `lsmTelemetryLayer` (`@cf-slatedb/lsm-cloudflare`) wraps `Telemetry.layerOtlp`.
-  - OTLP flush bug **confirmed on beta.87**. Per Dillon's review, Alchemy is not patched; the
-    workaround is `withEventTelemetryFlush` (design decision D5), applied outermost on every
-    handler. `telemetry-smoke.workerd.ts` is red with the wrapper made a no-op and green with it;
-    full parentage and DO alarm spans are covered too. Bridge-owned HTTP server spans still export
-    through Alchemy's `waitUntil` flush (lost only if the runtime is torn down immediately).
+  - OTLP flush bug **confirmed on beta.87**. Alchemy is not patched (review). Workaround (D5): a
+    stage-selected flush policy. Local stages (`dev`, `test`, `test-*`, ...) export a handler's spans
+    before the response; live stages (`production`, previews, ...) add no export latency and rely on
+    the bridge's `waitUntil` flush. Both modes are covered by unit tests and by workerd tests
+    (`telemetry-smoke.workerd.ts`, `telemetry-smoke-live-policy.workerd.ts`).
   - `infra/cf-slatedb/alchemy.run.ts` + `vp run dev` run a telemetry probe Worker + DO under
     `alchemy dev`; verified with the trace CLI (Worker → DO span nesting, alarm span,
     `assert` pass/fail exit codes).

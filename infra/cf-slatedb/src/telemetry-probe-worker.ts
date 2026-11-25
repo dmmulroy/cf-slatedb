@@ -1,5 +1,5 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
-import { lsmTelemetryLayer, withEventTelemetryFlush } from "@cf-slatedb/lsm-cloudflare";
+import { eventTelemetryFlushForStage, lsmTelemetryLayer } from "@cf-slatedb/lsm-cloudflare";
 import type { HttpEffect } from "alchemy/Http";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Effect } from "effect";
@@ -24,6 +24,7 @@ export class TelemetryProbeServer extends Cloudflare.DurableObject<
 const telemetryProbeServerLayer = TelemetryProbeServer.make(
   Effect.gen(function* () {
     const state = yield* Cloudflare.DurableObjectState;
+    const withEventTelemetryFlush = yield* eventTelemetryFlushForStage;
     return Effect.succeed({
       fetch: Effect.gen(function* () {
         const request = yield* HttpServerRequest.HttpServerRequest;
@@ -55,6 +56,7 @@ export const telemetryProbeWorkerLayer = TelemetryProbeWorker.make(
   },
   Effect.gen(function* () {
     const namespace = yield* TelemetryProbeServer;
+    const withEventTelemetryFlush = yield* eventTelemetryFlushForStage;
     return {
       fetch: Effect.gen(function* () {
         const request = yield* HttpServerRequest.HttpServerRequest;

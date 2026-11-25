@@ -1,3 +1,4 @@
+import { Stage } from "alchemy/Stage";
 import * as Telemetry from "alchemy/Telemetry";
 import { Effect, type Layer, Option } from "effect";
 import { OtlpExporter } from "effect/observability";
@@ -23,13 +24,36 @@ export interface LsmTelemetryOptions {
  * **Details**
  *
  * Durable Object classes hosted by the same Worker script share the binding, so their fetch and
- * alarm events export through it too. Wrap every handler with {@link withEventTelemetryFlush}.
+ * alarm events export through it too. Wrap every handler with the wrapper from
+ * {@link eventTelemetryFlushForStage}.
  */
 export const lsmTelemetryLayer = (options: LsmTelemetryOptions): Layer.Layer<never> =>
   Telemetry.layerOtlp({
     traces: { url: `${options.baseUrl.replace(/\/$/, "")}/v1/traces` },
     serviceName: options.serviceName,
   });
+
+/**
+ * When an event's spans are exported.
+ *
+ * - `BeforeResponse`: the handler exports its spans before its result is returned, so they survive
+ *   a runtime torn down right after the event. The response waits for the export (at most ten
+ *   seconds). For local stages: development, tests, and scenarios.
+ * - `AfterResponse`: the handler adds no export latency; Alchemy's bridge exports the event's
+ *   telemetry in `waitUntil` after the response. For live stages.
+ */
+export type EventTelemetryFlushPolicy = "BeforeResponse" | "AfterResponse";
+
+/** Stage names that run only under Alchemy's local providers: `dev`, `test`, `local`. */
+const LOCAL_STAGE_PATTERN = /^(?:dev|test|local)(?:-[a-z0-9-]+)?$/;
+
+/**
+ * Selects the flush policy for an Alchemy stage: `BeforeResponse` for local stages (`dev`, `test`,
+ * `local`, and `dev-*`, `test-*`, `local-*`), `AfterResponse` for every other stage, so a live
+ * stage never adds export latency to its responses.
+ */
+export const eventTelemetryFlushPolicyForStage = (stage: string): EventTelemetryFlushPolicy =>
+  LOCAL_STAGE_PATTERN.test(stage) ? "BeforeResponse" : "AfterResponse";
 
 /**
  * Exports the current event's buffered spans now, waiting at most ten seconds.
@@ -51,22 +75,37 @@ export const flushEventTelemetry: Effect.Effect<void> = Effect.serviceOption(
   ),
 );
 
+/** Wraps an event handler with an {@link EventTelemetryFlushPolicy}. */
+export type EventTelemetryFlush = <A, E, R>(
+  handler: Effect.Effect<A, E, R>,
+) => Effect.Effect<A, E, R>;
+
 /**
- * Runs an event handler (Worker or Durable Object `fetch`, `alarm`, a Workflow run, a cron event)
- * and then exports its spans before the handler's result is returned.
+ * Returns the handler wrapper for a flush policy.
  *
  * **Details**
  *
  * Works around alchemy 2.0.0-beta.87, whose bridges export an event's telemetry only inside
- * `waitUntil` after the event settles, so a runtime torn down right after the event loses it (see
- * `../alchemy-workerd-otlp-flush-repro` and `docs/design-decisions.md` D5). Every span that ends
- * inside `handler`, including outbound HTTP client spans, is exported before the event settles.
- * The bridge's own HTTP server span ends after the handler returns, so it still goes out through
- * the bridge's `waitUntil` flush.
+ * `waitUntil` after the event settles (see `docs/design-decisions.md` D5). With `BeforeResponse`,
+ * every span that ends inside the handler, including outbound HTTP client spans, is exported before
+ * the handler's result is returned; the bridge's own HTTP server span ends after the handler, so it
+ * still goes out through the bridge's flush. With `AfterResponse` the wrapper returns the handler
+ * unchanged.
  *
  * Apply it outermost, after `Effect.withSpan`, so the handler's own span has ended when the flush
- * runs. The response waits for the export.
+ * runs.
  */
-export const withEventTelemetryFlush = <A, E, R>(
-  handler: Effect.Effect<A, E, R>,
-): Effect.Effect<A, E, R> => handler.pipe(Effect.ensuring(flushEventTelemetry));
+export const withEventTelemetryFlush = (policy: EventTelemetryFlushPolicy): EventTelemetryFlush =>
+  policy === "BeforeResponse"
+    ? (handler) => handler.pipe(Effect.ensuring(flushEventTelemetry))
+    : (handler) => handler;
+
+/**
+ * The handler wrapper for the current Alchemy stage. Yield it in a Worker's or Durable Object's
+ * init Effect, where Alchemy provides `Stage` both at plan time and at runtime.
+ */
+export const eventTelemetryFlushForStage: Effect.Effect<EventTelemetryFlush, never, Stage> =
+  Effect.gen(function* () {
+    const stage = yield* Stage;
+    return withEventTelemetryFlush(eventTelemetryFlushPolicyForStage(stage));
+  });

@@ -35,36 +35,46 @@ of `alchemy` into `@alchemy.run/test`; cf-twitch pins the same versions. They ar
 Alchemy and Effect releases, run only locally, and do not change the architecture, so they do not
 need the "Stop and ask" approval for new dependencies.
 
-## D5. Workaround: flush OTLP telemetry before an event settles (alchemy 2.0.0-beta.87)
+## D5. Workaround: stage-selected OTLP flush policy (alchemy 2.0.0-beta.87)
 
 alchemy 2.0.0-beta.87 still exports an event's telemetry only when the request scope closes inside
 `waitUntil` after the event settles (`processEvent` in `alchemy/src/Workers/WorkerBridge.ts`,
 `execute` in `DurableObjectBridge.ts`), the bug reproduced by `../alchemy-workerd-otlp-flush-repro`.
-Alchemy is **not patched**. Instead every handler is wrapped with `withEventTelemetryFlush`
-(`packages/lsm-cloudflare/src/lsm-telemetry.ts`), which runs the handler and then, in
-`Effect.ensuring`, awaits the event's `OtlpExporter.Flusher.flush` (bounded at 10 seconds). The
-bridge builds that `Flusher` into every event's context, so the handler can reach it.
+Alchemy is **not patched** (Dillon's review). The workaround lives in
+`packages/lsm-cloudflare/src/lsm-telemetry.ts` and is a **stage-selected policy**:
 
-What it covers: every span that ends inside the handler (`Effect.fn` service spans, the handler's
-own span, outbound HTTP client spans to Durable Objects and `BlockServer`) is exported before the
-event settles. What it cannot cover: the HTTP server span the bridge's tracer middleware opens around
-the handler ends after the handler returns, so it still goes out through the bridge's own
-`waitUntil` flush. While the runtime keeps running (normal `alchemy dev` and production), it arrives;
-if the runtime is torn down immediately after the event, it can be lost, and its children then show
-as roots in the trace CLI. Alarm handlers and Workflow runs have no bridge-owned span, so they are
-fully covered.
+- `EventTelemetryFlushPolicy` is `BeforeResponse` or `AfterResponse`.
+- `eventTelemetryFlushPolicyForStage(stage)` selects `BeforeResponse` for local stages (`dev`,
+  `test`, `local`, and `dev-*`, `test-*`, `local-*`) and `AfterResponse` for every other stage
+  (`production`, previews, anything else), so a live stage never adds export latency to responses.
+- Every Worker and Durable Object yields `eventTelemetryFlushForStage` in its init Effect (Alchemy
+  provides `Stage` at plan time and at runtime) and wraps every `fetch`, `alarm`, Workflow run, and
+  cron handler with the returned wrapper, outermost, after `Effect.withSpan`.
+- `BeforeResponse`: the wrapper runs the handler, then in `Effect.ensuring` awaits the event's
+  `OtlpExporter.Flusher.flush` (bounded at 10 seconds). The bridge builds that `Flusher` into every
+  event's context, so the handler can reach it. Every span that ends inside the handler (service
+  spans, the handler's own span, outbound HTTP client spans) is exported before the event settles.
+  The bridge's HTTP server span ends after the handler, so it still goes out through the bridge's
+  `waitUntil` flush; it is lost only if the runtime is torn down immediately, and its children then
+  show as roots in the trace CLI. Alarm handlers and Workflow runs have no bridge-owned span.
+- `AfterResponse`: the wrapper returns the handler unchanged; the bridge's `waitUntil` flush
+  exports everything after the response, as Alchemy intends for live Workers.
 
-Rule: apply `withEventTelemetryFlush` outermost on every `fetch`, `alarm`, Workflow run, and cron
-handler.
+Evidence:
 
-Evidence: `packages/lsm-cloudflare/test/telemetry/telemetry-smoke.workerd.ts` tears workerd down
-right after the event with a collector that answers after 500 ms. With the wrapper, the Durable
-Object's span and the Worker's client span both arrive, in one trace; with the wrapper made a no-op,
-the test fails. A second test checks full parentage, server spans included, while workerd keeps
-running; a third checks alarm spans.
+- `src/lsm-telemetry.test.ts`: with a recording `Flusher`, `BeforeResponse` flushes after the
+  handler and before the result is returned (also on failure); `AfterResponse` never flushes; the
+  stage rule and the `Stage`-driven selection.
+- `test/telemetry/telemetry-smoke.workerd.ts` (stage `test-telemetry-smoke`, `BeforeResponse`):
+  with workerd torn down right after the event and a collector that answers after 500 ms, the
+  Durable Object span and the Worker's client span arrive in one trace, and the response waited at
+  least 500 ms. Run under a live-style stage name, the same test fails, which shows the policy is
+  selected from `Stage` at runtime. Full parentage and alarm spans are checked too.
+- `test/telemetry/telemetry-smoke-live-policy.workerd.ts` (stage `preview-telemetry-smoke`,
+  `AfterResponse`): with a collector that answers after 2 s, the response returns in under 2 s, and
+  the bridge still delivers every span, server spans included, with intact parentage.
 
-Trade-off: a response waits for its span export. Locally that is a loopback POST to the trace CLI.
-Remove the wrapper when an Alchemy release flushes before settling.
+Remove the workaround when an Alchemy release flushes before settling.
 
 ## D6. Local state store for the Stack
 
