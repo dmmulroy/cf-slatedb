@@ -27,7 +27,8 @@ tenant concept.
 - `tools/*` — the trace CLI, the scenario CLI, the preview CLI, formal verification, Traits, and
   the workspace boundary check.
 
-Progress, open questions, and the hand-off live in [`docs/progress.md`](docs/progress.md). Every
+Progress, open questions, and the hand-off live in [`docs/progress.md`](docs/progress.md). The
+plan for the production v1 is [`docs/handoff-v1.md`](docs/handoff-v1.md). Every
 judgment call the design did not make is in [`docs/design-decisions.md`](docs/design-decisions.md).
 Every design section maps to code and tests in [`docs/coverage-matrix.md`](docs/coverage-matrix.md).
 

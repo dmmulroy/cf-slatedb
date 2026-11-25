@@ -7,7 +7,8 @@ before you change anything. The prompt to start the agent is at the end.
 > built, how to run it locally and on a preview, what is verified, the live results, what is left,
 > and the commands to destroy the previews — is in [`docs/progress.md`](progress.md#hand-off).
 > `preview-1` (unrestricted) and `preview-2` (`eu`) are deployed on production settings; the
-> "State at hand-off" section below describes the state before that work.
+> "State at hand-off" section below describes the state before that work. **The next step — a
+> production v1 — is planned in [`docs/handoff-v1.md`](handoff-v1.md).**
 
 ## What cf-slatedb is
 

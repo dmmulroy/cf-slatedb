@@ -2,9 +2,11 @@
 
 ## Current phase
 
-**Done.** All ten phases of the build brief and all seven items of the hand-off's "Remaining
-work" are complete; the final hand-off is below. Nothing is blocked on Dillon; the open
-questions at the end are optional.
+**Next: v1 for production.** All ten phases of the build brief and all seven items of
+`docs/handoff.md`'s "Remaining work" are complete (hand-off below). The plan to close the remaining
+gaps and the live findings and ship a production v1 is
+[`docs/handoff-v1.md`](handoff-v1.md): ten workstreams, the decisions Dillon must make (P1–P6), and
+the prompt for the next agent.
 
 | Item                                   | Status | Commit                                     |
 | -------------------------------------- | ------ | ------------------------------------------ |
@@ -337,7 +339,7 @@ Details and methods are in [`docs/measurements.md`](measurements.md).
   - The router's 5 s split window was too short for a live split (D48).
   - Unset settings stayed bound on Workers across deploys (D54).
 
-### Anything left (none blocks use)
+### Anything left (planned in `docs/handoff-v1.md`)
 
 - Shorten every manifest CAS ~40% by writing the `LATEST` hint off the critical path, and make the
   forks' compactor wake asynchronous (~4 s per split). Both touch code the manifest CAS model covers;
