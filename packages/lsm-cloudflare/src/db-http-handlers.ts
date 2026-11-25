@@ -69,6 +69,11 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
       .handle("createCheckpoint", ({ params, payload }) =>
         lifecycle.createCheckpoint(params.databaseId, payload).pipe(publicFailures("checkpoint")),
       )
+      .handle("pinSnapshot", ({ params, payload }) =>
+        lifecycle
+          .pinSnapshot(params.databaseId, payload.lifetimeMs)
+          .pipe(publicFailures("checkpoint")),
+      )
       .handle("deleteCheckpoint", ({ params }) =>
         lifecycle
           .deleteCheckpoint(params.databaseId, params.checkpointId)

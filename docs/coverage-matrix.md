@@ -298,6 +298,11 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   (properties: budgets and accounting, LRU within a group, another group evicted only under total
   pressure and only while heaviest; four mutations caught), `block-cache.test.ts` (joined misses,
   failures not kept, a busy group never evicts a quiet one, a lone group held to its share).
+- **Long-lived snapshots (known gap, hand-off item 6)** — done (D52). `DatabaseLifecycle.pinSnapshot`,
+  `POST /v1/databases/:id/snapshots/pinned` (`db-http-api.ts`); plain snapshots' `gcMinAge` limit and
+  `SnapshotExpired` documented. Tests: `database-lifecycle.test.ts` (pinned readable past `gcMinAge`,
+  unpinned expired, pinned collected after its lifetime), `writer.workerd.ts` (pin, read, release
+  through the public API). Formal: `GcSafety` (`PinnedManifestsComplete`).
 - **Transactions across a flush (known gap, hand-off item 6)** — kept and justified (D50): only a
   transaction outlasting a whole flush aborts; measured 580/580 commits through a 28.7 s flush
   (`scenario-cli measure transactions`). Formal: `Transactions` (`Flush` interleaves anywhere).

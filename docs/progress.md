@@ -77,6 +77,9 @@ in order.
   half per `budgetGroup`, heaviest group evicts first under pressure; joined misses and
   never-kept failures preserved (`block-cache.test.ts`). The old metadata bound counted entries,
   each up to ~1 MB.
+- **6c. Pinned snapshots (D52).** `pinSnapshot` / `POST …/snapshots/pinned { lifetimeMs }` pins a
+  snapshot with an expiring checkpoint; plain snapshots stay free and their `gcMinAge` limit is
+  documented, with `SnapshotExpired` pointing to pinning.
 
 ## Done
 

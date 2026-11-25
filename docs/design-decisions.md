@@ -263,7 +263,7 @@ default) old, so right after a flush it may still see the older manifest. This i
 manifest whenever it predates the writer's `flushedSeq` or `seq`, so they are never stale. The
 `DbClient` property test models this, and a dedicated test pins it.
 
-## D30. Snapshots pin a manifest id
+## D30. Snapshots pin a manifest id (pinned snapshots: D52)
 
 `DbClient.snapshot` returns `{ databaseId, manifestId, snapshotSeq }`; reads with it read exactly
 that manifest. Until checkpoints (Phase 7) pin it, a snapshot is protected by GC `minAge` only, and
@@ -650,3 +650,25 @@ misses for one key join one read (a waiter whose reader is interrupted reads aga
 are never kept, and reads run with the calling invocation's services. Design §12 also offers a
 `LayerMap` per group with idle release; one structure with per-group accounting is simpler and
 lets groups borrow unused room.
+
+## D52. Long-lived snapshots pin through a checkpoint; plain snapshots stay free and expire
+
+D30's snapshots pin a manifest id that GC keeps only for `gcMinAge` after a newer manifest replaces
+it. Both of hand-off item 6's options are taken:
+
+- **Pinned snapshots.** `DatabaseLifecycle.pinSnapshot(databaseId, lifetimeMs)` and
+  `POST /v1/databases/:id/snapshots/pinned { lifetimeMs }` flush every acknowledged write, then pin the
+  resulting manifest with a checkpoint (named `snapshot`) that expires after `lifetimeMs` (at most
+  30 days over HTTP). They return `{ snapshot, checkpointId, expireAt }`; `snapshot` is an ordinary
+  `DbSnapshot`, so reads take it unchanged, and deleting the checkpoint releases it early. GC keeps a
+  checkpoint's manifest and every SST it references (the GC model's `PinnedManifestsComplete`), and
+  drops the checkpoint when it expires. A lifetime is required: a forgotten pin would otherwise keep
+  SSTs forever.
+- **Plain snapshots, documented.** `DbClient.snapshot` and `POST …/snapshots` still write nothing
+  — a pin is a manifest CAS, about a second on R2 — and their limit is now stated in the API: GC
+  keeps the manifest for `gcMinAge` (an hour by default) after it is replaced, then reads fail with
+  `SnapshotExpired`, whose message now says to take a pinned snapshot to read for longer.
+
+Pinning only reuses checkpoints, so GC and fork semantics are unchanged; `database-lifecycle.test.ts`
+shows a pinned snapshot readable past `gcMinAge` while an unpinned one has expired, and the pinned
+one collected after its lifetime.

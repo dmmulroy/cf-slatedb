@@ -17,6 +17,7 @@ import { Schema } from "effect";
 import { HttpApi, HttpApiEndpoint, HttpApiGroup, HttpApiSchema, OpenApi } from "effect/http-api";
 
 import { CompactorState } from "./compactor.ts";
+import { PinnedSnapshot } from "./database-lifecycle.ts";
 import { DbSnapshot } from "./db-client.ts";
 import { DB_PUBLIC_ERRORS } from "./db-public-error.ts";
 import { FlushedResponse, WriterStatusResponse } from "./writer-http-api.ts";
@@ -71,6 +72,11 @@ export const CompactionStatusResponse = Schema.Struct({
 export const CreateCheckpointRequest = Schema.Struct({
   name: Schema.OptionFromNullOr(Schema.String),
   lifetimeMs: Schema.OptionFromNullOr(Schema.Int.check(Schema.isGreaterThan(0))),
+});
+
+/** Schema for a pinned snapshot request: how long it stays readable, at most 30 days. */
+export const PinSnapshotRequest = Schema.Struct({
+  lifetimeMs: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 30 * 24 * 3_600_000 })),
 });
 
 /** Schema for a seal request: the databases that replace the sealed one. */
@@ -325,6 +331,20 @@ export class DbHttpApiGroup extends HttpApiGroup.make("databases")
     ),
   )
   .add(
+    HttpApiEndpoint.post("pinSnapshot", "/databases/:databaseId/snapshots/pinned", {
+      params: DatabaseParams,
+      payload: PinSnapshotRequest,
+      success: PinnedSnapshot.pipe(HttpApiSchema.status(201)),
+      error: DB_PUBLIC_ERRORS,
+    }).annotateMerge(
+      OpenApi.annotations({
+        summary: "Take a pinned snapshot",
+        description:
+          "Flushes every acknowledged write, then pins the resulting manifest with a checkpoint for lifetimeMs: pass `snapshot` to reads to see exactly that data until `expireAt`. Delete the checkpoint (`checkpointId`) to release it early. Each pinned snapshot is a manifest write; an unpinned snapshot (POST …/snapshots) costs none but is kept only about an hour.",
+      }),
+    ),
+  )
+  .add(
     HttpApiEndpoint.post("snapshot", "/databases/:databaseId/snapshots", {
       params: DatabaseParams,
       success: DbSnapshot,
@@ -333,7 +353,7 @@ export class DbHttpApiGroup extends HttpApiGroup.make("databases")
       OpenApi.annotations({
         summary: "Take a snapshot",
         description:
-          "Pins the current flushed manifest; pass the snapshot to reads to see exactly that data.",
+          "Pins the current flushed manifest without writing anything; pass the snapshot to reads to see exactly that data. It stays readable for GC's minimum age (an hour by default); reads after that may fail with SnapshotExpired. Take a pinned snapshot (POST …/snapshots/pinned) to read for longer.",
       }),
     ),
   )

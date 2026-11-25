@@ -25,6 +25,7 @@ import {
 import { DbClient, dbClientTestLayer } from "./db-client.ts";
 import type { DbReaderServices } from "./db-reader.ts";
 import { DurableObjectAlarm, durableObjectAlarmTestLayer } from "./durable-object-alarm.ts";
+import { GarbageCollector, makeGarbageCollector } from "./garbage-collector.ts";
 import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
 import { ManifestReader } from "./manifest-reader.ts";
 import { databasePrefix } from "./object-keys.ts";
@@ -43,6 +44,7 @@ const RIGHT_RANGE: KeyRange = { start: SPLIT, end: Option.none() };
 /** Lifecycle, client, executor, in-process launcher, budget, and stores over one bucket. */
 const testLayer = Layer.mergeAll(
   databaseLifecycleLayerWithoutDependencies.pipe(Layer.provide(blockSourceTestLayer)),
+  Layer.effect(GarbageCollector, makeGarbageCollector),
   compactionLauncherTestLayer,
   compactionBudgetTestLayer,
 ).pipe(
@@ -257,5 +259,57 @@ describe("DatabaseLifecycle", () => {
       }),
     );
     expect(error._tag).toBe("CheckpointNotFoundError");
+  });
+
+  it("keeps a pinned snapshot readable past gcMinAge until its checkpoint expires; an unpinned one expires (D52)", async () => {
+    const HOUR = 3_600_000;
+    const result = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const client = yield* DbClient;
+        const gc = yield* GarbageCollector;
+        yield* lifecycle.create(SOURCE, {
+          keyRange: Option.none(),
+          databaseOptions: DEFAULT_DATABASE_OPTIONS,
+        });
+        yield* client.put(SOURCE, bytes("a"), bytes("0"));
+        yield* client.flush(SOURCE);
+        const unpinned = yield* client.snapshot(SOURCE);
+        // The pin flushes this write first, so it pins a newer manifest than the unpinned one.
+        yield* client.put(SOURCE, bytes("a"), bytes("1"));
+        const pinned = yield* lifecycle.pinSnapshot(SOURCE, 3 * HOUR);
+        const readAt = (snapshot: typeof unpinned) =>
+          client
+            .get(SOURCE, bytes("a"), {
+              consistency: { _tag: "Flushed" },
+              snapshot: Option.some(snapshot),
+            })
+            .pipe(
+              Effect.map((value) => Option.getOrElse(Option.map(value, text), () => "none")),
+              Effect.catchTag("ReaderUnavailableError", (error) => Effect.succeed(error.reason)),
+            );
+        const fresh = { unpinned: yield* readAt(unpinned), pinned: yield* readAt(pinned.snapshot) };
+        // Newer manifests replace both snapshots' manifest.
+        for (const value of ["2", "3"]) {
+          yield* client.put(SOURCE, bytes("a"), bytes(value));
+          yield* client.flush(SOURCE);
+        }
+        yield* TestClock.adjust(HOUR + 1);
+        yield* gc.collect(SOURCE);
+        const afterAnHour = {
+          unpinned: yield* readAt(unpinned),
+          pinned: yield* readAt(pinned.snapshot),
+        };
+        // Past its lifetime the checkpoint is dropped, and its manifest collected like any other.
+        yield* TestClock.adjust(2 * HOUR);
+        yield* gc.collect(SOURCE);
+        yield* gc.collect(SOURCE);
+        return { fresh, afterAnHour, afterExpiry: yield* readAt(pinned.snapshot), pinned };
+      }),
+    );
+    expect(result.fresh).toEqual({ unpinned: "0", pinned: "1" });
+    expect(result.afterAnHour).toEqual({ unpinned: "SnapshotExpired", pinned: "1" });
+    expect(result.afterExpiry).toBe("SnapshotExpired");
+    expect(result.pinned.expireAt).toBeGreaterThan(0);
   });
 });

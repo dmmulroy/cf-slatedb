@@ -50,6 +50,13 @@ import {
 /**
  * Schema for a snapshot: a read view pinned to one manifest, so repeated reads see the same data.
  * Its `snapshotSeq` is the manifest's `lastL0Seq`; flush first to include the newest writes.
+ *
+ * **Details**
+ *
+ * A snapshot from {@link IDbClient.snapshot} writes nothing, and GC keeps its manifest only for
+ * `gcMinAge` (an hour by default) after a newer one replaces it; reads after that fail with
+ * `SnapshotExpired`. `DatabaseLifecycle.pinSnapshot` pins one with a checkpoint for a chosen
+ * lifetime instead (D52).
  */
 export const DbSnapshot = Schema.Struct({
   databaseId: Schema.String,
@@ -134,7 +141,10 @@ export interface IDbClient {
   ) => Stream.Stream<Row, DbClientReadError, DbReaderServices>;
   /** Flushes the memtable to L0 now. @returns The new `flushedSeq`. */
   readonly flush: (databaseId: DatabaseId) => Effect.Effect<SeqNum, DbWriteError, DbReaderServices>;
-  /** Pins a snapshot at the current flushed manifest. */
+  /**
+   * Takes a snapshot at the current flushed manifest. It writes nothing and is readable for at
+   * least `gcMinAge`; use `DatabaseLifecycle.pinSnapshot` to read it for longer.
+   */
   readonly snapshot: (
     databaseId: DatabaseId,
   ) => Effect.Effect<DbSnapshot, DbClientReadError, DbReaderServices>;

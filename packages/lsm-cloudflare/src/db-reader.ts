@@ -188,7 +188,7 @@ export const makeDbReader = Effect.gen(function* () {
           return yield* new ReaderUnavailableError({
             databaseId,
             reason: "SnapshotExpired",
-            message: `Snapshot manifest ${view.manifestId.value} of database ${databaseId} no longer exists. Take a new snapshot and read again.`,
+            message: `Snapshot manifest ${view.manifestId.value} of database ${databaseId} no longer exists: an unpinned snapshot is kept only for GC's minimum age, and a pinned one until its checkpoint expires or is deleted. Take a new snapshot (pinned, to read for longer) and read again.`,
           });
         }
         return { id: view.manifestId.value, manifest: pinned.value };

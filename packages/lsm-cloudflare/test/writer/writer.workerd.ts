@@ -195,6 +195,25 @@ test.provider(
       expect(snapshotKeys).not.toContain("c");
       expect(yield* read("c", { _tag: "Latest" })).toEqual(Option.some("3"));
 
+      // A pinned snapshot is a checkpoint with a lifetime; reads see exactly its manifest.
+      const pinned = yield* client.databases.pinSnapshot({
+        params: { databaseId },
+        payload: { lifetimeMs: 60_000 },
+      });
+      expect(pinned.expireAt).toBeGreaterThan(Date.now());
+      const atPinned = yield* client.databases.get({
+        params: { databaseId },
+        payload: {
+          key: bytes("c"),
+          consistency: { _tag: "Flushed" },
+          snapshot: Option.some(pinned.snapshot),
+        },
+      });
+      expect(Option.isSome(atPinned.row)).toBe(true);
+      yield* client.databases.deleteCheckpoint({
+        params: { databaseId, checkpointId: pinned.checkpointId },
+      });
+
       // Compaction: four flushes wake the compactor (CompactorWorker), which runs a Workflow.
       const compacted = DatabaseId.make(`compaction-${Date.now().toString(36)}`);
       yield* client.databases.createDatabase({

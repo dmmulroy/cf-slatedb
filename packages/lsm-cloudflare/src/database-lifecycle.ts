@@ -22,6 +22,7 @@ import { Clock, Context, Effect, Layer, Option, Result, Schema, type Scope } fro
 
 import { BlockSource, type BlockSourceServices } from "./block-source.ts";
 import { CompactorClient } from "./compactor-client.ts";
+import { DbSnapshot } from "./db-client.ts";
 import type { CompactorError } from "./compactor.ts";
 import { DatabaseNotFoundError, WriterUnavailableError } from "./lsm-errors.ts";
 import {
@@ -51,6 +52,19 @@ export interface CreateCheckpointOptions {
   /** How long the checkpoint lasts; none: until deleted. */
   readonly lifetimeMs: Option.Option<number>;
 }
+
+/**
+ * Schema for a snapshot pinned by a checkpoint: read with `snapshot` like any snapshot; it stays
+ * readable until `expireAt` or until the checkpoint is deleted (`DELETE …/checkpoints/<id>`).
+ */
+export const PinnedSnapshot = Schema.Struct({
+  snapshot: DbSnapshot,
+  checkpointId: CheckpointId,
+  expireAt: Timestamp,
+});
+
+/** A snapshot pinned by a checkpoint. */
+export type PinnedSnapshot = typeof PinnedSnapshot.Type;
 
 /** A fork: the new database, the source checkpoint it starts from, and the key range it takes. */
 export interface ForkRangeRequest {
@@ -109,6 +123,16 @@ export interface IDatabaseLifecycle {
     databaseId: DatabaseId,
     options: CreateCheckpointOptions,
   ) => Effect.Effect<Checkpoint, DatabaseLifecycleError, DatabaseLifecycleServices>;
+  /**
+   * Takes a snapshot that lasts `lifetimeMs` (D52): flushes every acknowledged write, then pins the
+   * resulting manifest with a checkpoint that expires then. Unpinned snapshots (`DbClient.snapshot`)
+   * cost no write but are kept only for GC's `gcMinAge`; pin one to read it for longer. Delete the
+   * checkpoint to release it early.
+   */
+  readonly pinSnapshot: (
+    databaseId: DatabaseId,
+    lifetimeMs: number,
+  ) => Effect.Effect<PinnedSnapshot, DatabaseLifecycleError, DatabaseLifecycleServices>;
   /** Deletes a checkpoint; deleting one that does not exist succeeds. */
   readonly deleteCheckpoint: (
     databaseId: DatabaseId,
@@ -202,39 +226,68 @@ export const makeDatabaseLifecycle = Effect.gen(function* () {
     }),
   );
 
+  /** Flushes, then pins the resulting manifest: the checkpoint and that manifest's `lastL0Seq`. */
+  const checkpointNow = (databaseId: DatabaseId, options: CreateCheckpointOptions) =>
+    Effect.gen(function* () {
+      // Every acknowledged write is in the manifest the checkpoint pins.
+      yield* writers
+        .flush(databaseId)
+        .pipe(Effect.catchTags({ DatabaseSealedError: () => Effect.void }));
+      const id = yield* generateCheckpointId;
+      const now = Timestamp.make(yield* Clock.currentTimeMillis);
+      const committed = yield* manifests
+        .update(databaseId, (manifest, manifestId) =>
+          addCheckpoint(manifest, {
+            id,
+            manifestId,
+            createdAt: now,
+            expireAt: Option.map(options.lifetimeMs, (lifetime) => Timestamp.make(now + lifetime)),
+            holder: Option.none(),
+            name: options.name,
+          }),
+        )
+        .pipe(
+          Effect.catchTags(updateFailures(databaseId, "checkpoint")),
+          Effect.catchTags(removedIsNotFound(databaseId)),
+        );
+      const checkpoint = committed.manifest.checkpoints.find((existing) => existing.id === id);
+      if (checkpoint === undefined) return yield* checkpointNotFound(databaseId, id);
+      yield* Effect.annotateCurrentSpan({
+        "checkpoint.id": id,
+        "manifest.id": checkpoint.manifestId,
+      });
+      // Adding a checkpoint changes no data: the pinned manifest's `lastL0Seq` is the committed one's.
+      return { checkpoint, lastL0Seq: committed.manifest.lastL0Seq };
+    });
+
   const createCheckpoint = Effect.fn("DatabaseLifecycle.createCheckpoint")(function* (
     databaseId: DatabaseId,
     options: CreateCheckpointOptions,
   ) {
     yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
-    // Every acknowledged write is in the manifest the checkpoint pins.
-    yield* writers
-      .flush(databaseId)
-      .pipe(Effect.catchTags({ DatabaseSealedError: () => Effect.void }));
-    const id = yield* generateCheckpointId;
-    const now = Timestamp.make(yield* Clock.currentTimeMillis);
-    const committed = yield* manifests
-      .update(databaseId, (manifest, manifestId) =>
-        addCheckpoint(manifest, {
-          id,
-          manifestId,
-          createdAt: now,
-          expireAt: Option.map(options.lifetimeMs, (lifetime) => Timestamp.make(now + lifetime)),
-          holder: Option.none(),
-          name: options.name,
-        }),
-      )
-      .pipe(
-        Effect.catchTags(updateFailures(databaseId, "checkpoint")),
-        Effect.catchTags(removedIsNotFound(databaseId)),
-      );
-    const checkpoint = committed.manifest.checkpoints.find((existing) => existing.id === id);
-    if (checkpoint === undefined) return yield* checkpointNotFound(databaseId, id);
+    return (yield* checkpointNow(databaseId, options)).checkpoint;
+  });
+
+  const pinSnapshot = Effect.fn("DatabaseLifecycle.pinSnapshot")(function* (
+    databaseId: DatabaseId,
+    lifetimeMs: number,
+  ) {
     yield* Effect.annotateCurrentSpan({
-      "checkpoint.id": id,
-      "manifest.id": checkpoint.manifestId,
+      "database.id": databaseId,
+      "snapshot.lifetime_ms": lifetimeMs,
     });
-    return checkpoint;
+    const { checkpoint, lastL0Seq } = yield* checkpointNow(databaseId, {
+      name: Option.some("snapshot"),
+      lifetimeMs: Option.some(lifetimeMs),
+    });
+    const pinned: PinnedSnapshot = {
+      snapshot: { databaseId, manifestId: checkpoint.manifestId, snapshotSeq: lastL0Seq },
+      checkpointId: checkpoint.id,
+      expireAt: Option.getOrElse(checkpoint.expireAt, () =>
+        Timestamp.make(checkpoint.createdAt + lifetimeMs),
+      ),
+    };
+    return pinned;
   });
 
   const deleteCheckpoint = Effect.fn("DatabaseLifecycle.deleteCheckpoint")(function* (
@@ -393,6 +446,7 @@ export const makeDatabaseLifecycle = Effect.gen(function* () {
   return DatabaseLifecycle.of({
     create,
     createCheckpoint,
+    pinSnapshot,
     deleteCheckpoint,
     seal,
     forkRange,
