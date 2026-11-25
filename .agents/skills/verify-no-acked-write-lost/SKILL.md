@@ -74,7 +74,7 @@ them. The `nonAtomicProbe` variant reproduces it.
 
 ## Keeping it in step with the code
 
-Sync commit: `SYNC_COMMIT_PLACEHOLDER`. When a covered function changes after it, update the model so
+Sync commit: `e03f7c8`. When a covered function changes after it, update the model so
 each action is still one awaited effect in the code, rerun, and show each invariant still fails on a
 broken variant before moving the sync commit. For drift that skipped this skill, use
 `.agents/skills/maintain-formal-verification-skill/SKILL.md`.
