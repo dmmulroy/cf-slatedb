@@ -2,7 +2,7 @@
 
 ## Current phase
 
-Phase 8: sharding package (starting). Phases 0–7 are done.
+Phase 9: transactions (starting). Phases 0–8 are done.
 
 ## Done
 
@@ -125,11 +125,18 @@ Phase 8: sharding package (starting). Phases 0–7 are done.
   and release, then removed (15 s). Fixed along the way: the trace CLI ignored unknown keys in
   assertion files, so a misspelled bound passed vacuously. Decisions D37–D39.
 
+- **Phase 8 — sharding package.** `packages/lsm-sharding`: `ShardMap` (pure), `ShardDirectory` +
+  `ShardDirectoryServer` (one DO per group; records the pending split and allocates its databases),
+  `ShardRouter` (cached map, refresh-and-retry on sealed/out-of-range/removed), `ShardSplit` (begin,
+  seal, checkpoint, fork ×2, publish; resumable), and the example `ShardRouterWorker` in the Stack.
+  lsm-cloudflare gained `dbServicesLayer` (DbClient + lifecycle for any Worker, cross-script) and
+  `dbServicesTestLayer`. Under `vp run dev` a split through the router Worker crosses Workers and the
+  reads and scans before and after it are correct. Decision D40.
+
 ## Next
 
-- Phase 8: `packages/lsm-sharding` — `ShardDirectoryServer` (range map + version, one DO per
-  group), `ShardRouter` (retry once on `DatabaseSealed` / `KeyOutOfRange`), `ShardSplit` (seal →
-  checkpoint → fork ×2 → publish), public APIs only.
+- Phase 9: optimistic transactions (`Snapshot` and `SerializableSnapshot` isolation) with the
+  conflict check inside the writer; formal check 6.
 
 ## Findings
 

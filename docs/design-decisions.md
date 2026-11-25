@@ -378,3 +378,25 @@ a prefix once its objects are older than `gcMinAge` (creation writes the first m
 other object, so a prefix without one is never a database being created). The writer's state is
 cleared with `DELETE`s rather than `deleteAll()`, so its tables survive and the next request starts a
 writer that finds the database gone.
+
+## D40. Sharding: the directory records each split; routers retry while it publishes
+
+The design's `ShardSplit` is seal → fork once → publish. Two databases are created per split, and a
+split that stops after sealing must be finishable, or the sealed shard refuses writes forever. So the
+group's directory (one `ShardDirectoryServer` per group) records the split first (`beginSplit`) and
+allocates the two new database ids (`s-<ulid>`; derived ids would outgrow `DatabaseId`'s 63
+characters after a few splits). Only one split per group runs at a time; retrying a split resumes it
+with the same ids (seal, checkpoint, and forks are idempotent), and `completeSplit` publishes the new
+map (version + 1). The split's own checkpoint expires after an hour if the split stops, and is
+deleted once both forks hold theirs.
+
+`ShardRouter` caches each group's map in the isolate. A stale map reaches only a sealed, out-of-range,
+or removed database, which fail with typed errors; the router then refreshes and retries every 100 ms
+for up to five seconds (a split's publish window), as the design describes. The core keeps no map
+versions. Batches are atomic only within a database, so a batch spanning shards is refused with
+`CrossShardBatchError`.
+
+The package uses only `@cf-slatedb/lsm-cloudflare`'s public entrypoint. `dbServicesLayer` gives any
+Worker in the Stack `DbClient` and `DatabaseLifecycle` over cross-script bindings; the example
+`ShardRouterWorker` (in the Stack, port 1341 under `vp run dev`) hosts the directories and serves a
+small sharded API.

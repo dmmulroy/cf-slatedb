@@ -234,7 +234,19 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   shown failing on four mutations), `compaction-budget.ts` (unlimited, ledger, test),
   `compaction-budget-server.ts` (global `CompactionBudgetServer` Durable Object and client).
   `compactor.test.ts`: a second database waits for the first job's lease (D35).
-- **Sharding: `ShardDirectory`, `ShardRouter`, `ShardSplit`** — pending (Phase 8).
+- **Sharding: `ShardDirectory`, `ShardRouter`, `ShardSplit`** — done. `packages/lsm-sharding`:
+  `shard-map.ts` (range map, pending split, pure edits), `shard-directory.ts` +
+  `shard-directory-server.ts` (one Durable Object per group), `shard-router.ts` (cached map; refresh
+  and retry on `DatabaseSealed`, `KeyOutOfRange`, or a removed database; cross-shard batches
+  refused; scans concatenate shards in key order), `shard-split.ts` (begin in the directory, seal,
+  checkpoint, fork ×2, delete the checkpoint, publish; resumable), `shard-router-worker.ts` (example
+  Worker, in the Stack). Public APIs only: `dbServicesLayer` / `dbServicesTestLayer` from
+  lsm-cloudflare; `workspace-boundaries.test.ts` enforces it. Tests: `shard-map.test.ts` (cover and
+  routing property, one split at a time), `sharding.test.ts` (Map oracle through the router across
+  random splits, also read straight from each shard's database and its key range; stale router;
+  cross-shard batch; resumed split; shown failing without the seal, without the map refresh, and with
+  overlapping fork ranges). Trace (`vp run dev`): one split crosses the shard router and API Workers,
+  two forks, one publish, no errors. Formal: `SealSplit`. D40.
 
 ## Brief requirements
 
@@ -275,3 +287,10 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `CheckpointNotFound` (404) and `DatabaseHasDependents` (409). `writer.workerd.ts`.
 - **`ManifestStore.update` passes the manifest id to the edit** — done (a checkpoint pins exactly
   the manifest its CAS applied to).
+
+## Phase 8 additions
+
+- **`dbServicesLayer` / `dbServicesTestLayer`** — done. `db-services.ts`: `DbClient` and
+  `DatabaseLifecycle` for any Worker in the Stack (cross-script `WriterServer` and `CompactorServer`,
+  `BlockServer`, bucket), and in memory for consumers' tests. `makeWriterClientOver` builds the writer
+  client over any `WriterServer` namespace.

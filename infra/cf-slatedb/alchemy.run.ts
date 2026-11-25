@@ -6,6 +6,7 @@ import {
   GcWorker,
 } from "@cf-slatedb/lsm-cloudflare";
 import * as Alchemy from "alchemy";
+import { ShardRouterWorker } from "@cf-slatedb/sharding";
 import { localState } from "alchemy/State";
 import { Effect } from "effect";
 
@@ -13,6 +14,7 @@ import { cfSlatedbBlockServerWorkerLayer } from "./src/block-server-worker-entry
 import { cfSlatedbCompactorWorkerLayer } from "./src/compactor-worker-entry.ts";
 import { cfSlatedbApiWorkerLayer } from "./src/db-api-worker-entry.ts";
 import { cfSlatedbGcWorkerLayer } from "./src/gc-worker-entry.ts";
+import { cfSlatedbShardRouterWorkerLayer } from "./src/shard-router-worker-entry.ts";
 import { TelemetryProbeWorker, telemetryProbeWorkerLayer } from "./src/telemetry-probe-worker.ts";
 
 /**
@@ -32,10 +34,13 @@ const CfSlatedbStack = Alchemy.Stack(
     yield* CompactorWorker;
     yield* GcWorker;
     const api = yield* DbApiWorker;
+    const shards = yield* ShardRouterWorker;
     const probe = yield* TelemetryProbeWorker;
     return {
       /** URL of the public database API (`/v1`). */
       apiUrl: api.url,
+      /** URL of the sharded API (the sharding package's example Worker). */
+      shardsUrl: shards.url,
       /** URL of the telemetry probe Worker. */
       probeUrl: probe.url,
     };
@@ -45,6 +50,7 @@ const CfSlatedbStack = Alchemy.Stack(
       cfSlatedbBlockServerWorkerLayer,
       cfSlatedbCompactorWorkerLayer,
       cfSlatedbGcWorkerLayer,
+      cfSlatedbShardRouterWorkerLayer,
       telemetryProbeWorkerLayer,
     ]),
   ),

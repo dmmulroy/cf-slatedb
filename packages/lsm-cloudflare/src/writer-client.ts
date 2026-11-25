@@ -228,28 +228,35 @@ const writerClientOperations = <E, R>(
 };
 
 /**
- * Constructs the writer client over the `WriterServer` namespace, with one generated HTTP client per
+ * Constructs the writer client over a `WriterServer` namespace, with one generated HTTP client per
  * database per invocation (Alchemy execution memo + `Cache`), never retained across invocations.
  */
+export const makeWriterClientOver = (namespace: {
+  readonly getByName: (name: string) => Parameters<typeof Cloudflare.toHttpClient>[0];
+}) =>
+  Effect.gen(function* () {
+    const clients = yield* makeExecutionMemo(
+      Cache.make({
+        capacity: Number.POSITIVE_INFINITY,
+        lookup: (databaseId: DatabaseId) =>
+          Effect.suspend(() =>
+            HttpApiClient.makeWith(WriterHttpApi, {
+              baseUrl: "http://writer.internal",
+              httpClient: Cloudflare.toHttpClient(namespace.getByName(databaseId)),
+            }),
+          ),
+      }),
+    );
+    return WriterClient.of(
+      writerClientOperations((databaseId: DatabaseId) =>
+        Effect.flatMap(clients, (cache) => Cache.get(cache, databaseId)),
+      ),
+    );
+  });
+
+/** Constructs the writer client over the `WriterServer` namespace the Worker being built hosts. */
 export const makeWriterClient = Effect.gen(function* () {
-  const namespace = yield* WriterServer;
-  const clients = yield* makeExecutionMemo(
-    Cache.make({
-      capacity: Number.POSITIVE_INFINITY,
-      lookup: (databaseId: DatabaseId) =>
-        Effect.suspend(() =>
-          HttpApiClient.makeWith(WriterHttpApi, {
-            baseUrl: "http://writer.internal",
-            httpClient: Cloudflare.toHttpClient(namespace.getByName(databaseId)),
-          }),
-        ),
-    }),
-  );
-  return WriterClient.of(
-    writerClientOperations((databaseId: DatabaseId) =>
-      Effect.flatMap(clients, (cache) => Cache.get(cache, databaseId)),
-    ),
-  );
+  return yield* makeWriterClientOver(yield* WriterServer);
 });
 
 /** Provides the writer client; the Worker's init supplies the `WriterServer` namespace binding. */
