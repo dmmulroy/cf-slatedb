@@ -295,6 +295,9 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   One bucket with `db/<id>/` prefixes and no LIST on read paths; owner database in every block URL
   (`block-server-http-api.ts`); L1 cache bounded by entry count, not a per-`budgetGroup` byte budget
   (D32, gap).
+- **Transactions across a flush (known gap, hand-off item 6)** — kept and justified (D50): only a
+  transaction outlasting a whole flush aborts; measured 580/580 commits through a 28.7 s flush
+  (`scenario-cli measure transactions`). Formal: `Transactions` (`Flush` interleaves anywhere).
 - **Data residency** — done, per Stack (D49). `lsm-jurisdiction.ts` (`lsmJurisdiction`,
   `inLsmJurisdiction`, `lsmJurisdictionAtDeclaration`), applied in `lsm-bucket.ts`,
   `trace-collector-worker.ts` (buckets), `writer-client.ts`, `compactor-client.ts`,

@@ -144,6 +144,11 @@ export interface IDbClient {
    * no other commit since conflicts (`TransactionConflictError`, retryable; nothing was written).
    * With `SerializableSnapshot` every key it read and range it scanned is checked too.
    *
+   * A transaction that lasts through a whole flush of newer data — from the moment a flush takes
+   * its cut to the moment it commits, at least a second or two on R2 — fails with
+   * `TransactionConflictError` (`SnapshotTooOld`, retryable): its snapshot can no longer be checked
+   * against the writer's memtable. Shorter transactions never see it (D50).
+   *
    * @returns The body's result, and the receipt when it wrote anything.
    */
   readonly transaction: <A, E, R>(

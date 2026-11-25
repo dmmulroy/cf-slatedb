@@ -109,6 +109,18 @@ path and waking the forks' compactors without waiting would shorten every CAS by
 by ~4 s; both touch code covered by the manifest CAS model and are left for a change that re-runs
 it.
 
+## How often a flush aborts a transaction
+
+`measure transactions` runs 4 loops of `SerializableSnapshot` transactions over the HTTP API (begin,
+read two keys, commit one put; disjoint keys, so they never conflict) while 4 loops write 100-row
+batches to the same database, for 150 s, production settings.
+
+| Transactions | Committed | `SnapshotTooOld` | Transaction p50 / max | Flushes during the run  |
+| -----------: | --------: | ---------------: | --------------------- | ----------------------- |
+|          580 |       580 |                0 | 1.0 s / 2.9 s         | 1 (19 MiB, 28.7 s wall) |
+
+A transaction aborts only if it outlasts a whole flush (D50); live flushes take at least ~1.5 s.
+
 ## Live checks
 
 | Check                                       | Result                         | How                                                                                                                                                                                                                                                                                                                                                                                             |

@@ -403,7 +403,7 @@ Worker in the Stack `DbClient` and `DatabaseLifecycle` over cross-script binding
 `ShardRouterWorker` (in the Stack, port 1341 under `vp run dev`) hosts the directories and serves a
 small sharded API.
 
-## D41. Transactions are valid until data newer than their reads is flushed
+## D41. Transactions are valid until data newer than their reads is flushed (narrowed by D50)
 
 The writer's conflict check reads only its memtable (an indexed SQLite query per key or range:
 `MemTable.writtenAfter`), which holds exactly the rows newer than `flushed_seq`. A transaction reads
@@ -589,3 +589,41 @@ is removed: it could only disagree with where the Stack actually stores data. Ma
 with it still decode — Schema ignores the unknown field — and the next manifest written drops it
 (`manifest.test.ts`). The public API never accepted it. `forkManifest` copies options unchanged, so
 fork inheritance needs nothing.
+
+## D50. Transactions keep the flush limit: only a transaction that outlasts a whole flush aborts
+
+Hand-off item 6 asked to let a transaction's conflict check read rows flushed after its snapshot from
+L0, or justify keeping D41's limit. It is kept, because live measurement shows the limit is far
+narrower than D41 described.
+
+**When it aborts.** A flush takes its cut (`last_seq` when it starts), uploads the L0 SST, commits
+the manifest, and only then truncates the memtable and sets `flushed_seq` to the cut, in one SQLite
+transaction (D21). A transaction aborts (`SnapshotTooOld`) only if `flushed_seq > readSeq` when it
+reads or commits, that is, only if it **began before the flush took its cut and reads or commits
+after the flush finished**: it must outlast the whole flush. A transaction that begins during a flush
+has `readSeq` at or above the cut; one that commits before the flush finishes still sees the old
+`flushed_seq` and its rows in the memtable. D41 said "a flush landing during it", which overstated it.
+
+**How long a flush takes live.** At least one SST upload and one manifest CAS: about 1.5 s on
+`preview-1` for a small flush (`DbWriter.flush` p50 1.6 s), 2–7 s for 6–52 MiB, and 28.7 s for a
+19 MiB flush under write load (`docs/measurements.md`). So transactions shorter than about a second
+and a half never abort for this reason. Measured: `scenario-cli measure transactions --stage
+preview-1` ran 580 `SerializableSnapshot` transactions over the HTTP API (begin, two reads, commit;
+p50 1.0 s, max 2.9 s from a laptop) while four writers loaded the same database through a 28.7 s
+flush: 580 committed, 0 `SnapshotTooOld`. A transaction longer than its flush aborts with
+probability about (duration − flush duration) / flush interval, and the error is retryable with
+nothing written.
+
+**Why not the alternative now.** Removing the limit needs reads at `readSeq` to stay exact after a
+flush (pin the manifest seen at begin and accept a newer one only if no compaction has removed any
+of its SSTs, since compaction keeps no versions for snapshots, D30), and the commit to check rows
+in the L0 SSTs flushed since begin for the transaction's keys and ranges — including tombstones and
+range deletes, which the reader's visible-row API hides — either in the writer (R2 reads inside the
+commit lock, stalling every write) or in the caller before commit (a new commit precondition on the
+flush horizon). That reworks the reader, the writer's commit check, and the public commit payload,
+and both the transactions and no-acknowledged-write-lost models, to remove an abort that live
+transactions under a second and a half cannot hit. The design is recorded here for when long
+transactions matter.
+
+The model (`Transactions.tla`) already lets `Flush` interleave anywhere, so it covers this exact
+window; no model or code change.

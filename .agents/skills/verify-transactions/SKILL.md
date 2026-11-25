@@ -73,6 +73,11 @@ refuses write skew through the public API.
   covered functions (`beginTransaction`, `getAt`, `scanAt`, `transaction`, the `maxLastL0Seq` check)
   did not change, and `vp run verify` passes with both broken variants still failing.
 
+- Checked again for hand-off item 6 (D50): the limit is kept and no covered function changed;
+  `Flush` in the model already interleaves anywhere between `Begin` and `Commit`, which includes the
+  only window that aborts live (a transaction outlasting a whole flush). `vp run verify` passes with
+  both broken variants failing.
+
 ## Keeping it in step with the code
 
 Sync commit: `c4ea735`. When a covered function changes after it, update the model

@@ -449,3 +449,119 @@ export const measureSplitPause = (load: SplitLoad) =>
       longestAckGapDuringSplitMs: longestGap,
     };
   });
+
+/** Options of {@link measureTransactionAborts}. */
+export interface TransactionLoad {
+  /** Concurrent transaction loops (each: begin, read two keys, commit one put). */
+  readonly transactors: number;
+  /** Concurrent plain-write loops (100-row batches) that keep the writer flushing. */
+  readonly writers: number;
+  readonly seconds: number;
+}
+
+/**
+ * Runs `SerializableSnapshot` transactions over the stateless HTTP API (begin, two reads, commit)
+ * on disjoint keys while plain writes load the same database, and counts how many abort because a
+ * flush landed during them (`SnapshotTooOld`, D41/D50). The transactors never conflict with each
+ * other or with the writers, so every abort is the flush limit.
+ */
+export const measureTransactionAborts = (load: TransactionLoad) =>
+  Effect.gen(function* () {
+    const databaseId = DatabaseId.make(uniqueId("ms-txn"));
+    yield* createDatabase(databaseId);
+    const client = yield* dbApi;
+    const started = yield* Clock.currentTimeMillis;
+    const deadline = started + load.seconds * 1000;
+    const durations: Array<number> = [];
+    const outcomes = new Map<string, number>();
+    const record = (outcome: string) => outcomes.set(outcome, (outcomes.get(outcome) ?? 0) + 1);
+    const value = valueBytes(100, 5);
+    const writers = Effect.forEach(
+      Array.from({ length: load.writers }, (_, worker) => worker),
+      (worker) =>
+        Effect.gen(function* () {
+          let sequence = 0;
+          while ((yield* Clock.currentTimeMillis) < deadline) {
+            sequence += 1;
+            yield* Effect.ignore(
+              client.databases.write({
+                params: { databaseId },
+                payload: {
+                  operations: Array.from({ length: 100 }, (_, row) => ({
+                    _tag: "Put" as const,
+                    key: keyBytes(100 + worker, sequence, row),
+                    value,
+                    ttlMillis: Option.none(),
+                  })),
+                },
+              }),
+            );
+          }
+        }),
+      { concurrency: "unbounded", discard: true },
+    );
+    const transactors = Effect.forEach(
+      Array.from({ length: load.transactors }, (_, worker) => worker),
+      (worker) =>
+        Effect.gen(function* () {
+          let sequence = 0;
+          while ((yield* Clock.currentTimeMillis) < deadline) {
+            sequence += 1;
+            const own = (name: string) => new TextEncoder().encode(`txn-${worker}-${name}`);
+            const began = yield* Clock.currentTimeMillis;
+            const outcome = yield* Effect.result(
+              Effect.gen(function* () {
+                const { readSeq } = yield* client.databases.beginTransaction({
+                  params: { databaseId },
+                });
+                for (const name of ["a", "b"]) {
+                  yield* client.databases.transactionGet({
+                    params: { databaseId },
+                    payload: { key: own(name), readSeq },
+                  });
+                }
+                return yield* client.databases.commitTransaction({
+                  params: { databaseId },
+                  payload: {
+                    readSeq,
+                    isolation: "SerializableSnapshot",
+                    batch: {
+                      operations: [
+                        {
+                          _tag: "Put",
+                          key: own("a"),
+                          value: new TextEncoder().encode(String(sequence)),
+                          ttlMillis: Option.none(),
+                        },
+                      ],
+                    },
+                    readKeys: [own("a"), own("b")],
+                    readRanges: [],
+                  },
+                });
+              }),
+            );
+            durations.push((yield* Clock.currentTimeMillis) - began);
+            if (outcome._tag === "Success") record("Committed");
+            else if (outcome.failure._tag === "TransactionConflictPublicError") {
+              record(outcome.failure.details.reason);
+            } else record(outcome.failure._tag);
+          }
+        }),
+      { concurrency: "unbounded", discard: true },
+    );
+    yield* Effect.all([writers, transactors], { concurrency: "unbounded", discard: true });
+    const status = yield* client.databases
+      .status({ params: { databaseId } })
+      .pipe(Effect.mapError(failed("status after the load")));
+    const total = [...outcomes.values()].reduce((sum, count) => sum + count, 0);
+    return {
+      databaseId,
+      load,
+      transactions: total,
+      outcomes: Object.fromEntries(outcomes),
+      snapshotTooOldRate: (outcomes.get("SnapshotTooOld") ?? 0) / Math.max(1, total),
+      transactionMs: summarize(durations),
+      flushesDuringRun: status.l0Count,
+    };
+  });

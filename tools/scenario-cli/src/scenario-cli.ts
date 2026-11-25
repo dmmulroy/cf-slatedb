@@ -22,6 +22,7 @@ import {
   MeasurementCollector,
   measureFlushCpu,
   measureSplitPause,
+  measureTransactionAborts,
   measureWrites,
 } from "./measurements.ts";
 import { ScenarioStack, type ScenarioFailure } from "./scenario.ts";
@@ -220,9 +221,25 @@ const measureSplitCommand = Command.make(
   ({ stage, ...load }) => runMeasurement(stage, measureSplitPause(load)),
 ).pipe(Command.withDescription("Write pause during a seal-then-fork split (design §12)"));
 
+const measureTransactionsCommand = Command.make(
+  "transactions",
+  {
+    stage: measureStage,
+    transactors: Flag.Int("transactors").pipe(Flag.withDefault(4)),
+    writers: Flag.Int("writers").pipe(Flag.withDefault(4)),
+    seconds: Flag.Int("seconds").pipe(Flag.withDefault(150)),
+  },
+  ({ stage, ...load }) => runMeasurement(stage, measureTransactionAborts(load)),
+).pipe(Command.withDescription("How often a flush aborts a transaction (SnapshotTooOld, D50)"));
+
 const measure = Command.make("measure").pipe(
   Command.withDescription("Measurements against a live preview stage; JSON results"),
-  Command.withSubcommands([measureWritesCommand, measureFlushCommand, measureSplitCommand]),
+  Command.withSubcommands([
+    measureWritesCommand,
+    measureFlushCommand,
+    measureSplitCommand,
+    measureTransactionsCommand,
+  ]),
 );
 
 const runScenarios = (names: ReadonlyArray<string>) =>

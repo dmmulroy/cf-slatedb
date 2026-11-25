@@ -67,6 +67,11 @@ in order.
   manifests still decode (D49). **Live:** `preview-2` deployed with `eu`: Cloudflare reports the LSM
   bucket, the trace bucket, and the Workflow in `eu`; all 11 scenarios pass (the `block-cache`
   scenario expects no Workers Cache `HIT` there and saw none).
+- **6a. Transactions across a flush: kept, with evidence (D50).** A transaction aborts only if it
+  began before a flush took its cut and reads or commits after the flush finished — it must outlast
+  the whole flush, which takes at least ~1.5 s on R2. Live: 580/580 transactions committed through a
+  28.7 s flush under write load (`measure transactions`). The exact alternative (pinned begin
+  manifest + caller-side L0 check) is recorded in D50.
 
 ## Done
 
