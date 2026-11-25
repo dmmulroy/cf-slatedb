@@ -1,0 +1,920 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>cf-slatedb: a SlateDB-style LSM on R2, Durable Objects, Alchemy, and Effect</title>
+    <style>
+      :root {
+        --bg: #faf8f4;
+        --panel: #ffffff;
+        --ink: #1f1d1a;
+        --muted: #6b665e;
+        --line: #d9d3c7;
+        --accent: #b4491f;
+        --accent-soft: #f6e3d8;
+        --code: #f1ede5;
+        --do: #1d6f6a;
+        --do-soft: #dcefed;
+        --r2: #6a3fa0;
+        --r2-soft: #ebe2f6;
+        --gap: #9a6b00;
+        --gap-soft: #f7ecd2;
+        --skip: #8d877c;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #171614;
+          --panel: #201f1c;
+          --ink: #ece8e0;
+          --muted: #a39d92;
+          --line: #3a3833;
+          --accent: #f08a5d;
+          --accent-soft: #4a2a1c;
+          --code: #262521;
+          --do: #5cc4bd;
+          --do-soft: #17302e;
+          --r2: #b596e5;
+          --r2-soft: #2c2240;
+          --gap: #e0b453;
+          --gap-soft: #3a2f14;
+          --skip: #6f6a62;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--ink);
+        font: 16px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      main { max-width: 1080px; margin: 0 auto; padding: 32px 20px 80px; }
+      h1 { font-size: 30px; line-height: 1.2; margin: 0 0 6px; }
+      h2 { font-size: 21px; margin: 52px 0 6px; }
+      h3 { font-size: 15px; margin: 0 0 8px; color: var(--muted); font-weight: 600; }
+      p { margin: 6px 0 14px; max-width: 72ch; }
+      .lede { color: var(--muted); }
+      code, pre { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 13px; }
+      code { background: var(--code); padding: 1px 5px; border-radius: 4px; }
+      pre {
+        background: var(--code);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 14px 16px;
+        margin: 0;
+        overflow-x: auto;
+        line-height: 1.5;
+      }
+      pre code { background: none; padding: 0; }
+      .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+      .two { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
+      @media (max-width: 760px) { .two { grid-template-columns: minmax(0, 1fr); } }
+      .note { color: var(--muted); font-size: 14px; }
+      table { border-collapse: collapse; width: 100%; font-size: 14px; }
+      th, td { text-align: left; vertical-align: top; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+      th { color: var(--muted); font-weight: 600; font-size: 13px; }
+      .scroll { overflow-x: auto; }
+
+      /* architecture */
+      .arch { display: grid; gap: 10px; }
+      .arch-row { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 10px; }
+      @media (max-width: 760px) { .arch-row { grid-auto-flow: row; } }
+      .box { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+      .box strong { display: block; }
+      .box span { color: var(--muted); font-size: 13px; }
+      .box.do { border-color: var(--do); background: var(--do-soft); }
+      .box.r2 { border-color: var(--r2); background: var(--r2-soft); }
+      .arrow { text-align: center; color: var(--muted); font-size: 13px; font-family: ui-monospace, Menlo, monospace; }
+
+      .steps { list-style: none; padding: 0; margin: 0; display: grid; gap: 8px; }
+      .steps li { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 10px; align-items: start; }
+      .who { font-size: 12px; font-weight: 600; text-align: center; border-radius: 999px; padding: 2px 8px; }
+      .who.do { background: var(--do-soft); color: var(--do); }
+      .who.r2 { background: var(--r2-soft); color: var(--r2); }
+      .who.code { background: var(--code); color: var(--muted); }
+      .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; margin-top: 14px; }
+      .fact { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: var(--panel); }
+      .fact b { display: block; font-size: 13px; color: var(--muted); font-weight: 600; }
+
+      /* audit */
+      .legend { display: flex; flex-wrap: wrap; gap: 8px 16px; font-size: 13px; color: var(--muted); margin: 8px 0 14px; }
+      .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+      .audit { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+      .group h3 { margin-bottom: 6px; }
+      .chips { display: flex; flex-wrap: wrap; gap: 5px; }
+      .chip {
+        font-family: ui-monospace, Menlo, monospace; font-size: 12px; padding: 2px 7px; border-radius: 5px;
+        border: 1px solid var(--line); background: var(--code); color: var(--ink); cursor: default;
+      }
+      .chip.core { border-color: var(--accent); background: var(--accent-soft); }
+      .chip.use { border-color: var(--do); background: var(--do-soft); }
+      .chip.skip { color: var(--skip); }
+      .why { margin-top: 10px; font-size: 13px; color: var(--muted); min-height: 2.6em; }
+      .gaps li { margin-bottom: 6px; }
+      .tag { font-size: 11px; font-weight: 700; letter-spacing: 0.03em; text-transform: uppercase; color: var(--gap); }
+      ul { padding-left: 20px; }
+      .decisions li { margin-bottom: 10px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>cf-slatedb: SlateDB's LSM, rebuilt on R2 and Durable Objects</h1>
+      <p class="lede">
+        A design sketch, not an implementation. It keeps SlateDB's model: one writer, many readers,
+        immutable SSTs, a CAS-versioned manifest, and size-tiered compaction. It swaps two pieces for Cloudflare-native ones. The writer is a
+        Durable Object whose SQLite storage is both the WAL and the memtable. Compaction runs in a Workflow. Code follows
+        <code>iac/docs/coding-standards.md</code> and was checked against the installed <code>effect@4.1.4</code> and
+        <code>@alchemy.run/cloudflare@2.0.0-beta.87</code>.
+      </p>
+
+      <h2>1. What changes from SlateDB</h2>
+      <div class="panel scroll">
+        <table>
+          <tr><th>Concern</th><th>SlateDB</th><th>This design</th><th>Why</th></tr>
+          <tr>
+            <td>Single writer</td>
+            <td>Convention, enforced by <code>writer_epoch</code> plus a WAL put-if-absent</td>
+            <td><code>WriterServer</code> Durable Object keyed by <code>DatabaseId</code>, still fenced by <code>writerEpoch</code></td>
+            <td>Cloudflare places the writer and runs one instance. Epoch fencing covers a stale instance whose R2 PUT lands late.</td>
+          </tr>
+          <tr>
+            <td>WAL</td>
+            <td><code>wal/&lt;id&gt;.sst</code> written to object storage every 100 ms</td>
+            <td>Durable Object SQLite table, made durable before the response is sent</td>
+            <td>An ack means the write is durable, with no 100 ms loss window and no idle R2 PUTs (up to 10/s per database in SlateDB's model). Change data capture comes from an optional changelog export at flush time (§3).</td>
+          </tr>
+          <tr>
+            <td>Memtable</td>
+            <td>In-memory skiplist, rebuilt from the WAL on restart</td>
+            <td>The same SQLite table, indexed on <code>(key, seq DESC)</code></td>
+            <td>Effect 4 has no sorted map. SQLite gives sorted scans, survives eviction, and needs no replay.</td>
+          </tr>
+          <tr>
+            <td>Manifest</td>
+            <td><code>manifest/&lt;id&gt;.manifest</code> using CAS</td>
+            <td>Same layout, using R2 <code>If-None-Match: *</code></td>
+            <td>Readers, the compactor, and GC stay independent of the writer.</td>
+          </tr>
+          <tr>
+            <td>Compaction</td>
+            <td>Compactor process, optionally distributed</td>
+            <td><code>CompactorServer</code> Durable Object with an alarm. It schedules jobs and a Workflow merges them.</td>
+            <td>Workflow steps are durable and retried, the same as SlateDB's resumable compaction. Each step stays under 128 MB.</td>
+          </tr>
+          <tr>
+            <td>Readers</td>
+            <td><code>DbReader</code> using a checkpoint and WAL replay</td>
+            <td>Any Worker reading the manifest and SSTs. Latest-data reads go through the writer.</td>
+            <td>Same visibility split as SlateDB's <code>DurabilityLevel</code>.</td>
+          </tr>
+        </table>
+      </div>
+
+      <h2>2. System</h2>
+      <div class="arch">
+        <div class="arch-row">
+          <div class="box"><strong>Caller Worker</strong><span>yields <code>DbClient</code> (put · get · scan · write batch)</span></div>
+        </div>
+        <div class="arrow">↓ HTTP /v1 to the database's WriterServer (name = DatabaseId): writes + memtable probes only ↘ SST reads stay in the caller · the optional sharding package routes before this</div>
+        <div class="arch-row">
+          <div class="box do">
+            <strong>WriterServer (Durable Object)</strong>
+            <span>SQLite <code>memtable_rows</code> = WAL + memtable · seq oracle · alarm-driven L0 flush · writerEpoch</span>
+          </div>
+          <div class="box">
+            <strong>Reader (in any Worker)</strong>
+            <span>current manifest · L1 block <code>Cache</code> in isolate memory · on a miss, a service-binding <code>fetch()</code> to BlockServer</span>
+          </div>
+          <div class="box">
+            <strong>BlockServer Worker (Workers Cache on)</strong>
+            <span>tiered cache in front, request collapsing · runs only on a miss · one block per URL, immutable</span>
+          </div>
+        </div>
+        <div class="arrow">↓ L0 SST PUT, then manifest CAS · ↓ R2 range GET (BlockServer, on cache miss only)</div>
+        <div class="arch-row">
+          <div class="box r2">
+            <strong>R2 bucket</strong>
+            <span><code>manifest/</code> · <code>compacted/</code> (L0 + sorted runs) · <code>gc/</code> · optional <code>changelog/</code></span>
+          </div>
+        </div>
+        <div class="arrow">↑ merged SSTs, then manifest CAS (compactorEpoch) · ↑ deletes</div>
+        <div class="arch-row">
+          <div class="box do">
+            <strong>CompactorServer (Durable Object)</strong>
+            <span>alarm: poll manifest → size-tiered scheduler → start a Workflow</span>
+          </div>
+          <div class="box">
+            <strong>CompactionWorkflow</strong>
+            <span>one step per output SST · streaming k-way merge · multipart PUT</span>
+          </div>
+          <div class="box">
+            <strong>GC cron Worker</strong>
+            <span>deletes unreferenced SSTs and old manifests after <code>minAge</code> · respects checkpoints</span>
+          </div>
+        </div>
+      </div>
+
+      <h2>3. Write path: the WAL is the memtable's SQLite table</h2>
+      <p>
+        There is one write path. The writer Durable Object's SQLite table <code>memtable_rows</code> is both the WAL and the
+        memtable. There's no <code>WalStore</code> abstraction and no R2 WAL. Optional changelog export at each flush
+        provides change data capture.
+      </p>
+      <div class="two">
+        <div class="panel">
+          <h3>put(key, value)</h3>
+          <ol class="steps">
+            <li><span class="who code">Worker</span><span><code>DbClient.put</code> → <code>POST /v1/databases/:id/batches</code> to WriterServer</span></li>
+            <li><span class="who do">Durable Object</span><span><code>Semaphore(1)</code>: seq = oracle.next; INSERT rows + meta in one <code>storage.transaction</code></span></li>
+            <li><span class="who do">Durable Object</span><span>The response waits until SQLite is durable, so the acknowledgement means the write is durable</span></li>
+            <li><span class="who do">Durable Object</span><span>If memtable bytes exceed <code>l0SstSize</code>, or <code>maxL0Age</code> has passed: <code>setAlarm(now)</code></span></li>
+            <li><span class="who do">Durable Object</span><span>alarm: stream rows in (key, seq desc) order → SstBuilder</span></li>
+            <li><span class="who r2">R2</span><span>PUT <code>compacted/&lt;ulid&gt;.sst</code> (and the changelog, if enabled), then CAS <code>manifest/&lt;n+1&gt;</code> with an epoch check</span></li>
+            <li><span class="who do">Durable Object</span><span>DELETE rows WHERE seq ≤ lastL0Seq</span></li>
+          </ol>
+        </div>
+        <div class="panel">
+          <h3>Consequences</h3>
+          <div class="facts">
+            <div class="fact"><b>Durable ack latency</b>Low ms (DO SQLite commit)</div>
+            <div class="fact"><b>Loss window on crash</b>None after the acknowledgement. <code>WriteReceipt</code> has no <code>awaitDurable</code>.</div>
+            <div class="fact"><b>R2 PUTs while idle</b>0</div>
+            <div class="fact"><b>Readers outside the writer see</b>L0 and below, bounded by <code>maxL0Age</code>; <code>Latest</code>/<code>AtLeast</code> reads ask the writer</div>
+            <div class="fact"><b>CDC</b>Optional changelog export: one extra PUT per flush</div>
+          </div>
+        </div>
+      </div>
+
+      <h3 style="margin-top: 20px">Why not SlateDB's R2 WAL</h3>
+      <div class="two">
+        <div class="panel">
+          <ul>
+            <li><b>It has no good home for the memtable.</b> Effect 4 has no sorted map, and a Durable Object can be evicted at any time. An in-memory skiplist would need to be written and then rebuilt from R2 on every wake-up. A SQLite memtable would mean writing every row twice with no durability gain.</li>
+            <li><b>It's worse at the main job.</b> Either it loses up to one <code>flushInterval</code> of acknowledged writes, or acknowledgements wait for a PUT plus the interval (about 100 ms or more).</li>
+            <li><b>It costs more:</b> up to 10 Class A PUTs per second per active database at a 100 ms interval.</li>
+            <li><b>It's more to build and test:</b> fencing by WAL file id, WAL replay, <code>awaitDurable</code> waiters, and a second test layer.</li>
+            <li><b>Its one real advantage, CDC, doesn't need it.</b> See the changelog export.</li>
+          </ul>
+          <p class="note">The real risk of this choice: until the next flush, durability is Durable Object storage's (replicated by Cloudflare before the acknowledgement), not R2's. <code>maxL0Age</code> bounds how long that lasts.</p>
+        </div>
+        <pre><code>flushL0(cut)                              # alarm
+  rows = SELECT … WHERE seq ≤ cut
+  l0   = SstBuilder(rows ORDER BY key, seq DESC)
+         → compacted/&lt;ulid&gt;.sst
+  if settings.changelog is enabled          # off by default
+    log = SstBuilder(rows ORDER BY seq)
+          → changelog/&lt;lastSeq&gt;.sst
+  manifest CAS: l0 += l0, lastL0Seq = cut,
+                changelog += log            # GC keeps it for
+                                            # changelogRetention
+  DELETE rows WHERE seq ≤ cut
+
+CDC consumer
+  cursor = last consumed seq
+  read manifest.changelog entries after cursor, in seq order
+  for the newest unflushed changes: GET /v1/databases/:id/changes?afterSeq=
+                                    (optional, served by the writer)</code></pre>
+      </div>
+
+      <h2>4. Read path</h2>
+      <div class="two">
+        <pre><code>get(key, { consistency })
+  manifest = ManifestCache.current   # Resource, refreshed on a schedule
+  match consistency
+    Flushed        → no writer call
+    AtLeast(seq)   → if manifest.lastL0Seq ≥ seq, no writer call   # seq from a WriteReceipt
+                     else treat as Latest
+    Latest         → WriterServer.probe(key)   # one SQLite index lookup, no SST I/O
+                       returns { row: Option, flushedSeq }
+                     if row is some → return resolve(row)
+                     if manifest.lastL0Seq &lt; flushedSeq → refresh manifest
+                     # writer deletes rows only after the manifest commit,
+                     # so memtable ∪ manifest(≥ flushedSeq) covers every write
+  # all SST work runs in the caller's isolate, never in the writer
+  for sst in manifest.l0 (newest first), then each sorted run
+    if not sst.range.contains(key) → skip
+    if bloom(sst).definitelyNot(key) → skip
+    block = BlockCache.get(sst.id, indexSearch(key))
+    row   = block.seek(key, snapshotSeq)
+    if row → return resolve(row)
+  return Option.none()</code></pre>
+        <div class="panel">
+          <h3>Cache tiers (SSTs are immutable, so no invalidation)</h3>
+          <ul>
+            <li><b>Isolate memory:</b> an Effect <code>Cache</code> keyed by <code>sstId:blockIndex</code>, with metadata in a separate cache so scans don't evict indexes and filters (SlateDB's <code>SplitCache</code>). It holds plain <code>Uint8Array</code>s and no I/O objects, so it can outlive an invocation.</li>
+            <li><b>L2, Workers Cache in front of <code>BlockServer</code>:</b> a cache in the nearest data center, then an upper tier shared by the whole network. A hit doesn't run the Worker. Concurrent misses for one key collapse into one run. This replaces the old <code>caches.default</code> Cache API, which has no tiering or collapsing, still runs the Worker, and needs explicit <code>put()</code>. It plays the role of SlateDB's Foyer disk tier.</li>
+            <li><b>R2:</b> <code>get(key, { range })</code>, called only by <code>BlockServer</code> on an L2 miss. R2 has no egress fees, but every GET is a Class B op.</li>
+          </ul>
+          <p class="note">A <code>Flushed</code> read never calls the writer, so a stale manifest only makes it older, never wrong. <code>Latest</code> costs the writer one cheap request. The writer's ~1k req/s budget therefore goes to writes, and reads scale out across isolates (§12).</p>
+        </div>
+      </div>
+
+      <h3 style="margin-top: 20px">Block addressing for Workers Cache</h3>
+      <div class="two">
+        <pre><code># Workers Cache removes Range, asks the Worker for the FULL body,
+# caches it, then slices; a 206 from the Worker is never cached.
+# One Range-addressed SST URL would pull 64 MB for a 4 KB read.
+# So every block gets its own URL and a full 200 response:
+
+GET /v1/databases/&lt;db&gt;/ssts/&lt;ulid&gt;/blocks/&lt;offset&gt;-&lt;length&gt;
+GET /v1/databases/&lt;db&gt;/ssts/&lt;ulid&gt;/meta   # index + filter + stats + footer
+GET /v1/databases/&lt;db&gt;/manifests/&lt;id&gt;     # immutable once created
+GET /v1/databases/&lt;db&gt;/manifests/latest   # hint: max-age=1, stale-while-revalidate
+# &lt;db&gt; is the database that OWNS the SST, which after a fork
+# may differ from the database being read (external reference)
+
+200 OK
+Cache-Control: public, max-age=31536000, immutable
+Cache-Tag: db:&lt;db&gt;</code></pre>
+        <div class="panel">
+          <h3>Rules</h3>
+          <ul>
+            <li><b>A separate Worker, cache on Worker-wide.</b> Alchemy supports per-entrypoint cache settings (<code>WorkerProps.entrypoints</code>), but named entrypoints are plain async <code>WorkerEntrypoint</code> classes. A separate Effect-native <code>BlockServer</code> keeps one handler style.</li>
+            <li><b><code>Cloudflare.cache({ crossVersionCache: true })</code></b>, because the served bytes are raw SST bytes that don't depend on the deploy. Otherwise every deploy would empty the block cache.</li>
+            <li><b>The owning database is in the path, not <code>ctx.props</code>.</b> Alchemy drops props on service bindings at upload, and binding props are fixed at deploy time anyway. Database id plus ULID makes each path unique by construction.</li>
+            <li><b>Reachable only through the service binding:</b> no custom domain, <code>workersDev: false</code>. Callers authorize access to the database before they fetch.</li>
+            <li><b><code>fetch()</code>, never RPC.</b> Custom RPC methods bypass Workers Cache.</li>
+            <li>Each <code>SstHandle</code> carries <code>metaOffset</code> and <code>metaLength</code>, so opening an SST is one cacheable request, not a suffix probe.</li>
+            <li>The response-size cap at launch is the Free-plan 512 MB. Blocks are KBs.</li>
+          </ul>
+          <p class="note">Neither Vitest nor <code>alchemy dev</code> emulates Workers Cache. <code>blockSourceTestLayer</code> reads the in-memory object store. Verify hits on a deployed preview with <code>Cf-Cache-Status: HIT</code>.</p>
+        </div>
+      </div>
+
+      <h2>5. Manifest CAS and fencing</h2>
+      <div class="two">
+        <pre><code>WriterServer init (blockConcurrencyWhile)
+  loop
+    latest = ManifestStore.loadLatest()        # GET manifest/LATEST hint, then
+                                               # HEAD id+1 … until 404 (no R2 LIST)
+    next   = latest with writerEpoch + 1
+    ManifestStore.create(latest.id + 1, next)  # If-None-Match: *
+      ManifestConflict → retry with backoff
+  store writerEpoch in SQLite meta
+
+flushL0
+  rows = SELECT … WHERE seq &lt;= cut ORDER BY key, seq DESC
+  sst  = SstBuilder.build(rows)               # ULID name
+  SstStore.put(sst)                           # orphan if we lose
+  ManifestStore.update(m =>
+    m.writerEpoch != ours → fail WriterFenced
+    m with l0 = [sst, ...m.l0], lastL0Seq = cut)
+  ObjectStore.put(manifest/LATEST, newId)     # best-effort hint
+  DELETE FROM memtable_rows WHERE seq &lt;= cut</code></pre>
+        <div class="panel">
+          <h3>Invariants</h3>
+          <ul>
+            <li>A manifest id is created exactly once. Losing the race means reloading and reapplying a pure <code>(Manifest) =&gt; Manifest</code> edit.</li>
+            <li>SST names are ULIDs, so a fenced writer can only leave orphans. GC removes them after <code>minAge</code>.</li>
+            <li>The compactor applies the same rule with <code>compactorEpoch</code>. A job's edit replaces exactly its input ids. If they have changed, the edit fails rather than merging.</li>
+            <li>Rows are deleted from SQLite only after the manifest commit, so a crash in between replays as duplicate rows with identical seqs, which merging deduplicates.</li>
+            <li><code>manifest/LATEST</code> is only a hint and may be behind. Probing <code>id+1</code> finds the real head. Create-if-absent ids still decide, and R2 <code>LIST</code> (a Class A op) never runs on a read path.</li>
+          </ul>
+          <p class="note">To verify: the R2 binding <code>onlyIf</code> object form once treated <code>*</code> as a literal etag (workerd #2572). Pass <code>new Headers({ "If-None-Match": "*" })</code> and cover it with an integration test against real R2.</p>
+        </div>
+      </div>
+
+      <h2>6. Types</h2>
+      <pre><code>// Brands: Schema.Int / Schema.String checks + Schema.brand, parsed once at each boundary
+DatabaseId (opaque branded string; the core attaches no tenant meaning. The DO name, R2 prefix db/&lt;id&gt;/, and cache tag db:&lt;id&gt; derive from it)
+KeyRange = { start: Uint8Array, end: Option&lt;Uint8Array&gt; }   // half-open
+SeqNum (≤ 2^53, u64 on the wire) · SstId (ULID) · ManifestId · WriterEpoch · CompactorEpoch
+
+type RowValue = Data.TaggedEnum&lt;{
+  Value:     { readonly bytes: Uint8Array }
+  Merge:     { readonly operand: Uint8Array }
+  Tombstone: {}
+}&gt;
+type Row = { key: Uint8Array; seq: SeqNum; value: RowValue; createTs: Option&lt;Timestamp&gt;; expireTs: Option&lt;Timestamp&gt; }
+
+class Manifest extends Schema.Class&lt;Manifest&gt;("Manifest")({
+  writerEpoch, compactorEpoch, lastL0Seq, lastL0ClockTick,
+  l0: Schema.Array(SstHandle),              // newest first, overlapping
+  sortedRuns: Schema.Array(SortedRun),      // SortedRun = { id, ssts: non-overlapping SstHandle[] }
+  checkpoints: Schema.Array(Checkpoint),      // includes checkpoints held by forks
+  keyRange: Schema.Option(KeyRange),          // writes outside → KeyOutOfRangeError
+  state: DatabaseState,                       // Open | Sealed { successors: DatabaseId[] }
+  externalRefs: Schema.Array(ExternalRef),    // { owner: DatabaseId, checkpointId }
+}) {}
+// SstHandle = { id: SstId, firstKey, lastKey (Uint8ArrayFromBase64), sizeBytes: ByteSize, rowCount,
+//               metaOffset, metaLength,    // one cacheable GET opens the SST
+//               owner: Option&lt;DatabaseId&gt;, view: Option&lt;KeyRange&gt; }  // set after a fork
+
+// SST file: data blocks · bloom · index · stats · footer(JSON via Schema) · u64 metaOffset · u16 version
+// Data block rows: hand-written DataView codec (varint shared/unshared prefix, restart every 16), CRC32C per block</code></pre>
+      <p class="note">
+        The manifest uses <code>Schema.fromJsonString(Manifest)</code> first. It is small and easy to inspect, and
+        <code>encoding/SchemaBinary</code> can replace it later without changing callers. Data blocks don't use SchemaBinary because the
+        byte layout has to support binary search and prefix compression.
+      </p>
+
+      <h2>7. Services (one capability per file)</h2>
+      <div class="panel scroll">
+        <table>
+          <tr><th>Service</th><th>Operations</th><th>Depends on</th><th>Effect primitives</th></tr>
+          <tr><td><code>ObjectStore</code></td><td>getRange · head · putIfAbsent · put (multipart) · list · delete</td><td>R2 <code>ReadWriteBucket</code></td><td>translates <code>R2Error</code> → <code>ObjectStoreUnavailableError</code>; <code>Schedule</code> retry</td></tr>
+          <tr><td><code>ManifestStore</code></td><td>loadLatest · create(id, m) · update(edit)</td><td>ObjectStore</td><td><code>Schema</code>, <code>Effect.retry</code> on <code>ManifestConflictError</code></td></tr>
+          <tr><td><code>ManifestCache</code></td><td>current · refresh</td><td>ManifestStore</td><td><code>Resource.auto</code> with <code>Schedule.spaced</code>; <code>SubscriptionRef</code> in the writer</td></tr>
+          <tr><td><code>SstStore</code></td><td>write(rows) · openReader(handle)</td><td>ObjectStore</td><td><code>Stream</code> → <code>Sink</code> builder, <code>ByteSize</code></td></tr>
+          <tr><td><code>BlockCache</code></td><td>block · meta (index, filter, footer)</td><td>BlockSource</td><td>L1: <code>Cache.make</code> (joins concurrent misses), separate data and meta caches</td></tr>
+          <tr><td><code>BlockSource</code></td><td>block(owner, sst, offset, length) · meta(owner, sst)</td><td>BlockServer service binding (prod) or ObjectStore (test)</td><td><code>HttpClient</code> over the binding's <code>fetch</code>; <code>blockSourceTestLayer</code> reads the in-memory store directly</td></tr>
+          <tr><td><code>BlockServer</code> (Worker)</td><td><code>GET /v1/databases/:db/ssts/:id/blocks/:range</code> · <code>/meta</code> · <code>/manifests/:id</code></td><td>ObjectStore</td><td>Effect <code>HttpApi</code>; runs only on a Workers Cache miss; immutable <code>Cache-Control</code>, <code>Cache-Tag: db:&lt;db&gt;</code></td></tr>
+          <tr><td><code>MemTable</code> (also the WAL)</td><td>apply(batch) · get · scan · rowsUpTo(seq) · truncate(seq) · byteSize</td><td>DurableObjectState SQLite</td><td><code>storage.transaction</code>, SQL cursor as <code>Stream</code></td></tr>
+          <tr><td><code>ChangelogExport</code></td><td>export(rows, lastSeq) during flushL0 · read(afterSeq)</td><td>SstStore, ManifestStore</td><td>off by default; seq-ordered SST per flush; GC keeps entries for <code>changelogRetention</code></td></tr>
+          <tr><td><code>SeqOracle</code></td><td>next · current</td><td>MemTable meta row</td><td>part of the same SQLite transaction</td></tr>
+          <tr><td><code>DbReader</code></td><td>get · scan · scanPrefix (Flushed)</td><td>ManifestCache, BlockCache</td><td><code>Pull</code> k-way merge, <code>Effect.forEach({ concurrency })</code></td></tr>
+          <tr><td><code>DbWriter</code></td><td>write(batch) · snapshot · flush</td><td>MemTable, SeqOracle, SstStore, ManifestStore</td><td><code>Semaphore(1)</code> around commit, <code>Effect.fn</code> spans, <code>Metric</code></td></tr>
+          <tr><td><code>CompactionScheduler</code></td><td>pick(manifest, running) → jobs</td><td>none (pure)</td><td>plain function, tested against random manifests from <code>Arbitrary</code></td></tr>
+          <tr><td><code>DbClient</code></td><td>the public API (§8)</td><td>WriterServer namespace, DbReader</td><td>execution memo + <code>Cache</code> of HTTP clients per <code>DatabaseId</code></td></tr>
+          <tr><td><code>DatabaseLifecycle</code></td><td>create(id, options) · remove(id) · seal(id, successors) · forkRange(source, checkpoint, range, newId)</td><td>ManifestStore, WriterServer and CompactorServer namespaces, ObjectStore, Workers Cache purge</td><td>every step is a manifest CAS; <code>remove</code> purges <code>db:&lt;id&gt;</code></td></tr>
+          <tr><td><code>GarbageCollector</code></td><td>collect(id)</td><td>ManifestStore, ObjectStore</td><td>reads only its own manifests and checkpoints; forks hold checkpoints on their sources, so shared SSTs stay alive (§12)</td></tr>
+          <tr><td><code>CompactionBudget</code></td><td>acquire(budgetGroup) · release</td><td>none, or a global DO</td><td>fair share across groups; the group defaults to the <code>DatabaseId</code>, so callers can group databases by tenant</td></tr>
+          <tr><td colspan="4" class="note">The optional <code>@cf-slatedb/sharding</code> package (<code>ShardDirectory</code>, <code>ShardRouter</code>, <code>ShardSplit</code>) is in §12. It depends only on <code>DbClient</code> and <code>DatabaseLifecycle</code>.</td></tr>
+        </table>
+      </div>
+      <pre style="margin-top: 12px"><code>// manifest-store.ts — the order the standards require
+export interface IManifestStore { readonly loadLatest: Effect.Effect&lt;VersionedManifest, ManifestStoreError, RuntimeContext&gt;; /* … */ }
+export class ManifestStore extends Context.Service&lt;ManifestStore, IManifestStore&gt;()("@cf-slatedb/ManifestStore") {}
+export const makeManifestStore = Effect.gen(function* () { const objects = yield* ObjectStore; /* … */ return ManifestStore.of({ /* … */ }) })
+export const manifestStoreLayerWithoutDependencies = Layer.effect(ManifestStore, makeManifestStore)
+export const manifestStoreLayer     = manifestStoreLayerWithoutDependencies.pipe(Layer.provide(objectStoreLayer))
+export const manifestStoreTestLayer = manifestStoreLayerWithoutDependencies.pipe(Layer.provide(objectStoreTestLayer))
+// objectStoreTestLayer: Ref&lt;Map&gt; with real put-if-absent semantics, so fencing tests are faithful</code></pre>
+
+      <h2>8. Public API and semantics</h2>
+      <div class="two">
+        <pre><code>interface IDbClient {
+  put(db, key, value, opts?)    → Effect&lt;WriteReceipt, DbWriteError&gt;
+  delete(db, key)               → Effect&lt;WriteReceipt, DbWriteError&gt;
+  merge(db, key, operand)       → Effect&lt;WriteReceipt, DbWriteError&gt;
+  write(db, WriteBatch)         → Effect&lt;WriteReceipt, DbWriteError&gt;
+  get(db, key, { consistency })  → Effect&lt;Option&lt;Uint8Array&gt;, DbReadError&gt;
+  getRow(db, key, …)            → Effect&lt;Option&lt;Row&gt;, DbReadError&gt;  // seq, timestamps
+  scan(db, range, …)            → Stream&lt;Row, DbReadError&gt;
+  flush(db)                     → Effect&lt;void, DbWriteError&gt;
+}
+type ReadConsistency =
+  | { _tag: "Latest" }                // SlateDB Memory: one writer probe
+  | { _tag: "AtLeast"; seq: SeqNum }  // read-your-writes from a receipt
+  | { _tag: "Flushed" }               // SlateDB Remote: no writer call
+// WriteReceipt = { seq: SeqNum, createTs: Timestamp }   // durable on return; no awaitDurable</code></pre>
+        <div class="panel">
+          <ul>
+            <li><b>Durability:</b> a write is durable once the call returns, because DO SQLite has confirmed it. SlateDB acknowledges from memory.</li>
+            <li><b>Atomicity:</b> a <code>WriteBatch</code> commits as one SQLite transaction with one seq.</li>
+            <li><b>Ordering:</b> seq decides visibility. Wall-clock time is only metadata, from a monotonic clock seeded by <code>lastL0ClockTick</code>.</li>
+            <li><b>Latest</b> reads see every acknowledged write and cost the writer one memtable probe. <b>AtLeast(seq)</b> sees the caller's own writes and usually skips the writer. <b>Flushed</b> reads see L0 and below, up to one memtable behind, and never touch the writer.</li>
+            <li><b>Scope of atomicity:</b> batches and transactions are atomic within one database. If a caller splits data across databases (for example with the sharding package), keys that must change together need to stay in the same database.</li>
+            <li><b>Lifecycle errors:</b> <code>KeyOutOfRangeError</code> (not retryable; the key is outside the database's <code>keyRange</code>) and <code>DatabaseSealedError { successors }</code> (not retryable against this database; route to a successor).</li>
+            <li><b>Errors</b> follow <code>docs/errors.md</code>: <code>WriterFencedError</code> (not retryable), <code>WriteStalledError</code> (retryable, compaction is behind), <code>ManifestConflictError</code> (internal and retried), <code>SstCorruptedError</code> (checksum, not retryable), <code>ObjectStoreUnavailableError</code>.</li>
+            <li><b>Later versions:</b> optimistic transactions, which are cheap here because the conflict check is a SQLite lookup on the writer. Also checkpoints, clones, merge operators, and TTL during compaction.</li>
+          </ul>
+        </div>
+      </div>
+
+      <h2>9. Effect 4.1.4 audit</h2>
+      <p>
+        These are all ~150 root modules and 24 subpath entrypoints in the installed package, rated for this project. Hover or tap a chip for its role.
+      </p>
+      <div class="legend">
+        <span><i style="background: var(--accent)"></i>core to the engine</span>
+        <span><i style="background: var(--do)"></i>used at the edges (infra, tests, ops)</span>
+        <span><i style="background: var(--code); border: 1px solid var(--line)"></i>available, not needed</span>
+      </div>
+      <div class="audit" id="audit"></div>
+      <div class="why panel" id="why" style="margin-top: 12px">Tap a module.</div>
+
+      <h3 style="margin-top: 22px">Gaps to build privately (Effect doesn't provide these)</h3>
+      <ul class="gaps">
+        <li><span class="tag">sorted map</span> v4 has no <code>SortedMap</code> or <code>RedBlackTree</code>. <b>Use DO SQLite.</b> BLOB comparison is memcmp, which matches <code>Bytes.Order</code>.</li>
+        <li><span class="tag">k-way merge</span> <code>Stream</code> has <code>merge</code>/<code>mergeAll</code> but not <code>mergeSorted</code>. Build a private binary heap over <code>Pull</code> sources, ordered by (key asc, seq desc). <code>TxPriorityQueue</code> is transactional and too heavy for this.</li>
+        <li><span class="tag">checksums</span> <code>crypto/Digest</code> covers MD5 and the SHA family only. Write a private CRC32C table, about 30 lines.</li>
+        <li><span class="tag">bloom filter</span> private, double hashing over a single 64-bit hash, sized by <code>filterBitsPerKey</code>.</li>
+        <li><span class="tag">ulid</span> private: <code>Clock</code> plus <code>Random</code>. <code>cluster/Snowflake</code> also sorts by time but ties ids to machine ids.</li>
+        <li><span class="tag">compression</span> Workers' built-in <code>CompressionStream</code> handles gzip and deflate. I'm not certain about zstd or lz4 (they may need WASM), so check before relying on them. Start uncompressed.</li>
+      </ul>
+
+      <h2>10. Infrastructure (Alchemy)</h2>
+      <div class="two">
+        <pre><code>// infra/cf-slatedb/alchemy.run.ts (sketch)
+Alchemy.Stack("CfSlatedb", { providers: Cloudflare.providers(), state: Cloudflare.state() },
+  Effect.gen(function* () {
+    const bucket = yield* LsmBucket          // R2.Bucket, retain(production)
+    const blocks = yield* BlockServerWorker  // Cloudflare.cache({ crossVersionCache: true }),
+                                             // workersDev: false, R2 read-only
+    const api    = yield* DbApiWorker        // binds WriterServer + BlockServer (service binding)
+    yield* CompactorWorker                   // CompactorServer DO + CompactionWorkflow
+    yield* GcWorker                          // cron trigger
+    return { url: api.url }
+  }))
+
+// writer-server.ts
+export class WriterServer extends Cloudflare.DurableObject&lt;WriterServer, WriterServerContract&gt;()("WriterServer") {}
+export const writerServerLayerWithoutDependencies = WriterServer.make(
+  Effect.gen(function* () {
+    const state = yield* Cloudflare.DurableObjectState
+    return Effect.gen(function* () {
+      /* fence, migrate memtable_rows, build HttpApi */
+      return { fetch, alarm: () => flusher.runAlarm() }
+    })
+  }))</code></pre>
+        <pre><code>cf-slatedb/
+├── packages/lsm-core/          # pure; no Cloudflare imports
+│   └── src/
+│       ├── row.ts  manifest.ts  ids.ts
+│       ├── sst-codec.ts  block-codec.ts  bloom-filter.ts  crc32c.ts
+│       ├── merge-iterator.ts            # Pull + heap
+│       └── size-tiered-compaction-scheduler.ts
+├── packages/lsm-cloudflare/
+│   └── src/
+│       ├── object-store.ts              # R2 adapter, owns R2Error
+│       ├── manifest-store.ts  manifest-cache.ts
+│       ├── sst-store.ts  block-cache.ts  block-source.ts
+│       ├── block-server-worker.ts  block-server-http-api.ts
+│       ├── mem-table.ts  db-writer.ts  db-reader.ts
+│       ├── writer-server.ts  writer-http-api.ts
+│       ├── db-client.ts                 # IDbClient / DbClient
+│       ├── database-lifecycle.ts        # create · remove · seal · forkRange
+│       ├── compaction-budget.ts
+│       ├── compactor-server.ts  compaction-workflow.ts
+│       └── garbage-collector.ts         # per database; fork checkpoints pin
+├── packages/lsm-sharding/      # optional; public API only
+│   └── src/
+│       ├── shard-directory-server.ts    # range map + version, one DO per group
+│       ├── shard-router.ts              # retry on DatabaseSealedError
+│       └── shard-split.ts               # seal → forkRange ×2 → publish
+└── infra/cf-slatedb/           # deploys; alchemy.run.ts only</code></pre>
+      </div>
+
+      <h2>11. Trade-offs and open decisions</h2>
+      <ul class="decisions">
+        <li><b>The SQLite WAL is limited to one location.</b> One DO holds at most 10 GB, so <code>maxUnflushedBytes</code> (about 256 MB) applies backpressure long before that limit. Writes always go to one placement, so distant callers pay a round trip.</li>
+        <li><b>One writer per database.</b> One logical dataset can grow past a single writer by spreading it over range-bounded databases (§12). A single hot key is still capped at one Durable Object; the storage layer can't fix that.</li>
+        <li><b>Binary over the HTTP boundary.</b> The standards require Effect HttpApi rather than Alchemy RPC. Base64 JSON (<code>Uint8ArrayFromBase64</code>) costs about 33% extra. An <code>application/octet-stream</code> batch body would avoid that. Decide before v1 routes are fixed.</li>
+        <li><b>Memory limit.</b> Isolates get 128 MB, so compaction must stream blocks in and stream multipart parts (at least 5 MiB) out. Input SSTs are never fully buffered.</li>
+        <li><b>Cost model.</b> Each memtable flush costs one PUT plus one manifest PUT. Each compaction output costs about one PUT per 5 MiB part. Every DO SQLite row written is billed. Use a 64 MB L0 size to amortize.</li>
+        <li><b>Wait to decide:</b> JSON vs <code>SchemaBinary</code> manifest, the default <code>changelogRetention</code>, and whether readers should use checkpoints (as SlateDB does) or a GC <code>minAge</code> margin.</li>
+      </ul>
+
+      <h2>12. Multi-tenancy: core primitives, optional sharding</h2>
+      <p>
+        The core has no tenant concept. Its unit is a <b>database</b>: one opaque <code>DatabaseId</code> with its own
+        <code>WriterServer</code>, <code>CompactorServer</code>, manifest chain, R2 prefix, and cache tag. Tenancy is a
+        mapping from tenant to databases, which callers own. SlateDB takes the same position. The core adds only the
+        primitives a layer can't build safely: range bounds, seal, zero-copy range fork, and GC that respects forks.
+      </p>
+
+      <h3>How callers scale without built-in tenancy</h3>
+      <div class="facts">
+        <div class="fact"><b>1 · One database per tenant (default)</b><code>DatabaseId.make(`tenant-${id}`)</code>. Routing is a pure function of the id, with no directory. Isolation, deletion, and residency are per database. Idle cost is about zero: the DO hibernates, and small data stays in SQLite until <code>maxL0Age</code> flushes it.</div>
+        <div class="fact"><b>2 · Pooled key prefixes (rarely right)</b>Many tiny tenants in one database under <code>tenantId/</code> keys. They share one writer's ~1k req/s and backpressure, deleting one is a range delete plus compaction, and there's no per-tenant residency. Option 1 is already cheap at scale.</div>
+        <div class="fact"><b>3 · Datasets beyond one writer</b>Use the optional <code>@cf-slatedb/sharding</code> package, or the same core primitives from your own code. Range-bounded databases split by forking without copying data.</div>
+      </div>
+
+      <h3 style="margin-top: 20px">Ownership</h3>
+      <div class="panel scroll">
+        <table>
+          <tr><th>Capability</th><th>Core</th><th>Sharding package</th><th>Caller</th></tr>
+          <tr><td><code>DatabaseId</code> → DO name, R2 prefix <code>db/&lt;id&gt;/</code>, cache tag <code>db:&lt;id&gt;</code></td><td>✅</td><td></td><td></td></tr>
+          <tr><td><code>create</code> · <code>delete</code> (DOs, prefix, purge tag)</td><td>✅</td><td></td><td></td></tr>
+          <tr><td>Key-range-bounded database → <code>KeyOutOfRangeError</code></td><td>✅</td><td></td><td></td></tr>
+          <tr><td><code>seal</code> → <code>DatabaseSealedError { successors }</code></td><td>✅</td><td></td><td></td></tr>
+          <tr><td>Zero-copy <code>forkRange</code> (SST views + external references)</td><td>✅</td><td></td><td></td></tr>
+          <tr><td>GC that keeps SSTs a fork still references</td><td>✅</td><td></td><td></td></tr>
+          <tr><td>Fair compaction and cache budgets by <code>budgetGroup</code></td><td>✅ hooks</td><td></td><td>sets the group</td></tr>
+          <tr><td>Range map with a version (<code>ShardDirectory</code> DO)</td><td></td><td>✅</td><td></td></tr>
+          <tr><td>Router that retries on <code>DatabaseSealedError</code></td><td></td><td>✅</td><td></td></tr>
+          <tr><td>Split and merge orchestration</td><td></td><td>✅</td><td></td></tr>
+          <tr><td>Tenant ids, auth, quotas, residency choice</td><td></td><td></td><td>✅</td></tr>
+        </table>
+      </div>
+      <p class="note">Each core row touches manifest invariants, fencing, or GC. The sharding package only calls public APIs, so it can change without a storage migration. The core rows are in the manifest schema from v1, even if the sharding package ships later.</p>
+
+      <h3 style="margin-top: 20px">Core primitives</h3>
+      <div class="two">
+        <pre><code>DatabaseLifecycle.forkRange(source, checkpoint, range, newId)
+  m = ManifestStore.load(source, checkpoint.manifestId)
+  create manifest for newId:
+    keyRange      = range
+    l0/sortedRuns = m's SSTs that overlap range,
+                    each as { owner: source, view: range ∩ sst }
+    externalRefs  = [{ owner: source, checkpointId }]
+  # the fork's compactor rewrites external SSTs into its own
+  # files; when none remain, it releases the source checkpoint
+
+DatabaseLifecycle.seal(id, successors)
+  WriterServer(id): flush memtable to L0
+  ManifestStore.update(m => m with state = Sealed(successors),
+                                   writerEpoch + 1)   # fences writer
+  later writes → DatabaseSealedError { successors }
+
+DatabaseLifecycle.remove(id)
+  forks still hold checkpoints → DatabaseHasDependentsError
+  else: clear DO storage · remove db/&lt;id&gt;/ · purge tag db:&lt;id&gt;</code></pre>
+        <div class="panel">
+          <h3>Why GC stays per database</h3>
+          <ul>
+            <li>This reuses SlateDB's clone mechanism. A fork holds a <b>checkpoint in its source's manifest</b>, so the source's GC, reading only its own manifests and checkpoints, keeps every SST the fork still reads.</li>
+            <li>GC never scans other databases. A fork releases its checkpoint once compaction has replaced every external SST, and the source then frees those files normally.</li>
+            <li>Fork checkpoints have no expiry. A fork compaction that falls behind keeps the source's files alive and costs storage, but never loses data.</li>
+            <li>Block reads for external SSTs use the <b>owner's</b> path: <code>/v1/databases/&lt;owner&gt;/ssts/…</code>. A fork's reads therefore hit the cache entries the source already warmed.</li>
+          </ul>
+        </div>
+      </div>
+
+      <h3 style="margin-top: 20px">Optional sharding package</h3>
+      <div class="two">
+        <pre><code>ShardRouter.put(group, key, value)
+  map = cached ShardDirectory(group).rangeMap   # { version, ranges → DatabaseId }
+  db  = map.databaseFor(key)
+  DbClient.put(db, key, value)
+    DatabaseSealedError { successors } → refresh map, retry once
+    KeyOutOfRangeError                 → refresh map, retry once
+
+ShardSplit.split(group, db, atKey k)          # seal first, fork once
+  DatabaseLifecycle.seal(db, [a, b])          # memtable flushed, fenced
+  cp = checkpoint of the sealed manifest
+  a  = forkRange(db, cp, [lo, k), newId)
+  b  = forkRange(db, cp, [k, hi), newId)
+  ShardDirectory(group).publish(version + 1, a, b)
+  # writes to db fail during the split; the router retries
+  # against a and b once the new map is published</code></pre>
+        <div class="panel">
+          <ul>
+            <li><b>Range shards, not hash shards.</b> Range and prefix scans stay in one database. Hash sharding (<code>HashRing</code>) would make every scan a scatter-gather merge.</li>
+            <li><b>Seal-then-fork is the simple version:</b> writes pause for one memtable flush plus a few manifest CAS operations. Forking before sealing shortens the pause, but needs a second catch-up fork for rows flushed in between.</li>
+            <li><b>Why the core needs no map versions:</b> a stale router can only hit a sealed or out-of-range database, and both fail with typed errors that tell it to refresh.</li>
+            <li><b>What callers give up:</b> atomic batches and transactions across databases. A single hot key still can't exceed one Durable Object.</li>
+          </ul>
+        </div>
+      </div>
+
+      <h3 style="margin-top: 20px">Per-database budget</h3>
+      <div class="panel scroll">
+        <table>
+          <tr><th>Limit</th><th>What uses it</th><th>How the design stays inside it</th></tr>
+          <tr><td>~1k req/s</td><td>Write requests and <code>Latest</code> memtable probes</td><td>SST reads run in the caller's isolate (§4). <code>AtLeast(seq)</code> and <code>Flushed</code> skip the writer. Batching raises rows per second without raising requests per second.</td></tr>
+          <tr><td>Single-threaded CPU</td><td>SQLite inserts and L0 encoding during a flush</td><td>Per-database <code>l0SstSize</code> (8–16 MB when hot, 64 MB otherwise) and yielding between blocks.</td></tr>
+          <tr><td>10 GB SQLite</td><td>Only unflushed rows</td><td><code>maxUnflushedBytes</code> applies backpressure far below 10 GB. Total data lives in R2 with no limit. The spare room can buffer writes through an R2 outage.</td></tr>
+          <tr><td>128 MB memory</td><td>Flush buffers</td><td>The memtable is in SQLite, not on the heap. A flush streams 5 MiB multipart parts. The writer has no block cache.</td></tr>
+        </table>
+      </div>
+
+      <h3 style="margin-top: 20px">Shared resources</h3>
+      <div class="panel scroll">
+        <table>
+          <tr><th>Resource</th><th>Per database?</th><th>Guard</th></tr>
+          <tr><td>Writer CPU, memory, SQLite</td><td>Yes</td><td>backpressure → <code>WriteStalledError</code> (retryable)</td></tr>
+          <tr><td>R2 request rate</td><td>No, account-wide</td><td>one bucket with <code>db/&lt;id&gt;/</code> prefixes; no <code>LIST</code> on read paths</td></tr>
+          <tr><td>Compaction (Workflow concurrency)</td><td>No</td><td><code>CompactionBudget</code> fair share by <code>budgetGroup</code> (callers can group a tenant's databases)</td></tr>
+          <tr><td>Reader isolate L1 block cache (128 MB)</td><td>No</td><td>byte budget per <code>budgetGroup</code>, or <code>LayerMap</code> per group with idle release</td></tr>
+          <tr><td>Workers Cache in front of BlockServer</td><td>No, one cache per Worker</td><td>owning database in every URL path, so entries are never shared by mistake</td></tr>
+          <tr><td>Data residency</td><td>Optional</td><td>DO and R2 jurisdiction in <code>DatabaseOptions</code> at <code>create</code>; a fork inherits its source's</td></tr>
+          <tr><td>Removal</td><td>Yes</td><td><code>DatabaseLifecycle.remove</code>; fails while forks still depend on it. Workers Cache purges always use Free-tier rate limits, so batch bulk removals.</td></tr>
+        </table>
+      </div>
+      <p class="note" style="margin-top: 12px">
+        Measure before trusting these numbers: rows/s per writer with batched requests, flush CPU per MB, whether DO
+        SQLite's page cache counts against 128 MB, the Workflows concurrent-instance limit on your plan, and the write
+        pause of a seal-then-fork split.
+      </p>
+    </main>
+
+    <script>
+      // [module, level, role] — level: core | use | skip
+      const audit = {
+        "Runtime and composition": [
+          ["Effect", "core", "Everything: Effect.gen workflows, Effect.fn spans, forEach concurrency for parallel SST probes."],
+          ["Layer", "core", "Capability graph: *LayerWithoutDependencies, *Layer, *TestLayer."],
+          ["Context", "core", "Context.Service for every capability (ManifestStore, BlockCache, …)."],
+          ["Scope", "core", "Owns multipart uploads and SST readers; aborts an upload when interrupted."],
+          ["Exit", "use", "Inspecting outcomes in tests and the workflow step boundary."],
+          ["Cause", "use", "Distinguishing defects from typed failures at the DO boundary."],
+          ["Fiber", "use", "Background prefetch of the next block during scans."],
+          ["Runtime", "skip", "Alchemy owns the runtime."],
+          ["ManagedRuntime", "skip", "Alchemy owns the runtime."],
+          ["Scheduler", "skip", "Default is fine."],
+          ["References", "skip", "Not needed."],
+          ["Effectable", "skip", "Library-author tooling."],
+          ["Pipeable", "skip", "Implicit."],
+          ["Function", "use", "pipe, flow, dual for small pure helpers."],
+          ["Types", "use", "Type utilities in public signatures."],
+          ["Unify", "skip", "Implicit."],
+          ["Utils", "skip", "Implicit."],
+          ["HKT", "skip", "Not needed."],
+          ["Inspectable", "skip", "Not needed."],
+          ["Formatter", "skip", "Not needed."],
+          ["ErrorReporter", "skip", "Workers observability covers this."],
+          ["LayerMap", "use", "Candidate for per-DatabaseId reader contexts in a multi-tenant reader Worker."],
+          ["LayerRef", "skip", "Not needed."],
+          ["ExecutionPlan", "skip", "Possible later: BlockServer, then direct R2 as a fallback when the service binding fails."],
+          ["Version", "skip", "Not needed."],
+        ],
+        "Errors, data, and control": [
+          ["Data", "core", "Data.TaggedError for every typed error; TaggedEnum for RowValue."],
+          ["Option", "core", "Every optional value (standards). get returns Option<Uint8Array>."],
+          ["Result", "core", "Pure codec results (block decode, footer parse) without Effect overhead."],
+          ["Match", "use", "Exhaustive RowValue resolution (Value | Merge | Tombstone)."],
+          ["Predicate", "use", "Refinements."],
+          ["Filter", "skip", "Not needed."],
+          ["Brand", "core", "SeqNum, SstId, ManifestId, WriterEpoch, DatabaseId."],
+          ["Newtype", "skip", "Schema brands cover this."],
+          ["Equal", "use", "Structural equality for manifest diffs in tests."],
+          ["Equivalence", "use", "Key equality."],
+          ["Hash", "use", "Cache keys."],
+          ["Order", "core", "Row order: key asc then seq desc, combined via Order.combine."],
+          ["Ordering", "use", "Comparator results."],
+          ["Redacted", "use", "R2 S3 credentials if the S3 API path is ever used."],
+          ["Redactable", "skip", "Not needed."],
+          ["PrimaryKey", "use", "HashRing node identity for sharding DatabaseIds."],
+          ["Symbol", "skip", "Not needed."],
+          ["UndefinedOr", "skip", "Option is the standard."],
+          ["Struct", "use", "Pure struct helpers."],
+          ["Tuple", "skip", "Not needed."],
+          ["Record", "skip", "Not needed."],
+          ["String", "skip", "Not needed."],
+          ["Number", "use", "Range checks."],
+          ["BigInt", "use", "u64 seq encode/decode at the SST boundary."],
+          ["BigDecimal", "skip", "Not needed."],
+          ["Boolean", "skip", "Not needed."],
+          ["Rational", "skip", "Not needed."],
+          ["RegExp", "skip", "Not needed."],
+          ["Iterable", "use", "Lazy row sequences in pure builders."],
+          ["NonEmptyIterable", "skip", "Not needed."],
+          ["Array", "core", "Manifest edits (immutable l0/sortedRuns updates)."],
+          ["Chunk", "use", "Stream batches of rows."],
+          ["Combiner", "skip", "Not needed."],
+          ["Reducer", "use", "Optional: shape of merge operators (must be associative)."],
+          ["Differ", "skip", "Manifest edits are plain functions."],
+          ["Optic", "skip", "Not needed."],
+          ["SemVer", "skip", "SST format version is a u16."],
+          ["SemVerRange", "skip", "Not needed."],
+          ["JsonPatch", "skip", "Not needed."],
+          ["JsonPointer", "skip", "Not needed."],
+          ["TextDiff", "skip", "Not needed."],
+          ["Glob", "skip", "Not needed."],
+        ],
+        "Schema": [
+          ["Schema", "core", "Manifest, SstHandle, HttpApi payloads, Schema.fromJsonString, brands, Uint8ArrayFromBase64."],
+          ["SchemaAST", "skip", "Library internals."],
+          ["SchemaGetter", "skip", "Library internals."],
+          ["SchemaIssue", "use", "Mapping decode failures to StoredDataInvalid reasons."],
+          ["SchemaParser", "skip", "Use Schema.decode* wrappers."],
+          ["SchemaRepresentation", "skip", "Not needed."],
+          ["SchemaTransformation", "use", "u64 ↔ bigint ↔ SeqNum transformations."],
+          ["JsonSchema", "skip", "OpenAPI generation handles it."],
+          ["StandardSchema", "skip", "Not needed."],
+          ["Arbitrary", "core", "Property tests: random batches against a Map oracle; random manifests for the scheduler."],
+          ["schema/Model", "skip", "SQL-model oriented."],
+          ["schema/VariantSchema", "skip", "Not needed."],
+          ["schema/SchemaJITCompiler", "skip", "Possible hot-path manifest decode optimization later."],
+          ["schema/SchemaAOTCompiler", "skip", "Same."],
+          ["schema/SchemaCompiler", "skip", "Same."],
+        ],
+        "Bytes and encoding": [
+          ["Bytes", "core", "Bytes.Order (memcmp key order), Bytes.Equivalence, concat."],
+          ["ByteSize", "core", "l0SstSize, maxUnflushedBytes, blockSize settings."],
+          ["encoding/SchemaBinary", "use", "Later: compact manifest/footer encoding with schema evolution."],
+          ["encoding/Base64", "use", "Binary keys over the HTTP boundary."],
+          ["encoding/Base64Url", "skip", "Not needed."],
+          ["encoding/Hex", "use", "Debug and CLI output of keys."],
+          ["encoding/Ndjson", "use", "Optional streaming scan response format."],
+          ["encoding/Json5", "skip", "Not needed."],
+          ["encoding/JsonArray", "skip", "Not needed."],
+          ["encoding/Jsonc", "skip", "Not needed."],
+          ["encoding/Csv", "skip", "Not needed."],
+          ["encoding/Ini", "skip", "Not needed."],
+          ["encoding/Sse", "skip", "Possible CDC transport later."],
+          ["encoding/Tar", "skip", "Not needed."],
+          ["encoding/Toml", "skip", "Not needed."],
+          ["encoding/Xml", "skip", "Not needed."],
+          ["encoding/Yaml", "skip", "Not needed."],
+          ["encoding/Zip", "skip", "Not needed (it has a private CRC32, not exported)."],
+          ["encoding/EncodingError", "skip", "Comes along with the codecs used."],
+        ],
+        "Immutable collections": [
+          ["HashMap", "use", "Pure write-set building for batches and transactions."],
+          ["HashSet", "use", "Live-SST sets in GC and scheduler conflict checks."],
+          ["Trie", "skip", "String keys only; keys here are bytes."],
+          ["Graph", "skip", "Not needed."],
+          ["HashRing", "use", "Optional: shard keyspaces across DatabaseIds."],
+        ],
+        "Mutable collections": [
+          ["MutableHashMap", "skip", "Prefer Cache/Ref."],
+          ["MutableHashSet", "skip", "Not needed."],
+          ["MutableList", "use", "Private row buffer inside the block builder."],
+          ["MutableRef", "skip", "Prefer Ref."],
+        ],
+        "Concurrency and state": [
+          ["Ref", "core", "Writer in-memory caches (byte counters), test ObjectStore Map."],
+          ["SynchronizedRef", "use", "Effectful updates to the cached manifest."],
+          ["SubscriptionRef", "use", "Writer's current manifest: flusher and reads observe changes."],
+          ["ScopedRef", "skip", "Not needed."],
+          ["RcRef", "skip", "Not needed."],
+          ["RcMap", "skip", "SST readers hold no I/O handles, so refcounting adds nothing."],
+          ["Deferred", "skip", "Not needed: every acknowledged write is already durable, so there are no durability waiters."],
+          ["Latch", "use", "Gate writes while the writer is fencing at startup."],
+          ["Semaphore", "core", "Serialize commit; bound concurrent R2 range GETs."],
+          ["PartitionedSemaphore", "use", "Fair R2 concurrency across scans vs point reads."],
+          ["Queue", "use", "Bounded prefetch queue in scans and compaction streaming."],
+          ["PubSub", "skip", "Possible CDC fan-out later."],
+          ["Pool", "skip", "No pooled connections."],
+          ["FiberHandle", "skip", "Not needed."],
+          ["FiberMap", "skip", "Alarms replace long-lived fibers in DOs."],
+          ["FiberSet", "skip", "Same."],
+          ["Cache", "core", "L1 BlockCache in isolate memory (L2 is Workers Cache in front of BlockServer) and per-invocation HTTP client cache (execution memo)."],
+          ["ScopedCache", "skip", "Entries own no scoped resources."],
+          ["Resource", "core", "ManifestCache: refresh on a schedule, readable repeatedly."],
+          ["Request", "skip", "Possible: batch point gets into one SST probe."],
+          ["RequestResolver", "skip", "Same."],
+        ],
+        "Transactional (STM)": [
+          ["TxRef", "skip", "The SQLite transaction is the commit point; STM would duplicate it."],
+          ["TxChunk", "skip", "Same."],
+          ["TxDeferred", "skip", "Same."],
+          ["TxHashMap", "skip", "Same."],
+          ["TxHashSet", "skip", "Same."],
+          ["TxPriorityQueue", "skip", "Too heavy for the merge heap."],
+          ["TxPubSub", "skip", "Same."],
+          ["TxQueue", "skip", "Same."],
+          ["TxReentrantLock", "skip", "Same."],
+          ["TxSemaphore", "skip", "Same."],
+          ["TxSubscriptionRef", "skip", "Same."],
+        ],
+        "Streaming": [
+          ["Stream", "core", "scan results, SQLite cursors, R2 bodies, multipart upload parts."],
+          ["Pull", "core", "Merge-iterator sources: each SST/memtable iterator is a Pull."],
+          ["Channel", "use", "Custom block-decoding transform if Stream operators are not enough."],
+          ["ChannelSchema", "skip", "Not needed."],
+          ["Sink", "core", "SstBuilder as a Sink<SstHandle, Row>."],
+          ["Take", "skip", "Not needed."],
+        ],
+        "Time, config, observability": [
+          ["Clock", "core", "Monotonic create_ts, ULIDs, TestClock in tests."],
+          ["Random", "use", "ULID randomness; jitter."],
+          ["Schedule", "core", "Manifest CAS retry with jitter; manifest refresh."],
+          ["Duration", "core", "flushInterval, minAge, checkpoint lifetime."],
+          ["DateTime", "use", "TTL expire timestamps."],
+          ["Cron", "skip", "Alchemy cron trigger instead."],
+          ["Config", "core", "LsmSettings parsed once at the composition root."],
+          ["ConfigProvider", "use", "Test overrides."],
+          ["Logger", "use", "Structured logs."],
+          ["LogLevel", "use", "Same."],
+          ["Console", "skip", "Use Logger."],
+          ["Tracer", "use", "Spans via Effect.fn → Workers traces."],
+          ["Metric", "core", "Flush bytes, L0 count, cache hit rate, CAS conflicts (SlateDB RFC-0021 parity)."],
+        ],
+        "Platform": [
+          ["FileSystem", "skip", "No filesystem in Workers."],
+          ["Path", "skip", "Same."],
+          ["Terminal", "use", "Only for a CLI admin tool."],
+          ["Stdio", "skip", "Same."],
+          ["PlatformError", "skip", "Same."],
+        ],
+        "Subpath entrypoints": [
+          ["effect/http", "core", "HttpRouter, HttpClient (Cloudflare.toHttpClient to WriterServer)."],
+          ["effect/http-api", "core", "Versioned /v1 contracts, HttpApiBuilder, HttpApiClient, OpenAPI."],
+          ["effect/testing", "core", "TestClock for flush intervals and alarms."],
+          ["effect/workflow", "skip", "Cloudflare Workflows via Alchemy instead."],
+          ["effect/cluster", "skip", "DOs are the sharding; Snowflake is an ID option."],
+          ["effect/rpc", "skip", "Standards: HTTP API, not RPC."],
+          ["effect/sql", "use", "Optional SqlClient over DO SQLite (@effect/sql-sqlite-do, as in cf-twitch)."],
+          ["effect/persistence", "skip", "KeyValueStore is the wrong level of abstraction; CircuitBreaker could guard R2."],
+          ["effect/crypto", "skip", "No CRC32C; only SHA/MD5 digests."],
+          ["effect/encoding", "use", "See Bytes and encoding."],
+          ["effect/cli", "use", "Admin CLI: inspect manifest, list SSTs, force compaction."],
+          ["effect/observability", "use", "OTLP export if traces leave Cloudflare."],
+          ["effect/ai", "skip", "Not relevant."],
+          ["effect/devtools", "skip", "Local debugging only."],
+          ["effect/eventlog", "skip", "Not relevant."],
+          ["effect/jose", "skip", "Access handles auth."],
+          ["effect/net", "skip", "Not relevant."],
+          ["effect/process", "skip", "Not in Workers."],
+          ["effect/reactivity", "skip", "UI-side."],
+          ["effect/graphql", "skip", "Not relevant."],
+          ["effect/socket", "skip", "Not relevant."],
+          ["effect/workers", "skip", "Web workers, not Cloudflare Workers."],
+          ["effect/schema", "skip", "Compilers and Model; see Schema."],
+        ],
+      };
+      const auditEl = document.getElementById("audit");
+      const whyEl = document.getElementById("why");
+      auditEl.innerHTML = Object.entries(audit)
+        .map(
+          ([group, mods]) =>
+            `<div class="panel group"><h3>${group}</h3><div class="chips">${mods
+              .map(([m, lvl, why]) => `<span class="chip ${lvl}" tabindex="0" title="${why.replace(/"/g, "&quot;")}" data-why="${why.replace(/"/g, "&quot;")}" data-m="${m}">${m}</span>`)
+              .join("")}</div></div>`,
+        )
+        .join("");
+      auditEl.addEventListener("click", (e) => {
+        const c = e.target.closest(".chip");
+        if (c) whyEl.innerHTML = `<code>${c.dataset.m}</code> — ${c.dataset.why}`;
+      });
+      auditEl.addEventListener("focusin", (e) => {
+        const c = e.target.closest(".chip");
+        if (c) whyEl.innerHTML = `<code>${c.dataset.m}</code> — ${c.dataset.why}`;
+      });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,27 @@
+{
+  "name": "cf-slatedb",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "ready": "vp check && vp run -r test",
+    "dev": "vp run @cf-slatedb/infra#dev",
+    "verify": "vp run @cf-slatedb/tools-formal-verification#verify",
+    "trace": "node tools/trace-cli/src/trace-cli.ts",
+    "scenario": "node tools/scenario-cli/src/scenario-cli.ts"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "vite-plus": "catalog:"
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "12.14.0",
+      "onFail": "download"
+    }
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  }
+}

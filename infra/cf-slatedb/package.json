@@ -1,0 +1,24 @@
+{
+  "name": "@cf-slatedb/infra",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vp test run"
+  },
+  "dependencies": {
+    "effect": "catalog:"
+  },
+  "devDependencies": {
+    "@alchemy.run/cloudflare": "catalog:",
+    "@cf-slatedb/lsm-cloudflare": "workspace:*",
+    "@cf-slatedb/lsm-core": "workspace:*",
+    "@cf-slatedb/sharding": "workspace:*",
+    "@cloudflare/workers-types": "catalog:",
+    "@effect/platform-node": "catalog:",
+    "@types/node": "catalog:",
+    "alchemy": "catalog:",
+    "typescript": "catalog:",
+    "vite-plus": "catalog:"
+  }
+}
