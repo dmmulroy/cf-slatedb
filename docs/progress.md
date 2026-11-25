@@ -80,6 +80,10 @@ in order.
 - **6c. Pinned snapshots (D52).** `pinSnapshot` / `POST …/snapshots/pinned { lifetimeMs }` pins a
   snapshot with an expiring checkpoint; plain snapshots stay free and their `gcMinAge` limit is
   documented, with `SnapshotExpired` pointing to pinning.
+- **6d. Corrupted SSTs in compaction (D53).** A corrupted input ends the job with a typed
+  `Corrupted` outcome (no defect, no retry loop); the compactor reads job outcomes, records the SST
+  in its state (`GET …/compaction`), counts and logs it, and never plans its source again until the
+  SST leaves the manifest.
 
 ## Done
 

@@ -127,6 +127,7 @@ export const compactorClientTestLayer = Layer.effect(
           compactorEpoch: CompactorEpoch.make(0),
           running: [],
           fenced: false,
+          corruptSsts: [],
         }),
       destroy: (databaseId) => Ref.update(record, (destroyed) => [...destroyed, databaseId]),
       status: () => Effect.succeed(Option.none()),

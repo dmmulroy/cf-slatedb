@@ -22,6 +22,8 @@ import { LsmConfiguration } from "./lsm-configuration.ts";
 import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
 import { ManifestReader } from "./manifest-reader.ts";
 import { ManifestStore } from "./manifest-store.ts";
+import { sstKey } from "./object-keys.ts";
+import { ObjectStore } from "./object-store.ts";
 import { sstStoreLayerWithoutDependencies } from "./sst-store.ts";
 
 const ORDERS = DatabaseId.make("orders");
@@ -81,6 +83,7 @@ const run = <A, E>(
     | CompactionLauncherRecord
     | CompactionBudget
     | LsmConfiguration
+    | ObjectStore
     | DbReaderServices
   >,
 ) =>
@@ -180,5 +183,59 @@ describe("Compactor", () => {
     expect(outcome.usersWaiting).toBe(4);
     expect(Option.isSome(outcome.usersPoll)).toBe(true);
     expect(outcome.usersAfter).toBe(0);
+  });
+
+  it("reports a corrupted input SST as a typed outcome and stops compacting it (D53)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createWithL0(ORDERS, 4);
+        const objects = yield* ObjectStore;
+        const before = yield* (yield* ManifestReader).loadLatest(ORDERS);
+        const victim = before.manifest.l0[1];
+        if (victim === undefined) return yield* Effect.die("expected four L0 SSTs");
+        // Flip a byte inside the SST's first data block: its CRC32C no longer matches.
+        const stored = yield* objects.get(sstKey(ORDERS, victim.id));
+        if (Option.isNone(stored)) return yield* Effect.die("the SST is missing");
+        const damaged = Uint8Array.from(stored.value);
+        damaged[2] = (damaged[2] ?? 0) ^ 0xff;
+        yield* objects.put(sstKey(ORDERS, victim.id), damaged);
+
+        const { compactor, fire } = yield* startCompactor;
+        yield* compactor.wake(ORDERS);
+        yield* fire;
+        for (let poll = 0; poll < 3; poll++) {
+          yield* TestClock.adjust("5 seconds");
+          yield* fire;
+        }
+        const jobs = yield* Ref.get(yield* CompactionLauncherRecord);
+        const status = yield* compactor.status(ORDERS);
+        const after = yield* (yield* ManifestReader).loadLatest(ORDERS);
+        return {
+          victim: victim.id,
+          jobs: [...jobs.values()],
+          status,
+          l0: after.manifest.l0.length,
+        };
+      }),
+    );
+    // One job ran and ended with a typed outcome naming the SST (no defect, no retry loop).
+    expect(outcome.jobs).toHaveLength(1);
+    expect(outcome.jobs[0]).toMatchObject({
+      _tag: "Corrupted",
+      sstId: outcome.victim,
+      section: "DataBlock",
+    });
+    // The compactor reports it and plans nothing more over that L0 SST.
+    const corrupt = Option.map(outcome.status, (state) => state.corruptSsts);
+    expect(corrupt).toEqual(
+      Option.some([
+        expect.objectContaining({
+          sstId: outcome.victim,
+          source: Option.some({ _tag: "L0", sstId: outcome.victim }),
+          reason: "ChecksumMismatch",
+        }),
+      ]),
+    );
+    expect(outcome.l0).toBe(4);
   });
 });

@@ -298,6 +298,12 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   (properties: budgets and accounting, LRU within a group, another group evicted only under total
   pressure and only while heaviest; four mutations caught), `block-cache.test.ts` (joined misses,
   failures not kept, a busy group never evicts a quiet one, a lone group held to its share).
+- **Corrupted SST in compaction (known gap, hand-off item 6)** — done (D53). `compaction-job.ts`
+  (`Corrupted` outcome), `compaction-launcher.ts` / `compaction-workflow.ts` (`progress` with the
+  outcome), `compactor.ts` (`corruptSsts`, metric, blocked sources),
+  `size-tiered-compaction-scheduler.ts` (`planCompactionsAround`). Tests: `compactor.test.ts` (one
+  corrupted byte → typed outcome, reported, never planned again; two mutations caught),
+  `size-tiered-compaction-scheduler.test.ts` (blocked run never planned).
 - **Long-lived snapshots (known gap, hand-off item 6)** — done (D52). `DatabaseLifecycle.pinSnapshot`,
   `POST /v1/databases/:id/snapshots/pinned` (`db-http-api.ts`); plain snapshots' `gcMinAge` limit and
   `SnapshotExpired` documented. Tests: `database-lifecycle.test.ts` (pinned readable past `gcMinAge`,

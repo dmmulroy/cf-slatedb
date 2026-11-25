@@ -1,5 +1,5 @@
 import type { RuntimeContext } from "alchemy/RuntimeContext";
-import { Context, Effect, Layer, Ref, Schema } from "effect";
+import { Context, Effect, Layer, Option, Ref, Schema } from "effect";
 
 import type { CompactionExecutor } from "./compaction-executor.ts";
 import {
@@ -24,11 +24,19 @@ export interface ICompactionLauncher {
   readonly start: (
     params: CompactionJobParams,
   ) => Effect.Effect<void, CompactionLauncherUnavailableError, RuntimeContext>;
-  /** Whether the job may still commit (queued, running, waiting, or paused). */
-  readonly isRunning: (
+  /**
+   * Whether the job may still commit (queued, running, waiting, or paused), or how it ended: its
+   * outcome, or none when it failed or its outcome is unknown.
+   */
+  readonly progress: (
     jobId: string,
-  ) => Effect.Effect<boolean, CompactionLauncherUnavailableError, RuntimeContext>;
+  ) => Effect.Effect<CompactionJobProgress, CompactionLauncherUnavailableError, RuntimeContext>;
 }
+
+/** Where a compaction job is: still able to commit, or finished (with its outcome, when known). */
+export type CompactionJobProgress =
+  | { readonly _tag: "Running" }
+  | { readonly _tag: "Finished"; readonly outcome: Option.Option<CompactionJobOutcome> };
 
 /** The contextual compaction launcher. */
 export class CompactionLauncher extends Context.Service<CompactionLauncher, ICompactionLauncher>()(
@@ -65,7 +73,17 @@ export const compactionLauncherTestLayer = Layer.effect(
               Ref.update(record, (jobs) => new Map(jobs).set(params.jobId, "Failed" as const)),
           }),
         ),
-      isRunning: () => Effect.succeed(false),
+      progress: (jobId) =>
+        Ref.get(record).pipe(
+          Effect.map((jobs): CompactionJobProgress => {
+            const ended = jobs.get(jobId);
+            return {
+              _tag: "Finished",
+              outcome:
+                ended === undefined || ended === "Failed" ? Option.none() : Option.some(ended),
+            };
+          }),
+        ),
     });
   }),
 ).pipe(

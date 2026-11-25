@@ -16,6 +16,7 @@ import {
 import {
   DEFAULT_SIZE_TIERED_COMPACTION_OPTIONS,
   planCompactions,
+  planCompactionsAround,
   type SizeTieredCompactionOptions,
 } from "./size-tiered-compaction-scheduler.ts";
 
@@ -255,5 +256,22 @@ describe("planCompactions", () => {
       manifest.l0.map((sst) => sst.id),
     );
     expect([job?.destination, job?.isBottom]).toEqual([0, true]);
+  });
+
+  it("never plans a job over a blocked (corrupted) source, and plans no fork rewrite while one is blocked", () => {
+    const runs = (ids: ReadonlyArray<number>): ReadonlyArray<SortedRun> =>
+      ids.map((id) => ({ id: SortedRunId.make(id), ssts: [handle(1000)] }));
+    const manifest = withLsm([], runs([7, 6, 5, 4, 3, 2, 1, 0]));
+    const options = { ...DEFAULT_SIZE_TIERED_COMPACTION_OPTIONS, maxConcurrentCompactions: 4 };
+    const blocked = [{ _tag: "SortedRun" as const, id: SortedRunId.make(5) }];
+    const planned = planCompactionsAround(manifest, [], blocked, options);
+    const sources = planned.flatMap((job) => job.sources);
+    expect(sources.some((source) => source._tag === "SortedRun" && source.id === 5)).toBe(false);
+    // Without the block, the same manifest compacts run 5.
+    expect(
+      planCompactions(manifest, [], options)
+        .flatMap((job) => job.sources)
+        .some((source) => source._tag === "SortedRun" && source.id === 5),
+    ).toBe(true);
   });
 });

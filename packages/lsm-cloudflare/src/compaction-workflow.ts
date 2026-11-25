@@ -8,7 +8,11 @@ import {
   type CompactionStepRunner,
   runCompactionJob,
 } from "./compaction-job.ts";
-import { CompactionLauncher, CompactionLauncherUnavailableError } from "./compaction-launcher.ts";
+import {
+  CompactionLauncher,
+  type CompactionJobProgress,
+  CompactionLauncherUnavailableError,
+} from "./compaction-launcher.ts";
 import { lsmJurisdictionAtDeclaration } from "./lsm-jurisdiction.ts";
 
 /**
@@ -59,6 +63,8 @@ export class CompactionWorkflow extends Cloudflare.Workflow<CompactionWorkflow>(
   }),
 ) {}
 
+const decodeOutcome = Schema.decodeUnknownOption(CompactionJobOutcome);
+
 /** Workflow statuses after which a job can still commit. */
 const RUNNING_STATUSES: ReadonlySet<string> = new Set([
   "queued",
@@ -95,7 +101,7 @@ export const compactionLauncherLayer = Layer.effect(
           .create({ id: params.jobId, params: encode(params) })
           .pipe(Effect.catchCause(unavailable(params.jobId, "start")));
       }),
-      isRunning: Effect.fn("CompactionLauncher.isRunning")(function* (jobId: string) {
+      progress: Effect.fn("CompactionLauncher.progress")(function* (jobId: string) {
         const status = yield* workflow.get(jobId).pipe(
           Effect.flatMap((instance) => instance.status()),
           Effect.catchCause(unavailable(jobId, "report the status of")),
@@ -104,7 +110,17 @@ export const compactionLauncherLayer = Layer.effect(
           "compaction.job_id": jobId,
           "workflow.status": status.status,
         });
-        return RUNNING_STATUSES.has(status.status);
+        if (RUNNING_STATUSES.has(status.status)) {
+          const running: CompactionJobProgress = { _tag: "Running" };
+          return running;
+        }
+        // A completed run returns its encoded outcome; an errored or terminated one has none.
+        const outcome =
+          status.status === "complete"
+            ? decodeOutcome(status.output)
+            : Option.none<CompactionJobOutcome>();
+        const finished: CompactionJobProgress = { _tag: "Finished", outcome };
+        return finished;
       }),
     });
   }),

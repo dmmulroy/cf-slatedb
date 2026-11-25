@@ -53,9 +53,25 @@ export const planCompactions = (
   manifest: Manifest,
   running: ReadonlyArray<CompactionJob>,
   options: SizeTieredCompactionOptions,
+): ReadonlyArray<CompactionJob> => planCompactionsAround(manifest, running, [], options);
+
+/**
+ * {@link planCompactions}, never using `blocked` sources: sources a compaction found corrupted
+ * (D53). They are reserved like a running job's sources, so no job reads them, and no fork rewrite
+ * is planned while any is blocked. A blocked L0 SST pauses L0 compaction, which keeps L0 in order.
+ */
+export const planCompactionsAround = (
+  manifest: Manifest,
+  running: ReadonlyArray<CompactionJob>,
+  blocked: ReadonlyArray<CompactionSource>,
+  options: SizeTieredCompactionOptions,
 ): ReadonlyArray<CompactionJob> => {
   const busyL0 = new Set<SstId>();
   const busyRuns = new Set<SortedRunId>();
+  for (const source of blocked) {
+    if (source._tag === "L0") busyL0.add(source.sstId);
+    else busyRuns.add(source.id);
+  }
   let highestRunId = manifest.sortedRuns.reduce((max, run) => Math.max(max, run.id), -1);
   const reserve = (job: CompactionJob) => {
     for (const source of job.sources) {
@@ -124,7 +140,7 @@ export const planCompactions = (
     reserve(job);
     planned.push(job);
   }
-  if (running.length === 0 && planned.length === 0) {
+  if (running.length === 0 && planned.length === 0 && blocked.length === 0) {
     const rewrite = planExternalRewrite(manifest);
     if (rewrite !== undefined) planned.push(rewrite);
   }

@@ -304,7 +304,7 @@ a manifest's own write time is wrong (a manifest can be the newest for hours); t
 it. The deletion bound is `min(boundary, cutoff)`; the model shows the `min` redundant with one GC
 at a time and it is kept for overlapping runs.
 
-## D34. Compaction runs one output SST per Workflow step
+## D34. Compaction runs one output SST per Workflow step (corruption: D53)
 
 `CompactionWorkflow` steps are `prepare` (resolve inputs in the newest manifest, fix `now` for TTL),
 `output-<n>` (re-open the inputs at the step's start key, merge, write one SST up to
@@ -672,3 +672,34 @@ it. Both of hand-off item 6's options are taken:
 Pinning only reuses checkpoints, so GC and fork semantics are unchanged; `database-lifecycle.test.ts`
 shows a pinned snapshot readable past `gcMinAge` while an unpinned one has expired, and the pinned
 one collected after its lifetime.
+
+## D53. A corrupted input SST ends its compaction with a typed outcome the compactor reports
+
+D34 turned a corrupted input (`SstCorruptedError`: a CRC32C mismatch, truncation, or malformed
+section) into a defect. The Workflow run then errored without saying which SST, the compactor saw only
+"not running", and its next poll planned the same job again, forever.
+
+Now:
+
+- **Typed outcome.** A step that hits `SstCorruptedError` returns `Corrupted { sstId, section,
+  reason, message }` as its result, and the job ends with that `CompactionJobOutcome`. Like a
+  discard, it is a result, so Workflows never retries it and the run completes. The job's span
+  records `compaction.outcome=Corrupted` and the SST, and an error is logged.
+- **The compactor reads outcomes.** `CompactionLauncher.isRunning` became `progress`: `Running`, or
+  `Finished` with the outcome when known (decoded from the Workflow instance's output; none when the
+  run errored or was terminated).
+- **Reported and quarantined.** A `Corrupted` outcome adds the SST to the compactor's durable state
+  (`corruptSsts`: SST, the L0 SST or sorted run holding it, section, reason, time;
+  `GET /v1/databases/:id/compaction` returns it), increments `lsm_compaction_corrupt_ssts`, and
+  logs an error. `planCompactionsAround` reserves those sources like a running job's, so no job reads
+  them again; while any is blocked, no fork rewrite is planned. A blocked L0 SST pauses L0
+  compaction (L0 must be merged oldest first), which can end in `WriteStalled` once L0 fills — an
+  honest stop: compacting would spread or drop the corrupted data. The entry is dropped once the SST
+  leaves the manifest (restored or removed by an operator).
+- **Compatibility.** Compactor state written before this decodes with no corrupt SSTs
+  (`withDecodingDefaultKey`).
+
+Reads of the SST still fail with `SstCorrupted` (public `StoredDataInvalid`, 500, not retryable).
+`compactor.test.ts` flips one byte of an L0 SST: one job runs, ends `Corrupted` naming that SST and
+`DataBlock`, the compactor records it with its L0 source, plans nothing more, and L0 keeps all four
+SSTs; restoring the defect, or not blocking the source, fails the test.
