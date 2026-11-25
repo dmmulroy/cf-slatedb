@@ -2,10 +2,28 @@
 
 ## Current phase
 
-All ten phases are done. See the hand-off below; open questions need Dillon.
+All ten phases are done. Working through the "Remaining work" in [`docs/handoff.md`](handoff.md),
+in order.
 
-**Next:** the remaining work (preview tooling, traces from previews, approved live checks, per-Stack
-data residency, known gaps) is in [`docs/handoff.md`](handoff.md). Start there.
+| Item                                   | Status  |
+| -------------------------------------- | ------- |
+| 1. Portable Alchemy state for previews | done    |
+| 2. Preview deployment tool             | next    |
+| 3. Traces from previews                | pending |
+| 4. Live checks                         | pending |
+| 5. Data residency, per Stack           | pending |
+| 6. Known gaps                          | pending |
+| 7. Finish                              | pending |
+
+## Remaining-work log
+
+- **Set up (new session).** Node 24.22, `vp` 1.8, pnpm 12.14; `repos/slatedb` and `.tlc/` present;
+  the deploy guard already allowlists `CfSlatedb` for `dev`, `preview-1..3`. `vp run ready` exit 0
+  before any change.
+- **1. Portable Alchemy state.** `cfSlatedbStateLayer` picks `localState()` for local stages and
+  `Cloudflare.state({ accountId })` (the account's default state store, pinned to Dillon's account)
+  for every live stage. `isLocalLsmStage` (lsm-cloudflare) is now the one local-stage rule, shared
+  with the telemetry flush policy. `vp run dev` still runs offline. D43.
 
 ## Done
 

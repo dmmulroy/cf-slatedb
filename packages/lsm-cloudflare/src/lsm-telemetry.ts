@@ -3,6 +3,8 @@ import * as Telemetry from "alchemy/Telemetry";
 import { Effect, type Layer, Option } from "effect";
 import { OtlpExporter } from "effect/observability";
 
+import { isLocalLsmStage } from "./lsm-stage.ts";
+
 /** Default OTLP/HTTP base URL in local development: the trace CLI's receiver. */
 export const LOCAL_OTLP_BASE_URL = "http://127.0.0.1:4318";
 
@@ -44,16 +46,13 @@ export const lsmTelemetryLayer = (options: LsmTelemetryOptions): Layer.Layer<nev
  */
 export type EventTelemetryFlushPolicy = "BeforeResponse" | "AfterResponse";
 
-/** Stage names that run only under Alchemy's local providers: `dev`, `test`, `local`. */
-const LOCAL_STAGE_PATTERN = /^(?:dev|test|local)(?:-[a-z0-9-]+)?$/;
-
 /**
  * Selects the flush policy for an Alchemy stage: `BeforeResponse` for local stages (`dev`, `test`,
  * `local`, and `dev-*`, `test-*`, `local-*`), `AfterResponse` for every other stage, so a live
  * stage never adds export latency to its responses.
  */
 export const eventTelemetryFlushPolicyForStage = (stage: string): EventTelemetryFlushPolicy =>
-  LOCAL_STAGE_PATTERN.test(stage) ? "BeforeResponse" : "AfterResponse";
+  isLocalLsmStage(stage) ? "BeforeResponse" : "AfterResponse";
 
 /**
  * Exports the current event's buffered spans now, waiting at most ten seconds.

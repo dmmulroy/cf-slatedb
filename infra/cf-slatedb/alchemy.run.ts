@@ -7,7 +7,6 @@ import {
 } from "@cf-slatedb/lsm-cloudflare";
 import * as Alchemy from "alchemy";
 import { ShardRouterWorker } from "@cf-slatedb/sharding";
-import { localState } from "alchemy/State";
 import { Effect } from "effect";
 
 import { cfSlatedbBlockServerWorkerLayer } from "./src/block-server-worker-entry.ts";
@@ -15,6 +14,7 @@ import { cfSlatedbCompactorWorkerLayer } from "./src/compactor-worker-entry.ts";
 import { cfSlatedbApiWorkerLayer } from "./src/db-api-worker-entry.ts";
 import { cfSlatedbGcWorkerLayer } from "./src/gc-worker-entry.ts";
 import { cfSlatedbShardRouterWorkerLayer } from "./src/shard-router-worker-entry.ts";
+import { cfSlatedbStateLayer } from "./src/cf-slatedb-stage.ts";
 import { TelemetryProbeWorker, telemetryProbeWorkerLayer } from "./src/telemetry-probe-worker.ts";
 
 /**
@@ -23,12 +23,13 @@ import { TelemetryProbeWorker, telemetryProbeWorkerLayer } from "./src/telemetry
  * **Details**
  *
  * Local first: `vp run dev` runs it under Alchemy's local providers (stage `dev`: local R2, Durable
- * Objects, and Workflows). State is the local state store, because no live stage exists yet; a live
- * stage needs Dillon's approval (see `docs/progress.md`).
+ * Objects, and Workflows) with local state. Live stages (the approved previews `preview-1`,
+ * `preview-2`, `preview-3`) keep their state in the account's Cloudflare state store, so any machine
+ * can redeploy them (`cfSlatedbStateLayer`, decision D43).
  */
 const CfSlatedbStack = Alchemy.Stack(
   "CfSlatedb",
-  { providers: Cloudflare.providers(), state: localState() },
+  { providers: Cloudflare.providers(), state: cfSlatedbStateLayer },
   Effect.gen(function* () {
     yield* BlockServerWorker;
     yield* CompactorWorker;

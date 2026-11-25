@@ -435,3 +435,19 @@ memtable holds exactly the rows above `flushed_seq`). Changelog SSTs are read st
 larger than the page is returned whole; the writer's internal page allows a whole batch,
 `MAX_BATCH_OPERATIONS`), so a consumer resuming from `nextAfterSeq` cannot skip rows. A consumer
 behind retention gets `ChangelogUnavailable` (`Expired`) instead of a silent gap.
+
+## D43. Live stages keep Alchemy state in Cloudflare; local stages keep it on the machine
+
+`infra/cf-slatedb/alchemy.run.ts` selects its state Layer from the stage (`cfSlatedbStateLayer` in
+`infra/cf-slatedb/src/cf-slatedb-stage.ts`). Local stages (`dev`, `test`, `local`, and their `-*`
+variants, the same rule the telemetry flush policy uses: `isLocalLsmStage`) use `localState()`, so
+`vp run dev` and the workerd tests never contact Cloudflare. Every live stage (`preview-1`,
+`preview-2`, `preview-3`, and `production` should it ever be approved) uses `Cloudflare.state()`, as
+`../iac` does, so a preview deployed from one machine can be redeployed, inspected, or handed to
+Dillon for destruction from another.
+
+The store is pinned to Dillon's account (`accountId: 99459fce09d9a9eec83befd957af4ec5`), so a login
+that reaches several accounts can never read or write this Stack's state elsewhere. It uses the
+account's default `alchemy-state-store` Worker rather than a dedicated one: the Stack name
+(`CfSlatedb`) and stage already key its records apart from other projects', and a second store would
+add a second Worker and secret pair to the account for no isolation gain.

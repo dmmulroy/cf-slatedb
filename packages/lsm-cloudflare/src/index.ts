@@ -6,6 +6,7 @@ export * from "./db-writer.ts";
 export * from "./lsm-bucket.ts";
 export * from "./lsm-configuration.ts";
 export * from "./lsm-errors.ts";
+export * from "./lsm-stage.ts";
 export * from "./lsm-telemetry.ts";
 export * from "./manifest-cache.ts";
 export * from "./manifest-reader.ts";

@@ -209,6 +209,10 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 
 - **Alchemy Stack with every Worker, DO, Workflow, and cron** — done for Phases 1–6
   (`infra/cf-slatedb/alchemy.run.ts`); `ShardDirectory` joins in Phase 8.
+- **`state: Cloudflare.state()` for live stages** — done. `cfSlatedbStateLayer`
+  (`infra/cf-slatedb/src/cf-slatedb-stage.ts`): local state for `dev`/`test`/`local` stages,
+  the account's Cloudflare state store (pinned account) for previews and production. Test:
+  `infra/cf-slatedb/src/cf-slatedb-stage.test.ts`; `vp run dev` still runs offline. D43.
 - **Layout `packages/lsm-core`, `packages/lsm-cloudflare`, `packages/lsm-sharding`,
   `infra/cf-slatedb`** — done. Enforced by `tools/workspace-boundaries` (D1, D2).
 
