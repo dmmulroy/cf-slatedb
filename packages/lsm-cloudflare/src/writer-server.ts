@@ -12,7 +12,7 @@ import { manifestReaderLayerWithoutDependencies } from "./manifest-reader.ts";
 import { manifestStoreLayerWithoutDependencies } from "./manifest-store.ts";
 import { ObjectStore, objectStoreLayer } from "./object-store.ts";
 import { sstStoreLayerWithoutDependencies } from "./sst-store.ts";
-import { writerAlarmLayer } from "./writer-alarm.ts";
+import { durableObjectAlarmLayer } from "./durable-object-alarm.ts";
 import { writerHttpRouterLayer } from "./writer-http-handlers.ts";
 import { writerSqlStorageLayer } from "./writer-sql-storage.ts";
 
@@ -64,7 +64,7 @@ export const writerServerLayerWithoutDependencies = WriterServer.make(
         Layer.provide(
           memTableLayerWithoutDependencies.pipe(Layer.provide(writerSqlStorageLayer(storage))),
         ),
-        Layer.provide(writerAlarmLayer(storage)),
+        Layer.provide(durableObjectAlarmLayer(storage)),
         Layer.provide(Layer.succeed(ObjectStore, objects)),
         Layer.provide(Layer.succeed(LsmConfiguration, settings)),
       );

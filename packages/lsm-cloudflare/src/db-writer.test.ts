@@ -21,7 +21,7 @@ import { ManifestReader } from "./manifest-reader.ts";
 import { ManifestStore, manifestStoreTestLayer } from "./manifest-store.ts";
 import { ObjectStore } from "./object-store.ts";
 import { sstStoreLayerWithoutDependencies } from "./sst-store.ts";
-import { WriterAlarm, writerAlarmTestLayer } from "./writer-alarm.ts";
+import { DurableObjectAlarm, durableObjectAlarmTestLayer } from "./durable-object-alarm.ts";
 import { WriterSqlStorage, writerSqlStorageTestLayer } from "./writer-sql-storage.ts";
 
 const DB = DatabaseId.make("orders");
@@ -71,7 +71,7 @@ const run = <A, E>(
     | ManifestStore
     | ManifestReader
     | ObjectStore
-    | WriterAlarm
+    | DurableObjectAlarm
     | RuntimeContext
   >,
   overrides: Parameters<typeof dbWriterTestLayer>[0] = {},
@@ -172,7 +172,7 @@ describe("DbWriter", () => {
       Effect.gen(function* () {
         yield* createDatabase();
         const writer = yield* DbWriter;
-        const alarm = yield* WriterAlarm;
+        const alarm = yield* DurableObjectAlarm;
         yield* TestClock.setTime(10_000);
         yield* writer.write(DB, put("a", "1"));
         const scheduled = yield* alarm.scheduled;
@@ -246,7 +246,7 @@ describe("DbWriter fencing and crash recovery", () => {
             Layer.provide(
               memTableLayerWithoutDependencies.pipe(Layer.provide(writerSqlStorageTestLayer)),
             ),
-            Layer.provide([writerAlarmTestLayer, lsmConfigurationTestLayer()]),
+            Layer.provide([durableObjectAlarmTestLayer, lsmConfigurationTestLayer()]),
             Layer.provide(Layer.succeedContext(shared)),
           ),
         ).pipe(Effect.map((context) => Context.get(context, DbWriter)));
@@ -307,7 +307,7 @@ describe("DbWriter fencing and crash recovery", () => {
           dbWriterLayerWithoutDependencies.pipe(
             Layer.provide(sstStoreLayerWithoutDependencies),
             Layer.provide(memTable),
-            Layer.provide([writerAlarmTestLayer, lsmConfigurationTestLayer()]),
+            Layer.provide([durableObjectAlarmTestLayer, lsmConfigurationTestLayer()]),
             Layer.provide(Layer.succeedContext(shared)),
           ),
         ).pipe(Effect.map((context) => Context.get(context, DbWriter)));

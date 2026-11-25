@@ -1,6 +1,6 @@
 import { type DatabaseId, type Manifest, ManifestId, ManifestJson } from "@cf-slatedb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
-import { Context, Data, Effect, Layer, Metric, Result, Schedule, Schema } from "effect";
+import { Context, Data, Effect, Layer, Metric, Option, Result, Schedule, Schema } from "effect";
 
 import type { DatabaseNotFoundError } from "./lsm-errors.ts";
 import {
@@ -9,7 +9,7 @@ import {
   manifestReaderLayerWithoutDependencies,
   type VersionedManifest,
 } from "./manifest-reader.ts";
-import { latestManifestKey, manifestKey } from "./object-keys.ts";
+import { latestManifestKey, manifestGcBoundaryKey, manifestKey } from "./object-keys.ts";
 import {
   ObjectStore,
   objectStoreLayer,
@@ -52,14 +52,17 @@ export class DatabaseAlreadyExistsError extends Data.TaggedError("DatabaseAlread
  * **Details**
  *
  * Every new manifest is `db/<id>/manifest/<n + 1>` created with `If-None-Match: *`, so each id is
- * written exactly once and concurrent writers serialize. After a successful create, the
- * `manifest/LATEST` hint is updated on a best-effort basis.
+ * written exactly once and concurrent writers serialize. GC deletes old manifests, after which
+ * create-if-absent no longer remembers their ids, so a create also checks GC's manifest boundary
+ * (`gc/manifest.boundary`, SlateDB RFC 0026): an id at or below it is a conflict, not a commit.
+ * After a successful create, the `manifest/LATEST` hint is updated on a best-effort basis.
  */
 export interface IManifestStore {
   /**
    * Creates manifest `manifestId`.
    *
-   * @returns Nothing, `ManifestConflictError` when the id already exists, or `ManifestWriteError`.
+   * @returns Nothing, `ManifestConflictError` when the id already exists or is at or below GC's
+   *   manifest boundary, or `ManifestWriteError`.
    */
   readonly create: (
     databaseId: DatabaseId,
@@ -98,6 +101,14 @@ export interface IManifestStore {
     E | DatabaseNotFoundError | ManifestReadError | ManifestWriteError,
     RuntimeContext
   >;
+  /**
+   * Advances GC's manifest boundary to at least `manifestId` (it never moves back). GC calls this
+   * before deleting manifests at or below `manifestId`.
+   */
+  readonly advanceManifestBoundary: (
+    databaseId: DatabaseId,
+    manifestId: ManifestId,
+  ) => Effect.Effect<void, ManifestWriteError, RuntimeContext>;
 }
 
 /** The contextual manifest store. */
@@ -115,6 +126,12 @@ export const manifestCasConflicts = Metric.counter("lsm_manifest_cas_conflicts",
 
 const CAS_ATTEMPTS = 12;
 
+const ManifestBoundary = Schema.NumberFromString.pipe(
+  Schema.decodeTo(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+);
+const decodeManifestBoundary = Schema.decodeUnknownResult(ManifestBoundary);
+const textDecoder = new TextDecoder();
+
 /** Constructs the manifest store over the contextual object store and manifest reader. */
 export const makeManifestStore = Effect.gen(function* () {
   const objects = yield* ObjectStore;
@@ -130,6 +147,54 @@ export const makeManifestStore = Effect.gen(function* () {
           message: `Writing database ${databaseId}'s manifest failed: ${error.message}`,
         }),
     );
+
+  /** GC's manifest boundary and its object version; 0 and none before GC first advances it. */
+  const readManifestBoundary = (databaseId: DatabaseId) =>
+    Effect.gen(function* () {
+      const stored = yield* objects
+        .getVersioned(manifestGcBoundaryKey(databaseId))
+        .pipe(writeUnavailable(databaseId));
+      if (Option.isNone(stored)) return { value: 0, version: Option.none<string>() };
+      const decoded = decodeManifestBoundary(textDecoder.decode(stored.value.bytes));
+      if (Result.isFailure(decoded)) {
+        return yield* new ManifestWriteError({
+          databaseId,
+          reason: "StorageUnavailable",
+          message: `Database ${databaseId}'s GC manifest boundary is not a manifest id. Restore it from the largest deleted manifest id; manifest writes stay blocked until then.`,
+        });
+      }
+      return { value: decoded.success, version: Option.some(stored.value.version) };
+    });
+
+  const advanceManifestBoundary = Effect.fn("ManifestStore.advanceManifestBoundary")(function* (
+    databaseId: DatabaseId,
+    manifestId: ManifestId,
+  ) {
+    yield* Effect.annotateCurrentSpan({ "database.id": databaseId, "manifest.id": manifestId });
+    const key = manifestGcBoundaryKey(databaseId);
+    const body = textEncoder.encode(String(manifestId));
+    const attempt = Effect.gen(function* () {
+      const current = yield* readManifestBoundary(databaseId);
+      if (current.value >= manifestId) return true;
+      const outcome = Option.isNone(current.version)
+        ? (yield* objects.putIfAbsent(key, body).pipe(writeUnavailable(databaseId))) === "Created"
+        : (yield* objects
+            .putIfVersion(key, body, current.version.value)
+            .pipe(writeUnavailable(databaseId))) === "Written";
+      return outcome;
+    });
+    // A concurrent GC moved it first: re-read; it only ever moves forward.
+    const advanced = yield* attempt.pipe(
+      Effect.repeat({ until: (done) => done, times: CAS_ATTEMPTS - 1 }),
+    );
+    if (!advanced) {
+      return yield* new ManifestWriteError({
+        databaseId,
+        reason: "ContentionPersisted",
+        message: `Database ${databaseId}'s GC manifest boundary changed concurrently on every one of ${CAS_ATTEMPTS} attempts. Retry the collection later.`,
+      });
+    }
+  });
 
   const create = Effect.fn("ManifestStore.create")(function* (
     databaseId: DatabaseId,
@@ -149,6 +214,18 @@ export const makeManifestStore = Effect.gen(function* () {
         databaseId,
         manifestId,
         message: `Manifest ${manifestId} of database ${databaseId} was created by a concurrent edit. Reload and reapply.`,
+      });
+    }
+    // Checked after the create: GC advances the boundary before deleting, so an id it may have
+    // deleted (and that this create could have reused) is at or below it.
+    const boundary = yield* readManifestBoundary(databaseId);
+    if (manifestId <= boundary.value) {
+      yield* Metric.update(manifestCasConflicts, 1);
+      yield* Effect.annotateCurrentSpan({ "manifest.gc_boundary": boundary.value });
+      return yield* new ManifestConflictError({
+        databaseId,
+        manifestId,
+        message: `Manifest ${manifestId} of database ${databaseId} is at or below GC's manifest boundary ${boundary.value}: the id was used before and its manifest collected. Reload and reapply.`,
       });
     }
     // Best effort: the hint may lag, and readers probe past it.
@@ -218,7 +295,7 @@ export const makeManifestStore = Effect.gen(function* () {
       return result;
     }).pipe(Effect.withSpan("ManifestStore.update"));
 
-  return ManifestStore.of({ create, initialize, update });
+  return ManifestStore.of({ create, initialize, update, advanceManifestBoundary });
 });
 
 /** Provides the manifest store, leaving the object store and manifest reader visible. */

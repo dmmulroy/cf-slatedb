@@ -37,7 +37,7 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `writer-http-api.ts`, `db-http-api.ts`, `lsm-cloudflare/src/db-writer.ts` (`commitLock`), `MemTable.commit`.
   Tests: `db-writer.test.ts`, `writer-client.test.ts`, `writer.workerd.ts`.
 - **Flush trigger: `l0SstSize`, `maxL0Age`, `setAlarm(now)`** — done. `scheduleFlush`/`runAlarm`
-  in `lsm-cloudflare/src/db-writer.ts`, `writer-alarm.ts`. Tests: `db-writer.test.ts` (alarm at `maxL0Age`, `TestClock`),
+  in `lsm-cloudflare/src/db-writer.ts`, `durable-object-alarm.ts`. Tests: `db-writer.test.ts` (alarm at `maxL0Age`, `TestClock`),
   `writer.workerd.ts` (the real alarm flushes after `maxL0Age`).
 - **`flushL0`: SST build, PUT, manifest CAS, delete rows ≤ cut** — done. `flushNow` in `lsm-cloudflare/src/db-writer.ts`,
   `sst-store.ts` (streamed multipart), `commitL0Flush`, `MemTable.truncate`. Tests:

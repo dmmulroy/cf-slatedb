@@ -191,6 +191,34 @@ describe("ManifestStore", () => {
     expect(epochs).toEqual([1, 2, 1]);
   });
 
+  it("does not commit a stale create that reuses an id GC collected (RFC 0026 boundary)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* initialize;
+        const store = yield* ManifestStore;
+        const objects = yield* ObjectStore;
+        // A writer read manifest 1 and stalled; others committed 2 and 3; GC collected 2.
+        const staleBase = yield* (yield* ManifestReader).loadLatest(DB);
+        for (const n of [1, 2]) yield* store.update(DB, flushEdit(n, WriterEpoch.make(0)));
+        yield* store.advanceManifestBoundary(DB, ManifestId.make(2));
+        yield* objects.delete([manifestKey(DB, ManifestId.make(2))]);
+        const staleEdit = Result.getOrThrow(flushEdit(9, WriterEpoch.make(0))(staleBase.manifest));
+        // Create-if-absent succeeds (the object is gone), but the boundary check refuses it.
+        const stale = yield* Effect.flip(store.create(DB, ManifestId.make(2), staleEdit));
+        // The boundary never moves back, and an update still commits past it.
+        yield* store.advanceManifestBoundary(DB, ManifestId.make(1));
+        const next = yield* store.update(DB, flushEdit(3, WriterEpoch.make(0)));
+        const boundary = yield* objects.get("db/orders/gc/manifest.boundary");
+        return { stale, nextId: next.id, boundary };
+      }),
+    );
+    expect(outcome.stale._tag).toBe("ManifestConflictError");
+    expect(outcome.nextId).toBe(4);
+    expect(Option.map(outcome.boundary, (bytes) => new TextDecoder().decode(bytes))).toEqual(
+      Option.some("2"),
+    );
+  });
+
   it("finds the newest manifest when the LATEST hint lags or names a collected manifest", async () => {
     const result = await run(
       Effect.gen(function* () {

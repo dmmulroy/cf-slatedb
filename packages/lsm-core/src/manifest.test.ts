@@ -12,8 +12,10 @@ import {
   WriterEpoch,
 } from "./ids.ts";
 import { keyRangeContains } from "./key-range.ts";
+import { encodeUlid } from "./ulid.ts";
 import {
   addCheckpoint,
+  advanceGcSstBoundary,
   commitCompaction,
   commitL0Flush,
   type CompactionJob,
@@ -25,6 +27,7 @@ import {
   Manifest,
   ManifestJson,
   removeCheckpoint,
+  replaceManifestFields,
   sealManifest,
   type SstHandle,
 } from "./manifest.ts";
@@ -49,23 +52,7 @@ const empty = initialManifest(DB, {
   databaseOptions: DEFAULT_DATABASE_OPTIONS,
 });
 
-/** A copy of `base` with some fields replaced (class instances cannot be spread). */
-const manifestWith = (base: Manifest, fields: Partial<Manifest>): Manifest =>
-  new Manifest({
-    databaseId: fields.databaseId ?? base.databaseId,
-    writerEpoch: fields.writerEpoch ?? base.writerEpoch,
-    compactorEpoch: fields.compactorEpoch ?? base.compactorEpoch,
-    lastL0Seq: fields.lastL0Seq ?? base.lastL0Seq,
-    lastL0ClockTick: fields.lastL0ClockTick ?? base.lastL0ClockTick,
-    l0: fields.l0 ?? base.l0,
-    sortedRuns: fields.sortedRuns ?? base.sortedRuns,
-    checkpoints: fields.checkpoints ?? base.checkpoints,
-    keyRange: fields.keyRange ?? base.keyRange,
-    state: fields.state ?? base.state,
-    externalRefs: fields.externalRefs ?? base.externalRefs,
-    changelog: fields.changelog ?? base.changelog,
-    options: fields.options ?? base.options,
-  });
+const manifestWith = replaceManifestFields;
 
 const flush = (manifest: Manifest, n: number, writerEpoch = manifest.writerEpoch) =>
   commitL0Flush(manifest, {
@@ -147,6 +134,49 @@ describe("manifest edits", () => {
     expect(Result.isFailure(changed) && changed.failure._tag).toBe("CompactionInputsChangedError");
     const fenced = commitCompaction(fenceCompactor(manifest), commit);
     expect(Result.isFailure(fenced) && fenced.failure._tag).toBe("CompactorFencedError");
+  });
+
+  it("rejects new SSTs created before GC's boundary, which only moves forward", () => {
+    const at = (timeMillis: number, n: number): SstHandle => ({
+      ...handle(n, n, n + 1),
+      id: SstId.make(
+        encodeUlid(
+          timeMillis,
+          Array.from({ length: 16 }, () => n),
+        ),
+      ),
+    });
+    const bounded = advanceGcSstBoundary(empty, Timestamp.make(5_000));
+    expect(bounded.gcSstBoundary).toBe(5_000);
+    expect(advanceGcSstBoundary(bounded, Timestamp.make(4_000))).toBe(bounded);
+    expect(advanceGcSstBoundary(bounded, Timestamp.make(5_000))).toBe(bounded);
+
+    const commitAt = (sst: SstHandle) =>
+      commitL0Flush(bounded, {
+        writerEpoch: bounded.writerEpoch,
+        sst,
+        lastSeq: SeqNum.make(1),
+        clockTick: Timestamp.make(1),
+        changelog: Option.none(),
+      });
+    const late = commitAt(at(4_999, 1));
+    expect(Result.isFailure(late) && late.failure._tag).toBe("SstBelowGcBoundaryError");
+    // GC deletes only SSTs created strictly before the boundary, so one created at it is safe.
+    const flushed = Result.getOrThrow(commitAt(at(5_000, 2)));
+    expect(flushed.l0.map((sst) => sst.id)).toEqual([at(5_000, 2).id]);
+
+    const job: CompactionJob = {
+      sources: [{ _tag: "L0", sstId: at(5_000, 2).id }],
+      destination: SortedRunId.make(0),
+      isBottom: true,
+    };
+    const compaction = (output: SstHandle) =>
+      commitCompaction(flushed, { compactorEpoch: flushed.compactorEpoch, job, outputs: [output] });
+    const staleOutput = compaction(at(1_000, 3));
+    expect(Result.isFailure(staleOutput) && staleOutput.failure._tag).toBe(
+      "SstBelowGcBoundaryError",
+    );
+    expect(Result.isSuccess(compaction(at(6_000, 4)))).toBe(true);
   });
 
   it("adds and removes checkpoints idempotently", () => {

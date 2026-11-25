@@ -41,3 +41,10 @@ export const changelogKey = (databaseId: DatabaseId, lastSeq: SeqNum, sstId: Sst
 
 /** Prefix of a database's GC boundary files. */
 export const gcPrefix = (databaseId: DatabaseId): string => `${databasePrefix(databaseId)}gc/`;
+
+/**
+ * Key of a database's manifest GC boundary (SlateDB RFC 0026): an ASCII manifest id at or below
+ * which ids may have been deleted, so a manifest created there does not count as committed.
+ */
+export const manifestGcBoundaryKey = (databaseId: DatabaseId): string =>
+  `${gcPrefix(databaseId)}manifest.boundary`;

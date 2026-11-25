@@ -50,7 +50,7 @@ import {
 } from "./manifest-store.ts";
 import { changelogKey, sstKey } from "./object-keys.ts";
 import { SstStore, sstStoreLayerWithoutDependencies } from "./sst-store.ts";
-import { WriterAlarm, writerAlarmTestLayer } from "./writer-alarm.ts";
+import { DurableObjectAlarm, durableObjectAlarmTestLayer } from "./durable-object-alarm.ts";
 
 /** What a `Latest` read learns from the writer about one key. */
 export interface MemTableProbe {
@@ -191,7 +191,7 @@ export const makeDbWriter = Effect.gen(function* () {
   const memTable = yield* MemTable;
   const manifests = yield* ManifestStore;
   const ssts = yield* SstStore;
-  const alarm = yield* WriterAlarm;
+  const alarm = yield* DurableObjectAlarm;
   const settings = yield* LsmConfiguration;
 
   const phase = yield* Ref.make<WriterPhase>({ _tag: "Uninitialized" });
@@ -401,6 +401,12 @@ export const makeDbWriter = Effect.gen(function* () {
             )
             .pipe(
               Effect.catchTags(manifestFailures(databaseId, "flush")),
+              // The upload outlasted GC's boundary (a stall longer than `gcMinAge`): the rows are
+              // still in SQLite, so the next flush writes them to a new SST; this one is an orphan.
+              Effect.catchTags({
+                SstBelowGcBoundaryError: (error) =>
+                  Effect.fail(unavailable(databaseId, "flush")(error)),
+              }),
               Effect.tapError((error) =>
                 error._tag === "WriterFencedError" ? markFenced(databaseId, error) : Effect.void,
               ),
@@ -741,7 +747,11 @@ export const dbWriterTestLayer = (
   dbWriterLayerWithoutDependencies.pipe(
     Layer.provideMerge(sstStoreLayerWithoutDependencies),
     Layer.provideMerge(
-      Layer.mergeAll(memTableTestLayer, writerAlarmTestLayer, lsmConfigurationTestLayer(overrides)),
+      Layer.mergeAll(
+        memTableTestLayer,
+        durableObjectAlarmTestLayer,
+        lsmConfigurationTestLayer(overrides),
+      ),
     ),
     Layer.provideMerge(manifestStoreTestLayer),
   );

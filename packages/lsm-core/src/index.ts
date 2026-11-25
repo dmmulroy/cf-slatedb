@@ -15,3 +15,5 @@ export * from "./sst-codec.ts";
 export * from "./ulid.ts";
 export * from "./write-batch.ts";
 export * from "./read-consistency.ts";
+export * from "./compaction-merge.ts";
+export * from "./garbage-collection-plan.ts";

@@ -2,7 +2,16 @@
 
 ## Current phase
 
-Phase 6: compaction and GC (starting). Phases 0–5 are done.
+Phase 6: compaction and GC (in progress). Phases 0–5 are done.
+
+Phase 6 so far: `compactRowStreams` (lsm-core streaming compaction merge, property-tested against
+the oracle), GC planning (`planManifestCollection`, `planSstCollection`, `prepareGarbageCollection`),
+the manifest's `gcSstBoundary` (commits reject SSTs created before it), the RFC 0026 manifest
+boundary in `ManifestStore`, versioned and delimited `ObjectStore` operations (and a fix to
+multipart re-chunking, which copied the whole pending part on every block), and
+`CompactionExecutor` (prepare, one output SST per step, commit). Next: `CompactorServer`,
+`CompactionWorkflow`, `CompactionBudget`, `GarbageCollector`, the GC cron Worker, and formal
+check 4 (GC safety).
 
 ## Done
 
@@ -69,7 +78,7 @@ Phase 6: compaction and GC (starting). Phases 0–5 are done.
   test against sequential application), `WriterSqlStorage` (Durable Object SQLite; `node:sqlite`
   test layer), `MemTable` (the WAL: `memtable_rows (key, seq DESC)`, sequence oracle and clock in
   the commit transaction, keyset-paged flush stream, atomic `consistently` reads), `SstStore`
-  (streams blocks into multipart uploads), `WriterAlarm`, `DbWriter` (lazy fence-in, `KeyOutOfRange`,
+  (streams blocks into multipart uploads), `DurableObjectAlarm`, `DbWriter` (lazy fence-in, `KeyOutOfRange`,
   sealed, backpressure `WriteStalled` on bytes and L0 backlog, alarm flush on `l0SstSize`/`maxL0Age`,
   upload → CAS → truncate, restart recovery, `Latest` probe with `flushedSeq`, memtable scan pages,
   changes feed, changelog SST export, seal), `WriterHttpApi` (`/v1`), `WriterServer` DO,

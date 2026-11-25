@@ -28,6 +28,22 @@ export interface ObjectListing {
 /** Whether a create-if-absent write created the object or found it already there. */
 export type PutIfAbsentOutcome = "Created" | "AlreadyExists";
 
+/** An object's bytes with its version (R2's HTTP etag), for conditional replacement. */
+export interface VersionedObject {
+  readonly bytes: Uint8Array;
+  readonly version: string;
+}
+
+/** Whether a conditional replacement wrote the object or found another version stored. */
+export type PutIfVersionOutcome = "Written" | "VersionChanged";
+
+/** One page of a delimited listing: the next-level prefixes under a prefix. */
+export interface PrefixListing {
+  readonly prefixes: ReadonlyArray<string>;
+  /** Cursor for the next page, or none on the last page. */
+  readonly cursor: Option.Option<string>;
+}
+
 /**
  * The object store could not complete an operation after retries.
  *
@@ -43,6 +59,7 @@ export class ObjectStoreUnavailableError extends Data.TaggedError("ObjectStoreUn
     | "getRange"
     | "head"
     | "putIfAbsent"
+    | "putIfVersion"
     | "put"
     | "putMultipart"
     | "list"
@@ -71,6 +88,20 @@ export interface IObjectStore {
     key: string,
     range: ByteRange,
   ) => Effect.Effect<Option.Option<Uint8Array>, ObjectStoreUnavailableError, RuntimeContext>;
+  /** Reads a whole object with its version; none when it does not exist. */
+  readonly getVersioned: (
+    key: string,
+  ) => Effect.Effect<Option.Option<VersionedObject>, ObjectStoreUnavailableError, RuntimeContext>;
+  /**
+   * Replaces an object only if its stored version is still `version` (R2 `If-Match`).
+   *
+   * @returns `Written`, or `VersionChanged` without writing when another write came first.
+   */
+  readonly putIfVersion: (
+    key: string,
+    body: Uint8Array,
+    version: string,
+  ) => Effect.Effect<PutIfVersionOutcome, ObjectStoreUnavailableError, RuntimeContext>;
   /** Reads an object's metadata; none when it does not exist. */
   readonly head: (
     key: string,
@@ -107,6 +138,14 @@ export interface IObjectStore {
     prefix: string,
     cursor: Option.Option<string>,
   ) => Effect.Effect<ObjectListing, ObjectStoreUnavailableError, RuntimeContext>;
+  /**
+   * Lists the next-level prefixes under `prefix` (delimiter `/`), at most 1000 per page. Never used
+   * on read paths.
+   */
+  readonly listPrefixes: (
+    prefix: string,
+    cursor: Option.Option<string>,
+  ) => Effect.Effect<PrefixListing, ObjectStoreUnavailableError, RuntimeContext>;
   /** Deletes objects; deleting a missing key succeeds. */
   readonly delete: (
     keys: ReadonlyArray<string>,
@@ -125,24 +164,26 @@ const r2RetrySchedule = {
 };
 
 /**
- * Re-chunks a byte stream into parts of exactly `partSize` bytes, except a shorter final part.
+ * Re-chunks a byte stream into parts of exactly `partSize` bytes, except a shorter final part. Each
+ * byte is copied once.
  */
-const toUniformParts = <E, R>(body: Stream.Stream<Uint8Array, E, R>, partSize: number) =>
+export const toUniformParts = <E, R>(body: Stream.Stream<Uint8Array, E, R>, partSize: number) =>
   body.pipe(
     Stream.mapAccum(
       (): { pending: Array<Uint8Array>; size: number } => ({ pending: [], size: 0 }),
       (state, chunk) => {
-        const pending = [...state.pending, chunk];
-        let buffered = Bytes.concat(pending);
+        // Chunks are only collected until a part is full, so each byte is copied once into its part.
+        state.pending.push(chunk);
+        state.size += chunk.length;
+        if (state.size < partSize) return [state, []] as const;
+        const buffered = Bytes.concat(state.pending);
         const parts: Array<Uint8Array> = [];
-        while (buffered.length >= partSize) {
-          parts.push(buffered.slice(0, partSize));
-          buffered = buffered.slice(partSize);
+        let offset = 0;
+        for (; buffered.length - offset >= partSize; offset += partSize) {
+          parts.push(buffered.subarray(offset, offset + partSize));
         }
-        return [
-          { pending: buffered.length > 0 ? [buffered] : [], size: buffered.length },
-          parts,
-        ] as const;
+        const rest = buffered.subarray(offset);
+        return [{ pending: rest.length > 0 ? [rest] : [], size: rest.length }, parts] as const;
       },
       { onHalt: (state) => (state.size > 0 ? [Bytes.concat(state.pending)] : []) },
     ),
@@ -192,6 +233,26 @@ export const makeObjectStore = Effect.gen(function* () {
         .pipe(Effect.retry(r2RetrySchedule), Effect.mapError(unavailable("getRange", key)));
       if (object === null) return Option.none<Uint8Array>();
       return Option.some(yield* object.bytes().pipe(Effect.mapError(unavailable("getRange", key))));
+    }),
+    getVersioned: Effect.fn("ObjectStore.getVersioned")(function* (key: string) {
+      const object = yield* bucket
+        .get(key)
+        .pipe(Effect.retry(r2RetrySchedule), Effect.mapError(unavailable("get", key)));
+      if (object === null) return Option.none<VersionedObject>();
+      const bytes = yield* object.bytes().pipe(Effect.mapError(unavailable("get", key)));
+      return Option.some({ bytes, version: object.httpEtag });
+    }),
+    putIfVersion: Effect.fn("ObjectStore.putIfVersion")(function* (
+      key: string,
+      body: Uint8Array,
+      version: string,
+    ) {
+      const written = yield* bucket
+        .put(key, body, { onlyIf: new Headers({ "If-Match": version }) })
+        .pipe(Effect.retry(r2RetrySchedule), Effect.mapError(unavailable("putIfVersion", key)));
+      const outcome: PutIfVersionOutcome = written === null ? "VersionChanged" : "Written";
+      yield* Effect.annotateCurrentSpan({ "object.outcome": outcome });
+      return outcome;
     }),
     head: Effect.fn("ObjectStore.head")(function* (key: string) {
       const object = yield* bucket
@@ -291,6 +352,23 @@ export const makeObjectStore = Effect.gen(function* () {
         cursor: page.truncated ? Option.some(page.cursor) : Option.none(),
       };
     }),
+    listPrefixes: Effect.fn("ObjectStore.listPrefixes")(function* (
+      prefix: string,
+      cursor: Option.Option<string>,
+    ) {
+      const page = yield* bucket
+        .list({
+          prefix,
+          delimiter: "/",
+          limit: 1000,
+          ...(Option.isSome(cursor) ? { cursor: cursor.value } : {}),
+        })
+        .pipe(Effect.retry(r2RetrySchedule), Effect.mapError(unavailable("list", prefix)));
+      return {
+        prefixes: page.delimitedPrefixes,
+        cursor: page.truncated ? Option.some(page.cursor) : Option.none(),
+      };
+    }),
     delete: Effect.fn("ObjectStore.delete")(function* (keys: ReadonlyArray<string>) {
       for (let start = 0; start < keys.length; start += 1000) {
         const batch = keys.slice(start, start + 1000);
@@ -320,6 +398,8 @@ const R2_MIN_PART_SIZE = 5 * 1024 * 1024;
 interface StoredObject {
   readonly bytes: Uint8Array;
   readonly uploadedAt: Timestamp;
+  /** Bumped on every write of the key, like an etag. */
+  readonly version: number;
 }
 
 /**
@@ -330,12 +410,16 @@ interface StoredObject {
  */
 const inMemoryObjectStore = Effect.gen(function* () {
   const objects = yield* Ref.make(new Map<string, StoredObject>());
+  let nextVersion = 1;
+  const stored = (bytes: Uint8Array, uploadedAt: Timestamp): StoredObject => ({
+    bytes: bytes.slice(),
+    uploadedAt,
+    version: nextVersion++,
+  });
   const store = (key: string, bytes: Uint8Array) =>
     Effect.gen(function* () {
       const uploadedAt = Timestamp.make(yield* Clock.currentTimeMillis);
-      yield* Ref.update(objects, (current) =>
-        new Map(current).set(key, { bytes: bytes.slice(), uploadedAt }),
-      );
+      yield* Ref.update(objects, (current) => new Map(current).set(key, stored(bytes, uploadedAt)));
     });
   const read = (key: string) =>
     Ref.get(objects).pipe(Effect.map((current) => Option.fromUndefinedOr(current.get(key))));
@@ -353,6 +437,30 @@ const inMemoryObjectStore = Effect.gen(function* () {
         object.bytes.slice(range.offset, range.offset + range.length),
       );
     }),
+    getVersioned: Effect.fn("ObjectStore.getVersioned")(function* (key: string) {
+      return Option.map(yield* read(key), (object) => ({
+        bytes: object.bytes.slice(),
+        version: `"${object.version}"`,
+      }));
+    }),
+    putIfVersion: Effect.fn("ObjectStore.putIfVersion")(function* (
+      key: string,
+      body: Uint8Array,
+      version: string,
+    ) {
+      const uploadedAt = Timestamp.make(yield* Clock.currentTimeMillis);
+      const outcome = yield* Ref.modify(
+        objects,
+        (current): readonly [PutIfVersionOutcome, Map<string, StoredObject>] => {
+          const existing = current.get(key);
+          return existing !== undefined && `"${existing.version}"` === version
+            ? ["Written", new Map(current).set(key, stored(body, uploadedAt))]
+            : ["VersionChanged", current];
+        },
+      );
+      yield* Effect.annotateCurrentSpan({ "object.outcome": outcome });
+      return outcome;
+    }),
     head: Effect.fn("ObjectStore.head")(function* (key: string) {
       return Option.map(yield* read(key), (object) => ({
         key,
@@ -367,7 +475,7 @@ const inMemoryObjectStore = Effect.gen(function* () {
         (current): readonly [PutIfAbsentOutcome, Map<string, StoredObject>] =>
           current.has(key)
             ? ["AlreadyExists", current]
-            : ["Created", new Map(current).set(key, { bytes: body.slice(), uploadedAt })],
+            : ["Created", new Map(current).set(key, stored(body, uploadedAt))],
       );
       yield* Effect.annotateCurrentSpan({ "object.outcome": outcome, "object.size": body.length });
       return outcome;
@@ -408,6 +516,27 @@ const inMemoryObjectStore = Effect.gen(function* () {
             : [{ key, sizeBytes: object.bytes.length, uploadedAt: object.uploadedAt }];
         }),
         cursor: keys.length > 1000 ? Option.fromUndefinedOr(page[page.length - 1]) : Option.none(),
+      };
+    }),
+    listPrefixes: Effect.fn("ObjectStore.listPrefixes")(function* (
+      prefix: string,
+      cursor: Option.Option<string>,
+    ) {
+      const current = yield* Ref.get(objects);
+      const prefixes = new Set<string>();
+      for (const key of current.keys()) {
+        if (!key.startsWith(prefix)) continue;
+        const slash = key.indexOf("/", prefix.length);
+        if (slash !== -1) prefixes.add(key.slice(0, slash + 1));
+      }
+      const sorted = [...prefixes]
+        .sort()
+        .filter((candidate) => Option.isNone(cursor) || candidate > cursor.value);
+      const page = sorted.slice(0, 1000);
+      return {
+        prefixes: page,
+        cursor:
+          sorted.length > 1000 ? Option.fromUndefinedOr(page[page.length - 1]) : Option.none(),
       };
     }),
     delete: Effect.fn("ObjectStore.delete")(function* (keys: ReadonlyArray<string>) {

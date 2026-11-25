@@ -36,7 +36,7 @@ import type { ManifestReader } from "./manifest-reader.ts";
 import type { ManifestStore } from "./manifest-store.ts";
 import type { ObjectStore } from "./object-store.ts";
 import { sstStoreLayerWithoutDependencies } from "./sst-store.ts";
-import { writerAlarmTestLayer } from "./writer-alarm.ts";
+import { durableObjectAlarmTestLayer } from "./durable-object-alarm.ts";
 import { WriterHttpApi } from "./writer-http-api.ts";
 import { writerHttpRouterLayer } from "./writer-http-handlers.ts";
 import { WriterServer } from "./writer-server.ts";
@@ -269,7 +269,7 @@ export const writerClientTestLayer = Layer.effect(
             Layer.provide(
               memTableLayerWithoutDependencies.pipe(Layer.provide(writerSqlStorageTestLayer)),
             ),
-            Layer.provide(writerAlarmTestLayer),
+            Layer.provide(durableObjectAlarmTestLayer),
             Layer.provide(Layer.succeedContext(shared)),
           );
           const writer = Context.get(yield* Layer.buildWithScope(writerLayer, scope), DbWriter);

@@ -19,6 +19,7 @@ import {
 } from "./key-range.ts";
 import { MergeOperatorName } from "./row-resolution.ts";
 import type { SstInfo } from "./sst-codec.ts";
+import { ulidTimeMillis } from "./ulid.ts";
 
 /**
  * Schema for a reference to one SST as the manifest records it.
@@ -154,6 +155,10 @@ export const DEFAULT_DATABASE_OPTIONS: DatabaseOptions = {
  * `lastL0Seq` is the newest sequence number in L0 or below; `lastL0ClockTick` seeds the writer's
  * monotonic clock. Lifecycle primitives (`keyRange`, `state`, `externalRefs`, fork `checkpoints`) are
  * part of v1.
+ *
+ * `gcSstBoundary` is GC's SST deletion boundary: GC advances it (by CAS) before deleting unreferenced
+ * SSTs created before it, and commits reject new SSTs created before it (`SstBelowGcBoundaryError`),
+ * so an SST that is uploaded but not yet committed is never deleted out from under its commit.
  */
 export class Manifest extends Schema.Class<Manifest>("Manifest")({
   databaseId: DatabaseId,
@@ -169,6 +174,7 @@ export class Manifest extends Schema.Class<Manifest>("Manifest")({
   externalRefs: Schema.Array(ExternalRef),
   changelog: Schema.Array(ChangelogEntry),
   options: DatabaseOptions,
+  gcSstBoundary: Timestamp,
 }) {}
 
 /** Codec for a manifest object's body: JSON via `Schema.fromJsonString(Manifest)`. */
@@ -198,6 +204,7 @@ export const initialManifest = (
     externalRefs: [],
     changelog: [],
     options: options.databaseOptions,
+    gcSstBoundary: Timestamp.make(0),
   });
 
 /** Every SST handle the manifest references: L0 newest first, then each sorted run. */
@@ -263,6 +270,42 @@ export class CompactionInputsChangedError extends Schema.TaggedError<CompactionI
   { databaseId: DatabaseId, message: Schema.String },
 ) {}
 
+/**
+ * A flush or compaction tried to commit an SST created before the manifest's `gcSstBoundary`: GC may
+ * already have deleted it as an orphan. Not retryable with this SST; write the data to a new SST
+ * (the writer re-flushes; the compactor discards the job and plans again).
+ */
+export class SstBelowGcBoundaryError extends Schema.TaggedError<SstBelowGcBoundaryError>()(
+  "SstBelowGcBoundaryError",
+  {
+    databaseId: DatabaseId,
+    sstId: SstId,
+    gcSstBoundary: Timestamp,
+    message: Schema.String,
+  },
+) {}
+
+/** The creation time GC compares with its boundary: the time in the SST's ULID. */
+export const sstCreatedAt = (sstId: SstId): Timestamp => Timestamp.make(ulidTimeMillis(sstId));
+
+/** The first new SST created before the manifest's GC boundary, as an error; none when all are newer. */
+const belowGcBoundary = (
+  manifest: Manifest,
+  sstIds: ReadonlyArray<SstId>,
+): Option.Option<SstBelowGcBoundaryError> => {
+  const stale = sstIds.find((sstId) => sstCreatedAt(sstId) < manifest.gcSstBoundary);
+  return stale === undefined
+    ? Option.none()
+    : Option.some(
+        new SstBelowGcBoundaryError({
+          databaseId: manifest.databaseId,
+          sstId: stale,
+          gcSstBoundary: manifest.gcSstBoundary,
+          message: `SST ${stale} of database ${manifest.databaseId} was created before GC boundary ${manifest.gcSstBoundary}, so GC may have deleted it. Write the data to a new SST and commit that instead.`,
+        }),
+      );
+};
+
 const writerFenced = (manifest: Manifest, writerEpoch: WriterEpoch) =>
   new WriterFencedError({
     databaseId: manifest.databaseId,
@@ -284,7 +327,8 @@ const databaseSealed = (manifest: Manifest, successors: ReadonlyArray<DatabaseId
 export const sealedSuccessors = (manifest: Manifest): Option.Option<ReadonlyArray<DatabaseId>> =>
   manifest.state._tag === "Sealed" ? Option.some(manifest.state.successors) : Option.none();
 
-const withFields = (manifest: Manifest, fields: Partial<Manifest>): Manifest =>
+/** A copy of `manifest` with some fields replaced (`Schema.Class` instances cannot be spread). */
+export const replaceManifestFields = (manifest: Manifest, fields: Partial<Manifest>): Manifest =>
   new Manifest({
     databaseId: fields.databaseId ?? manifest.databaseId,
     writerEpoch: fields.writerEpoch ?? manifest.writerEpoch,
@@ -299,6 +343,7 @@ const withFields = (manifest: Manifest, fields: Partial<Manifest>): Manifest =>
     externalRefs: fields.externalRefs ?? manifest.externalRefs,
     changelog: fields.changelog ?? manifest.changelog,
     options: fields.options ?? manifest.options,
+    gcSstBoundary: fields.gcSstBoundary ?? manifest.gcSstBoundary,
   });
 
 // ---------------------------------------------------------------------------------------------
@@ -315,12 +360,16 @@ export const fenceWriter = (manifest: Manifest): Result.Result<Manifest, Databas
   manifest.state._tag === "Sealed"
     ? Result.fail(databaseSealed(manifest, manifest.state.successors))
     : Result.succeed(
-        withFields(manifest, { writerEpoch: WriterEpoch.make(manifest.writerEpoch + 1) }),
+        replaceManifestFields(manifest, {
+          writerEpoch: WriterEpoch.make(manifest.writerEpoch + 1),
+        }),
       );
 
 /** A new compactor takes over: increments `compactorEpoch`. */
 export const fenceCompactor = (manifest: Manifest): Manifest =>
-  withFields(manifest, { compactorEpoch: CompactorEpoch.make(manifest.compactorEpoch + 1) });
+  replaceManifestFields(manifest, {
+    compactorEpoch: CompactorEpoch.make(manifest.compactorEpoch + 1),
+  });
 
 /** One memtable flush to commit. */
 export interface L0Flush {
@@ -338,20 +387,26 @@ export interface L0Flush {
  * changelog entry, if any).
  *
  * @returns The new manifest; the same manifest when this SST is already in L0 (a retried commit
- *   that had succeeded); `WriterFencedError` when another writer took over; or
- *   `DatabaseSealedError` when the database was sealed.
+ *   that had succeeded); `WriterFencedError` when another writer took over;
+ *   `DatabaseSealedError` when the database was sealed; or `SstBelowGcBoundaryError` when the SST
+ *   (or changelog SST) predates GC's boundary.
  */
 export const commitL0Flush = (
   manifest: Manifest,
   flush: L0Flush,
-): Result.Result<Manifest, WriterFencedError | DatabaseSealedError> => {
+): Result.Result<Manifest, WriterFencedError | DatabaseSealedError | SstBelowGcBoundaryError> => {
   if (manifest.l0.some((sst) => sst.id === flush.sst.id)) return Result.succeed(manifest);
   if (manifest.writerEpoch !== flush.writerEpoch)
     return Result.fail(writerFenced(manifest, flush.writerEpoch));
   if (manifest.state._tag === "Sealed")
     return Result.fail(databaseSealed(manifest, manifest.state.successors));
+  const stale = belowGcBoundary(manifest, [
+    flush.sst.id,
+    ...Option.toArray(flush.changelog).map((entry) => entry.sst.id),
+  ]);
+  if (Option.isSome(stale)) return Result.fail(stale.value);
   return Result.succeed(
-    withFields(manifest, {
+    replaceManifestFields(manifest, {
       l0: [flush.sst, ...manifest.l0],
       lastL0Seq: flush.lastSeq > manifest.lastL0Seq ? flush.lastSeq : manifest.lastL0Seq,
       lastL0ClockTick:
@@ -399,13 +454,17 @@ export interface CompactionCommit {
  * sorted run.
  *
  * @returns The new manifest; the same manifest when the commit already happened; or
- *   `CompactorFencedError` / `CompactionInputsChangedError` when the compactor was fenced or an input
- *   is no longer in the manifest. The edit never merges into changed inputs.
+ *   `CompactorFencedError` / `CompactionInputsChangedError` / `SstBelowGcBoundaryError` when the
+ *   compactor was fenced, an input is no longer in the manifest, or an output predates GC's
+ *   boundary. The edit never merges into changed inputs.
  */
 export const commitCompaction = (
   manifest: Manifest,
   commit: CompactionCommit,
-): Result.Result<Manifest, CompactorFencedError | CompactionInputsChangedError> => {
+): Result.Result<
+  Manifest,
+  CompactorFencedError | CompactionInputsChangedError | SstBelowGcBoundaryError
+> => {
   const l0Inputs = new Set(
     commit.job.sources.flatMap((source) => (source._tag === "L0" ? [source.sstId] : [])),
   );
@@ -440,6 +499,11 @@ export const commitCompaction = (
       }),
     );
   }
+  const stale = belowGcBoundary(
+    manifest,
+    commit.outputs.map((output) => output.id),
+  );
+  if (Option.isSome(stale)) return Result.fail(stale.value);
   const remainingRuns = manifest.sortedRuns.filter((run) => !runInputs.has(run.id));
   const sortedRuns =
     commit.outputs.length === 0
@@ -448,7 +512,10 @@ export const commitCompaction = (
           (left, right) => right.id - left.id,
         );
   return Result.succeed(
-    withFields(manifest, { l0: manifest.l0.filter((sst) => !l0Inputs.has(sst.id)), sortedRuns }),
+    replaceManifestFields(manifest, {
+      l0: manifest.l0.filter((sst) => !l0Inputs.has(sst.id)),
+      sortedRuns,
+    }),
   );
 };
 
@@ -466,21 +533,30 @@ export const sealManifest = (
   manifest.state.successors.length === successors.length &&
   manifest.state.successors.every((id, index) => id === successors[index])
     ? manifest
-    : withFields(manifest, {
+    : replaceManifestFields(manifest, {
         state: { _tag: "Sealed", successors },
         writerEpoch: WriterEpoch.make(manifest.writerEpoch + 1),
       });
+
+/**
+ * Advances GC's SST boundary to `boundary`; the same manifest when it is already there or later (the
+ * boundary never moves back).
+ */
+export const advanceGcSstBoundary = (manifest: Manifest, boundary: Timestamp): Manifest =>
+  boundary > manifest.gcSstBoundary
+    ? replaceManifestFields(manifest, { gcSstBoundary: boundary })
+    : manifest;
 
 /** Adds a checkpoint; the same manifest when a checkpoint with its id exists. */
 export const addCheckpoint = (manifest: Manifest, checkpoint: Checkpoint): Manifest =>
   manifest.checkpoints.some((existing) => existing.id === checkpoint.id)
     ? manifest
-    : withFields(manifest, { checkpoints: [...manifest.checkpoints, checkpoint] });
+    : replaceManifestFields(manifest, { checkpoints: [...manifest.checkpoints, checkpoint] });
 
 /** Removes a checkpoint; the same manifest when it is absent. */
 export const removeCheckpoint = (manifest: Manifest, checkpointId: CheckpointId): Manifest =>
   manifest.checkpoints.some((existing) => existing.id === checkpointId)
-    ? withFields(manifest, {
+    ? replaceManifestFields(manifest, {
         checkpoints: manifest.checkpoints.filter((existing) => existing.id !== checkpointId),
       })
     : manifest;
@@ -492,7 +568,7 @@ export const removeExpiredCheckpoints = (manifest: Manifest, now: Timestamp): Ma
   );
   return live.length === manifest.checkpoints.length
     ? manifest
-    : withFields(manifest, { checkpoints: live });
+    : replaceManifestFields(manifest, { checkpoints: live });
 };
 
 /** Removes a fork's external reference to `owner`'s checkpoint; the same manifest when absent. */
@@ -500,7 +576,7 @@ export const removeExternalRef = (manifest: Manifest, ref: ExternalRef): Manifes
   manifest.externalRefs.some(
     (existing) => existing.owner === ref.owner && existing.checkpointId === ref.checkpointId,
   )
-    ? withFields(manifest, {
+    ? replaceManifestFields(manifest, {
         externalRefs: manifest.externalRefs.filter(
           (existing) =>
             !(existing.owner === ref.owner && existing.checkpointId === ref.checkpointId),
@@ -513,7 +589,7 @@ export const pruneChangelog = (manifest: Manifest, cutoff: Timestamp): Manifest 
   const kept = manifest.changelog.filter((entry) => entry.createdAt >= cutoff);
   return kept.length === manifest.changelog.length
     ? manifest
-    : withFields(manifest, { changelog: kept });
+    : replaceManifestFields(manifest, { changelog: kept });
 };
 
 /**
@@ -579,6 +655,7 @@ export const forkManifest = (
     externalRefs: [{ owner: source, checkpointId: fork.checkpointId }],
     changelog: [],
     options: checkpointManifest.options,
+    gcSstBoundary: Timestamp.make(0),
   });
 };
 
