@@ -124,6 +124,19 @@ export class CheckpointNotFoundPublicError extends Schema.TaggedError<Checkpoint
   },
 ) {}
 
+/** `409` — the change feed is disabled, or the requested changes were dropped by retention. */
+export class ChangelogUnavailablePublicError extends Schema.TaggedError<ChangelogUnavailablePublicError>()(
+  "ChangelogUnavailablePublicError",
+  {
+    code: Schema.Literal("ChangelogUnavailable"),
+    details: Schema.Struct({
+      databaseId: DatabaseId,
+      reason: Schema.Literals(["Disabled", "Expired"]),
+    }),
+    ...common,
+  },
+) {}
+
 /** `409` — a merge operand cannot be resolved because the database has no merge operator. */
 export class MergeOperatorMissingPublicError extends Schema.TaggedError<MergeOperatorMissingPublicError>()(
   "MergeOperatorMissingPublicError",
@@ -211,6 +224,7 @@ export const DB_PUBLIC_ERRORS = [
   MergeOperatorMissingPublicError.pipe(HttpApiSchema.status(409)),
   TransactionConflictPublicError.pipe(HttpApiSchema.status(409)),
   SnapshotExpiredPublicError.pipe(HttpApiSchema.status(409)),
+  ChangelogUnavailablePublicError.pipe(HttpApiSchema.status(409)),
   WriteStalledPublicError.pipe(HttpApiSchema.status(503)),
   StorageUnavailablePublicError.pipe(HttpApiSchema.status(503)),
   StoredDataInvalidPublicError.pipe(HttpApiSchema.status(500)),
@@ -231,6 +245,7 @@ export type DbPublicError =
   | MergeOperatorMissingPublicError
   | TransactionConflictPublicError
   | SnapshotExpiredPublicError
+  | ChangelogUnavailablePublicError
   | WriteStalledPublicError
   | StorageUnavailablePublicError
   | StoredDataInvalidPublicError

@@ -19,12 +19,7 @@ import { HttpApi, HttpApiEndpoint, HttpApiGroup, HttpApiSchema, OpenApi } from "
 import { CompactorState } from "./compactor.ts";
 import { DbSnapshot } from "./db-client.ts";
 import { DB_PUBLIC_ERRORS } from "./db-public-error.ts";
-import {
-  ChangesQuery,
-  ChangesResponse,
-  FlushedResponse,
-  WriterStatusResponse,
-} from "./writer-http-api.ts";
+import { FlushedResponse, WriterStatusResponse } from "./writer-http-api.ts";
 
 const DatabaseParams = Schema.Struct({
   databaseId: DatabaseId.annotate({ examples: [DatabaseId.make("orders-eu")] }),
@@ -99,6 +94,20 @@ export const TransactionScanRequest = Schema.Struct({
   readSeq: SeqNum,
   range: KeyRange,
   limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 1000 })),
+});
+
+/** Schema for one page of the change feed (see `ChangeFeedPage`). */
+export const ChangeFeedResponse = Schema.Struct({
+  rows: Schema.Array(RowSchema),
+  nextAfterSeq: SeqNum,
+});
+
+/** Schema for the change feed's query: changes after `afterSeq`, at most `limit` rows. */
+export const ChangeFeedQuery = Schema.Struct({
+  afterSeq: Schema.NumberFromString.pipe(Schema.decodeTo(SeqNum)),
+  limit: Schema.NumberFromString.pipe(
+    Schema.decodeTo(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 1000 }))),
+  ),
 });
 
 /** Largest page a scan returns. */
@@ -331,14 +340,14 @@ export class DbHttpApiGroup extends HttpApiGroup.make("databases")
   .add(
     HttpApiEndpoint.get("changes", "/databases/:databaseId/changes", {
       params: DatabaseParams,
-      query: ChangesQuery,
-      success: ChangesResponse,
+      query: ChangeFeedQuery,
+      success: ChangeFeedResponse,
       error: DB_PUBLIC_ERRORS,
     }).annotateMerge(
       OpenApi.annotations({
-        summary: "Read unflushed changes",
+        summary: "Read the change feed",
         description:
-          "Returns committed but not yet flushed changes after `afterSeq`, in sequence order. Older changes are in the manifest's changelog SSTs.",
+          "Returns committed changes after `afterSeq` in sequence order (flushed ones from the changelog, then unflushed ones), never splitting a batch. Continue from `nextAfterSeq`. Requires the database's changelog; fails with ChangelogUnavailable when it is disabled or the changes were dropped by retention.",
       }),
     ),
   ) {}

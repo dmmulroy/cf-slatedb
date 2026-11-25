@@ -1,7 +1,6 @@
 import {
   firstBlockForKey,
   blocksOverlappingRange,
-  type DatabaseId,
   groupRowsByKey,
   intersectKeyRanges,
   type KeyRange,
@@ -20,15 +19,20 @@ import {
   sstHandleOwner,
   sstHandleVisibleRange,
   sstMayContainKey,
+  DatabaseId,
   Timestamp,
+  decodeDataBlock,
+  decodeSstMeta,
 } from "@cf-slatedb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
-import { Bytes, Clock, Context, Data, Effect, Layer, Option, Stream } from "effect";
+import { Bytes, Clock, Context, Data, Effect, Layer, Option, Schema, Stream } from "effect";
 
 import { BlockCache, blockCacheLayer, blockCacheLayerWithoutDependencies } from "./block-cache.ts";
 import { blockSourceTestLayer } from "./block-source.ts";
 import { lsmConfigurationLayer, lsmConfigurationTestLayer } from "./lsm-configuration.ts";
-import { objectStoreTestLayer } from "./object-store.ts";
+import { changelogKey } from "./object-keys.ts";
+import { ObjectReader, objectReaderFromObjectStoreLayer } from "./object-reader.ts";
+import { objectStoreLayer, objectStoreTestLayer } from "./object-store.ts";
 import type { BlockSourceServices } from "./block-source.ts";
 import type { DatabaseNotFoundError } from "./lsm-errors.ts";
 import { ManifestCache, manifestCacheLayerWithoutDependencies } from "./manifest-cache.ts";
@@ -67,6 +71,20 @@ export class ReaderUnavailableError extends Data.TaggedError("ReaderUnavailableE
   readonly message: string;
 }> {}
 
+/**
+ * The change feed cannot serve the request: the database exports no changelog (`Disabled`), or
+ * changes after `afterSeq` were already dropped by changelog retention (`Expired`, the consumer fell
+ * behind). Not retryable as asked: enable the changelog, or restart the consumer from a snapshot.
+ */
+export class ChangelogUnavailableError extends Schema.TaggedError<ChangelogUnavailableError>()(
+  "ChangelogUnavailableError",
+  {
+    databaseId: DatabaseId,
+    reason: Schema.Literals(["Disabled", "Expired"]),
+    message: Schema.String,
+  },
+) {}
+
 /** Every failure a read can report. */
 export type DbReadError =
   | DatabaseNotFoundError
@@ -102,6 +120,16 @@ export interface IDbReader {
     view: ReadView,
     options: ScanOptions,
   ) => Stream.Stream<Row, DbReadError, DbReaderServices>;
+  /**
+   * Up to `limit` changelog rows with sequence numbers in (`afterSeq`, `upToSeq`], in sequence
+   * order, from a manifest that covers `upToSeq` (the change feed's flushed part).
+   */
+  readonly changelogRows: (
+    databaseId: DatabaseId,
+    afterSeq: SeqNum,
+    upToSeq: SeqNum,
+    limit: number,
+  ) => Effect.Effect<ReadonlyArray<Row>, DbReadError | ChangelogUnavailableError, DbReaderServices>;
   /** The manifest a `Flushed` read at this moment would use (for snapshots and `AtLeast`). */
   readonly currentManifest: (
     databaseId: DatabaseId,
@@ -126,6 +154,7 @@ export const makeDbReader = Effect.gen(function* () {
   const manifests = yield* ManifestCache;
   const reader = yield* ManifestReader;
   const blocks = yield* BlockCache;
+  const objects = yield* ObjectReader;
 
   const manifestUnavailable = (databaseId: DatabaseId) => ({
     ManifestReadError: (error: ManifestReadError) =>
@@ -363,7 +392,86 @@ export const makeDbReader = Effect.gen(function* () {
       .pipe(Effect.catchTags(manifestUnavailable(databaseId)));
   });
 
-  return DbReader.of({ getRow, scan, currentManifest });
+  const changelogRows = Effect.fn("DbReader.changelogRows")(function* (
+    databaseId: DatabaseId,
+    afterSeq: SeqNum,
+    upToSeq: SeqNum,
+    limit: number,
+  ) {
+    yield* Effect.annotateCurrentSpan({ "database.id": databaseId, seq: afterSeq });
+    const { manifest } = yield* manifestFor(databaseId, {
+      minLastL0Seq: upToSeq,
+      snapshotSeq: Option.none(),
+      memtable: [],
+      manifestId: Option.none(),
+      maxLastL0Seq: Option.none(),
+    });
+    if (Option.isNone(manifest.options.changelog)) {
+      return yield* new ChangelogUnavailableError({
+        databaseId,
+        reason: "Disabled",
+        message: `Database ${databaseId} exports no changelog, so flushed changes cannot be read. Create the database with a changelog retention to use the change feed.`,
+      });
+    }
+    const entries = [...manifest.changelog]
+      .filter((entry) => entry.lastSeq > afterSeq)
+      .sort((left, right) => left.firstSeq - right.firstSeq);
+    const [oldest] = entries;
+    if (oldest !== undefined && oldest.firstSeq > afterSeq + 1) {
+      return yield* new ChangelogUnavailableError({
+        databaseId,
+        reason: "Expired",
+        message: `Changes of database ${databaseId} after sequence number ${afterSeq} were dropped by changelog retention (the oldest kept starts at ${oldest.firstSeq}). Restart the consumer from a snapshot.`,
+      });
+    }
+    // Changelog SSTs are read sequentially and once per consumer: straight from R2, not cached.
+    const unavailable = (key: string) => (error: { readonly message: string }) =>
+      new ReaderUnavailableError({
+        databaseId,
+        reason: "StorageUnavailable",
+        message: `Changelog SST ${key} of database ${databaseId} could not be read: ${error.message}`,
+      });
+    const readRange = (key: string, offset: number, length: number) =>
+      objects.getRange(key, { offset, length }).pipe(
+        Effect.mapError(unavailable(key)),
+        Effect.flatMap((bytes) =>
+          Option.isSome(bytes) && bytes.value.length === length
+            ? Effect.succeed(bytes.value)
+            : Effect.fail(
+                unavailable(key)({ message: "it no longer exists (pruned by retention)" }),
+              ),
+        ),
+      );
+    const rows: Array<Row> = [];
+    for (const entry of entries) {
+      if (rows.length >= limit) break;
+      const key = changelogKey(databaseId, entry.lastSeq, entry.sst.id);
+      const meta = yield* Effect.fromResult(
+        decodeSstMeta(
+          entry.sst.id,
+          yield* readRange(key, entry.sst.metaOffset, entry.sst.metaLength),
+        ),
+      );
+      for (const indexEntry of meta.index) {
+        const block = yield* Effect.fromResult(
+          decodeDataBlock(yield* readRange(key, indexEntry.offset, indexEntry.length), {
+            sstId: entry.sst.id,
+            offset: indexEntry.offset,
+          }),
+        );
+        for (const row of block.rows()) {
+          if (row.seq > afterSeq && row.seq <= upToSeq) rows.push(row);
+        }
+      }
+    }
+    yield* Effect.annotateCurrentSpan({
+      "changelog.rows": rows.length,
+      "changelog.ssts": entries.length,
+    });
+    return rows;
+  });
+
+  return DbReader.of({ getRow, scan, changelogRows, currentManifest });
 });
 
 /** Provides the reader, leaving its caches and manifest reader visible. */
@@ -372,13 +480,22 @@ export const dbReaderLayerWithoutDependencies = Layer.effect(DbReader, makeDbRea
 /** Provides the reader over the R2 manifest reader and the `BlockServer` block cache. */
 export const dbReaderLayer = dbReaderLayerWithoutDependencies.pipe(
   Layer.provide(manifestCacheLayerWithoutDependencies),
-  Layer.provide(Layer.mergeAll(manifestReaderLayer, lsmConfigurationLayer, blockCacheLayer)),
+  Layer.provide(
+    Layer.mergeAll(
+      manifestReaderLayer,
+      lsmConfigurationLayer,
+      blockCacheLayer,
+      objectReaderFromObjectStoreLayer.pipe(Layer.provide(objectStoreLayer)),
+    ),
+  ),
 );
 
 /** Provides the reader over a fresh in-memory object store. */
 export const dbReaderTestLayer = dbReaderLayerWithoutDependencies.pipe(
   Layer.provide(manifestCacheLayerWithoutDependencies),
   Layer.provide(blockCacheLayerWithoutDependencies.pipe(Layer.provide(blockSourceTestLayer))),
-  Layer.provide(manifestReaderLayerWithoutDependencies),
+  Layer.provide(
+    Layer.mergeAll(manifestReaderLayerWithoutDependencies, objectReaderFromObjectStoreLayer),
+  ),
   Layer.provide(Layer.mergeAll(objectStoreTestLayer, lsmConfigurationTestLayer())),
 );

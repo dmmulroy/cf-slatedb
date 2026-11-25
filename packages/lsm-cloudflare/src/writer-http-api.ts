@@ -3,6 +3,7 @@ import {
   DatabaseSealedError,
   KeyOutOfRangeError,
   KeyRange,
+  MAX_BATCH_OPERATIONS,
   RowSchema,
   TransactionCommit,
   TransactionConflictError,
@@ -59,8 +60,11 @@ export const FlushedResponse = Schema.Struct({ flushedSeq: SeqNum });
 /** Schema for the change-feed query: rows after `afterSeq`, at most `limit`. */
 export const ChangesQuery = Schema.Struct({
   afterSeq: Schema.NumberFromString.pipe(Schema.decodeTo(SeqNum)),
+  // Up to one whole write batch, so the change feed can return any batch in one page.
   limit: Schema.NumberFromString.pipe(
-    Schema.decodeTo(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 1000 }))),
+    Schema.decodeTo(
+      Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: MAX_BATCH_OPERATIONS })),
+    ),
   ),
 });
 

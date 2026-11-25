@@ -4,6 +4,7 @@ import {
   keyRangeOfPrefix,
   type KeyRange,
   type LsmSettings,
+  MAX_BATCH_OPERATIONS,
   ManifestId,
   MERGE_OPERATORS,
   type ReadConsistency,
@@ -27,6 +28,7 @@ import {
   dbReaderLayerWithoutDependencies,
   type DbReaderServices,
   type DbReadError,
+  type ChangelogUnavailableError,
   type ReaderUnavailableError,
   type ReadView,
 } from "./db-reader.ts";
@@ -34,6 +36,7 @@ import { compactionTriggerTestLayer } from "./compaction-trigger.ts";
 import { lsmConfigurationTestLayer } from "./lsm-configuration.ts";
 import { manifestCacheLayerWithoutDependencies } from "./manifest-cache.ts";
 import { manifestStoreTestLayer } from "./manifest-store.ts";
+import { objectReaderFromObjectStoreLayer } from "./object-reader.ts";
 import type { MemTableCursor } from "./mem-table.ts";
 import {
   WriterClient,
@@ -150,6 +153,20 @@ export interface IDbClient {
     E | DbTransactionError,
     R | DbReaderServices
   >;
+  /**
+   * The change feed (design §3, CDC): committed changes after `afterSeq` in sequence order, at most
+   * `limit` rows (never splitting a batch): flushed changes from the changelog SSTs, then unflushed
+   * ones from the writer.
+   */
+  readonly changes: (
+    databaseId: DatabaseId,
+    afterSeq: SeqNum,
+    limit: number,
+  ) => Effect.Effect<
+    ChangeFeedPage,
+    DbClientReadError | ChangelogUnavailableError,
+    DbReaderServices
+  >;
   /** A transaction's read sequence number: everything committed now. */
   readonly beginTransaction: (
     databaseId: DatabaseId,
@@ -173,6 +190,29 @@ export interface IDbClient {
     commit: TransactionCommit,
   ) => Effect.Effect<WriteReceipt, DbWriteError, DbReaderServices>;
 }
+
+/** One page of the change feed: rows in sequence order, and where the next page starts. */
+export interface ChangeFeedPage {
+  readonly rows: ReadonlyArray<Row>;
+  /** Pass as `afterSeq` for the next page (the last sequence number returned, or `afterSeq`). */
+  readonly nextAfterSeq: SeqNum;
+}
+
+/**
+ * Cuts rows in sequence order to at most `limit`, only between sequence numbers, so a page never
+ * splits a batch (a consumer resuming after the page's last sequence number would skip the rest).
+ * A single batch larger than `limit` is returned whole.
+ */
+export const cutAtSequenceBoundary = (
+  rows: ReadonlyArray<Row>,
+  limit: number,
+): ReadonlyArray<Row> => {
+  if (rows.length <= limit) return rows;
+  const boundary = rows[limit]?.seq;
+  const kept = rows.slice(0, limit).filter((row) => row.seq !== boundary);
+  if (kept.length > 0) return kept;
+  return rows.filter((row) => row.seq === boundary);
+};
 
 /** A transaction in progress (see `IDbClient.transaction`). */
 export interface DbTransaction {
@@ -391,6 +431,39 @@ export const makeDbClient = Effect.gen(function* () {
     ).pipe(Effect.catchTags(expiredIsTooOld(databaseId, readSeq)));
   });
 
+  const changes = Effect.fn("DbClient.changes")(function* (
+    databaseId: DatabaseId,
+    afterSeq: SeqNum,
+    limit: number,
+  ) {
+    yield* Effect.annotateCurrentSpan({ "database.id": databaseId, seq: afterSeq });
+    /** Changes after `afterSeq`, at least `count` rows when that many exist, in sequence order. */
+    const fetch = (count: number) =>
+      Effect.gen(function* () {
+        // The writer's unflushed rows (> flushedSeq) and its flushedSeq, read together.
+        const unflushed = yield* writer.changes(databaseId, afterSeq, count);
+        const flushed =
+          afterSeq < unflushed.flushedSeq
+            ? yield* reader.changelogRows(databaseId, afterSeq, unflushed.flushedSeq, count)
+            : [];
+        // The memtable holds exactly the rows above flushedSeq (truncate and flushed_seq commit
+        // together), so the two parts neither overlap nor leave a gap.
+        return [...flushed, ...unflushed.rows];
+      });
+    // One row past the limit shows whether the page's last batch continues.
+    let fetched = yield* fetch(limit + 1);
+    let rows = cutAtSequenceBoundary(fetched, limit);
+    const boundary = fetched[limit];
+    if (boundary !== undefined && rows.every((row) => row.seq === boundary.seq)) {
+      // One batch larger than the page: return the whole batch.
+      fetched = yield* fetch(MAX_BATCH_OPERATIONS);
+      rows = fetched.filter((row) => row.seq === boundary.seq);
+    }
+    const last = rows[rows.length - 1];
+    yield* Effect.annotateCurrentSpan({ "changes.rows": rows.length });
+    return { rows, nextAfterSeq: last === undefined ? afterSeq : last.seq };
+  });
+
   const commitTransaction = (databaseId: DatabaseId, commit: TransactionCommit) =>
     writer.commitTransaction(databaseId, commit);
 
@@ -559,6 +632,7 @@ export const makeDbClient = Effect.gen(function* () {
       return { databaseId, manifestId: current.id, snapshotSeq: current.manifest.lastL0Seq };
     }),
     transaction,
+    changes,
     beginTransaction,
     getAt,
     scanAt,
@@ -588,6 +662,7 @@ export const dbClientTestLayer = (overrides: Partial<LsmSettings> = {}) =>
     Layer.provideMerge(writerClientTestLayer),
     Layer.provideMerge(
       dbReaderLayerWithoutDependencies.pipe(
+        Layer.provide(objectReaderFromObjectStoreLayer),
         Layer.provide(manifestCacheLayerWithoutDependencies),
         Layer.provide(blockCacheLayerWithoutDependencies.pipe(Layer.provide(blockSourceTestLayer))),
       ),

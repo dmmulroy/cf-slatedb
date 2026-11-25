@@ -423,3 +423,15 @@ SQLite rows per flushed key; recorded as a possible improvement.
 with the database's operator). Over HTTP the API is stateless: `transactions/begin` returns
 `readSeq`, `transactions/get` and `transactions/scan` read at it, and `transactions/commit` sends the
 writes with the keys read and ranges scanned; nothing is held on the server.
+
+## D42. The change feed reads changelog SSTs directly and never splits a batch
+
+The design's `ChangelogExport.read(afterSeq)` is `DbClient.changes`: it asks the writer for its
+unflushed changes and `flushed_seq` together, reads the changelog SSTs for (`afterSeq`,
+`flushed_seq`] from a manifest that covers `flushed_seq`, and appends the unflushed rows (the
+memtable holds exactly the rows above `flushed_seq`). Changelog SSTs are read straight from R2 through
+`ObjectReader` (sequential, once per consumer), not through the block caches, whose URLs address
+`compacted/` SSTs. A page never ends inside a batch: it is cut between sequence numbers (and a batch
+larger than the page is returned whole; the writer's internal page allows a whole batch,
+`MAX_BATCH_OPERATIONS`), so a consumer resuming from `nextAfterSeq` cannot skip rows. A consumer
+behind retention gets `ChangelogUnavailable` (`Expired`) instead of a silent gap.

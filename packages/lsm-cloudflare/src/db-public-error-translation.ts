@@ -12,6 +12,7 @@ import { Option } from "effect";
 
 import {
   BatchInvalidPublicError,
+  ChangelogUnavailablePublicError,
   CheckpointNotFoundPublicError,
   DatabaseAlreadyExistsPublicError,
   DatabaseHasDependentsPublicError,
@@ -36,7 +37,7 @@ import type {
 } from "./lsm-errors.ts";
 import type { CompactorUnavailableError } from "./compactor.ts";
 import type { CheckpointNotFoundError } from "./database-lifecycle.ts";
-import type { ReaderUnavailableError } from "./db-reader.ts";
+import type { ChangelogUnavailableError, ReaderUnavailableError } from "./db-reader.ts";
 import type { DatabaseAlreadyExistsError } from "./manifest-store.ts";
 
 /** Every internal failure the public API classifies. */
@@ -56,7 +57,8 @@ export type DbInternalError =
   | CompactorUnavailableError
   | DatabaseHasDependentsError
   | CheckpointNotFoundError
-  | TransactionConflictError;
+  | TransactionConflictError
+  | ChangelogUnavailableError;
 
 /**
  * Classifies an internal failure as its public error: a stable code, a caller-facing message, the
@@ -162,6 +164,15 @@ export const toPublicError =
               requestId,
               retryable: true,
             });
+      case "ChangelogUnavailableError":
+        return new ChangelogUnavailablePublicError({
+          code: "ChangelogUnavailable",
+          operation,
+          message: error.message,
+          details: { databaseId: error.databaseId, reason: error.reason },
+          requestId,
+          retryable: false,
+        });
       case "TransactionConflictError":
         return new TransactionConflictPublicError({
           code: "TransactionConflict",

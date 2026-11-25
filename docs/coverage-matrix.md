@@ -55,10 +55,15 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `db-writer.test.ts` (SST bytes decode to the flushed rows; crash between commit and truncate).
   Trace: the flush assertion (exactly one `ManifestStore.create`, `MemTable.truncate` under
   `DbWriter.flush`, no `ObjectStore.list`, no errors, safe attributes). Formal: `NoAckedWriteLost`.
-- **Changelog export (CDC), `changes?afterSeq=`** — done (write side). `exportChangelog` in
-  `lsm-cloudflare/src/db-writer.ts` (sequence-ordered `Changelog` SST per flush, `Manifest.changelog` entry),
-  `GET /v1/databases/:id/changes`. Tests: `db-writer.test.ts`, `writer-client.test.ts`. Retention
-  by GC: Phase 6.
+- **Changelog export (CDC), `changes?afterSeq=`** — done. Write side: `exportChangelog` in
+  `db-writer.ts` (a sequence-ordered `Changelog` SST per flush, `Manifest.changelog` entry); retention
+  by GC (`prepareGarbageCollection` prunes entries past `retentionMs`; their SSTs are then
+  unreferenced). Read side (`ChangelogExport.read`): `DbClient.changes` (flushed changes from the
+  changelog SSTs via `DbReader.changelogRows`, then the writer's unflushed ones; pages never split
+  a batch), `GET /v1/databases/:id/changes?afterSeq=&limit=` (`nextAfterSeq`), errors
+  `ChangelogUnavailable` (`Disabled`, `Expired`). Tests: `db-writer.test.ts`, `change-feed.test.ts`
+  (exactly-once, in-order delivery across random batches, flushes, and page sizes; shown failing
+  when a page can cut a batch), D42.
 
 ## §4 Read path
 

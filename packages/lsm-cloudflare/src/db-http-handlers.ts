@@ -181,7 +181,7 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
         client.snapshot(params.databaseId).pipe(publicFailures("get")),
       )
       .handle("changes", ({ params, query }) =>
-        writer
+        client
           .changes(params.databaseId, query.afterSeq, query.limit)
           .pipe(publicFailures("changes")),
       );
