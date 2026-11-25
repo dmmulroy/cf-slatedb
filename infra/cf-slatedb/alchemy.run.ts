@@ -1,3 +1,5 @@
+import { join } from "node:path";
+
 import * as Cloudflare from "@alchemy.run/cloudflare";
 import {
   BlockServerWorker,
@@ -5,6 +7,7 @@ import {
   DbApiWorker,
   GcWorker,
   isLocalLsmStage,
+  LSM_WORKER_COMPATIBILITY_DATE,
 } from "@cf-slatedb/lsm-cloudflare";
 import * as Alchemy from "alchemy";
 import { ShardRouterWorker } from "@cf-slatedb/sharding";
@@ -17,7 +20,12 @@ import { cfSlatedbGcWorkerLayer } from "./src/gc-worker-entry.ts";
 import { cfSlatedbShardRouterWorkerLayer } from "./src/shard-router-worker-entry.ts";
 import { cfSlatedbStateLayer } from "./src/cf-slatedb-stage.ts";
 import { TelemetryProbeWorker, telemetryProbeWorkerLayer } from "./src/telemetry-probe-worker.ts";
-import { TraceCollectorWorker, traceCollectorWorkerLayer } from "./src/trace-collector-worker.ts";
+import { CPU_TAIL_WORKER_ID } from "./src/cf-slatedb-telemetry.ts";
+import {
+  TraceBucket,
+  TraceCollectorWorker,
+  traceCollectorWorkerLayer,
+} from "./src/trace-collector-worker.ts";
 
 const cfSlatedbWorkersLayer = Layer.mergeAll(
   cfSlatedbApiWorkerLayer,
@@ -68,6 +76,15 @@ const CfSlatedbStack = Alchemy.Stack(
     const traces = isLocalLsmStage(stage)
       ? Option.none()
       : Option.some(yield* Cloudflare.Worker.ref(TraceCollectorWorker));
+    // Live stages also record every API and compactor invocation's CPU time (D48).
+    if (!isLocalLsmStage(stage)) {
+      yield* Cloudflare.Worker(CPU_TAIL_WORKER_ID, {
+        main: join(import.meta.dirname, "src", "cpu-tail-worker.ts"),
+        workersDev: false,
+        compatibility: { date: LSM_WORKER_COMPATIBILITY_DATE },
+        env: { TRACE_BUCKET: yield* TraceBucket },
+      });
+    }
     return {
       /** URL of the public database API (`/v1`). */
       apiUrl: api.url,

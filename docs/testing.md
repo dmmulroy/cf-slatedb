@@ -39,6 +39,12 @@ from `vp run ready` and never cached. Stages are reused, not destroyed; Dillon t
 
 Never test against `production`, a developer's stage, or another run's stage.
 
+`node tools/scenario-cli/src/scenario-cli.ts run --stage <stage> all` runs every scenario against a
+preview (deploy it with `--dev-timings`: the scenarios expect compaction and GC within seconds), and
+`scenario-cli measure writes | flush-cpu | split-pause --stage <stage>` takes the design §12
+measurements (deploy without `--dev-timings`). Record results in
+[`measurements.md`](measurements.md) with the stage and method.
+
 A preview's spans go to its own `TraceCollector` Worker. Run `node tools/trace-cli/src/trace-cli.ts
 pull --stage <stage>` (or `tail --stage <stage>`) to bring them into the local trace store before
 `assert`, `show`, or `stats`. Live Workers export after the response (D5), so pull a few seconds

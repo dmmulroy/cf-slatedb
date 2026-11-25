@@ -391,8 +391,10 @@ map (version + 1). The split's own checkpoint expires after an hour if the split
 deleted once both forks hold theirs.
 
 `ShardRouter` caches each group's map in the isolate. A stale map reaches only a sealed, out-of-range,
-or removed database, which fail with typed errors; the router then refreshes and retries every 100 ms
-for up to five seconds (a split's publish window), as the design describes. The core keeps no map
+or removed database, which fail with typed errors; the router then refreshes and retries every 250 ms
+for up to 30 seconds (a split's publish window), as the design describes. (It was 100 ms for five
+seconds until a live split on `preview-1` took 13 seconds and every write that arrived early in it
+failed; D48.) The core keeps no map
 versions. Batches are atomic only within a database, so a batch spanning shards is refused with
 `CrossShardBatchError`.
 
@@ -537,3 +539,21 @@ every span arrives (probe: 10 of 10 complete traces; API: complete Worker → wr
 exports spans. Calls between cf-slatedb's Workers use service bindings and Durable Object stubs,
 which the flag does not affect. Local stages leave it off, because their spans go to `127.0.0.1`,
 which a strictly public `fetch()` cannot reach.
+
+## D48. Live stages record per-invocation CPU time with a Tail Worker; measurements drive the router's window
+
+Design §12 asks for flush CPU per MB and rows/s per writer, but a Worker cannot read its own CPU
+time (its clock advances only across I/O). Live stages therefore declare `CpuTailWorker`
+(`infra/cf-slatedb/src/cpu-tail-worker.ts`), a plain module Worker with a `tail()` handler — Alchemy's
+Effect-native Workers cannot export one — attached as a tail consumer to the API Worker (writer
+Durable Objects) and the compactor Worker through a new `tailConsumers` option
+(`LsmWorkerTailConsumers`; `noLsmTailConsumers` locally and in tests). It stores one record per
+invocation (script, Durable Object id, event kind, method, URL path, status, outcome, `cpuTime`,
+`wallTime`) under `tails/` in the stage's trace bucket; headers, logs, and exception messages are
+dropped, so no keys, values, or secrets are kept. The collector serves them at
+`GET /v1/tails/batches`, and `scenario-cli measure writes | flush-cpu | split-pause` combine them with
+spans (`docs/measurements.md`).
+
+The measurements changed one setting: the shard router retried a sealed or out-of-range write for 5
+seconds, but a split on `preview-1` takes about 13 seconds (each manifest CAS is about 1.1 s on R2),
+so every write arriving early in a split failed. The window is now 30 seconds (every 250 ms).

@@ -14,7 +14,11 @@ import { compactionLauncherLayer } from "./compaction-workflow.ts";
 import { CompactorServer, compactorServerLayerWithoutDependencies } from "./compactor-server.ts";
 import { lsmWorkerCompatibility } from "./lsm-stage.ts";
 import { lsmConfigurationLayer } from "./lsm-configuration.ts";
-import { eventTelemetryFlushForStage, type LsmWorkerTelemetry } from "./lsm-telemetry.ts";
+import {
+  eventTelemetryFlushForStage,
+  type LsmWorkerTailConsumers,
+  type LsmWorkerTelemetry,
+} from "./lsm-telemetry.ts";
 import { objectStoreLayer } from "./object-store.ts";
 
 /** Options of the compactor Worker. */
@@ -26,6 +30,8 @@ export interface CompactorWorkerOptions<R = never> {
    * the Stack's own factory on live stages. `R` is what building it needs at plan time.
    */
   readonly telemetry: LsmWorkerTelemetry<R>;
+  /** Tail Workers attached to the Worker (`noLsmTailConsumers` locally). */
+  readonly tailConsumers: LsmWorkerTailConsumers<R>;
   readonly devPort: number;
 }
 
@@ -48,6 +54,7 @@ export const compactorWorkerLayer = <R = never>(options: CompactorWorkerOptions<
         main: options.main,
         workersDev: false,
         compatibility: yield* lsmWorkerCompatibility,
+        tailConsumers: yield* options.tailConsumers,
         dev: { host: "127.0.0.1", port: options.devPort },
       };
     }),

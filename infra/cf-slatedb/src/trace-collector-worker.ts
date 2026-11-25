@@ -18,6 +18,9 @@ export const TRACE_COLLECTOR_TOKEN_BINDING = "CF_SLATEDB_TRACE_COLLECTOR_TOKEN";
 /** Key prefix of every stored OTLP export in the trace bucket. */
 export const TRACE_COLLECTOR_PREFIX = "traces/";
 
+/** Key prefix of the Tail Worker's invocation records in the trace bucket (`cpu-tail-worker.ts`). */
+export const TAIL_RECORDS_PREFIX = "tails/";
+
 /** Most exports one `GET /v1/traces/batches` returns. */
 const MAX_BATCHES_PER_PAGE = 100;
 
@@ -84,68 +87,73 @@ const receiveTraces = Effect.gen(function* () {
 );
 
 /**
- * `GET /v1/traces/batches?after=<key>&limit=<n>`: the stored exports after `after`, oldest first,
- * each with its content type and body (base64). `next` is the key to continue after, and `more`
- * says whether another page follows.
+ * `GET /v1/traces/batches?after=<key>&limit=<n>` (and `/v1/tails/batches` for invocation records):
+ * the stored objects under `prefix` after `after`, oldest first, each with its content type and
+ * body (base64). `next` is the key to continue after, and `more` says whether another page follows.
  */
-const readBatches = Effect.gen(function* () {
-  const bucket = yield* TraceBucketClient;
-  const request = yield* HttpServerRequest.HttpServerRequest;
-  const query = yield* decodeBatchesQuery(
-    Object.fromEntries(new URL(request.originalUrl, "http://collector.internal").searchParams),
+const readBatchesUnder = (prefix: string) =>
+  Effect.gen(function* () {
+    const bucket = yield* TraceBucketClient;
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const query = yield* decodeBatchesQuery(
+      Object.fromEntries(new URL(request.originalUrl, "http://collector.internal").searchParams),
+    );
+    const limit = Math.min(
+      Math.max(1, Math.floor(query.limit ?? MAX_BATCHES_PER_PAGE)),
+      MAX_BATCHES_PER_PAGE,
+    );
+    const page = yield* bucket
+      .list({
+        prefix,
+        limit,
+        ...(query.after === undefined ? {} : { startAfter: query.after }),
+      })
+      .pipe(Effect.retry(r2Retry));
+    const batches = yield* Effect.forEach(
+      page.objects,
+      (object) =>
+        Effect.gen(function* () {
+          const stored = yield* bucket.get(object.key).pipe(Effect.retry(r2Retry));
+          if (stored === null) return Option.none();
+          const bytes = yield* stored.bytes();
+          return Option.some({
+            key: object.key,
+            contentType: stored.httpMetadata?.contentType ?? "application/json",
+            body: Base64.encode(bytes),
+          });
+        }),
+      { concurrency: 8 },
+    );
+    const found = batches.flatMap((batch) => (Option.isSome(batch) ? [batch.value] : []));
+    return HttpServerResponse.jsonUnsafe(
+      {
+        batches: found,
+        next: page.objects.at(-1)?.key ?? query.after ?? null,
+        more: page.truncated,
+      },
+      { headers: { "cache-control": "no-store" } },
+    );
+  }).pipe(
+    Effect.catchTags({
+      SchemaError: () =>
+        Effect.succeed(failure(400, "`after` must be a key and `limit` a number from 1 to 100.")),
+      R2Error: (error) =>
+        Effect.succeed(
+          failure(
+            503,
+            `The stored exports could not be read: ${error.message}. Retry the request.`,
+          ),
+        ),
+    }),
   );
-  const limit = Math.min(
-    Math.max(1, Math.floor(query.limit ?? MAX_BATCHES_PER_PAGE)),
-    MAX_BATCHES_PER_PAGE,
-  );
-  const page = yield* bucket
-    .list({
-      prefix: TRACE_COLLECTOR_PREFIX,
-      limit,
-      ...(query.after === undefined ? {} : { startAfter: query.after }),
-    })
-    .pipe(Effect.retry(r2Retry));
-  const batches = yield* Effect.forEach(
-    page.objects,
-    (object) =>
-      Effect.gen(function* () {
-        const stored = yield* bucket.get(object.key).pipe(Effect.retry(r2Retry));
-        if (stored === null) return Option.none();
-        const bytes = yield* stored.bytes();
-        return Option.some({
-          key: object.key,
-          contentType: stored.httpMetadata?.contentType ?? "application/json",
-          body: Base64.encode(bytes),
-        });
-      }),
-    { concurrency: 8 },
-  );
-  const found = batches.flatMap((batch) => (Option.isSome(batch) ? [batch.value] : []));
-  return HttpServerResponse.jsonUnsafe(
-    {
-      batches: found,
-      next: page.objects.at(-1)?.key ?? query.after ?? null,
-      more: page.truncated,
-    },
-    { headers: { "cache-control": "no-store" } },
-  );
-}).pipe(
-  Effect.catchTags({
-    SchemaError: () =>
-      Effect.succeed(failure(400, "`after` must be a key and `limit` a number from 1 to 100.")),
-    R2Error: (error) =>
-      Effect.succeed(
-        failure(503, `The stored exports could not be read: ${error.message}. Retry the request.`),
-      ),
-  }),
-);
 
 /** Accepts OTLP logs and metrics and discards them: the collector keeps spans only. */
 const acceptAndDiscard = Effect.succeed(HttpServerResponse.jsonUnsafe(OTLP_PARTIAL_SUCCESS));
 
 const traceCollectorRoutesLayer = Layer.mergeAll(
   HttpRouter.add("POST", "/v1/traces", receiveTraces),
-  HttpRouter.add("GET", "/v1/traces/batches", readBatches),
+  HttpRouter.add("GET", "/v1/traces/batches", readBatchesUnder(TRACE_COLLECTOR_PREFIX)),
+  HttpRouter.add("GET", "/v1/tails/batches", readBatchesUnder(TAIL_RECORDS_PREFIX)),
   HttpRouter.add("POST", "/v1/logs", acceptAndDiscard),
   HttpRouter.add("POST", "/v1/metrics", acceptAndDiscard),
 ).pipe(Layer.provide(lsmHttpServerLayer));

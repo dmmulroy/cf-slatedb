@@ -47,3 +47,18 @@ export const cfSlatedbTelemetry = (serviceName: string) =>
       });
     }),
   );
+
+/** Logical id of the live stages' Tail Worker (`cpu-tail-worker.ts`), declared by the Stack. */
+export const CPU_TAIL_WORKER_ID = "CpuTailWorker";
+
+/**
+ * The Tail Workers of the API and compactor Workers, by stage: none locally; on live stages the
+ * Stack's `CpuTailWorker`, which records each invocation's CPU and wall time (D48). Referenced, not
+ * declared, like the trace collector.
+ */
+export const cfSlatedbTailConsumers = Effect.gen(function* () {
+  const stage = yield* Stage;
+  if (isLocalLsmStage(stage)) return [];
+  if ((yield* Alchemy.ALCHEMY_PHASE) === "runtime") return [];
+  return [yield* Cloudflare.Worker.ref(CPU_TAIL_WORKER_ID)];
+});

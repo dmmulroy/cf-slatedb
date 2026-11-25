@@ -21,7 +21,11 @@ import { dbReaderLayer } from "./db-reader.ts";
 import { lsmAccessGateForStage } from "./lsm-access-gate.ts";
 import { lsmWorkerCompatibility } from "./lsm-stage.ts";
 import { lsmConfigurationLayer } from "./lsm-configuration.ts";
-import { eventTelemetryFlushForStage, type LsmWorkerTelemetry } from "./lsm-telemetry.ts";
+import {
+  eventTelemetryFlushForStage,
+  type LsmWorkerTailConsumers,
+  type LsmWorkerTelemetry,
+} from "./lsm-telemetry.ts";
 import { ManifestReader, manifestReaderLayerWithoutDependencies } from "./manifest-reader.ts";
 import { manifestStoreLayerWithoutDependencies } from "./manifest-store.ts";
 import { objectStoreLayer } from "./object-store.ts";
@@ -40,6 +44,8 @@ export interface DbApiWorkerOptions<R = never> {
    * the Stack's own factory on live stages. `R` is what building it needs at plan time.
    */
   readonly telemetry: LsmWorkerTelemetry<R>;
+  /** Tail Workers attached to the Worker (`noLsmTailConsumers` locally). */
+  readonly tailConsumers: LsmWorkerTailConsumers<R>;
   /** Local dev port. */
   readonly devPort: number;
 }
@@ -67,6 +73,7 @@ export const dbApiWorkerLayer = <R = never>(options: DbApiWorkerOptions<R>) =>
       return {
         main: options.main,
         compatibility: yield* lsmWorkerCompatibility,
+        tailConsumers: yield* options.tailConsumers,
         dev: { host: "127.0.0.1", port: options.devPort },
       };
     }),

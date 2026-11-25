@@ -227,6 +227,13 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `preview-trace-pull.test.ts` (JSON and protobuf exports across pages, repeated pulls download
   nothing twice, a refused token). Live (`preview-1`): API Worker → writer DO trees complete, DO
   alarm spans arrive, 10/10 probe traces complete, unauthenticated reads `401`. D46, D47.
+- **Live checks and §12 measurements (hand-off item 4)** — done. Scenarios `block-cache`
+  (Workers Cache `HIT` on `BlockServer` through a second Worker; `cache.l2.status` on `BlockSource`
+  spans from `Cf-Cache-Status`, `block-source.ts`) and `create-race` (16 concurrent creates, one
+  `Created`, 15 `AlreadyExists`), both also local; all 11 scenarios pass on `preview-1` and under
+  `vp run dev`. `scenario-cli measure writes | flush-cpu | split-pause`
+  (`tools/scenario-cli/src/measurements.ts`) with `CpuTailWorker` CPU records. Results:
+  `docs/measurements.md`. D48.
 - **Access gate on live stages' public Workers** — done. `lsm-access-gate.ts`
   (`LsmAccessToken`, `lsmAccessGateForStage`), applied by `db-api-worker.ts`, `gc-worker.ts`,
   `shard-router-worker.ts`, and the telemetry probe. Test: `lsm-access-gate.test.ts`. Live:
@@ -280,9 +287,10 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 - **Per-database budget (~1k req/s, single-threaded CPU, 10 GB SQLite, 128 MB)** — done. Reads run
   in the caller's isolate (`db-reader.ts`), `AtLeast`/`Flushed` skip the writer, batches raise rows per
   request; `l0SstSize`/`maxL0Age` flush triggers; `maxUnflushedBytes` backpressure far below 10 GB;
-  the memtable lives in SQLite and flushes/compactions stream (no writer block cache). Measurements
-  that need a live preview (rows/s per writer, flush CPU per MB, SQLite page cache against 128 MB,
-  Workflows concurrency, split write pause) wait for approval (open question 4).
+  the memtable lives in SQLite and flushes/compactions stream (no writer block cache). Measured on
+  `preview-1` (`docs/measurements.md`): a writer is CPU-bound at ~12–15k small rows/s with 1,000-row
+  batches; a flush costs ~55–90 ms CPU per MiB; a split pauses writes ~13–16 s. Not measured: SQLite
+  page cache against 128 MB, the Workflows concurrency limit.
 - **Shared resources: R2 request rate, Workers Cache per Worker, L1 cache budget** — done with one gap.
   One bucket with `db/<id>/` prefixes and no LIST on read paths; owner database in every block URL
   (`block-server-http-api.ts`); L1 cache bounded by entry count, not a per-`budgetGroup` byte budget

@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { Context, Data, Effect, Schedule } from "effect";
+import { Context, Data, Effect, Option, Schedule } from "effect";
 import type { HttpClient } from "effect/http";
 
 /**
@@ -13,20 +13,26 @@ export class ScenarioFailure extends Data.TaggedError("ScenarioFailure")<{
   readonly message: string;
 }> {}
 
-/** Where the local Stack's Workers listen (`vp run dev`). */
+/** Where the Stack's Workers listen, and where their spans can be read. */
 export interface StackUrls {
   readonly api: string;
   readonly gc: string;
   readonly shards: string;
+  /**
+   * The live preview stage the Workers belong to, whose spans are pulled from its trace collector
+   * before each trace assertion; `None` for `vp run dev`, whose spans reach the local receiver
+   * before each response returns.
+   */
+  readonly previewStage: Option.Option<string>;
 }
 
-/** The local Stack a scenario runs against. */
-export class LocalStack extends Context.Service<LocalStack, StackUrls>()(
-  "@cf-slatedb/scenario/LocalStack",
+/** The Stack a scenario runs against: `vp run dev`, or a live preview stage. */
+export class ScenarioStack extends Context.Service<ScenarioStack, StackUrls>()(
+  "@cf-slatedb/scenario/ScenarioStack",
 ) {}
 
 /** Services every scenario may use. */
-export type ScenarioServices = LocalStack | HttpClient.HttpClient;
+export type ScenarioServices = ScenarioStack | HttpClient.HttpClient;
 
 /** A named end-to-end scenario: calls to the local Stack, checks on results, then trace checks. */
 export interface Scenario {
@@ -102,25 +108,52 @@ export const eventually = <A, E, R>(
 
 const TRACE_CLI = fileURLToPath(new URL("../../trace-cli/src/trace-cli.ts", import.meta.url));
 
+/** How long live Workers get to export a scenario's spans (after each response) before a pull. */
+const PREVIEW_SPAN_SETTLE = "5 seconds";
+
+/** Pulls and asserts again this many times, a few seconds apart, before a preview check fails. */
+const PREVIEW_ASSERT_ATTEMPTS = 6;
+
+const runTraceCli = (args: ReadonlyArray<string>, input?: string) =>
+  Effect.sync(() =>
+    spawnSync(process.execPath, [TRACE_CLI, ...args], {
+      ...(input === undefined ? {} : { input }),
+      encoding: "utf8",
+    }),
+  );
+
 /**
  * Runs a trace assertion (the trace CLI's `assert`, in its own process) against the local trace
- * store. The Workers flush spans before responding in the `dev` stage, so a scenario's traces are
- * stored by the time its requests return.
+ * store. Locally, the Workers flush spans before responding, so a scenario's traces are stored by
+ * the time its requests return. On a preview stage they are exported after each response to the
+ * stage's collector: the check waits, pulls them into the store, and retries a few times while
+ * late spans arrive.
  */
 export const assertTraces = (name: string, assertion: unknown) =>
   Effect.gen(function* () {
-    const result = yield* Effect.sync(() =>
-      spawnSync(process.execPath, [TRACE_CLI, "assert", "-"], {
-        input: JSON.stringify(assertion),
-        encoding: "utf8",
-      }),
-    );
-    if (result.status !== 0) {
+    const { previewStage } = yield* ScenarioStack;
+    const input = JSON.stringify(assertion);
+    if (Option.isNone(previewStage)) {
+      const result = yield* runTraceCli(["assert", "-"], input);
+      if (result.status === 0) return;
       return yield* new ScenarioFailure({
         step: name,
         message: `trace assertion failed:\n${result.stdout}${result.stderr}`.trimEnd(),
       });
     }
+    let last = "";
+    for (let attempt = 1; attempt <= PREVIEW_ASSERT_ATTEMPTS; attempt++) {
+      yield* Effect.sleep(attempt === 1 ? PREVIEW_SPAN_SETTLE : "3 seconds");
+      const pulled = yield* runTraceCli(["pull", "--stage", previewStage.value]);
+      if (pulled.status !== 0) {
+        last = `pulling ${previewStage.value}'s spans failed:\n${pulled.stdout}${pulled.stderr}`;
+        continue;
+      }
+      const result = yield* runTraceCli(["assert", "-"], input);
+      if (result.status === 0) return;
+      last = `trace assertion failed:\n${result.stdout}${result.stderr}`;
+    }
+    return yield* new ScenarioFailure({ step: name, message: last.trimEnd() });
   });
 
 /** A database id unique to this run of a scenario. */

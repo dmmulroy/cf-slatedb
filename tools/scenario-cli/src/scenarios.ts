@@ -11,7 +11,7 @@ import {
   expectEqual,
   expectFailure,
   expectThat,
-  LocalStack,
+  ScenarioStack,
   type Scenario,
   step,
   uniqueId,
@@ -22,19 +22,19 @@ const text = (value: Uint8Array) => new TextDecoder().decode(value);
 
 const api = Effect.gen(function* () {
   return yield* HttpApiClient.makeWith(DbHttpApi, {
-    baseUrl: (yield* LocalStack).api,
+    baseUrl: (yield* ScenarioStack).api,
     httpClient: yield* HttpClient.HttpClient,
   });
 });
 const gcApi = Effect.gen(function* () {
   return yield* HttpApiClient.makeWith(GcHttpApi, {
-    baseUrl: (yield* LocalStack).gc,
+    baseUrl: (yield* ScenarioStack).gc,
     httpClient: yield* HttpClient.HttpClient,
   });
 });
 const shardsApi = Effect.gen(function* () {
   return yield* HttpApiClient.makeWith(ShardedHttpApi, {
-    baseUrl: (yield* LocalStack).shards,
+    baseUrl: (yield* ScenarioStack).shards,
     httpClient: yield* HttpClient.HttpClient,
   });
 });
@@ -510,6 +510,110 @@ const removal: Scenario = {
   }),
 };
 
+const blockCache: Scenario = {
+  name: "block-cache",
+  description:
+    "Reads one flushed block through two Workers: the second gets it from Workers Cache (Cf-Cache-Status HIT) on a preview.",
+  run: Effect.gen(function* () {
+    const { previewStage } = yield* ScenarioStack;
+    const group = ShardGroup.make(uniqueId("sc-cache"));
+    const databaseId = DatabaseId.make(`${group}-0`);
+    const shards = yield* shardsApi;
+    yield* step(
+      "create the group",
+      shards.groups.create({ params: { group }, payload: { databaseId } }),
+    );
+    yield* step(
+      "put k",
+      shards.groups.put({ params: { group }, payload: { key: bytes("k"), value: bytes("V") } }),
+    );
+    yield* flush(databaseId);
+    // The API Worker's isolate reads the block first: an L1 miss that fills Workers Cache.
+    yield* expectEqual("value of k through the API", yield* read(databaseId, "k", "Flushed"), "V");
+    // The shard router is another Worker with its own L1: its BlockServer call for the same block
+    // URL is answered by Workers Cache without running the BlockServer.
+    const got = yield* step(
+      "get k through the shard router",
+      shards.groups.get({ params: { group }, payload: { key: bytes("k") } }),
+    );
+    yield* expectEqual(
+      "value of k through the router",
+      Option.map(got.value, text),
+      Option.some("V"),
+    );
+    yield* assertTraces("the second Worker's block came from Workers Cache", {
+      select: { databaseId },
+      checks: [
+        { _tag: "SpanCount", span: { name: "BlockSource.block" }, count: { atLeast: 2 } },
+        // Workers Cache is not emulated locally: there the header is absent.
+        Option.isSome(previewStage)
+          ? {
+              _tag: "SpanExists",
+              span: { attributes: { "cache.l2.status": "HIT" } },
+            }
+          : {
+              _tag: "SpanExists",
+              span: { attributes: { "cache.l2.status": "absent" } },
+            },
+        { _tag: "NoErrorStatus" },
+      ],
+    });
+  }),
+};
+
+/** Concurrent creates of one database in `create-race`. */
+const CREATE_RACERS = 16;
+
+const createRace: Scenario = {
+  name: "create-race",
+  description: `${CREATE_RACERS} concurrent creates of one database: R2 create-if-absent (If-None-Match: * as Headers) lets exactly one win.`,
+  run: Effect.gen(function* () {
+    const databaseId = DatabaseId.make(uniqueId("sc-race"));
+    const client = yield* api;
+    const outcomes = yield* Effect.forEach(
+      Array.from({ length: CREATE_RACERS }, (_, index) => index),
+      () =>
+        Effect.result(
+          client.databases.createDatabase({
+            payload: {
+              databaseId,
+              keyRange: Option.none(),
+              mergeOperator: Option.none(),
+              changelogRetentionMs: Option.none(),
+              budgetGroup: Option.none(),
+            },
+          }),
+        ),
+      { concurrency: "unbounded" },
+    );
+    const created = outcomes.filter((outcome) => outcome._tag === "Success").length;
+    const refused = outcomes.filter(
+      (outcome) =>
+        outcome._tag === "Failure" && outcome.failure._tag === "DatabaseAlreadyExistsPublicError",
+    ).length;
+    yield* expectEqual("creates that won", created, 1);
+    yield* expectEqual("creates refused as DatabaseAlreadyExists", refused, CREATE_RACERS - 1);
+    yield* assertTraces("one manifest created; every other create saw AlreadyExists", {
+      select: { databaseId },
+      checks: [
+        {
+          _tag: "SpanCount",
+          span: { name: "ObjectStore.putIfAbsent", attributes: { "object.outcome": "Created" } },
+          count: { equals: 1 },
+        },
+        {
+          _tag: "SpanCount",
+          span: {
+            name: "ObjectStore.putIfAbsent",
+            attributes: { "object.outcome": "AlreadyExists" },
+          },
+          count: { equals: CREATE_RACERS - 1 },
+        },
+      ],
+    });
+  }),
+};
+
 /** Every scenario, in the order `run all` runs them. */
 export const SCENARIOS: ReadonlyArray<Scenario> = [
   writeRead,
@@ -521,4 +625,6 @@ export const SCENARIOS: ReadonlyArray<Scenario> = [
   changelog,
   transactions,
   removal,
+  blockCache,
+  createRace,
 ];

@@ -98,11 +98,15 @@ const isRoutingError = (error: { readonly _tag: string }) =>
   error._tag === "KeyOutOfRangeError" ||
   error._tag === "DatabaseNotFoundError";
 
-/** Refresh-and-retry: every 100 ms for five seconds, the time a split takes to publish. */
+/**
+ * Refresh-and-retry while a split publishes: every 250 ms for up to 30 seconds. A split on a live
+ * stage takes about 13 seconds (seal, checkpoint, two forks, publish; each manifest CAS is about a
+ * second on R2: `docs/measurements.md`), so a shorter window turns a pause into failed writes.
+ */
 const routingRetry = {
   while: isRoutingError,
-  schedule: Schedule.spaced("100 millis"),
-  times: 50,
+  schedule: Schedule.spaced("250 millis"),
+  times: 120,
 };
 
 /** Constructs the router over the contextual database client and shard directory. */

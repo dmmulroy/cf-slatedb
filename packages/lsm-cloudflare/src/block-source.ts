@@ -4,6 +4,7 @@ import type { DatabaseId, SstId } from "@cf-slatedb/lsm-core";
 import { makeExecutionMemo } from "alchemy/Runtime/ExecutionMemo";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Context, Data, Effect, Layer, Option, type Scope } from "effect";
+import { HttpClient } from "effect/http";
 import { HttpApiClient } from "effect/http-api";
 
 import { BlockServerHttpApi } from "./block-server-http-api.ts";
@@ -100,7 +101,15 @@ export const makeBlockSource = Effect.gen(function* () {
       }
       return yield* HttpApiClient.makeWith(BlockServerHttpApi, {
         baseUrl: "http://blocks.internal",
-        httpClient: Cloudflare.toHttpClient(Cloudflare.fromCloudflareFetcher(binding)),
+        httpClient: Cloudflare.toHttpClient(Cloudflare.fromCloudflareFetcher(binding)).pipe(
+          // Workers Cache answers in front of the BlockServer: `HIT` means it did not run.
+          HttpClient.tap((response) =>
+            Effect.annotateCurrentSpan(
+              "cache.l2.status",
+              response.headers["cf-cache-status"] ?? "absent",
+            ),
+          ),
+        ),
       });
     }),
   );

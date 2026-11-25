@@ -1,3 +1,4 @@
+import type * as Cloudflare from "@alchemy.run/cloudflare";
 import { Stage } from "alchemy/Stage";
 import * as Telemetry from "alchemy/Telemetry";
 import { Effect, type Layer, Option } from "effect";
@@ -44,6 +45,22 @@ export const lsmTelemetryLayer = (options: LsmTelemetryOptions): Layer.Layer<nev
  *   spans; it joins the Worker's own requirements.
  */
 export type LsmWorkerTelemetry<R = never> = (serviceName: string) => Layer.Layer<never, never, R>;
+
+/**
+ * The Tail Workers that receive a Worker's finished invocations (event, outcome, CPU and wall
+ * time), resolved when the Worker is planned. Locally and in tests there are none
+ * ({@link noLsmTailConsumers}); a Stack may attach its own on live stages.
+ *
+ * @template R - What resolving them needs at plan time.
+ */
+export type LsmWorkerTailConsumers<R = never> = Effect.Effect<
+  Array<string | Cloudflare.Worker>,
+  never,
+  R
+>;
+
+/** No Tail Workers. */
+export const noLsmTailConsumers: LsmWorkerTailConsumers = Effect.succeed([]);
 
 /** Exports every Worker's spans over OTLP/HTTP to `baseUrl`: the trace CLI receiver, or a test's. */
 export const lsmOtlpTelemetry =

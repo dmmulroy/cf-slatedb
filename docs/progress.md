@@ -42,6 +42,24 @@ in order.
   fixed with `global_fetch_strictly_public` on live stages (D47), after which 10/10 probe traces and
   the API's Worker → writer traces are complete. (3) A random external client requested the probe's
   `/favicon.ico` minutes after the first deploy and got `401`, which supports gating previews (D44).
+- **4. Live checks** (all on `preview-1`; details and method in
+  [`docs/measurements.md`](measurements.md)):
+  1. **Workers Cache: `HIT`.** New scenario `block-cache`: the API Worker's read of a flushed block
+     is `MISS` (`cache.l2.status`, read from `Cf-Cache-Status` on the `BlockServer` binding's
+     response), and the shard router's read of the same block URL is `HIT`. A second read through
+     the same isolate never reaches `BlockServer` (L1), hence the second Worker.
+  2. **R2 create-if-absent: confirmed.** New scenario `create-race`: 16 concurrent creates of one
+     database, exactly one `Created`, 15 `AlreadyExists` on real R2 with the `Headers` form.
+  3. **Scenarios: 11/11 pass** on `preview-1` (`run --stage preview-1 all`, `--dev-timings`
+     deploy) with trace assertions pulled from the collector, and 11/11 under `vp run dev`.
+  4. **Measurements** (production settings): a writer is CPU-bound at ~2.7k rows/s (100-row
+     batches) to ~12.3k rows/s (1,000-row batches); a flush costs ~55–90 ms CPU per MiB; a split
+     pauses the shard's writes ~13–16 s, because each manifest CAS is ~1.1 s on R2.
+     **Finding (fixed):** the shard router's 5 s retry window assumed a local split; live, every write
+     arriving early in a 13 s split failed with `DatabaseSealed`. Now 30 s; the re-run had 0 failed
+     writes (D40, D48). **Finding (recorded):** the best-effort `LATEST` hint is ~40% of every CAS and
+     the forks' compactor wake-ups add ~4 s to a split; moving them off the critical path is left for a
+     change that re-runs the manifest CAS model. CPU comes from a new live-only Tail Worker (D48).
 
 ## Done
 
@@ -266,20 +284,9 @@ account.
 
 ## Open questions
 
-Live checks waiting for Dillon's approval (none has run; none runs from `vp run ready`):
-
-1. **Workers Cache hit on a deployed preview.** Deploy the Stack to a preview stage, read the same
-   block twice through the API Worker, and confirm `Cf-Cache-Status: HIT` on the `BlockServer`
-   response (Workers Cache is not emulated by Vitest or `alchemy dev`).
-2. **R2 `If-None-Match: *` with the Headers form on real R2** (workerd #2572). Verified only
-   against Alchemy's local R2 (`test/object-store/object-store.workerd.ts`).
-3. **Data residency design.** `DatabaseOptions.jurisdiction` is stored and inherited by forks but
-   not enforced. Per-database residency needs the R2 bucket chosen before the manifest is read (a
-   bucket per jurisdiction keyed by the database id, or a small directory); per-Stack residency
-   (the bucket's and the Durable Objects' jurisdiction set for a whole installation, and `create`
-   refusing a database whose option differs) is simpler. Which one? Until then the option is
-   advisory.
-4. **Live measurements** (design §12, "Measure before trusting these numbers"): rows/s per writer
-   with batched requests, flush CPU per MB, whether DO SQLite's page cache counts against 128 MB, the
-   Workflows concurrent-instance limit on the plan, and the write pause of a seal-then-fork split.
-   Each needs a preview stage on the real account.
+1. ~~Workers Cache hit on a deployed preview~~ — confirmed (item 4, `docs/measurements.md`).
+2. ~~R2 `If-None-Match: *` with the Headers form on real R2~~ — confirmed (item 4).
+3. ~~Data residency design~~ — Dillon chose per-Stack residency (hand-off item 5).
+4. **Live measurements** — rows/s per writer, flush CPU per MB, and the split pause are measured
+   (`docs/measurements.md`). Still open, if Dillon wants them: whether DO SQLite's page cache counts
+   against 128 MB, and the Workflows concurrent-instance limit on the plan.

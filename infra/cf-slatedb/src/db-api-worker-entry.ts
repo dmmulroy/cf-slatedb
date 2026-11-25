@@ -1,6 +1,6 @@
 import { dbApiWorkerLayer } from "@cf-slatedb/lsm-cloudflare";
 
-import { cfSlatedbTelemetry } from "./cf-slatedb-telemetry.ts";
+import { cfSlatedbTailConsumers, cfSlatedbTelemetry } from "./cf-slatedb-telemetry.ts";
 
 /** Local dev port of the public API Worker. */
 export const DB_API_DEV_PORT = 1337;
@@ -12,6 +12,7 @@ export const DB_API_DEV_PORT = 1337;
 export const cfSlatedbApiWorkerLayer = dbApiWorkerLayer({
   main: import.meta.url,
   telemetry: cfSlatedbTelemetry,
+  tailConsumers: cfSlatedbTailConsumers,
   devPort: DB_API_DEV_PORT,
 });
 
