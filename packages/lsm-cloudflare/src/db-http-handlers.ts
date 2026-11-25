@@ -99,6 +99,27 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
       .handle("removeDatabase", ({ params }) =>
         lifecycle.remove(params.databaseId).pipe(publicFailures("remove")),
       )
+      .handle("beginTransaction", ({ params }) =>
+        client.beginTransaction(params.databaseId).pipe(
+          Effect.map((readSeq) => ({ readSeq })),
+          publicFailures("transaction"),
+        ),
+      )
+      .handle("transactionGet", ({ params, payload }) =>
+        client.getAt(params.databaseId, payload.key, payload.readSeq).pipe(
+          Effect.map((row) => ({ row })),
+          publicFailures("transaction"),
+        ),
+      )
+      .handle("transactionScan", ({ params, payload }) =>
+        client.scanAt(params.databaseId, payload.range, payload.readSeq, payload.limit).pipe(
+          Effect.map((rows) => ({ rows })),
+          publicFailures("transaction"),
+        ),
+      )
+      .handle("commitTransaction", ({ params, payload }) =>
+        client.commitTransaction(params.databaseId, payload).pipe(publicFailures("transaction")),
+      )
       .handle("compaction", ({ params }) =>
         Effect.gen(function* () {
           const latest = yield* manifests.loadLatest(params.databaseId).pipe(

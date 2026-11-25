@@ -1,4 +1,5 @@
 import type {
+  TransactionConflictError,
   DatabaseHasDependentsError,
   DatabaseSealedError,
   KeyOutOfRangeError,
@@ -24,6 +25,7 @@ import {
   SnapshotExpiredPublicError,
   StorageUnavailablePublicError,
   StoredDataInvalidPublicError,
+  TransactionConflictPublicError,
   WriteStalledPublicError,
 } from "./db-public-error.ts";
 import type {
@@ -53,7 +55,8 @@ export type DbInternalError =
   | ReaderUnavailableError
   | CompactorUnavailableError
   | DatabaseHasDependentsError
-  | CheckpointNotFoundError;
+  | CheckpointNotFoundError
+  | TransactionConflictError;
 
 /**
  * Classifies an internal failure as its public error: a stable code, a caller-facing message, the
@@ -159,6 +162,15 @@ export const toPublicError =
               requestId,
               retryable: true,
             });
+      case "TransactionConflictError":
+        return new TransactionConflictPublicError({
+          code: "TransactionConflict",
+          operation,
+          message: error.message,
+          details: { databaseId: error.databaseId, reason: error.reason },
+          requestId,
+          retryable: true,
+        });
       case "DatabaseHasDependentsError":
         return new DatabaseHasDependentsPublicError({
           code: "DatabaseHasDependents",

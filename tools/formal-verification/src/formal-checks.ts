@@ -133,4 +133,23 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
       },
     ],
   },
+  {
+    name: "transactions",
+    spec: "Transactions.tla",
+    runs: [
+      { config: "Transactions.cfg", broken: "none", expect: "pass", timeLimitSeconds: 120 },
+      {
+        config: "Transactions.cfg",
+        broken: "snapshotOnly",
+        expect: "Serializable",
+        timeLimitSeconds: 60,
+      },
+      {
+        config: "Transactions.cfg",
+        broken: "noFlushCheck",
+        expect: "Serializable",
+        timeLimitSeconds: 60,
+      },
+    ],
+  },
 ];

@@ -163,11 +163,17 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   with and without older data and an operator, matches the oracle; shown failing when deletes are
   dropped above the bottom, an input is skipped, or expired operands are kept),
   `compaction-executor.test.ts` (merges through real SSTs).
-- **Checkpoints, clones (forks), transactions** — checkpoints and forks done (Phase 7:
-  `createCheckpoint` flushes first and pins the manifest its CAS applied to; `forkRange` takes the
-  fork's own hold on the source; lifetimes expire through GC's `prepareGarbageCollection`);
-  transactions in Phase 9. Tests: `database-lifecycle.test.ts` (fork has a write that was unflushed
-  at checkpoint time, shown failing without the flush; missing checkpoint), `manifest.test.ts`.
+- **Checkpoints, clones (forks), transactions** — done. Checkpoints and forks (Phase 7, D37). Optimistic
+  transactions (Phase 9, D41): lsm-core `transaction.ts` (`TransactionIsolation`,
+  `TransactionCommit`, `TransactionConflictError`); `DbWriter.commitTransaction` (conflict check and
+  commit under the commit lock; `MemTable.writtenAfter`); `DbClient.transaction` (interactive:
+  buffered writes, reads of its own writes and merges, recorded read keys and ranges) and the
+  stateless `beginTransaction`/`getAt`/`scanAt`/`commitTransaction`; public
+  `/v1/databases/:id/transactions/{begin,get,scan,commit}`. Tests: `db-transaction.test.ts`
+  (serializability-in-commit-order property for `SerializableSnapshot` and no-lost-update property
+  for `Snapshot` over interleavings with direct writes and flushes; write skew; own writes;
+  `SnapshotTooOld`; each shown failing on its mutation), `writer.workerd.ts` (write skew refused
+  through the public API). Formal: `Transactions` (check 6).
 
 ## §9 Effect audit and private gaps
 
@@ -256,13 +262,13 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   the probe and smoke Workers; every new handler must use `eventTelemetryFlushForStage` (D5).
   Tests: `lsm-cloudflare/src/lsm-telemetry.test.ts`, `test/telemetry/*.workerd.ts`.
 - **Scenario CLI (write/read, flush, compaction, fork/split, fencing, changelog)** — pending.
-- **Formal checks 1–6** — partial. Check 1 (no acknowledged write lost or hidden): `NoAckedWriteLost.tla`, skill
-  `.agents/skills/verify-no-acked-write-lost`. Check 2 (fencing) and 3 (manifest CAS linearizability):
-  `tools/formal-verification/specs/ManifestCasFencing.tla`, skill
-  `.agents/skills/verify-manifest-cas-fencing`. Check 4 (GC safety): `GcSafety.tla`, skill
-  `.agents/skills/verify-gc-safety`. Check 5 (seal and split): `SealSplit.tla`, skill
-  `.agents/skills/verify-seal-split`. All run by `vp run verify`, each broken variant shown failing.
-  Check 6 (transactions) pending.
+- **Formal checks 1–6** — done. Check 1 (no acknowledged write lost or hidden): `NoAckedWriteLost.tla`,
+  skill `.agents/skills/verify-no-acked-write-lost`. Check 2 (fencing) and 3 (manifest CAS
+  linearizability): `ManifestCasFencing.tla`, skill `.agents/skills/verify-manifest-cas-fencing`.
+  Check 4 (GC safety): `GcSafety.tla`, skill `.agents/skills/verify-gc-safety`. Check 5 (seal and
+  split): `SealSplit.tla`, skill `.agents/skills/verify-seal-split`. Check 6 (transactions):
+  `Transactions.tla`, skill `.agents/skills/verify-transactions`. All run by `vp run verify`, each
+  broken variant shown failing.
 - **Hardening scenarios** — pending (Phase 10).
 
 ## Phase 6 additions

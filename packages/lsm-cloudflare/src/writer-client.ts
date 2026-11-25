@@ -5,6 +5,8 @@ import type {
   KeyOutOfRangeError,
   KeyRange,
   SeqNum,
+  TransactionCommit,
+  TransactionConflictError,
   WriteBatch,
   WriteBatchInvalidError,
   WriteReceipt,
@@ -52,6 +54,7 @@ export type WriterClientError =
   | WriteStalledError
   | WriteBatchInvalidError
   | KeyOutOfRangeError
+  | TransactionConflictError
   | WriterUnavailableError;
 
 /** Services every writer call needs from the current Worker invocation. */
@@ -63,6 +66,11 @@ export interface IWriterClient {
   readonly write: (
     databaseId: DatabaseId,
     batch: WriteBatch,
+  ) => Effect.Effect<WriteReceipt, WriterClientError, WriterClientServices>;
+  /** Commits a transaction if nothing since its read sequence number conflicts with it. */
+  readonly commitTransaction: (
+    databaseId: DatabaseId,
+    commit: TransactionCommit,
   ) => Effect.Effect<WriteReceipt, WriterClientError, WriterClientServices>;
   /** The key's unflushed versions and the sequence numbers a `Latest` read needs. */
   readonly probe: (
@@ -157,6 +165,22 @@ const writerClientOperations = <E, R>(
       return yield* client.writer
         .write({ params: { databaseId }, payload: batch })
         .pipe(Effect.catchTags(transport(databaseId, "write")), Effect.retry(retryRoutable));
+    }),
+    commitTransaction: Effect.fn("WriterClient.commitTransaction")(function* (
+      databaseId: DatabaseId,
+      commit: TransactionCommit,
+    ) {
+      yield* Effect.annotateCurrentSpan({
+        "database.id": databaseId,
+        "transaction.isolation": commit.isolation,
+      });
+      const client = yield* writerHttpClient(databaseId);
+      return yield* client.writer
+        .commitTransaction({ params: { databaseId }, payload: commit })
+        .pipe(
+          Effect.catchTags(transport(databaseId, "commitTransaction")),
+          Effect.retry(retryRoutable),
+        );
     }),
     probe: Effect.fn("WriterClient.probe")(function* (databaseId: DatabaseId, key: Uint8Array) {
       yield* Effect.annotateCurrentSpan({ "database.id": databaseId });

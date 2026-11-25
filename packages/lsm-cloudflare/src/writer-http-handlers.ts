@@ -11,6 +11,9 @@ export const writerHttpHandlersLayer = HttpApiBuilder.group(WriterHttpApi, "writ
     const writer = yield* DbWriter;
     return handlers
       .handle("write", ({ params, payload }) => writer.write(params.databaseId, payload))
+      .handle("commitTransaction", ({ params, payload }) =>
+        writer.commitTransaction(params.databaseId, payload),
+      )
       .handle("probe", ({ params, payload }) => writer.probe(params.databaseId, payload.key))
       .handle("scan", ({ params, payload }) => writer.scan(params.databaseId, payload))
       .handle("flush", ({ params }) =>

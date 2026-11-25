@@ -134,6 +134,15 @@ export interface IMemTable {
   readonly stats: Effect.Effect<MemTableStats, MemTableError>;
   /** Deletes every row and the writer's identity and sequence state (removal of the database). */
   readonly clear: Effect.Effect<void, MemTableError>;
+  /**
+   * Whether any of `keys`, or any key in `ranges`, has a row with a sequence number above
+   * `afterSeq` (a transaction's conflict check). Uses the `(key, seq)` primary key.
+   */
+  readonly writtenAfter: (
+    keys: ReadonlyArray<Uint8Array>,
+    ranges: ReadonlyArray<KeyRange>,
+    afterSeq: SeqNum,
+  ) => Effect.Effect<boolean, MemTableError>;
 }
 
 /** The contextual memtable. */
@@ -416,6 +425,39 @@ export const makeMemTable = Effect.gen(function* () {
         .pipe(Effect.asVoid, Effect.mapError(failed("truncate")));
     }),
     stats,
+    writtenAfter: Effect.fn("MemTable.writtenAfter")(function* (
+      keys: ReadonlyArray<Uint8Array>,
+      ranges: ReadonlyArray<KeyRange>,
+      afterSeq: SeqNum,
+    ) {
+      for (const key of keys) {
+        const hits = yield* exec(
+          "writtenAfter",
+          "SELECT 1 AS hit FROM memtable_rows WHERE key = ? AND seq > ? LIMIT 1",
+          key,
+          afterSeq,
+        );
+        if (hits.length > 0) return true;
+      }
+      for (const range of ranges) {
+        const hits = Option.isSome(range.end)
+          ? yield* exec(
+              "writtenAfter",
+              "SELECT 1 AS hit FROM memtable_rows WHERE key >= ? AND key < ? AND seq > ? LIMIT 1",
+              range.start,
+              range.end.value,
+              afterSeq,
+            )
+          : yield* exec(
+              "writtenAfter",
+              "SELECT 1 AS hit FROM memtable_rows WHERE key >= ? AND seq > ? LIMIT 1",
+              range.start,
+              afterSeq,
+            );
+        if (hits.length > 0) return true;
+      }
+      return false;
+    }),
     clear: sql
       .transaction(
         Effect.all([sql.exec("DELETE FROM memtable_rows"), sql.exec("DELETE FROM writer_meta")]),

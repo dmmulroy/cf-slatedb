@@ -2,7 +2,7 @@
 
 ## Current phase
 
-Phase 9: transactions (starting). Phases 0–8 are done.
+Phase 10: hardening (starting). Phases 0–9 are done.
 
 ## Done
 
@@ -133,10 +133,22 @@ Phase 9: transactions (starting). Phases 0–8 are done.
   `dbServicesTestLayer`. Under `vp run dev` a split through the router Worker crosses Workers and the
   reads and scans before and after it are correct. Decision D40.
 
+- **Phase 9 — transactions.** Optimistic transactions with `Snapshot` and `SerializableSnapshot`
+  isolation: the conflict check runs inside the writer's commit lock against its SQLite memtable;
+  `DbClient.transaction` (interactive) and the stateless begin/get/scan/commit primitives, also on
+  the public API. A property test checks serializability in commit order (and no lost updates for
+  `Snapshot`) over random interleavings with direct writes and flushes; formal check 6
+  (`Transactions.tla`, skill `verify-transactions`). The property test first found nothing because
+  the generator produced mostly one-step schedules; it now requires 20–60 steps, and every mutation
+  of the checks is caught. Decision D41.
+
 ## Next
 
-- Phase 9: optimistic transactions (`Snapshot` and `SerializableSnapshot` isolation) with the
-  conflict check inside the writer; formal check 6.
+- Phase 10: hardening — the scenario CLI (`tools/scenario-cli`) running named scenarios against
+  `vp run dev` with trace assertions (write/read, flush, compaction, fork/split, fencing, changelog,
+  transactions), failure scenarios (writer eviction mid-flush, crash between L0 upload and commit,
+  CAS races, stale writer, R2 failures, compaction resumed after failure, split under load), the
+  coverage matrix filled, and the hand-off.
 
 ## Findings
 

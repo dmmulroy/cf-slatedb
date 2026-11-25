@@ -400,3 +400,26 @@ The package uses only `@cf-slatedb/lsm-cloudflare`'s public entrypoint. `dbServi
 Worker in the Stack `DbClient` and `DatabaseLifecycle` over cross-script bindings; the example
 `ShardRouterWorker` (in the Stack, port 1341 under `vp run dev`) hosts the directories and serves a
 small sharded API.
+
+## D41. Transactions are valid until data newer than their reads is flushed
+
+The writer's conflict check reads only its memtable (an indexed SQLite query per key or range:
+`MemTable.writtenAfter`), which holds exactly the rows newer than `flushed_seq`. A transaction reads
+at `readSeq` (the writer's `last_seq` when it began) and commits only if `flushed_seq <= readSeq`
+still holds, so every commit since `readSeq` is in the memtable and the check is exact; otherwise it
+fails with `TransactionConflictError { reason: "SnapshotTooOld" }` (retryable). Reads apply the
+same rule: a read whose probe reports `flushedSeq > readSeq`, or that would need a manifest with
+`lastL0Seq > readSeq` (`ReadView.maxLastL0Seq`), aborts, because compaction may have collapsed the
+versions a read at `readSeq` needs (compaction keeps no versions for snapshots, D30). The two read
+checks back each other up (mutation testing removes either one alone without effect).
+
+This needs no extra stored state and no extra SQLite writes (every row written is billed). The cost:
+a transaction aborts when a flush of newer writes lands during it — with the default `maxL0Age`
+(60 s) and `l0SstSize` (64 MiB) rarely for short transactions, more often for long ones or very
+hot databases. A writer-side record of keys flushed since a horizon would remove that, at the cost of
+SQLite rows per flushed key; recorded as a possible improvement.
+
+`DbClient.transaction` is interactive in a Worker (buffered writes, reads see them, merges folded
+with the database's operator). Over HTTP the API is stateless: `transactions/begin` returns
+`readSeq`, `transactions/get` and `transactions/scan` read at it, and `transactions/commit` sends the
+writes with the keys read and ranges scanned; nothing is held on the server.

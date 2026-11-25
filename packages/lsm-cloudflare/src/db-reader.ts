@@ -50,6 +50,12 @@ export interface ReadView {
   readonly memtable: ReadonlyArray<Row>;
   /** Read exactly this manifest (a snapshot) instead of the newest one. */
   readonly manifestId: Option.Option<ManifestId>;
+  /**
+   * The newest `lastL0Seq` the read accepts (a transaction's read sequence number): a manifest with
+   * data flushed after it may have compacted away versions the read needs, so the read fails with
+   * `SnapshotExpired` instead. None: any.
+   */
+  readonly maxLastL0Seq: Option.Option<SeqNum>;
 }
 
 /**
@@ -160,6 +166,16 @@ export const makeDbReader = Effect.gen(function* () {
           .refresh(databaseId)
           .pipe(Effect.catchTags(manifestUnavailable(databaseId)));
         yield* Effect.annotateCurrentSpan({ "manifest.refreshed": true });
+      }
+      if (
+        Option.isSome(view.maxLastL0Seq) &&
+        current.manifest.lastL0Seq > view.maxLastL0Seq.value
+      ) {
+        return yield* new ReaderUnavailableError({
+          databaseId,
+          reason: "SnapshotExpired",
+          message: `Database ${databaseId} has flushed data newer than the read's snapshot (sequence number ${view.maxLastL0Seq.value}), so the snapshot can no longer be read. Read again at a new snapshot.`,
+        });
       }
       if (current.manifest.lastL0Seq < view.minLastL0Seq) {
         return yield* new ReaderUnavailableError({

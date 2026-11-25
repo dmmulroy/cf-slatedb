@@ -19,6 +19,8 @@ import {
   type WriteReceipt,
   WriterEpoch,
   WriterFencedError,
+  TransactionConflictError,
+  type TransactionCommit,
 } from "@cf-slatedb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import {
@@ -101,6 +103,7 @@ export type DbWriterError =
   | DatabaseIdMismatchError
   | DatabaseSealedError
   | WriterFencedError
+  | TransactionConflictError
   | WriteStalledError
   | WriteBatchInvalidError
   | KeyOutOfRangeError
@@ -137,6 +140,15 @@ export interface IDbWriter {
   ) => Effect.Effect<MemTableScanPage, DbWriterError, RuntimeContext>;
   /** Flushes every committed row to L0 now. @returns The new `flushedSeq`. */
   readonly flush: (databaseId: DatabaseId) => Effect.Effect<SeqNum, DbWriterError, RuntimeContext>;
+  /**
+   * Commits a transaction's writes if no other commit since its `readSeq` conflicts with it (its
+   * written keys, and for `SerializableSnapshot` its read keys and ranges); the check and the commit
+   * hold the commit lock together.
+   */
+  readonly commitTransaction: (
+    databaseId: DatabaseId,
+    commit: TransactionCommit,
+  ) => Effect.Effect<WriteReceipt, DbWriterError, RuntimeContext>;
   /** Unflushed changes after `afterSeq`, in sequence order. */
   readonly changes: (
     databaseId: DatabaseId,
@@ -489,88 +501,150 @@ export const makeDbWriter = Effect.gen(function* () {
       }));
     }).pipe(Effect.withSpan("ChangelogExport.export"));
 
+  /**
+   * Commits a batch under the commit lock. `beforeCommit` runs inside the lock, after the writer is
+   * ready and backpressure allows the write, so a transaction's conflict check sees every commit
+   * before its own.
+   */
+  const commitBatch = <E>(
+    databaseId: DatabaseId,
+    batch: WriteBatch,
+    beforeCommit: Effect.Effect<void, E>,
+  ) =>
+    Effect.gen(function* () {
+      const receipt = yield* commitLock.withPermits(1)(
+        Effect.gen(function* () {
+          let ready = yield* writableReady(databaseId);
+          const bytes = yield* Ref.get(unflushedBytes);
+          if (bytes >= settings.maxUnflushedBytes) {
+            yield* Metric.update(writeStalls, 1);
+            yield* scheduleFlush(databaseId);
+            return yield* Effect.fail(
+              new WriteStalledError({
+                databaseId,
+                reason: "UnflushedBytes",
+                retryAfterMs: 1_000,
+                message: `Database ${databaseId} has ${bytes} unflushed bytes, above its ${settings.maxUnflushedBytes} limit, so the write was refused. Retry the same batch after a short wait; nothing was written.`,
+              }),
+            );
+          }
+          if (ready.manifest.manifest.l0.length >= settings.l0MaxSsts) {
+            // The cached manifest may predate compactions: reload before refusing.
+            const latest = yield* manifests
+              .update(databaseId, (manifest) => Result.succeed(manifest))
+              .pipe(Effect.catchTags(manifestFailures(databaseId, "write")));
+            ready = { ...ready, manifest: latest };
+            yield* Ref.set(phase, ready);
+            if (latest.manifest.l0.length >= settings.l0MaxSsts) {
+              yield* Metric.update(writeStalls, 1);
+              // Compaction is behind: make sure the compactor is awake (a lost wake would stall forever).
+              yield* compaction.wake(databaseId);
+              return yield* Effect.fail(
+                new WriteStalledError({
+                  databaseId,
+                  reason: "L0Backlog",
+                  retryAfterMs: 5_000,
+                  message: `Database ${databaseId} has ${latest.manifest.l0.length} L0 SSTs waiting for compaction, at its ${settings.l0MaxSsts} limit, so the write was refused. Retry the same batch later; nothing was written.`,
+                }),
+              );
+            }
+          }
+          yield* beforeCommit;
+          const manifest: Manifest = ready.manifest.manifest;
+          const writes = yield* Effect.fromResult(
+            collapseWriteBatch(batch, {
+              databaseId,
+              keyRange: manifest.keyRange,
+              mergeOperator: Option.map(
+                manifest.options.mergeOperator,
+                (name) => MERGE_OPERATORS[name],
+              ),
+            }),
+          );
+          const meta = yield* memTable.meta.pipe(Effect.mapError(unavailable(databaseId, "write")));
+          // Monotonic clock: never behind the newest tick already handed out or flushed.
+          const now = yield* Clock.currentTimeMillis;
+          const createTs = Timestamp.make(Math.max(now, meta.clockTick));
+          const seq = yield* memTable
+            .commit(writes, createTs)
+            .pipe(Effect.mapError(unavailable(databaseId, "write")));
+          const added = writes.reduce(
+            (sum, item) =>
+              sum +
+              rowEncodedSizeEstimate({
+                key: item.key,
+                seq,
+                value: item.value,
+                createTs: Option.some(createTs),
+                expireTs: Option.none(),
+              }) +
+              24,
+            0,
+          );
+          yield* Ref.update(unflushedBytes, (current) => current + added);
+          return { seq, createTs };
+        }),
+      );
+      yield* scheduleFlush(databaseId).pipe(
+        Effect.catchTags({ WriterUnavailableError: () => Effect.void }),
+      );
+      yield* Effect.annotateCurrentSpan({ seq: receipt.seq });
+      return receipt;
+    });
+
   const write = Effect.fn("DbWriter.write")(function* (databaseId: DatabaseId, batch: WriteBatch) {
     yield* Effect.annotateCurrentSpan({
       "database.id": databaseId,
       "batch.operations": batch.operations.length,
     });
-    const receipt = yield* commitLock.withPermits(1)(
-      Effect.gen(function* () {
-        let ready = yield* writableReady(databaseId);
-        const bytes = yield* Ref.get(unflushedBytes);
-        if (bytes >= settings.maxUnflushedBytes) {
-          yield* Metric.update(writeStalls, 1);
-          yield* scheduleFlush(databaseId);
-          return yield* Effect.fail(
-            new WriteStalledError({
-              databaseId,
-              reason: "UnflushedBytes",
-              retryAfterMs: 1_000,
-              message: `Database ${databaseId} has ${bytes} unflushed bytes, above its ${settings.maxUnflushedBytes} limit, so the write was refused. Retry the same batch after a short wait; nothing was written.`,
-            }),
-          );
-        }
-        if (ready.manifest.manifest.l0.length >= settings.l0MaxSsts) {
-          // The cached manifest may predate compactions: reload before refusing.
-          const latest = yield* manifests
-            .update(databaseId, (manifest) => Result.succeed(manifest))
-            .pipe(Effect.catchTags(manifestFailures(databaseId, "write")));
-          ready = { ...ready, manifest: latest };
-          yield* Ref.set(phase, ready);
-          if (latest.manifest.l0.length >= settings.l0MaxSsts) {
-            yield* Metric.update(writeStalls, 1);
-            // Compaction is behind: make sure the compactor is awake (a lost wake would stall forever).
-            yield* compaction.wake(databaseId);
-            return yield* Effect.fail(
-              new WriteStalledError({
-                databaseId,
-                reason: "L0Backlog",
-                retryAfterMs: 5_000,
-                message: `Database ${databaseId} has ${latest.manifest.l0.length} L0 SSTs waiting for compaction, at its ${settings.l0MaxSsts} limit, so the write was refused. Retry the same batch later; nothing was written.`,
-              }),
-            );
-          }
-        }
-        const manifest: Manifest = ready.manifest.manifest;
-        const writes = yield* Effect.fromResult(
-          collapseWriteBatch(batch, {
-            databaseId,
-            keyRange: manifest.keyRange,
-            mergeOperator: Option.map(
-              manifest.options.mergeOperator,
-              (name) => MERGE_OPERATORS[name],
-            ),
-          }),
+    return yield* commitBatch(databaseId, batch, Effect.void);
+  });
+
+  const commitTransaction = Effect.fn("DbWriter.commitTransaction")(function* (
+    databaseId: DatabaseId,
+    commit: TransactionCommit,
+  ) {
+    yield* Effect.annotateCurrentSpan({
+      "database.id": databaseId,
+      "batch.operations": commit.batch.operations.length,
+      "transaction.isolation": commit.isolation,
+      "transaction.read_seq": commit.readSeq,
+    });
+    const conflict = (reason: TransactionConflictError["reason"], message: string) =>
+      Effect.fail(new TransactionConflictError({ databaseId, reason, message }));
+    const check = Effect.gen(function* () {
+      const meta = yield* memTable.meta.pipe(
+        Effect.mapError(unavailable(databaseId, "transaction")),
+      );
+      // Every write after readSeq must still be in the memtable to be checked.
+      if (meta.flushedSeq > commit.readSeq || commit.readSeq > meta.lastSeq) {
+        return yield* conflict(
+          "SnapshotTooOld",
+          `Data newer than the transaction's reads (sequence number ${commit.readSeq}) has been flushed in database ${databaseId}, so its snapshot can no longer be checked. Begin a new transaction and run it again; nothing was written.`,
         );
-        const meta = yield* memTable.meta.pipe(Effect.mapError(unavailable(databaseId, "write")));
-        // Monotonic clock: never behind the newest tick already handed out or flushed.
-        const now = yield* Clock.currentTimeMillis;
-        const createTs = Timestamp.make(Math.max(now, meta.clockTick));
-        const seq = yield* memTable
-          .commit(writes, createTs)
-          .pipe(Effect.mapError(unavailable(databaseId, "write")));
-        const added = writes.reduce(
-          (sum, item) =>
-            sum +
-            rowEncodedSizeEstimate({
-              key: item.key,
-              seq,
-              value: item.value,
-              createTs: Option.some(createTs),
-              expireTs: Option.none(),
-            }) +
-            24,
-          0,
+      }
+      const writtenAfter = (keys: ReadonlyArray<Uint8Array>, ranges: ReadonlyArray<KeyRange>) =>
+        memTable
+          .writtenAfter(keys, ranges, commit.readSeq)
+          .pipe(Effect.mapError(unavailable(databaseId, "transaction")));
+      const writeKeys = commit.batch.operations.map((operation) => operation.key);
+      if (yield* writtenAfter(writeKeys, [])) {
+        return yield* conflict(
+          "WriteConflict",
+          `Another commit wrote a key this transaction writes in database ${databaseId} after the transaction began. Begin a new transaction and run it again; nothing was written.`,
         );
-        yield* Ref.update(unflushedBytes, (current) => current + added);
-        return { seq, createTs };
-      }),
-    );
-    yield* scheduleFlush(databaseId).pipe(
-      Effect.catchTags({ WriterUnavailableError: () => Effect.void }),
-    );
-    yield* Effect.annotateCurrentSpan({ seq: receipt.seq });
-    return receipt;
+      }
+      if (
+        commit.isolation === "SerializableSnapshot" &&
+        (yield* writtenAfter(commit.readKeys, commit.readRanges))
+      ) {
+        return yield* conflict(
+          "ReadConflict",
+          `Another commit wrote a key this transaction read in database ${databaseId} after the transaction began, so committing it would not be serializable. Begin a new transaction and run it again; nothing was written.`,
+        );
+      }
+    });
+    return yield* commitBatch(databaseId, commit.batch, check);
   });
 
   const probe = Effect.fn("DbWriter.probe")(function* (databaseId: DatabaseId, key: Uint8Array) {
@@ -772,7 +846,18 @@ export const makeDbWriter = Effect.gen(function* () {
     }
   }).pipe(Effect.withSpan("DbWriter.alarm"));
 
-  return DbWriter.of({ write, probe, scan, flush, changes, status, seal, destroy, runAlarm });
+  return DbWriter.of({
+    write,
+    commitTransaction,
+    probe,
+    scan,
+    flush,
+    changes,
+    status,
+    seal,
+    destroy,
+    runAlarm,
+  });
 });
 
 /** Provides the writer, leaving its memtable, stores, alarm, and settings visible. */

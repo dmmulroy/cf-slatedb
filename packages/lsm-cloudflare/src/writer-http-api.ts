@@ -4,6 +4,8 @@ import {
   KeyOutOfRangeError,
   KeyRange,
   RowSchema,
+  TransactionCommit,
+  TransactionConflictError,
   SeqNum,
   WriteBatch,
   WriteBatchInvalidError,
@@ -95,6 +97,7 @@ const WRITER_ERRORS = [
   DatabaseNotFoundError.pipe(HttpApiSchema.status(404)),
   KeyOutOfRangeError.pipe(HttpApiSchema.status(409)),
   DatabaseSealedError.pipe(HttpApiSchema.status(409)),
+  TransactionConflictError.pipe(HttpApiSchema.status(409)),
   WriterFencedError.pipe(HttpApiSchema.status(503)),
   WriteStalledError.pipe(HttpApiSchema.status(503)),
   WriterUnavailableError.pipe(HttpApiSchema.status(503)),
@@ -106,6 +109,14 @@ export class WriterHttpApiGroup extends HttpApiGroup.make("writer")
     HttpApiEndpoint.post("write", "/databases/:databaseId/batches", {
       params: DatabaseParams,
       payload: WriteBatch,
+      success: WriteReceipt,
+      error: WRITER_ERRORS,
+    }),
+  )
+  .add(
+    HttpApiEndpoint.post("commitTransaction", "/databases/:databaseId/transactions", {
+      params: DatabaseParams,
+      payload: TransactionCommit,
       success: WriteReceipt,
       error: WRITER_ERRORS,
     }),

@@ -139,7 +139,10 @@ export class TransactionConflictPublicError extends Schema.TaggedError<Transacti
   "TransactionConflictPublicError",
   {
     code: Schema.Literal("TransactionConflict"),
-    details: Schema.Struct({ databaseId: DatabaseId }),
+    details: Schema.Struct({
+      databaseId: DatabaseId,
+      reason: Schema.Literals(["WriteConflict", "ReadConflict", "SnapshotTooOld"]),
+    }),
     ...common,
   },
 ) {}

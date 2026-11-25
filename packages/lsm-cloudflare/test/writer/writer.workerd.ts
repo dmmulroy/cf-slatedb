@@ -375,6 +375,59 @@ test.provider(
       expect(removed._tag).toBe("DatabaseNotFoundPublicError");
       expect(yield* readFork(left, "b")).toBe(true);
       expect(yield* readFork(right, "e")).toBe(true);
+
+      // Transactions over the public API: write skew is refused under SerializableSnapshot.
+      const accounts = DatabaseId.make(`txn-${Date.now().toString(36)}`);
+      yield* client.databases.createDatabase({
+        payload: {
+          databaseId: accounts,
+          keyRange: Option.none(),
+          mergeOperator: Option.none(),
+          changelogRetentionMs: Option.none(),
+          budgetGroup: Option.none(),
+        },
+      });
+      yield* client.databases.write({
+        params: { databaseId: accounts },
+        payload: {
+          operations: ["x", "y"].map((key) => ({
+            _tag: "Put" as const,
+            key: bytes(key),
+            value: bytes("1"),
+            ttlMillis: Option.none(),
+          })),
+        },
+      });
+      const txnA = yield* client.databases.beginTransaction({ params: { databaseId: accounts } });
+      const txnB = yield* client.databases.beginTransaction({ params: { databaseId: accounts } });
+      const seen = yield* client.databases.transactionGet({
+        params: { databaseId: accounts },
+        payload: { readSeq: txnA.readSeq, key: bytes("y") },
+      });
+      expect(Option.isSome(seen.row)).toBe(true);
+      const commitSkew = (readSeq: typeof txnA.readSeq, key: string) =>
+        client.databases.commitTransaction({
+          params: { databaseId: accounts },
+          payload: {
+            readSeq,
+            isolation: "SerializableSnapshot",
+            batch: {
+              operations: [
+                { _tag: "Put", key: bytes(key), value: bytes("0"), ttlMillis: Option.none() },
+              ],
+            },
+            readKeys: [bytes("x"), bytes("y")],
+            readRanges: [],
+          },
+        });
+      yield* commitSkew(txnA.readSeq, "x");
+      const skewed = yield* Effect.flip(commitSkew(txnB.readSeq, "y"));
+      expect(
+        skewed._tag === "TransactionConflictPublicError" && [
+          skewed.details.reason,
+          skewed.retryable,
+        ],
+      ).toEqual(["ReadConflict", true]);
       yield* stack.destroy();
     }),
   { timeout: 300_000 },

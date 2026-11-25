@@ -9,6 +9,7 @@ import {
   RowSchema,
   SeqNum,
   SortedRunId,
+  TransactionCommit,
   WriteBatch,
   WriteReceipt,
 } from "@cf-slatedb/lsm-core";
@@ -85,6 +86,19 @@ export const ForkDatabaseRequest = Schema.Struct({
   forkId: DatabaseId,
   checkpointId: CheckpointId,
   range: KeyRange,
+});
+
+/** Schema for a transaction's read: a key at the transaction's read sequence number. */
+export const TransactionGetRequest = Schema.Struct({
+  readSeq: SeqNum,
+  key: Schema.Uint8ArrayFromBase64,
+});
+
+/** Schema for a transaction's scan: a range at the transaction's read sequence number. */
+export const TransactionScanRequest = Schema.Struct({
+  readSeq: SeqNum,
+  range: KeyRange,
+  limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 1000 })),
 });
 
 /** Largest page a scan returns. */
@@ -227,6 +241,49 @@ export class DbHttpApiGroup extends HttpApiGroup.make("databases")
         summary: "Remove a database",
         description:
           "Deletes the database and all its data. Fails with DatabaseHasDependents while forks still read it.",
+      }),
+    ),
+  )
+  .add(
+    HttpApiEndpoint.post("beginTransaction", "/databases/:databaseId/transactions/begin", {
+      params: DatabaseParams,
+      success: Schema.Struct({ readSeq: SeqNum }),
+      error: DB_PUBLIC_ERRORS,
+    }).annotateMerge(
+      OpenApi.annotations({
+        summary: "Begin a transaction",
+        description:
+          "Returns the read sequence number: read with transactions/get and transactions/scan at it, then send the writes, the keys read, and the ranges scanned to transactions/commit. Nothing is held on the server.",
+      }),
+    ),
+  )
+  .add(
+    HttpApiEndpoint.post("transactionGet", "/databases/:databaseId/transactions/get", {
+      params: DatabaseParams,
+      payload: TransactionGetRequest,
+      success: GetResponse,
+      error: DB_PUBLIC_ERRORS,
+    }).annotateMerge(OpenApi.annotations({ summary: "Read a key in a transaction" })),
+  )
+  .add(
+    HttpApiEndpoint.post("transactionScan", "/databases/:databaseId/transactions/scan", {
+      params: DatabaseParams,
+      payload: TransactionScanRequest,
+      success: Schema.Struct({ rows: Schema.Array(RowSchema) }),
+      error: DB_PUBLIC_ERRORS,
+    }).annotateMerge(OpenApi.annotations({ summary: "Scan a range in a transaction" })),
+  )
+  .add(
+    HttpApiEndpoint.post("commitTransaction", "/databases/:databaseId/transactions/commit", {
+      params: DatabaseParams,
+      payload: TransactionCommit,
+      success: WriteReceipt,
+      error: DB_PUBLIC_ERRORS,
+    }).annotateMerge(
+      OpenApi.annotations({
+        summary: "Commit a transaction",
+        description:
+          "Commits the writes atomically unless another commit since readSeq wrote one of its keys (Snapshot) or one of the keys it read or ranges it scanned (SerializableSnapshot). TransactionConflict is retryable: begin again.",
       }),
     ),
   )
