@@ -1,9 +1,20 @@
 import { defineConfig } from "vite-plus";
 
-/** Vite+ configuration for `@cf-slatedb/tools-formal-verification`; `vp run -r test` (and so `vp run ready`) runs its tests. */
+/**
+ * Vite+ configuration for the formal checks. `verify` (uncached; root alias `vp run verify`) runs
+ * every TLA+ check and every deliberately broken variant with TLC, each under a hard time limit.
+ */
 const formalVerificationViteConfig = defineConfig({
   test: {
     passWithNoTests: true,
+  },
+  run: {
+    tasks: {
+      verify: {
+        cache: false,
+        command: "node src/verify.ts",
+      },
+    },
   },
 });
 

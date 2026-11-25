@@ -2,7 +2,7 @@
 
 ## Current phase
 
-Phase 3: object storage and manifests (starting). Phase 2 (lsm-core) is done.
+Phase 4: writer (starting). Phases 0–3 are done.
 
 ## Done
 
@@ -53,26 +53,31 @@ Phase 3: object storage and manifests (starting). Phase 2 (lsm-core) is done.
   for merge/tombstone/TTL), varints (`byte-codec.test.ts`), and ULIDs (round trip, monotonic sort).
   Each was shown failing on a deliberate break (size threshold ignored, in-flight not reserved,
   probes collapsed, one probe, varint off-by-one, operand order inverted). Coverage matrix updated.
-- **Phase 3 — in progress.** `ObjectStore` (R2 adapter + faithful in-memory layer),
-  `ManifestReader`, `ManifestStore` (CAS with retry, idempotent edits, `LATEST` hint),
+- **Phase 3 — object storage and manifests.** `ObjectStore` (R2 adapter + faithful in-memory
+  layer), `ManifestReader`, `ManifestStore` (CAS with retry, idempotent edits, `LATEST` hint),
   `ManifestCache`, `LsmConfiguration`, `LsmBucket`. Local-R2 workerd test shows the Headers
-  `If-None-Match: *` form works and 16 concurrent commits lose nothing. TLA+ model
-  `tools/formal-verification/specs/ManifestCasFencing.tla` written; JDK 21 + tla2tools 1.7.4
-  downloaded to `.tlc/` (gitignored).
+  `If-None-Match: *` form works and 16 concurrent commits lose nothing.
+- **Formal check 2 (fencing) and 3 (manifest CAS linearizability).**
+  `tools/formal-verification/specs/ManifestCasFencing.tla`, two configs; `vp run verify`
+  (`tools/formal-verification/src/verify.ts`) downloads a pinned JDK 21 + tla2tools 1.7.4 into
+  `.tlc/`, runs every check under a hard time limit, and requires each broken variant to fail:
+  `noWriterEpochCheck` → `NoStaleCommit`, `blindCreate` → `CreateOnce`, `noInputsCheck` →
+  `AckedDataVisible`. ~10 s total. Skill: `.agents/skills/verify-manifest-cas-fencing`. The
+  matching real-code checks were also broken and caught by unit tests.
 
 ## Next
 
-- Phase 3: `ObjectStore` (R2 adapter + faithful in-memory layer with create-if-absent),
-  `ManifestStore` (CAS retry, `manifest/LATEST` hint, probe `id+1`), `ManifestCache`, epoch
-  fencing, and the first TLA+ model (manifest CAS + fencing).
+- Phase 4: `WriterServer` DO (HttpApi `/v1`), `MemTable` on DO SQLite, `SeqOracle`, batches,
+  TTL, monotonic clock, backpressure, alarm flush, `Latest` probe, changelog export; formal
+  check 1 (no acknowledged write lost).
 
 ## Findings
 
 - alchemy 2.0.0-beta.87 still flushes event telemetry inside `waitUntil` after the event settles;
   worked around in application code (D5), no patch.
 - Effect 4.1.4 names HTTP spans by method (`GET`); the trace CLI shows span kind (D7).
-- No Java or mise on this machine; TLC needs a JDK. Plan: download a pinned JDK and `tla2tools.jar`
-  into a gitignored tool cache from the formal verification task.
+- No Java or mise on this machine; `vp run verify` downloads a pinned JDK and `tla2tools.jar` into
+  `.tlc/` (gitignored) and passes `JAVA`/`TLA2TOOLS` to `/statechart` runs.
 - The traits MCP checker is configured (`.pi/mcp.json`) and `TYPESAFE_API_KEY` is set; it runs as an
   MCP server in the next pi session. Until then, review against `.agents/traits/*.md` by hand.
 

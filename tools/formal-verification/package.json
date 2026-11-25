@@ -6,10 +6,7 @@
   "scripts": {
     "test": "vp test run"
   },
-  "dependencies": {
-    "@effect/platform-node": "catalog:",
-    "effect": "catalog:"
-  },
+  "dependencies": {},
   "devDependencies": {
     "@types/node": "catalog:",
     "typescript": "catalog:",

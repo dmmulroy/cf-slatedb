@@ -1,0 +1,61 @@
+/**
+ * Every formal check `vp run verify` runs: a TLA+ spec, a TLC config, and the expected outcome
+ * for the code as written ("pass") and for each deliberately broken variant (the invariant that
+ * must fail). A check's verify skill in `.agents/skills/verify-*` explains what it covers.
+ */
+
+/** One TLC run and the outcome it must have. */
+export interface FormalCheckRun {
+  /** Config file in `specs/`. */
+  readonly config: string;
+  /** Value of the spec's `Broken` constant: `"none"` for the code as written. */
+  readonly broken: string;
+  /** `"pass"`, or the name of the invariant or property that must be violated. */
+  readonly expect: string;
+  /** Hard time limit in seconds; a run that exceeds it fails the verification. */
+  readonly timeLimitSeconds: number;
+}
+
+/** A spec and its runs. */
+export interface FormalCheck {
+  /** Short name, matching `.agents/skills/verify-<name>`. */
+  readonly name: string;
+  /** Spec file in `specs/`. */
+  readonly spec: string;
+  readonly runs: ReadonlyArray<FormalCheckRun>;
+}
+
+/** Every formal check, in the order `vp run verify` runs them. */
+export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
+  {
+    name: "manifest-cas-fencing",
+    spec: "ManifestCasFencing.tla",
+    runs: [
+      { config: "ManifestCasFencing.cfg", broken: "none", expect: "pass", timeLimitSeconds: 150 },
+      {
+        config: "ManifestCasFencing.cfg",
+        broken: "noWriterEpochCheck",
+        expect: "NoStaleCommit",
+        timeLimitSeconds: 60,
+      },
+      {
+        config: "ManifestCasFencing.cfg",
+        broken: "blindCreate",
+        expect: "CreateOnce",
+        timeLimitSeconds: 60,
+      },
+      {
+        config: "ManifestCasFencingRace.cfg",
+        broken: "none",
+        expect: "pass",
+        timeLimitSeconds: 120,
+      },
+      {
+        config: "ManifestCasFencingRace.cfg",
+        broken: "noInputsCheck",
+        expect: "AckedDataVisible",
+        timeLimitSeconds: 60,
+      },
+    ],
+  },
+];

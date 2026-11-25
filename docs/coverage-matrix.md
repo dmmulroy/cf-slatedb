@@ -6,9 +6,9 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 
 ## §1 What changes from SlateDB
 
-- **Single writer per database, fenced by `writerEpoch`** — pending. Edits: `lsm-core/src/manifest.ts`
-  (`fenceWriter`, `commitL0Flush` epoch check; tested in `manifest.test.ts`). Writer: Phase 4.
-  Formal: fencing model (Phase 3).
+- **Single writer per database, fenced by `writerEpoch`** — partial. Edits: `lsm-core/src/manifest.ts`
+  (`fenceWriter`, `commitL0Flush` epoch check; `manifest.test.ts`, `manifest-store.test.ts`).
+  Formal: `ManifestCasFencing` (`NoStaleCommit`, `FencedWriterOrphansUnreferenced`). Writer: Phase 4.
 - **WAL = DO SQLite memtable; an ack is durable; no `awaitDurable`** — pending (Phase 4).
 - **Manifest CAS with R2 `If-None-Match: *`** — partial. `lsm-cloudflare/src/object-store.ts`
   (`putIfAbsent`), `manifest-store.ts` (`create`, `update` with CAS retry). Tests:
@@ -164,5 +164,8 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   the probe and smoke Workers; every new handler must use `eventTelemetryFlushForStage` (D5).
   Tests: `lsm-cloudflare/src/lsm-telemetry.test.ts`, `test/telemetry/*.workerd.ts`.
 - **Scenario CLI (write/read, flush, compaction, fork/split, fencing, changelog)** — pending.
-- **Formal checks 1–6** — pending.
+- **Formal checks 1–6** — partial. Check 2 (fencing) and 3 (manifest CAS linearizability):
+  `tools/formal-verification/specs/ManifestCasFencing.tla`, skill
+  `.agents/skills/verify-manifest-cas-fencing`, run by `vp run verify`, each broken variant shown
+  failing. Checks 1, 4, 5, 6 pending.
 - **Hardening scenarios** — pending (Phase 10).
