@@ -1,4 +1,4 @@
-import { Option } from "effect";
+import { Effect, Exit, Option } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 
 import type { CollectedSpan } from "./collected-span.ts";
@@ -9,7 +9,11 @@ import {
   summarizeTrace,
   type TraceSummary,
 } from "./trace-analysis.ts";
-import { evaluateTraceAssertion, type TraceCheck } from "./trace-assertion.ts";
+import {
+  decodeTraceAssertionJson,
+  evaluateTraceAssertion,
+  type TraceCheck,
+} from "./trace-assertion.ts";
 
 const span = (
   fields: Partial<CollectedSpan> & Pick<CollectedSpan, "name" | "spanId">,
@@ -92,6 +96,20 @@ describe("evaluateTraceAssertion", () => {
     expect(report.passed).toBe(false);
     expect(report.results.map((result) => result.passed)).toEqual([false, false, false, false]);
     expect(report.results[3]?.detail).toContain("R2 unavailable");
+  });
+
+  it("rejects an assertion file with an unknown key instead of ignoring it", () => {
+    const file = (count: string) =>
+      JSON.stringify({
+        select: { traceIds: ["t1"] },
+        checks: [{ _tag: "SpanExists", span: { name: "A" }, count: JSON.parse(count) }],
+      });
+    expect(Exit.isSuccess(Effect.runSyncExit(decodeTraceAssertionJson(file('{"equals":1}'))))).toBe(
+      true,
+    );
+    expect(
+      Exit.isFailure(Effect.runSyncExit(decodeTraceAssertionJson(file('{"exactly":1}')))),
+    ).toBe(true);
   });
 
   it("fails when the selection matches no trace", () => {

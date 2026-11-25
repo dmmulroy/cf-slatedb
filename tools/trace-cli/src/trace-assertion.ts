@@ -67,6 +67,15 @@ export const TraceAssertion = Schema.Struct({
 /** Which traces to check and the checks to run. */
 export type TraceAssertion = typeof TraceAssertion.Type;
 
+/**
+ * Decodes an assertion file's JSON text. Unknown keys are errors: a misspelled bound such as
+ * `"exactly"` would otherwise be dropped and the check would pass vacuously.
+ */
+export const decodeTraceAssertionJson = (text: string) =>
+  Schema.decodeUnknownEffect(Schema.fromJsonString(TraceAssertion))(text, {
+    onExcessProperty: "error",
+  });
+
 /** Outcome of one check. */
 export interface TraceCheckResult {
   readonly check: TraceCheck;

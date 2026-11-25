@@ -26,7 +26,7 @@ import {
   summarizeTrace,
   type TraceSummary,
 } from "./trace-analysis.ts";
-import { evaluateTraceAssertion, TraceAssertion } from "./trace-assertion.ts";
+import { decodeTraceAssertionJson, evaluateTraceAssertion } from "./trace-assertion.ts";
 import { DEFAULT_TRACE_STORE_DIRECTORY, TraceStore, traceStoreLayer } from "./trace-store.ts";
 
 /**
@@ -282,8 +282,6 @@ const diff = Command.make(
     ),
 ).pipe(Command.withDescription("Compare two traces or runs (run:<startMs>-<endMs>) by span name"));
 
-const decodeTraceAssertion = Schema.decodeUnknownEffect(Schema.fromJsonString(TraceAssertion));
-
 const assert = Command.make(
   "assert",
   {
@@ -314,7 +312,7 @@ const assert = Command.make(
                     }),
                 ),
               );
-        const assertion = yield* decodeTraceAssertion(text).pipe(
+        const assertion = yield* decodeTraceAssertionJson(text).pipe(
           Effect.mapError(
             (error) =>
               new TraceCliError({
