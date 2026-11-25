@@ -1,5 +1,5 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
-import { DatabaseId } from "@cf-slatedb/lsm-core";
+import { DatabaseId, FULL_KEY_RANGE, type ReadConsistency } from "@cf-slatedb/lsm-core";
 import * as Test from "@alchemy.run/test/Vitest";
 import { expect } from "@effect/vitest";
 import { Effect, Option, Schedule } from "effect";
@@ -114,6 +114,75 @@ test.provider(
         client.databases.write({ params: { databaseId }, payload: { operations: [] } }),
       );
       expect(invalid._tag === "BatchInvalidPublicError" && invalid.details.reason).toBe("Empty");
+
+      // Reads run in the API Worker and fetch blocks from the BlockServer over its binding.
+      const read = (key: string, consistency: ReadConsistency) =>
+        client.databases
+          .get({
+            params: { databaseId },
+            payload: { key: bytes(key), consistency, snapshot: Option.none() },
+          })
+          .pipe(
+            Effect.map((response) =>
+              Option.map(response.row, (row) =>
+                row.value._tag === "Value"
+                  ? new TextDecoder().decode(row.value.bytes)
+                  : `<${row.value._tag}>`,
+              ),
+            ),
+          );
+      // `a` was deleted (flushed by the alarm); `log` holds flushed merges "x" + "y".
+      expect(yield* read("a", { _tag: "Flushed" })).toEqual(Option.none());
+      expect(yield* read("log", { _tag: "Flushed" })).toEqual(Option.some("xy"));
+      const unflushed = yield* client.databases.write({
+        params: { databaseId },
+        payload: {
+          operations: [
+            { _tag: "Merge", key: bytes("log"), operand: bytes("z"), ttlMillis: Option.none() },
+            { _tag: "Put", key: bytes("b"), value: bytes("2"), ttlMillis: Option.none() },
+          ],
+        },
+      });
+      expect(yield* read("log", { _tag: "Latest" })).toEqual(Option.some("xyz"));
+      expect(yield* read("b", { _tag: "AtLeast", seq: unflushed.seq })).toEqual(Option.some("2"));
+
+      const snapshot = yield* client.databases.snapshot({ params: { databaseId } });
+      const page = yield* client.databases.scan({
+        params: { databaseId },
+        payload: {
+          range: FULL_KEY_RANGE,
+          consistency: { _tag: "Latest" },
+          snapshot: Option.none(),
+          limit: 1,
+        },
+      });
+      expect(page.rows.map((row) => new TextDecoder().decode(row.key))).toEqual(["b"]);
+      expect(Option.map(page.resumeFrom, (key) => new TextDecoder().decode(key))).toEqual(
+        Option.some("log"),
+      );
+      // A key written and flushed after the snapshot is invisible at the snapshot.
+      yield* client.databases.write({
+        params: { databaseId },
+        payload: {
+          operations: [
+            { _tag: "Put", key: bytes("c"), value: bytes("3"), ttlMillis: Option.none() },
+          ],
+        },
+      });
+      yield* client.databases.flush({ params: { databaseId } });
+      const atSnapshot = yield* client.databases.scan({
+        params: { databaseId },
+        payload: {
+          range: FULL_KEY_RANGE,
+          consistency: { _tag: "Flushed" },
+          snapshot: Option.some(snapshot),
+          limit: 100,
+        },
+      });
+      const snapshotKeys = atSnapshot.rows.map((row) => new TextDecoder().decode(row.key));
+      expect(snapshotKeys).toContain("log");
+      expect(snapshotKeys).not.toContain("c");
+      expect(yield* read("c", { _tag: "Latest" })).toEqual(Option.some("3"));
       yield* stack.destroy();
     }),
   { timeout: 180_000 },

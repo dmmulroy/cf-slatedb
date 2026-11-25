@@ -9,7 +9,9 @@ import {
   DatabaseLifecycle,
   databaseLifecycleLayerWithoutDependencies,
 } from "./database-lifecycle.ts";
+import { DbClient, dbClientLayerWithoutDependencies } from "./db-client.ts";
 import { dbHttpRouterLayer } from "./db-http-handlers.ts";
+import { dbReaderLayer } from "./db-reader.ts";
 import { lsmConfigurationLayer } from "./lsm-configuration.ts";
 import { eventTelemetryFlushForStage, lsmTelemetryLayer } from "./lsm-telemetry.ts";
 import { manifestReaderLayerWithoutDependencies } from "./manifest-reader.ts";
@@ -42,8 +44,9 @@ export class DbApiWorker extends Cloudflare.Worker<
 >()("DbApiWorker") {}
 
 /**
- * Builds the API Worker: binds the LSM bucket read-write, hosts `WriterServer`, and serves the
- * public API with execution-scoped writer clients.
+ * Builds the API Worker: binds the LSM bucket read-write and the `BlockServer` service, hosts
+ * `WriterServer`, and serves the public API. Reads run here, in the caller's isolate; writes and
+ * `Latest` probes go to the writer.
  */
 export const dbApiWorkerLayer = (options: DbApiWorkerOptions) =>
   DbApiWorker.make(
@@ -57,18 +60,26 @@ export const dbApiWorkerLayer = (options: DbApiWorkerOptions) =>
       const withEventTelemetryFlush = yield* eventTelemetryFlushForStage;
       const writer = yield* WriterClient;
       const lifecycle = yield* DatabaseLifecycle;
+      const client = yield* DbClient;
       // The router's scope must not outlive the invocation that built it.
       const router = yield* makeExecutionMemo(
         HttpRouter.toHttpEffect(
           dbHttpRouterLayer.pipe(
             Layer.provide(Layer.succeed(WriterClient, writer)),
             Layer.provide(Layer.succeed(DatabaseLifecycle, lifecycle)),
+            Layer.provide(Layer.succeed(DbClient, client)),
           ),
         ),
       );
       return { fetch: withEventTelemetryFlush(Effect.flatten(router)) };
     }).pipe(
-      Effect.provide(writerClientLayer),
+      // The reader's manifest cache and L1 block cache are built here, once per isolate.
+      Effect.provide(
+        dbClientLayerWithoutDependencies.pipe(
+          Layer.provideMerge(writerClientLayer),
+          Layer.provide(dbReaderLayer),
+        ),
+      ),
       Effect.provide(
         databaseLifecycleLayerWithoutDependencies.pipe(
           Layer.provide(

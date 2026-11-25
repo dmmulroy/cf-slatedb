@@ -1,4 +1,5 @@
 import { DEFAULT_DATABASE_OPTIONS } from "@cf-slatedb/lsm-core";
+import { Chunk, Stream } from "effect";
 import { Effect, Layer, Option } from "effect";
 import { HttpApiBuilder } from "effect/http-api";
 
@@ -8,6 +9,7 @@ import { DbHttpRequest, dbHttpRequestMiddlewareLayer } from "./db-http-request.t
 import { type DbApiOperation } from "./db-public-error.ts";
 import { toPublicError, type DbInternalError } from "./db-public-error-translation.ts";
 import { lsmHttpServerLayer } from "./lsm-http-server.ts";
+import { DbClient } from "./db-client.ts";
 import { WriterClient } from "./writer-client.ts";
 
 /** Runs a handler body and classifies its failure as the public error for `operation`. */
@@ -24,6 +26,7 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
   Effect.gen(function* () {
     const writer = yield* WriterClient;
     const lifecycle = yield* DatabaseLifecycle;
+    const client = yield* DbClient;
     return handlers
       .handle("createDatabase", ({ payload }) =>
         lifecycle
@@ -57,6 +60,40 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
       )
       .handle("status", ({ params }) =>
         writer.status(params.databaseId).pipe(publicFailures("status")),
+      )
+      .handle("get", ({ params, payload }) =>
+        client
+          .getRow(params.databaseId, payload.key, {
+            consistency: payload.consistency,
+            snapshot: payload.snapshot,
+          })
+          .pipe(
+            Effect.map((row) => ({ row })),
+            publicFailures("get"),
+          ),
+      )
+      .handle("scan", ({ params, payload }) =>
+        Stream.runCollect(
+          client.scan(params.databaseId, payload.range, {
+            consistency: payload.consistency,
+            snapshot: payload.snapshot,
+            // One extra row tells whether another page follows.
+            limit: Option.some(payload.limit + 1),
+          }),
+        ).pipe(
+          Effect.map((collected) => {
+            const rows = Chunk.toReadonlyArray(Chunk.fromIterable(collected));
+            const next = rows[payload.limit];
+            return {
+              rows: rows.slice(0, payload.limit),
+              resumeFrom: next === undefined ? Option.none() : Option.some(next.key),
+            };
+          }),
+          publicFailures("scan"),
+        ),
+      )
+      .handle("snapshot", ({ params }) =>
+        client.snapshot(params.databaseId).pipe(publicFailures("get")),
       )
       .handle("changes", ({ params, query }) =>
         writer

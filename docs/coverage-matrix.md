@@ -22,7 +22,9 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   (Headers form; 16 concurrent flush commits). Real-R2 check needs approval. Formal: fencing/CAS
   model (in progress).
 - **Compaction in `CompactorServer` + Workflow** — pending (Phase 6).
-- **Readers in any Worker; `Latest`/`AtLeast` through the writer** — pending (Phase 5).
+- **Readers in any Worker; `Latest`/`AtLeast` through the writer** — done. `db-reader.ts` runs
+  in the caller's isolate; `db-client.ts` builds `Latest` views from the writer's probe. Trace: the
+  `Flushed` read assertion (no `WriterClient.probe`, no `ObjectStore.list`).
 
 ## §2 System
 
@@ -49,19 +51,28 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 
 ## §4 Read path
 
-- **`Flushed`, `AtLeast(seq)`, `Latest` (probe + `flushedSeq`)** — pending (Phase 5).
-- **SST skip by range and Bloom filter; index search; block seek** — partial.
-  `lsm-core/src/sst-codec.ts` (`sstMayContainKey`, `firstBlockForKey`, `blocksOverlappingRange`),
-  `block-codec.ts` (`DataBlock.seek`), `row-resolution.ts` (`resolveVisibleRow`). Tests:
-  `sst-codec.test.ts` reads every key at random snapshots and times exactly as a `Map` oracle does.
-- **L1 `BlockCache` (separate data and metadata caches)** — pending (Phase 5).
+- **`Flushed`, `AtLeast(seq)`, `Latest` (probe + `flushedSeq`)** — done. `read-consistency.ts`
+  (lsm-core), `DbClient.pointView`/`scanView`, `DbReader.manifestFor` (refresh when older than
+  `flushedSeq`/`seq`). Tests: `db-client.test.ts` (Map-oracle property at every consistency;
+  staleness bound, shown failing without the refresh), `writer.workerd.ts`. Formal:
+  `NoAckedWriteLost` (`LatestSeesAcked`) (D29).
+- **SST skip by range and Bloom filter; index search; block seek** — done. `DbReader.getRow`/
+  `sstVersions` (range and view skip, Bloom skip, `firstBlockForKey`, seek continuing across blocks,
+  stop at the first settled level), `DbReader.scan` (`blocksOverlappingRange`, prefetch of the next
+  block). Tests: `sst-codec.test.ts`, `db-client.test.ts`.
+- **L1 `BlockCache` (separate data and metadata caches)** — done. `block-cache.ts` (joined
+  misses, failures not cached, `cache.hit` span attribute, `lsm_block_cache_requests` metric) (D32).
+  Trace: the repeat-read assertion (both caches hit, no `BlockServer` span).
 - **L2 Workers Cache in front of `BlockServer`; block/meta/manifest URLs; immutable headers;
-  `Cache-Tag`** — pending (Phase 5; live `Cf-Cache-Status: HIT` check needs approval).
-- **`BlockServer`: separate Worker, `crossVersionCache`, `workersDev: false`, `fetch()` not RPC** —
-  pending (Phase 5).
-- **`SstHandle.metaOffset`/`metaLength`** — partial. `lsm-core/src/manifest.ts`
-  (`sstHandleFromInfo`), `sst-codec.ts` (`SstInfo`); `sst-codec.test.ts` checks
-  `metaLength = size − metaOffset`.
+  `Cache-Tag`** — done locally; live hit check pending approval. `block-server-http-api.ts`,
+  `block-server-http-handlers.ts` (D27, D28). Test: `block-server.test.ts` (status codes,
+  `Cache-Control`, `Cache-Tag: db:<owner>`, latest hint, no short bodies). Live
+  `Cf-Cache-Status: HIT`: open question 1.
+- **`BlockServer`: separate Worker, `crossVersionCache`, `workersDev: false`, `fetch()` not RPC**
+  — done. `block-server-worker.ts`, `block-source.ts` (D31). Test: `writer.workerd.ts` reads through
+  the binding; trace shows `GET (client)` → `BlockServer.*` on the `cf-slatedb-blocks` service.
+- **`SstHandle.metaOffset`/`metaLength`** — done. One ranged request opens an SST
+  (`BlockCache.meta` → `/meta/<offset>-<length>`); `sst-codec.test.ts` checks the bounds.
 
 ## §5 Manifest CAS and fencing
 
@@ -106,8 +117,9 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   (`ManifestConflictError` internal and retried, `ManifestWriteError`, idempotent edits write
   nothing, `lsm_manifest_cas_conflicts` metric), `manifest-cache.ts` (D17), `lsm-configuration.ts`,
   `lsm-bucket.ts`, `object-keys.ts`. Tests: `manifest-store.test.ts`, `object-store.workerd.ts`.
-- **`SstStore`, `BlockCache`, `BlockSource`, `BlockServer`, `DbReader`, `DbClient`** — pending
-  (Phase 5).
+- **`SstStore`, `BlockCache`, `BlockSource`, `BlockServer`, `DbReader`, `DbClient`** — done
+  (`SstStore.openReader` is `BlockCache.meta`/`block`). Execution-scoped HTTP clients:
+  `writer-client.ts`, `block-source.ts`.
 - **`MemTable`, `SeqOracle`, `DbWriter`, `ChangelogExport`** — done. `mem-table.ts`,
   `db-writer.ts` (sequence oracle and clock in the commit transaction, D20; `ChangelogExport` is
   `exportChangelog`), `writer-client.ts`, `writer-server.ts`, `writer-http-api.ts`.
@@ -121,8 +133,9 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 
 ## §8 Public API and semantics
 
-- **`put`, `delete`, `merge`, `write`, `get`, `getRow`, `scan`, `flush`** — partial. Write side:
-  `DbHttpApi` (`write`, `flush`) and `WriterClient`; reads in Phase 5 (`DbClient`).
+- **`put`, `delete`, `merge`, `write`, `get`, `getRow`, `scan`, `flush`** — done. `DbClient`
+  (plus `scanPrefix`, `snapshot`) and the public `DbHttpApi`. Tests: `db-client.test.ts`,
+  `writer-client.test.ts`, `writer.workerd.ts`.
 - **Errors** — partial (public envelope done: `db-public-error.ts`, `db-public-error-translation.ts`, D25; `WriteStalledError`, `WriterUnavailableError`, `DatabaseNotFoundError` in `lsm-errors.ts`). Core: `SstCorruptedError`, `MergeOperatorMissingError`
   (`lsm-core-errors.ts`), `WriterFencedError`, `CompactorFencedError`, `DatabaseSealedError`,
   `CompactionInputsChangedError` (`manifest.ts`). Pending: `KeyOutOfRangeError`,

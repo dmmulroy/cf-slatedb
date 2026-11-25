@@ -133,6 +133,16 @@ export class TransactionConflictPublicError extends Schema.TaggedError<Transacti
   },
 ) {}
 
+/** `409` — a snapshot's manifest was collected; take a new snapshot. */
+export class SnapshotExpiredPublicError extends Schema.TaggedError<SnapshotExpiredPublicError>()(
+  "SnapshotExpiredPublicError",
+  {
+    code: Schema.Literal("SnapshotExpired"),
+    details: Schema.Struct({ databaseId: DatabaseId }),
+    ...common,
+  },
+) {}
+
 /** `503` — the writer refused the write (backpressure); retry after `retryAfterMs`. */
 export class WriteStalledPublicError extends Schema.TaggedError<WriteStalledPublicError>()(
   "WriteStalledPublicError",
@@ -185,6 +195,7 @@ export const DB_PUBLIC_ERRORS = [
   DatabaseHasDependentsPublicError.pipe(HttpApiSchema.status(409)),
   MergeOperatorMissingPublicError.pipe(HttpApiSchema.status(409)),
   TransactionConflictPublicError.pipe(HttpApiSchema.status(409)),
+  SnapshotExpiredPublicError.pipe(HttpApiSchema.status(409)),
   WriteStalledPublicError.pipe(HttpApiSchema.status(503)),
   StorageUnavailablePublicError.pipe(HttpApiSchema.status(503)),
   StoredDataInvalidPublicError.pipe(HttpApiSchema.status(500)),
@@ -203,6 +214,7 @@ export type DbPublicError =
   | DatabaseHasDependentsPublicError
   | MergeOperatorMissingPublicError
   | TransactionConflictPublicError
+  | SnapshotExpiredPublicError
   | WriteStalledPublicError
   | StorageUnavailablePublicError
   | StoredDataInvalidPublicError

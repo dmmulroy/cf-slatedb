@@ -239,3 +239,47 @@ adding an internal error is a type error until it is classified, which is the gu
 `WriterServer` and `DbApiWorker` are defined in `@cf-slatedb/lsm-cloudflare` (as Alchemy class +
 Layer), so the library's workerd tests can run them. `infra/cf-slatedb` only composes them into the
 Stack with a bundle-entry module (`src/db-api-worker-entry.ts`), passed as `main`.
+
+## D27. The SST metadata URL carries its range
+
+Design §4 lists `/v1/databases/<db>/ssts/<ulid>/meta`. The implementation uses
+`/meta/<offset>-<length>` (from `SstHandle.metaOffset`/`metaLength`), so the `BlockServer` serves
+the metadata section with one ranged R2 read and no suffix probe on a cache miss, and the URL still
+names one immutable object. Blocks use `/blocks/<offset>-<length>` as designed.
+
+## D28. Readers load manifests from R2; `BlockServer` also serves manifest URLs
+
+`DbReader` loads manifests through `ManifestCache` → `ManifestReader` → R2 (the API Worker binds the
+bucket): the `LATEST` hint plus probing `id + 1` needs uncached existence checks, and the manifest
+is small and cached in the isolate for `manifestRefreshInterval`. The `BlockServer` serves
+`/manifests/<id>` (immutable) and `/manifests/latest` (`max-age=1, stale-while-revalidate=10`) as
+designed, for other readers and tools.
+
+## D29. `Flushed` reads may lag by the manifest refresh interval
+
+A `Flushed` read uses the isolate's cached manifest until it is `manifestRefreshInterval` (1 s by
+default) old, so right after a flush it may still see the older manifest. This is the design's
+"a stale manifest only makes it older, never wrong". `Latest` and `AtLeast(seq)` refresh the cached
+manifest whenever it predates the writer's `flushedSeq` or `seq`, so they are never stale. The
+`DbClient` property test models this, and a dedicated test pins it.
+
+## D30. Snapshots pin a manifest id
+
+`DbClient.snapshot` returns `{ databaseId, manifestId, snapshotSeq }`; reads with it read exactly
+that manifest. Until checkpoints (Phase 7) pin it, a snapshot is protected by GC `minAge` only, and
+a read of a collected snapshot fails with `SnapshotExpired`.
+
+## D31. `BlockServer` is called with the service binding's `fetch()`
+
+`Cloudflare.Workers.bindWorker` returns an RPC proxy, and RPC bypasses Workers Cache. `BlockSource`
+calls `bindWorker` only to register the binding, reads the raw `Fetcher` from the runtime
+`WorkerEnvironment` (present at runtime, absent while planning), and wraps it with
+`fromCloudflareFetcher` → `toHttpClient` → the generated `BlockServerHttpApi` client, once per
+invocation. A missing binding is a defect.
+
+## D32. L1 cache budget is by entry count
+
+`BlockCache` caps the data cache at 4,096 blocks (~16 MiB at 4 KiB) and the metadata cache at 1,024
+entries, isolate-wide. Design §12 suggests a byte budget per `budgetGroup` (or a `LayerMap` per
+group); Effect's `Cache` bounds entries, not bytes, so this is a coarser global budget. Per-group
+budgets are a recorded gap.

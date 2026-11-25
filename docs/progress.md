@@ -2,7 +2,7 @@
 
 ## Current phase
 
-Phase 5: reader and block serving (starting). Phases 0–4 are done.
+Phase 6: compaction and GC (starting). Phases 0–5 are done.
 
 ## Done
 
@@ -87,11 +87,27 @@ Phase 5: reader and block serving (starting). Phases 0–4 are done.
   `flushed_seq` + rows in `probe`); fixed (D21). Broken variants `truncateBeforeCommit` →
   `NoAckedWriteLost`, `nonAtomicProbe` → `LatestSeesAcked`.
 
+- **Phase 5 — reader and block serving.** `ReadConsistency` (lsm-core), `ObjectReader` (read-only
+  R2), `BlockServerHttpApi` + handlers (immutable `200`s, `Cache-Control: public, max-age=31536000,
+  immutable`, `Cache-Tag: db:<owner>`, latest-manifest hint, tag purge), `BlockServerWorker`
+  (`Cloudflare.cache({ crossVersionCache: true })`, `workersDev: false`), `BlockSource` (service
+  binding `fetch()`, never RPC; test layer reads the store), `BlockCache` (separate data and meta
+  `Cache`s, joined misses, failures not cached, hit/miss span attributes and metric), `DbReader`
+  (manifest for a view, range + Bloom skip, block seek across blocks, merged scans with prefetch,
+  resolution), `DbClient` (`put`, `delete`, `merge`, `write`, `get`, `getRow`, `scan`,
+  `scanPrefix`, `flush`, `snapshot`; `Latest`/`AtLeast`/`Flushed` views), public read endpoints
+  (`get`, `scan` with `resumeFrom`, `snapshots`). Tests: a `DbClient` property test against a `Map`
+  oracle (puts, deletes, merges, flushes, reads at every consistency, scans); staleness and
+  snapshot tests; `BlockServer` contract test; workerd read path through the real binding. Under
+  `vp run dev` the trace CLI shows a `Flushed` read with no writer call and no `LIST`, served
+  through `BlockServer`, and the repeat read hitting L1. Decisions D27–D32.
+
 ## Next
 
-- Phase 5: `DbReader` (`Latest`/`AtLeast`/`Flushed`, `get`, `getRow`, `scan`, `scanPrefix`,
-  snapshots), `BlockCache` (separate data and metadata caches), `BlockSource`, `BlockServer` Worker
-  (Workers Cache, immutable URLs), `DbClient`, read endpoints on the public API.
+- Phase 6: `CompactorServer` DO (alarm, scheduler, `compactorEpoch`), compaction Workflow
+  (streaming merge, multipart output, TTL and merge resolution), `CompactionBudget`,
+  `GarbageCollector` (`minAge`, checkpoints, `gc/` boundary), GC cron Worker; formal check 4
+  (GC safety).
 
 ## Findings
 
@@ -105,4 +121,10 @@ Phase 5: reader and block serving (starting). Phases 0–4 are done.
 
 ## Open questions
 
-None yet.
+Live checks waiting for Dillon's approval (none has run; none runs from `vp run ready`):
+
+1. **Workers Cache hit on a deployed preview.** Deploy the Stack to a preview stage, read the same
+   block twice through the API Worker, and confirm `Cf-Cache-Status: HIT` on the `BlockServer`
+   response (Workers Cache is not emulated by Vitest or `alchemy dev`).
+2. **R2 `If-None-Match: *` with the Headers form on real R2** (workerd #2572). Verified only
+   against Alchemy's local R2 (`test/object-store/object-store.workerd.ts`).

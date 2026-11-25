@@ -18,6 +18,7 @@ import {
   InternalFailurePublicError,
   KeyOutOfRangePublicError,
   MergeOperatorMissingPublicError,
+  SnapshotExpiredPublicError,
   StorageUnavailablePublicError,
   StoredDataInvalidPublicError,
   WriteStalledPublicError,
@@ -28,6 +29,7 @@ import type {
   WriterUnavailableError,
   WriteStalledError,
 } from "./lsm-errors.ts";
+import type { ReaderUnavailableError } from "./db-reader.ts";
 import type { DatabaseAlreadyExistsError } from "./manifest-store.ts";
 
 /** Every internal failure the public API classifies. */
@@ -42,7 +44,8 @@ export type DbInternalError =
   | KeyOutOfRangeError
   | WriterUnavailableError
   | MergeOperatorMissingError
-  | SstCorruptedError;
+  | SstCorruptedError
+  | ReaderUnavailableError;
 
 /**
  * Classifies an internal failure as its public error: a stable code, a caller-facing message, the
@@ -148,6 +151,37 @@ export const toPublicError =
               requestId,
               retryable: true,
             });
+      case "ReaderUnavailableError":
+        switch (error.reason) {
+          case "SnapshotExpired":
+            return new SnapshotExpiredPublicError({
+              code: "SnapshotExpired",
+              operation,
+              message: error.message,
+              details: { databaseId: error.databaseId },
+              requestId,
+              retryable: false,
+            });
+          case "StoredManifestInvalid":
+            return new StoredDataInvalidPublicError({
+              code: "StoredDataInvalid",
+              operation,
+              message: `Database ${error.databaseId}'s stored manifest failed validation. Contact the operator with request id ${requestId}.`,
+              details: { databaseId: error.databaseId },
+              requestId,
+              retryable: false,
+            });
+          case "StorageUnavailable":
+            return new StorageUnavailablePublicError({
+              code: "StorageUnavailable",
+              operation,
+              message: `Database ${error.databaseId}'s data could not be read just now. Retry the same request.`,
+              details: { databaseId: error.databaseId },
+              requestId,
+              retryable: true,
+            });
+        }
+      // falls through: the inner switch is exhaustive
       case "SstCorruptedError":
       case "DatabaseIdMismatchError":
         return new InternalFailurePublicError({
