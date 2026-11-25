@@ -94,6 +94,14 @@ export interface IMemTable {
     writes: ReadonlyArray<CollapsedWrite>,
     createTs: Timestamp,
   ) => Effect.Effect<SeqNum, MemTableError>;
+  /**
+   * Runs `read` with the current bookkeeping, both in one SQLite transaction, so no flush can
+   * truncate rows between reading `flushedSeq` and reading the rows (a `Latest` read relies on
+   * every row above `flushedSeq` still being in the memtable).
+   */
+  readonly consistently: <A>(
+    read: (meta: WriterMeta) => Effect.Effect<A, MemTableError>,
+  ) => Effect.Effect<A, MemTableError>;
   /** Every version of `key` at or below `snapshotSeq`, newest first. */
   readonly versions: (
     key: Uint8Array,
@@ -324,6 +332,12 @@ export const makeMemTable = Effect.gen(function* () {
       yield* Effect.annotateCurrentSpan({ seq: committed, "batch.rows": writes.length });
       return committed;
     }),
+    consistently: (read) =>
+      sql.transaction(Effect.flatMap(meta, read)).pipe(
+        Effect.catchTags({
+          WriterSqlError: (error) => Effect.fail(failed("consistently")(error)),
+        }),
+      ),
     versions: (key, snapshotSeq) =>
       selectRows(
         "versions",

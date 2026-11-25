@@ -49,7 +49,12 @@ export class WriterUnavailableError extends Schema.TaggedError<WriterUnavailable
   {
     databaseId: DatabaseId,
     operation: Schema.String,
-    reason: Schema.Literals(["StorageUnavailable", "ManifestContention", "StoredDataInvalid"]),
+    reason: Schema.Literals([
+      "StorageUnavailable",
+      "ManifestContention",
+      "StoredDataInvalid",
+      "WriterUnreachable",
+    ]),
     message: Schema.String,
   },
 ) {}

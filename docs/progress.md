@@ -2,7 +2,7 @@
 
 ## Current phase
 
-Phase 4: writer (starting). Phases 0–3 are done.
+Phase 5: reader and block serving (starting). Phases 0–4 are done.
 
 ## Done
 
@@ -65,11 +65,33 @@ Phase 4: writer (starting). Phases 0–3 are done.
   `AckedDataVisible`. ~10 s total. Skill: `.agents/skills/verify-manifest-cas-fencing`. The
   matching real-code checks were also broken and caught by unit tests.
 
+- **Phase 4 — writer.** `WriteBatch`/`WriteReceipt` and `collapseWriteBatch` (lsm-core, property
+  test against sequential application), `WriterSqlStorage` (Durable Object SQLite; `node:sqlite`
+  test layer), `MemTable` (the WAL: `memtable_rows (key, seq DESC)`, sequence oracle and clock in
+  the commit transaction, keyset-paged flush stream, atomic `consistently` reads), `SstStore`
+  (streams blocks into multipart uploads), `WriterAlarm`, `DbWriter` (lazy fence-in, `KeyOutOfRange`,
+  sealed, backpressure `WriteStalled` on bytes and L0 backlog, alarm flush on `l0SstSize`/`maxL0Age`,
+  upload → CAS → truncate, restart recovery, `Latest` probe with `flushedSeq`, memtable scan pages,
+  changes feed, changelog SST export, seal), `WriterHttpApi` (`/v1`), `WriterServer` DO,
+  `WriterClient` (execution memo + `Cache`; test layer crosses the real HTTP contract in-process),
+  public `DbHttpApi` (create, write, flush, status, changes) with the public error envelope and
+  `x-request-id`, `DbApiWorker` (hosts `WriterServer`), `DatabaseLifecycle.create`.
+  Tests: memtable properties on real SQLite, writer behavior (fencing with two writers, crash
+  between commit and truncate, backpressure, seal, alarm, changelog), writer client over HTTP, and
+  `test/writer/writer.workerd.ts` (API Worker → DO SQLite → local R2, including the alarm flush).
+  `vp run dev` serves the API on `http://localhost:1337`; the trace CLI shows API → writer → flush →
+  one manifest CAS → truncate, and the flush assertion passes.
+- **Formal check 1 (no acknowledged write lost or hidden).**
+  `tools/formal-verification/specs/NoAckedWriteLost.tla`, skill
+  `.agents/skills/verify-no-acked-write-lost`. Found a real bug while being written (non-atomic
+  `flushed_seq` + rows in `probe`); fixed (D21). Broken variants `truncateBeforeCommit` →
+  `NoAckedWriteLost`, `nonAtomicProbe` → `LatestSeesAcked`.
+
 ## Next
 
-- Phase 4: `WriterServer` DO (HttpApi `/v1`), `MemTable` on DO SQLite, `SeqOracle`, batches,
-  TTL, monotonic clock, backpressure, alarm flush, `Latest` probe, changelog export; formal
-  check 1 (no acknowledged write lost).
+- Phase 5: `DbReader` (`Latest`/`AtLeast`/`Flushed`, `get`, `getRow`, `scan`, `scanPrefix`,
+  snapshots), `BlockCache` (separate data and metadata caches), `BlockSource`, `BlockServer` Worker
+  (Workers Cache, immutable URLs), `DbClient`, read endpoints on the public API.
 
 ## Findings
 

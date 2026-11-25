@@ -550,9 +550,11 @@ export const makeDbWriter = Effect.gen(function* () {
   const probe = Effect.fn("DbWriter.probe")(function* (databaseId: DatabaseId, key: Uint8Array) {
     yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
     yield* ensureReady(databaseId);
-    const meta = yield* memTable.meta.pipe(Effect.mapError(unavailable(databaseId, "probe")));
-    const versions = yield* memTable
-      .versions(key, meta.lastSeq)
+    // Read flushedSeq and the versions atomically: a flush truncating in between would hide rows.
+    const { meta, versions } = yield* memTable
+      .consistently((meta) =>
+        Effect.map(memTable.versions(key, meta.lastSeq), (versions) => ({ meta, versions })),
+      )
       .pipe(Effect.mapError(unavailable(databaseId, "probe")));
     yield* Effect.annotateCurrentSpan({
       seq: meta.lastSeq,
@@ -573,11 +575,20 @@ export const makeDbWriter = Effect.gen(function* () {
   ) {
     yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
     yield* ensureReady(databaseId);
-    const meta = yield* memTable.meta.pipe(Effect.mapError(unavailable(databaseId, "scan")));
-    const snapshotSeq = Option.getOrElse(request.snapshotSeq, () => meta.lastSeq);
     const limit = Math.max(1, Math.min(request.limit, 1000));
-    const rows = yield* memTable
-      .scan(request.range, snapshotSeq, request.cursor, limit)
+    // One page is read atomically with flushedSeq; across pages the reader takes the largest one.
+    const { meta, snapshotSeq, rows } = yield* memTable
+      .consistently((meta) => {
+        const snapshotSeq = Option.getOrElse(request.snapshotSeq, () => meta.lastSeq);
+        return Effect.map(
+          memTable.scan(request.range, snapshotSeq, request.cursor, limit),
+          (rows) => ({
+            meta,
+            snapshotSeq,
+            rows,
+          }),
+        );
+      })
       .pipe(Effect.mapError(unavailable(databaseId, "scan")));
     const last = rows[rows.length - 1];
     return {
@@ -605,9 +616,16 @@ export const makeDbWriter = Effect.gen(function* () {
   ) {
     yield* Effect.annotateCurrentSpan({ "database.id": databaseId, seq: afterSeq });
     yield* ensureReady(databaseId);
-    const meta = yield* memTable.meta.pipe(Effect.mapError(unavailable(databaseId, "changes")));
-    const rows = yield* memTable
-      .rowsBySeq(afterSeq, meta.lastSeq, Math.max(1, Math.min(limit, 1000)))
+    const { meta, rows } = yield* memTable
+      .consistently((meta) =>
+        Effect.map(
+          memTable.rowsBySeq(afterSeq, meta.lastSeq, Math.max(1, Math.min(limit, 1000))),
+          (rows) => ({
+            meta,
+            rows,
+          }),
+        ),
+      )
       .pipe(Effect.mapError(unavailable(databaseId, "changes")));
     return {
       rows: [...rows].sort(changelogRowOrder),

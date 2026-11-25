@@ -6,10 +6,15 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 
 ## §1 What changes from SlateDB
 
-- **Single writer per database, fenced by `writerEpoch`** — partial. Edits: `lsm-core/src/manifest.ts`
-  (`fenceWriter`, `commitL0Flush` epoch check; `manifest.test.ts`, `manifest-store.test.ts`).
-  Formal: `ManifestCasFencing` (`NoStaleCommit`, `FencedWriterOrphansUnreferenced`). Writer: Phase 4.
-- **WAL = DO SQLite memtable; an ack is durable; no `awaitDurable`** — pending (Phase 4).
+- **Single writer per database, fenced by `writerEpoch`** — done. `WriterServer` DO keyed by
+  `DatabaseId` (`writer-server.ts`); `DbWriter.ensureReady` fences in with `fenceWriter`; flushes
+  carry the epoch (`commitL0Flush`). Tests: `db-writer.test.ts` (a stale writer's flush and later
+  writes fail with `WriterFencedError`; its SST stays an unreferenced orphan), `manifest-store.test.ts`.
+  Formal: `ManifestCasFencing` (`NoStaleCommit`, `FencedWriterOrphansUnreferenced`).
+- **WAL = DO SQLite memtable; an ack is durable; no `awaitDurable`** — done. `mem-table.ts`
+  (`memtable_rows (key, seq DESC)`), `writer-sql-storage.ts`; `WriteReceipt` has only `seq` and
+  `createTs`. Tests: `mem-table.test.ts` (real SQLite), `writer.workerd.ts` (DO SQLite).
+  Formal: `NoAckedWriteLost`.
 - **Manifest CAS with R2 `If-None-Match: *`** — partial. `lsm-cloudflare/src/object-store.ts`
   (`putIfAbsent`), `manifest-store.ts` (`create`, `update` with CAS retry). Tests:
   `manifest-store.test.ts` (32 concurrent create-if-absent → one `Created`; 12 concurrent edits →
@@ -26,13 +31,21 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 
 ## §3 Write path
 
-- **`POST /v1/databases/:id/batches`, `Semaphore(1)`, one SQLite transaction** — pending (Phase 4).
-- **Flush trigger: `l0SstSize`, `maxL0Age`, `setAlarm(now)`** — pending (Phase 4). Settings:
-  `lsm-core/src/lsm-settings.ts`.
-- **`flushL0`: SST build, PUT, manifest CAS, delete rows ≤ cut** — partial. SST builder:
-  `lsm-core/src/sst-codec.ts`; edit: `commitL0Flush` (idempotent; `manifest.test.ts`). Writer: Phase 4.
-- **Changelog export (CDC), `changes?afterSeq=`** — partial. `SstKind` `Changelog` and
-  `changelogRowOrder` (`lsm-core`); `Manifest.changelog`, `pruneChangelog`. Export: Phase 4.
+- **`POST /v1/databases/:id/batches`, `Semaphore(1)`, one SQLite transaction** — done.
+  `writer-http-api.ts`, `db-http-api.ts`, `lsm-cloudflare/src/db-writer.ts` (`commitLock`), `MemTable.commit`.
+  Tests: `db-writer.test.ts`, `writer-client.test.ts`, `writer.workerd.ts`.
+- **Flush trigger: `l0SstSize`, `maxL0Age`, `setAlarm(now)`** — done. `scheduleFlush`/`runAlarm`
+  in `lsm-cloudflare/src/db-writer.ts`, `writer-alarm.ts`. Tests: `db-writer.test.ts` (alarm at `maxL0Age`, `TestClock`),
+  `writer.workerd.ts` (the real alarm flushes after `maxL0Age`).
+- **`flushL0`: SST build, PUT, manifest CAS, delete rows ≤ cut** — done. `flushNow` in `lsm-cloudflare/src/db-writer.ts`,
+  `sst-store.ts` (streamed multipart), `commitL0Flush`, `MemTable.truncate`. Tests:
+  `db-writer.test.ts` (SST bytes decode to the flushed rows; crash between commit and truncate).
+  Trace: the flush assertion (exactly one `ManifestStore.create`, `MemTable.truncate` under
+  `DbWriter.flush`, no `ObjectStore.list`, no errors, safe attributes). Formal: `NoAckedWriteLost`.
+- **Changelog export (CDC), `changes?afterSeq=`** — done (write side). `exportChangelog` in
+  `lsm-cloudflare/src/db-writer.ts` (sequence-ordered `Changelog` SST per flush, `Manifest.changelog` entry),
+  `GET /v1/databases/:id/changes`. Tests: `db-writer.test.ts`, `writer-client.test.ts`. Retention
+  by GC: Phase 6.
 
 ## §4 Read path
 
@@ -52,7 +65,8 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 
 ## §5 Manifest CAS and fencing
 
-- **Writer init fencing loop** — pending (Phase 4).
+- **Writer init fencing loop** — done. `ensureReady` (`ManifestStore.update(fenceWriter)` with CAS
+  retry, epoch stored in `writer_meta`, sequence oracle and clock seeded from the manifest) (D19).
 - **`manifest/LATEST` hint + probe `id+1`; no LIST on read paths** — partial.
   `lsm-cloudflare/src/manifest-reader.ts` (`loadLatest`; LIST only to recover when the hint names a
   collected manifest). `manifest-store.test.ts` covers a lagging hint and a collected hinted
@@ -60,8 +74,10 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 - **Compactor edit replaces exactly its inputs, else fails** — partial. `commitCompaction`
   (`manifest.test.ts`: replace, idempotent retry, `CompactionInputsChangedError`,
   `CompactorFencedError`).
-- **Delete-after-commit; duplicate replay is deduplicated** — partial. `mergeRowStreams` drops exact
-  duplicates (`merge-iterator.test.ts`, shown failing without the drop). Writer: Phase 4.
+- **Delete-after-commit; duplicate replay is deduplicated** — done. `flushNow` truncates only after
+  the manifest commit; restart drops rows `<= lastL0Seq` (D22); `mergeRowStreams` drops exact
+  duplicates. Tests: `db-writer.test.ts` (crash between commit and truncate), `merge-iterator.test.ts`.
+  Formal: `NoAckedWriteLost` (`truncateBeforeCommit` fails).
 - **`onlyIf: new Headers({ "If-None-Match": "*" })` (workerd #2572)** — partial.
   `object-store.ts` `putIfAbsent` passes the Headers form; verified against local R2 in
   `object-store.workerd.ts` (second create returns `AlreadyExists`, stored bytes unchanged). The
@@ -92,7 +108,9 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `lsm-bucket.ts`, `object-keys.ts`. Tests: `manifest-store.test.ts`, `object-store.workerd.ts`.
 - **`SstStore`, `BlockCache`, `BlockSource`, `BlockServer`, `DbReader`, `DbClient`** — pending
   (Phase 5).
-- **`MemTable`, `SeqOracle`, `DbWriter`, `ChangelogExport`** — pending (Phase 4).
+- **`MemTable`, `SeqOracle`, `DbWriter`, `ChangelogExport`** — done. `mem-table.ts`,
+  `db-writer.ts` (sequence oracle and clock in the commit transaction, D20; `ChangelogExport` is
+  `exportChangelog`), `writer-client.ts`, `writer-server.ts`, `writer-http-api.ts`.
 - **`CompactionScheduler` (pure)** — done. `lsm-core/src/size-tiered-compaction-scheduler.ts`;
   `size-tiered-compaction-scheduler.test.ts` over `Arbitrary` manifests and options: jobs are
   consecutive, all-L0 or all-runs, within min/max sources and `includeSizeThreshold`, never overlap
@@ -103,8 +121,9 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 
 ## §8 Public API and semantics
 
-- **`put`, `delete`, `merge`, `write`, `get`, `getRow`, `scan`, `flush`** — pending (Phases 4–5).
-- **Errors** — partial. Core: `SstCorruptedError`, `MergeOperatorMissingError`
+- **`put`, `delete`, `merge`, `write`, `get`, `getRow`, `scan`, `flush`** — partial. Write side:
+  `DbHttpApi` (`write`, `flush`) and `WriterClient`; reads in Phase 5 (`DbClient`).
+- **Errors** — partial (public envelope done: `db-public-error.ts`, `db-public-error-translation.ts`, D25; `WriteStalledError`, `WriterUnavailableError`, `DatabaseNotFoundError` in `lsm-errors.ts`). Core: `SstCorruptedError`, `MergeOperatorMissingError`
   (`lsm-core-errors.ts`), `WriterFencedError`, `CompactorFencedError`, `DatabaseSealedError`,
   `CompactionInputsChangedError` (`manifest.ts`). Pending: `KeyOutOfRangeError`,
   `WriteStalledError`, `ManifestConflictError`, `ObjectStoreUnavailableError`, public HTTP errors.
@@ -141,14 +160,19 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 ## §11 Trade-offs
 
 - **`maxUnflushedBytes` backpressure; 128 MB streaming; multipart parts ≥ 5 MiB** — partial.
-  Settings in `lsm-settings.ts`; streaming SST builder (`SstBuilder.add` returns closed blocks);
-  Bloom builder keeps 8 bytes per key (D9). Writer and compaction: Phases 4 and 6.
+  `WriteStalledError` on `maxUnflushedBytes` and `l0MaxSsts` (`db-writer.test.ts`); flush streams
+  memtable pages into the SST builder and closed blocks into uniform multipart parts
+  (`ObjectStore.putMultipart`, test layer enforces the 5 MiB minimum). Compaction: Phase 6.
 
 ## §12 Multi-tenancy primitives and sharding
 
-- **Key-range bounds (`KeyOutOfRangeError`)** — partial (`Manifest.keyRange`); writer: Phase 4.
-- **Seal (`DatabaseSealedError { successors }`)** — partial (`sealManifest`, `fenceWriter` and
-  `commitL0Flush` reject sealed; `manifest.test.ts`).
+- **Key-range bounds (`KeyOutOfRangeError`)** — done (writes). `collapseWriteBatch` checks
+  `Manifest.keyRange`; public `KeyOutOfRange` (409). Tests: `write-batch.test.ts`,
+  `db-writer.test.ts`.
+- **Seal (`DatabaseSealedError { successors }`)** — partial. `DbWriter.seal` holds the commit lock,
+  flushes, then `sealManifest` (fences the writer); later writes fail with `DatabaseSealedError` and
+  the successors. Tests: `db-writer.test.ts`, `writer-client.test.ts`. Lifecycle orchestration and
+  formal check 5: Phase 7.
 - **Zero-copy `forkRange` (SST views + external references)** — partial (`forkManifest`;
   `manifest.test.ts`) (D13).
 - **GC per database respecting fork checkpoints** — pending (Phase 6–7).
@@ -164,8 +188,9 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   the probe and smoke Workers; every new handler must use `eventTelemetryFlushForStage` (D5).
   Tests: `lsm-cloudflare/src/lsm-telemetry.test.ts`, `test/telemetry/*.workerd.ts`.
 - **Scenario CLI (write/read, flush, compaction, fork/split, fencing, changelog)** — pending.
-- **Formal checks 1–6** — partial. Check 2 (fencing) and 3 (manifest CAS linearizability):
+- **Formal checks 1–6** — partial. Check 1 (no acknowledged write lost or hidden): `NoAckedWriteLost.tla`, skill
+  `.agents/skills/verify-no-acked-write-lost`. Check 2 (fencing) and 3 (manifest CAS linearizability):
   `tools/formal-verification/specs/ManifestCasFencing.tla`, skill
   `.agents/skills/verify-manifest-cas-fencing`, run by `vp run verify`, each broken variant shown
-  failing. Checks 1, 4, 5, 6 pending.
+  failing. Checks 4, 5, 6 pending.
 - **Hardening scenarios** — pending (Phase 10).

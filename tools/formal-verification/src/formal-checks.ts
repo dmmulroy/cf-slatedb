@@ -58,4 +58,23 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
       },
     ],
   },
+  {
+    name: "no-acked-write-lost",
+    spec: "NoAckedWriteLost.tla",
+    runs: [
+      { config: "NoAckedWriteLost.cfg", broken: "none", expect: "pass", timeLimitSeconds: 120 },
+      {
+        config: "NoAckedWriteLost.cfg",
+        broken: "truncateBeforeCommit",
+        expect: "NoAckedWriteLost",
+        timeLimitSeconds: 60,
+      },
+      {
+        config: "NoAckedWriteLost.cfg",
+        broken: "nonAtomicProbe",
+        expect: "LatestSeesAcked",
+        timeLimitSeconds: 60,
+      },
+    ],
+  },
 ];

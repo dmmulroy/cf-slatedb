@@ -94,6 +94,20 @@ interface RunOutcome {
   readonly seconds: number;
 }
 
+/** The first lines that explain a TLC failure: semantic errors, parse errors, or `Error` lines. */
+const tlcErrorSummary = (output: string): string => {
+  const lines = output.split("\n").map((line) => line.trim());
+  const detail = lines.filter(
+    (line) =>
+      line.includes("already defined") ||
+      line.includes("Unknown operator") ||
+      line.startsWith("Encountered") ||
+      line.startsWith("line ") ||
+      line.startsWith("Error"),
+  );
+  return detail.slice(0, 4).join(" | ") || "no result";
+};
+
 const runTlc = (
   tools: { readonly java: string; readonly jar: string },
   check: FormalCheck,
@@ -146,12 +160,7 @@ const runTlc = (
           ? violated
           : passed
             ? "pass"
-            : `TLC error: ${
-                output
-                  .split("\n")
-                  .filter((line) => line.startsWith("Error"))
-                  .join(" ") || "no result"
-              }`;
+            : `TLC error: ${tlcErrorSummary(output)}`;
       if (actual !== run.expect) writeFileSync(join(work, "tlc.out"), output);
       else rmSync(work, { recursive: true, force: true });
       done({

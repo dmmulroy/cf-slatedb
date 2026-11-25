@@ -179,3 +179,63 @@ own service (`manifest-reader.ts`) and `ManifestStore` (`create`, `initialize`, 
 it. `loadLatest` reads the `LATEST` hint and probes `id + 1` (no LIST); only when the hinted manifest
 was already collected does it list the manifest prefix to recover, which never happens on a normal
 read path.
+
+## D19. The writer learns its database id from the request path
+
+A Durable Object is addressed by `getByName(databaseId)`, but the name is not reliably available to
+the object itself, so every writer route carries `:databaseId`. The first request (or the alarm,
+which reads it back) records it in `writer_meta`; a later request for another id fails with
+`DatabaseIdMismatchError`. The writer fences in lazily, on its first request or alarm, under an
+initialization semaphore, instead of in `blockConcurrencyWhile` (the id is not known at
+construction). The SQLite tables are created when the instance is built.
+
+## D20. `SeqOracle` and the monotonic clock live inside `MemTable.commit`
+
+Design §7 lists `SeqOracle` as a service whose state is "part of the same SQLite transaction". To
+make that true by construction, `MemTable.commit` assigns `last_seq + 1` inside the commit
+transaction and records the clock tick there; there is no separate service. The clock is
+`max(Clock.currentTimeMillis, last tick)`, seeded on start from the manifest's `lastL0ClockTick`.
+
+## D21. Atomic memtable reads for `Latest`
+
+`DbWriter.probe`, `scan`, and `changes` read `flushed_seq` and the rows in one SQLite transaction
+(`MemTable.consistently`). Reading them as separate Effect steps lets a concurrent flush truncate in
+between, so a `Latest` read could accept a manifest that lacks the truncated rows. The TLA+ model
+`NoAckedWriteLost` found this (variant `nonAtomicProbe`). Multi-page `Latest` scans use the largest
+`flushedSeq` seen across pages.
+
+## D22. Restart drops rows already in L0
+
+On start, the writer deletes memtable rows at or below the manifest's `lastL0Seq` (a crash between
+the manifest commit and the truncate left them). Flushing them again would also be correct (merging
+drops exact duplicates), but dropping them keeps the next L0 SST small.
+
+## D23. Write-batch rules and limits
+
+One batch has one sequence number, so a batch is collapsed to one row per key (`collapseWriteBatch`):
+a later put or delete replaces earlier operations on the key; merges fold with the database's merge
+operator (SlateDB's rule that merges of one key share one TTL); folded results expire at the
+earliest TTL. Limits: key 16 KiB, value 1 MiB (Durable Object SQLite rows hold at most 2 MB),
+10,000 operations, 8 MiB per batch.
+
+## D24. Binary over the HTTP boundary: base64 JSON for v1
+
+Design §11 leaves base64 JSON vs `application/octet-stream` open. v1 uses base64 JSON
+(`Schema.Uint8ArrayFromBase64`) for every key and value on both the writer API and the public API:
+one encoding, Effect `HttpApi` contracts and generated clients end to end, and the cost (~33%) is
+on writes and memtable probes only; SST block reads go through `BlockServer` as raw bytes.
+
+## D25. Public error envelope and translation
+
+The public API (`DbHttpApi`) answers every failure with one schema class per stable code
+(`db-public-error.ts`): `code`, `operation`, `message`, `details` (variant-specific), `requestId`
+(Cloudflare ray id or a UUID, also returned as `x-request-id`), and a truthful `retryable`.
+Internal errors are classified by `toPublicError`, an exhaustive `switch` over the internal tags:
+adding an internal error is a type error until it is classified, which is the guarantee
+`catchTags` gives, in a form that works for the shared translation of every handler.
+
+## D26. Durable Object and Worker classes live in the library
+
+`WriterServer` and `DbApiWorker` are defined in `@cf-slatedb/lsm-cloudflare` (as Alchemy class +
+Layer), so the library's workerd tests can run them. `infra/cf-slatedb` only composes them into the
+Stack with a bundle-entry module (`src/db-api-worker-entry.ts`), passed as `main`.
