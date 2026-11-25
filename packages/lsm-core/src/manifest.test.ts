@@ -92,6 +92,19 @@ describe("Manifest JSON", () => {
       Schema.encodeSync(ManifestJson)(manifest),
     );
   });
+
+  it("decodes manifests written with the per-database jurisdiction option, ignoring it (D49)", () => {
+    const current = Schema.encodeSync(ManifestJson)(empty);
+    for (const jurisdiction of [null, "eu", "fedramp"]) {
+      // A manifest as written before residency moved to the Stack: the option was in `options`.
+      const written = JSON.parse(current);
+      written.options = { ...written.options, jurisdiction };
+      const decoded = Schema.decodeSync(ManifestJson)(JSON.stringify(written));
+      expect(decoded.options).toEqual(empty.options);
+      // The next manifest written from it no longer carries the field.
+      expect(Schema.encodeSync(ManifestJson)(decoded)).toBe(current);
+    }
+  });
 });
 
 describe("manifest edits", () => {

@@ -41,6 +41,7 @@ import type { ObjectStore } from "./object-store.ts";
 import { sstStoreLayerWithoutDependencies } from "./sst-store.ts";
 import { durableObjectAlarmTestLayer } from "./durable-object-alarm.ts";
 import { WriterHttpApi } from "./writer-http-api.ts";
+import { inLsmJurisdiction, lsmJurisdiction, type LsmJurisdiction } from "./lsm-jurisdiction.ts";
 import { writerHttpRouterLayer } from "./writer-http-handlers.ts";
 import { WriterServer } from "./writer-server.ts";
 import { writerSqlStorageTestLayer } from "./writer-sql-storage.ts";
@@ -251,14 +252,20 @@ const writerClientOperations = <E, R>(
   };
 };
 
+/** The `WriterServer` namespace operations the writer client uses: lookup by name, jurisdiction. */
+export interface WriterServerNamespace {
+  readonly getByName: (name: string) => Parameters<typeof Cloudflare.toHttpClient>[0];
+  readonly jurisdiction: (jurisdiction: LsmJurisdiction) => WriterServerNamespace;
+}
+
 /**
  * Constructs the writer client over a `WriterServer` namespace, with one generated HTTP client per
  * database per invocation (Alchemy execution memo + `Cache`), never retained across invocations.
+ * Writers are addressed in the Stack's jurisdiction (`lsmJurisdiction`).
  */
-export const makeWriterClientOver = (namespace: {
-  readonly getByName: (name: string) => Parameters<typeof Cloudflare.toHttpClient>[0];
-}) =>
+export const makeWriterClientOver = (namespace: WriterServerNamespace) =>
   Effect.gen(function* () {
+    const jurisdiction = yield* lsmJurisdiction;
     const clients = yield* makeExecutionMemo(
       Cache.make({
         capacity: Number.POSITIVE_INFINITY,
@@ -266,7 +273,9 @@ export const makeWriterClientOver = (namespace: {
           Effect.suspend(() =>
             HttpApiClient.makeWith(WriterHttpApi, {
               baseUrl: "http://writer.internal",
-              httpClient: Cloudflare.toHttpClient(namespace.getByName(databaseId)),
+              httpClient: Cloudflare.toHttpClient(
+                inLsmJurisdiction(namespace, jurisdiction).getByName(databaseId),
+              ),
             }),
           ),
       }),

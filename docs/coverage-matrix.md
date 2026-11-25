@@ -295,12 +295,15 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   One bucket with `db/<id>/` prefixes and no LIST on read paths; owner database in every block URL
   (`block-server-http-api.ts`); L1 cache bounded by entry count, not a per-`budgetGroup` byte budget
   (D32, gap).
-- **Data residency (`DatabaseOptions.jurisdiction`; forks inherit it)** — partial. The option is
-  stored in the manifest and forks inherit it (`forkManifest` copies options), but Durable Object
-  placement and R2 residency are not enforced: per-database R2 residency needs the bucket chosen
-  before the manifest can be read (a bucket per jurisdiction keyed by the database id, or a
-  directory), and per-Stack residency (bucket and Durable Object jurisdiction for a whole
-  installation) is the simpler alternative. Waiting on a decision (open question 3).
+- **Data residency** — done, per Stack (D49). `lsm-jurisdiction.ts` (`lsmJurisdiction`,
+  `inLsmJurisdiction`, `lsmJurisdictionAtDeclaration`), applied in `lsm-bucket.ts`,
+  `trace-collector-worker.ts` (buckets), `writer-client.ts`, `compactor-client.ts`,
+  `compaction-budget-server.ts`, `shard-directory-server.ts`, the probe (Durable Objects),
+  `compaction-workflow.ts` (Workflow), and `block-server-worker.ts` (Workers Cache off when
+  restricted); `preview-cli deploy --jurisdiction`. The per-database option is removed; old manifests
+  decode. Tests: `lsm-jurisdiction.test.ts`, `manifest.test.ts`, `preview-stage.test.ts`. Live:
+  `preview-2` deployed with `eu` — Cloudflare reports both buckets and the Workflow in `eu`, all 11
+  scenarios pass, and `BlockServer` responses carry no `Cf-Cache-Status`.
 - **Removal (fails while forks depend; purges in batches)** — done. `DatabaseLifecycle.remove`
   (`DatabaseHasDependentsError`; one tag purge per database through `BlockServer`).
 - **Sharding: `ShardDirectory`, `ShardRouter`, `ShardSplit`** — done. `packages/lsm-sharding`:

@@ -513,9 +513,9 @@ const removal: Scenario = {
 const blockCache: Scenario = {
   name: "block-cache",
   description:
-    "Reads one flushed block through two Workers: the second gets it from Workers Cache (Cf-Cache-Status HIT) on a preview.",
+    "Reads one flushed block through two Workers: the second gets it from Workers Cache (Cf-Cache-Status HIT) on an unrestricted preview.",
   run: Effect.gen(function* () {
-    const { previewStage } = yield* ScenarioStack;
+    const { workersCache } = yield* ScenarioStack;
     const group = ShardGroup.make(uniqueId("sc-cache"));
     const databaseId = DatabaseId.make(`${group}-0`);
     const shards = yield* shardsApi;
@@ -545,15 +545,14 @@ const blockCache: Scenario = {
       select: { databaseId },
       checks: [
         { _tag: "SpanCount", span: { name: "BlockSource.block" }, count: { atLeast: 2 } },
-        // Workers Cache is not emulated locally: there the header is absent.
-        Option.isSome(previewStage)
-          ? {
-              _tag: "SpanExists",
-              span: { attributes: { "cache.l2.status": "HIT" } },
-            }
+        // Workers Cache is not emulated locally, and a Stack restricted to a jurisdiction turns it
+        // off: there no block is served from it.
+        workersCache
+          ? { _tag: "SpanExists", span: { attributes: { "cache.l2.status": "HIT" } } }
           : {
-              _tag: "SpanExists",
-              span: { attributes: { "cache.l2.status": "absent" } },
+              _tag: "SpanCount",
+              span: { attributes: { "cache.l2.status": "HIT" } },
+              count: { equals: 0 },
             },
         { _tag: "NoErrorStatus" },
       ],

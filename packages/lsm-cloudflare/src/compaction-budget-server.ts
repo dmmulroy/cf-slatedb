@@ -16,6 +16,7 @@ import { CompactionBudgetHttpApi } from "./compaction-budget-http-api.ts";
 import { durableObjectCell } from "./durable-object-cell.ts";
 import { LsmConfiguration } from "./lsm-configuration.ts";
 import { lsmHttpServerLayer } from "./lsm-http-server.ts";
+import { inLsmJurisdiction, lsmJurisdiction } from "./lsm-jurisdiction.ts";
 import { eventTelemetryFlushForStage } from "./lsm-telemetry.ts";
 
 /** Handlers of the budget HTTP API, delegating to the contextual (ledger) `CompactionBudget`. */
@@ -83,11 +84,14 @@ export const compactionBudgetClientLayer = Layer.effect(
   CompactionBudget,
   Effect.gen(function* () {
     const namespace = yield* CompactionBudgetServer;
+    const jurisdiction = yield* lsmJurisdiction;
     const client = yield* makeExecutionMemo(
       Effect.suspend(() =>
         HttpApiClient.makeWith(CompactionBudgetHttpApi, {
           baseUrl: "http://compaction-budget.internal",
-          httpClient: Cloudflare.toHttpClient(namespace.getByName(COMPACTION_BUDGET_INSTANCE)),
+          httpClient: Cloudflare.toHttpClient(
+            inLsmJurisdiction(namespace, jurisdiction).getByName(COMPACTION_BUDGET_INSTANCE),
+          ),
         }),
       ),
     );

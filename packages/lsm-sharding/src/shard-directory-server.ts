@@ -3,7 +3,9 @@ import { DatabaseId } from "@cf-slatedb/lsm-core";
 import {
   durableObjectCell,
   eventTelemetryFlushForStage,
+  inLsmJurisdiction,
   lsmHttpServerLayer,
+  lsmJurisdiction,
 } from "@cf-slatedb/lsm-cloudflare";
 import type { HttpEffect } from "alchemy/Http";
 import { makeExecutionMemo } from "alchemy/Runtime/ExecutionMemo";
@@ -144,6 +146,7 @@ export const shardDirectoryLayer = Layer.effect(
   ShardDirectory,
   Effect.gen(function* () {
     const namespace = yield* ShardDirectoryServer;
+    const jurisdiction = yield* lsmJurisdiction;
     const clients = yield* makeExecutionMemo(
       Cache.make({
         capacity: Number.POSITIVE_INFINITY,
@@ -151,7 +154,9 @@ export const shardDirectoryLayer = Layer.effect(
           Effect.suspend(() =>
             HttpApiClient.makeWith(ShardDirectoryHttpApi, {
               baseUrl: "http://shard-directory.internal",
-              httpClient: Cloudflare.toHttpClient(namespace.getByName(group)),
+              httpClient: Cloudflare.toHttpClient(
+                inLsmJurisdiction(namespace, jurisdiction).getByName(group),
+              ),
             }),
           ),
       }),

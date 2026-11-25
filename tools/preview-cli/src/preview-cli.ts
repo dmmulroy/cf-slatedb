@@ -22,11 +22,13 @@ import { Argument, Command, Flag } from "effect/cli";
 
 import {
   CF_SLATEDB_STACK_NAME,
+  deployJurisdiction,
   deployTask,
   destroyCommand,
   parseStateRead,
   PREVIEW_DEV_TIMINGS,
   PREVIEW_STAGES,
+  PreviewJurisdiction,
   previewOutputs,
   previewSecret,
   type PreviewStage,
@@ -95,6 +97,12 @@ const deploy = Command.make(
   "deploy",
   {
     stage: stageArgument,
+    jurisdiction: Flag.Literals("jurisdiction", PreviewJurisdiction.literals).pipe(
+      Flag.withDescription(
+        "Data residency for the whole stage: eu, fedramp, or none. Default: the stage's current one. Changing it replaces the stage's buckets and Workflow and starts new Durable Objects: the data does not move.",
+      ),
+      Flag.optional,
+    ),
     devTimings: Flag.Boolean("dev-timings").pipe(
       Flag.withDescription(
         `Use vp run dev's short GC and compactor timings (${JSON.stringify(PREVIEW_DEV_TIMINGS)}) instead of the production defaults`,
@@ -103,15 +111,31 @@ const deploy = Command.make(
     ),
     json: jsonFlag,
   },
-  ({ stage, devTimings, json }) =>
+  ({ stage, jurisdiction, devTimings, json }) =>
     Effect.gen(function* () {
-      // Settings come only from the flag: a value left in the shell must not change a preview.
-      const { CF_SLATEDB_LSM_SETTINGS: _ignored, ...inherited } = process.env;
-      const env = devTimings
-        ? { ...inherited, CF_SLATEDB_LSM_SETTINGS: JSON.stringify(PREVIEW_DEV_TIMINGS) }
-        : inherited;
+      const current = yield* previewOutputs(yield* readStateRecords(Option.some(stage)), stage);
+      const residency = deployJurisdiction(jurisdiction, current);
+      const previous = Option.flatMap(current, (outputs) =>
+        Option.fromUndefinedOr(outputs.jurisdiction),
+      );
+      if (Option.isSome(previous) && previous.value !== residency) {
+        yield* Console.error(
+          `${stage} moves from jurisdiction ${previous.value} to ${residency}: its buckets and Workflow are replaced and new Durable Objects are addressed, so its databases do not carry over.`,
+        );
+      }
+      // Settings come only from the flags: values left in the shell must not change a preview.
+      const {
+        CF_SLATEDB_LSM_SETTINGS: _settings,
+        CF_SLATEDB_JURISDICTION: _jurisdiction,
+        ...inherited
+      } = process.env;
+      const env = {
+        ...inherited,
+        ...(devTimings ? { CF_SLATEDB_LSM_SETTINGS: JSON.stringify(PREVIEW_DEV_TIMINGS) } : {}),
+        ...(residency === "none" ? {} : { CF_SLATEDB_JURISDICTION: residency }),
+      };
       yield* Console.error(
-        `Deploying ${CF_SLATEDB_STACK_NAME} to ${stage} with ${devTimings ? "dev" : "production"} timings (vp run ${deployTask(stage)})`,
+        `Deploying ${CF_SLATEDB_STACK_NAME} to ${stage} with ${devTimings ? "dev" : "production"} timings, jurisdiction ${residency} (vp run ${deployTask(stage)})`,
       );
       const result = yield* Effect.sync(() =>
         // The task's own output goes to stderr, so stdout carries only this command's result.

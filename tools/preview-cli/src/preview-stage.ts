@@ -19,6 +19,27 @@ export const CF_SLATEDB_STACK_NAME = "CfSlatedb";
  */
 export const PREVIEW_DEV_TIMINGS = { gcMinAge: 10_000, compactorPollInterval: 1_000 } as const;
 
+/** Schema for a preview's data-residency jurisdiction: `none` leaves it unrestricted. */
+export const PreviewJurisdiction = Schema.Literals(["none", "eu", "fedramp"]);
+
+/** A preview's data-residency jurisdiction. */
+export type PreviewJurisdiction = typeof PreviewJurisdiction.Type;
+
+/**
+ * The jurisdiction a deploy uses: the one asked for, or else the stage's current one (so a redeploy
+ * never moves an installation by accident), or else none.
+ */
+export const deployJurisdiction = (
+  requested: Option.Option<PreviewJurisdiction>,
+  current: Option.Option<PreviewOutputs>,
+): PreviewJurisdiction =>
+  Option.getOrElse(requested, () =>
+    Option.getOrElse(
+      Option.flatMap(current, (outputs) => Option.fromUndefinedOr(outputs.jurisdiction)),
+      () => "none" as const,
+    ),
+  );
+
 /** Schema for a deployed preview's Stack outputs (`CfSlatedb/<stage>/output` in Alchemy state). */
 export const PreviewOutputs = Schema.Struct({
   /** Public database API (`/v1`). */
@@ -33,6 +54,8 @@ export const PreviewOutputs = Schema.Struct({
   probeUrl: Schema.String,
   /** OTLP receiver of the stage's spans (`TraceCollector`), once the Stack has one. */
   traceCollectorUrl: Schema.optionalKey(Schema.String),
+  /** Data-residency jurisdiction (`eu`, `fedramp`, `none`), once the Stack reports one. */
+  jurisdiction: Schema.optionalKey(PreviewJurisdiction),
 });
 
 /** A deployed preview's Stack outputs. */

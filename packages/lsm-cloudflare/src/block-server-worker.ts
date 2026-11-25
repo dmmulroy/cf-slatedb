@@ -2,7 +2,7 @@ import * as Cloudflare from "@alchemy.run/cloudflare";
 import type { HttpEffect } from "alchemy/Http";
 import { makeExecutionMemo } from "alchemy/Runtime/ExecutionMemo";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
-import { Effect, Layer } from "effect";
+import { Effect, Layer, Option } from "effect";
 import { HttpRouter } from "effect/http";
 
 import {
@@ -10,6 +10,7 @@ import {
   blockServerHttpRouterLayer,
   databaseCacheTag,
 } from "./block-server-http-handlers.ts";
+import { lsmJurisdiction } from "./lsm-jurisdiction.ts";
 import { lsmWorkerCompatibility } from "./lsm-stage.ts";
 import { eventTelemetryFlushForStage, type LsmWorkerTelemetry } from "./lsm-telemetry.ts";
 import { ObjectReader, objectReaderLayer } from "./object-reader.ts";
@@ -50,7 +51,13 @@ export const blockServerWorkerLayer = <R = never>(options: BlockServerWorkerOpti
       };
     }),
     Effect.gen(function* () {
-      const cache = yield* Cloudflare.cache({ crossVersionCache: true });
+      // Workers Cache keeps block bytes in data centers anywhere: a Stack restricted to a
+      // jurisdiction turns it off, and its readers rely on L1 and R2 alone (D49).
+      const jurisdiction = yield* lsmJurisdiction;
+      const cache = yield* Cloudflare.cache({
+        crossVersionCache: true,
+        enabled: Option.isNone(jurisdiction),
+      });
       const objects = yield* ObjectReader;
       const withEventTelemetryFlush = yield* eventTelemetryFlushForStage;
       const cachePurge = BlockCachePurge.of({

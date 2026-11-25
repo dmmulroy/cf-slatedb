@@ -55,6 +55,9 @@ docs, RFCs, Rust source, and FizzBee specs when you implement the matching part.
   `destroy:preview-<n>` tasks are for Dillon; `preview-cli destroy-command <stage>` prints them).
   Any other live operation needs Dillon's approval: write the request under "Open questions" in
   `docs/progress.md` and keep working on anything not blocked.
+- A Stack runs in one data-residency jurisdiction (`--jurisdiction eu|fedramp|none` on
+  `preview-cli deploy`, D49); it is fixed per installation, so do not change it on a stage holding
+  data you need.
 - Live stages keep Alchemy state in the account's Cloudflare state store (D43), and their public
   Workers require the stage's access token (`Authorization: Bearer $(preview-cli token <stage>)`,
   D44).

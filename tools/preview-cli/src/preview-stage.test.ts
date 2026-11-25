@@ -1,7 +1,13 @@
 import { Effect, Option } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 
-import { destroyCommand, parseStateRead, previewOutputs, previewSecret } from "./preview-stage.ts";
+import {
+  deployJurisdiction,
+  destroyCommand,
+  parseStateRead,
+  previewOutputs,
+  previewSecret,
+} from "./preview-stage.ts";
 
 const outputs = {
   apiUrl: "https://cfslatedb-dbapiworker-preview-1-abc.example.workers.dev",
@@ -71,5 +77,18 @@ describe("preview state", () => {
 
   it("prints a destroy command for Dillon that goes through the stage's vp task", () => {
     expect(destroyCommand("preview-3")).toBe("vp run @cf-slatedb/infra#destroy:preview-3");
+  });
+});
+
+describe("deployJurisdiction", () => {
+  const deployed = (jurisdiction: "none" | "eu" | "fedramp") =>
+    Option.some({ ...outputs, jurisdiction });
+
+  it("keeps a stage's jurisdiction unless the deploy asks for another, so a redeploy never moves it", () => {
+    expect(deployJurisdiction(Option.none(), Option.none())).toBe("none");
+    expect(deployJurisdiction(Option.none(), deployed("eu"))).toBe("eu");
+    expect(deployJurisdiction(Option.some("none"), deployed("eu"))).toBe("none");
+    expect(deployJurisdiction(Option.some("fedramp"), Option.some(outputs))).toBe("fedramp");
+    expect(deployJurisdiction(Option.none(), Option.some(outputs))).toBe("none");
   });
 });

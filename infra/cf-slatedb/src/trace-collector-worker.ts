@@ -3,6 +3,7 @@ import {
   LSM_WORKER_COMPATIBILITY_DATE,
   lsmAccessGateFor,
   lsmHttpServerLayer,
+  lsmJurisdiction,
 } from "@cf-slatedb/lsm-cloudflare";
 import * as Alchemy from "alchemy";
 import type { HttpEffect } from "alchemy/Http";
@@ -33,9 +34,15 @@ export const TraceCollectorToken = Alchemy.makeRandom("TraceCollectorToken");
 
 /**
  * The R2 bucket holding a live stage's OTLP exports, one object per export under `traces/`, keyed
- * by arrival time. Only live stages have one; its name is generated and it is never retained.
+ * by arrival time. Only live stages have one; its name is generated, it is never retained, and it
+ * is created in the Stack's jurisdiction like the LSM bucket.
  */
-export const TraceBucket = Cloudflare.R2.Bucket("TraceBucket", {});
+export const TraceBucket = Cloudflare.R2.Bucket(
+  "TraceBucket",
+  Effect.map(lsmJurisdiction, (jurisdiction) =>
+    Option.isSome(jurisdiction) ? { jurisdiction: jurisdiction.value } : {},
+  ),
+);
 
 class TraceBucketClient extends Context.Service<
   TraceBucketClient,

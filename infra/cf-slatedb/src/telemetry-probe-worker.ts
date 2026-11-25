@@ -1,6 +1,8 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
 import {
   eventTelemetryFlushForStage,
+  inLsmJurisdiction,
+  lsmJurisdiction,
   lsmAccessGateForStage,
   lsmWorkerCompatibility,
 } from "@cf-slatedb/lsm-cloudflare";
@@ -62,13 +64,16 @@ export const telemetryProbeWorkerLayer = TelemetryProbeWorker.make(
   }),
   Effect.gen(function* () {
     const namespace = yield* TelemetryProbeServer;
+    const jurisdiction = yield* lsmJurisdiction;
     const withEventTelemetryFlush = yield* eventTelemetryFlushForStage;
     const withAccessGate = yield* lsmAccessGateForStage;
     return {
       fetch: withAccessGate(
         Effect.gen(function* () {
           const request = yield* HttpServerRequest.HttpServerRequest;
-          const client = Cloudflare.toHttpClient(namespace.getByName("probe"));
+          const client = Cloudflare.toHttpClient(
+            inLsmJurisdiction(namespace, jurisdiction).getByName("probe"),
+          );
           const path = request.url.endsWith("/alarm") ? "/alarm" : "/";
           const response = yield* client.execute(HttpClientRequest.get(`http://probe${path}`));
           return HttpServerResponse.text(`worker-saw:${yield* response.text}`);

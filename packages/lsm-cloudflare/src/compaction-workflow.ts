@@ -1,5 +1,5 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
-import { Effect, Layer, Schema } from "effect";
+import { Effect, Layer, Option, Schema } from "effect";
 
 import { CompactionExecutor } from "./compaction-executor.ts";
 import {
@@ -9,6 +9,7 @@ import {
   runCompactionJob,
 } from "./compaction-job.ts";
 import { CompactionLauncher, CompactionLauncherUnavailableError } from "./compaction-launcher.ts";
+import { lsmJurisdictionAtDeclaration } from "./lsm-jurisdiction.ts";
 
 /**
  * Runs each step as a durable Workflow step: its result is encoded with the step's Schema (Workflow
@@ -35,6 +36,11 @@ const workflowStepRunner: CompactionStepRunner<Cloudflare.Workflows.WorkflowStep
  */
 export class CompactionWorkflow extends Cloudflare.Workflow<CompactionWorkflow>()(
   "CompactionWorkflow",
+  // Steps record SST handles, whose first and last keys are data: the Workflow runs and stores in
+  // the Stack's jurisdiction (D49). It is read when this module loads, from the deploy's environment.
+  Option.isSome(lsmJurisdictionAtDeclaration)
+    ? { jurisdiction: lsmJurisdictionAtDeclaration.value }
+    : {},
   Effect.gen(function* () {
     const executor = yield* CompactionExecutor;
     return Effect.fn("CompactionWorkflow.run")(function* (

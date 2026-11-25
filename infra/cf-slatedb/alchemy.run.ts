@@ -8,6 +8,7 @@ import {
   GcWorker,
   isLocalLsmStage,
   LSM_WORKER_COMPATIBILITY_DATE,
+  lsmJurisdiction,
 } from "@cf-slatedb/lsm-cloudflare";
 import * as Alchemy from "alchemy";
 import { ShardRouterWorker } from "@cf-slatedb/sharding";
@@ -58,7 +59,10 @@ const cfSlatedbStackLayer = Layer.unwrap(
  * Local first: `vp run dev` runs it under Alchemy's local providers (stage `dev`: local R2, Durable
  * Objects, and Workflows) with local state. Live stages (the approved previews `preview-1`,
  * `preview-2`, `preview-3`) keep their state in the account's Cloudflare state store, so any machine
- * can redeploy them (`cfSlatedbStateLayer`, decision D43).
+ * can redeploy them (`cfSlatedbStateLayer`, decision D43). `CF_SLATEDB_JURISDICTION` (`eu`,
+ * `fedramp`, or unset) in the deploy's environment restricts the whole Stack to one jurisdiction
+ * (D49); it is fixed per installation, because changing it replaces the buckets and the Workflow and
+ * addresses new Durable Objects.
  */
 const CfSlatedbStack = Alchemy.Stack(
   "CfSlatedb",
@@ -73,6 +77,7 @@ const CfSlatedbStack = Alchemy.Stack(
     // Live stages export spans to their own collector (`cfSlatedbTelemetry`); local stages export
     // to the trace CLI's receiver and have none.
     const stage = yield* Alchemy.Stage;
+    const jurisdiction = yield* lsmJurisdiction;
     const traces = isLocalLsmStage(stage)
       ? Option.none()
       : Option.some(yield* Cloudflare.Worker.ref(TraceCollectorWorker));
@@ -88,6 +93,8 @@ const CfSlatedbStack = Alchemy.Stack(
     return {
       /** URL of the public database API (`/v1`). */
       apiUrl: api.url,
+      /** Data-residency jurisdiction of every bucket, Durable Object, and the Workflow (D49). */
+      jurisdiction: Option.getOrElse(jurisdiction, () => "none"),
       /** URL of the sharded API (the sharding package's example Worker). */
       shardsUrl: shards.url,
       /** URL of the GC operator API: the dev port locally, workers.dev on live stages. */

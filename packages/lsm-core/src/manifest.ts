@@ -126,14 +126,18 @@ export type ChangelogEntry = typeof ChangelogEntry.Type;
 /**
  * Schema for the options a database is created with; readers, writers, and compactors all read
  * them from the manifest.
+ *
+ * **Details**
+ *
+ * Data residency is not a database option: a whole Stack runs in one jurisdiction (D49). Manifests
+ * written before that carry a `jurisdiction` field; decoding ignores it and the next manifest
+ * written drops it.
  */
 export const DatabaseOptions = Schema.Struct({
   /** Merge operator that resolves merge operands; none makes merge rows unreadable. */
   mergeOperator: Schema.OptionFromNullOr(MergeOperatorName),
   /** Group for fair compaction and cache budgets; defaults to the database id. */
   budgetGroup: Schema.OptionFromNullOr(Schema.String),
-  /** Data residency for the writer and compactor Durable Objects; a fork inherits its source's. */
-  jurisdiction: Schema.OptionFromNullOr(Schema.Literals(["eu", "fedramp"])),
   /** Changelog export: none disables it; retention is how long GC keeps changelog SSTs. */
   changelog: Schema.OptionFromNullOr(Schema.Struct({ retentionMs: Schema.Int })),
 });
@@ -141,11 +145,10 @@ export const DatabaseOptions = Schema.Struct({
 /** The options a database is created with. */
 export type DatabaseOptions = typeof DatabaseOptions.Type;
 
-/** Default options: no merge operator, budget group = database id, no residency, no changelog. */
+/** Default options: no merge operator, budget group = database id, no changelog. */
 export const DEFAULT_DATABASE_OPTIONS: DatabaseOptions = {
   mergeOperator: Option.none(),
   budgetGroup: Option.none(),
-  jurisdiction: Option.none(),
   changelog: Option.none(),
 };
 

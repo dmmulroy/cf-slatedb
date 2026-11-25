@@ -40,7 +40,12 @@ const PREVIEW_CLI = fileURLToPath(new URL("../../preview-cli/src/preview-cli.ts"
 
 const decodePreviewUrls = Schema.decodeUnknownEffect(
   Schema.fromJsonString(
-    Schema.Struct({ apiUrl: Schema.String, gcUrl: Schema.String, shardsUrl: Schema.String }),
+    Schema.Struct({
+      apiUrl: Schema.String,
+      gcUrl: Schema.String,
+      shardsUrl: Schema.String,
+      jurisdiction: Schema.optionalKey(Schema.String),
+    }),
   ),
 );
 const decodePreviewToken = Schema.decodeUnknownEffect(
@@ -117,7 +122,13 @@ const run = Command.make(
         Option.match(stage, {
           onNone: () =>
             Layer.mergeAll(
-              Layer.succeed(ScenarioStack, { api, gc, shards, previewStage: Option.none() }),
+              Layer.succeed(ScenarioStack, {
+                api,
+                gc,
+                shards,
+                previewStage: Option.none(),
+                workersCache: false,
+              }),
               FetchHttpClient.layer,
             ),
           // Preview Workers answer `401` without the stage's access token (D44).
@@ -142,6 +153,7 @@ const previewStackLayer = (stage: string) =>
           gc: urls.gcUrl,
           shards: urls.shardsUrl,
           previewStage: Option.some(stage),
+          workersCache: (urls.jurisdiction ?? "none") === "none",
         }),
         Layer.effect(
           HttpClient.HttpClient,

@@ -14,6 +14,7 @@ import {
 import { CompactorHttpApi } from "./compactor-http-api.ts";
 import { CompactorServer } from "./compactor-server.ts";
 import { CompactorWorker } from "./compactor-worker.ts";
+import { inLsmJurisdiction, lsmJurisdiction } from "./lsm-jurisdiction.ts";
 
 /** Calls a database's compactor (`CompactorServer`, hosted by `CompactorWorker`) over HTTP. */
 export interface ICompactorClient {
@@ -45,6 +46,7 @@ export const compactorClientLayer = Layer.effect(
   CompactorClient,
   Effect.gen(function* () {
     const namespace = yield* CompactorServer.from(CompactorWorker);
+    const jurisdiction = yield* lsmJurisdiction;
     const clients = yield* makeExecutionMemo(
       Cache.make({
         capacity: Number.POSITIVE_INFINITY,
@@ -52,7 +54,9 @@ export const compactorClientLayer = Layer.effect(
           Effect.suspend(() =>
             HttpApiClient.makeWith(CompactorHttpApi, {
               baseUrl: "http://compactor.internal",
-              httpClient: Cloudflare.toHttpClient(namespace.getByName(databaseId)),
+              httpClient: Cloudflare.toHttpClient(
+                inLsmJurisdiction(namespace, jurisdiction).getByName(databaseId),
+              ),
             }),
           ),
       }),

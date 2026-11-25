@@ -1,7 +1,9 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
 import * as Alchemy from "alchemy";
 import * as RemovalPolicy from "alchemy/RemovalPolicy";
-import { Context, Effect, Layer } from "effect";
+import { Context, Effect, Layer, Option } from "effect";
+
+import { lsmJurisdiction } from "./lsm-jurisdiction.ts";
 
 /** Alchemy stage that pins the bucket's production name and retains it. */
 export const LSM_PRODUCTION_STAGE = "production";
@@ -13,14 +15,18 @@ export const LSM_PRODUCTION_STAGE = "production";
  * **Details**
  *
  * Production would use the name `cf-slatedb` and be retained; every other stage gets a generated,
- * destroyable name. Under `alchemy dev` it is Alchemy's local R2 simulator.
+ * destroyable name. It is created in the Stack's jurisdiction (`lsmJurisdiction`), if any. Under
+ * `alchemy dev` it is Alchemy's local R2 simulator.
  */
 export const LsmBucket = Effect.gen(function* () {
   const stage = yield* Alchemy.Stage;
   const production = stage === LSM_PRODUCTION_STAGE;
-  return yield* Cloudflare.R2.Bucket("LsmBucket", production ? { name: "cf-slatedb" } : {}).pipe(
-    RemovalPolicy.retain(production),
-  );
+  const jurisdiction = yield* lsmJurisdiction;
+  return yield* Cloudflare.R2.Bucket("LsmBucket", {
+    ...(production ? { name: "cf-slatedb" } : {}),
+    // The Stack's jurisdiction (D49). Changing it replaces the bucket: it is fixed per installation.
+    ...(Option.isSome(jurisdiction) ? { jurisdiction: jurisdiction.value } : {}),
+  }).pipe(RemovalPolicy.retain(production));
 });
 
 /** The read-write client of {@link LsmBucket} for the current Worker or Durable Object. */

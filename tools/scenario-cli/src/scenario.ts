@@ -24,6 +24,11 @@ export interface StackUrls {
    * before each response returns.
    */
   readonly previewStage: Option.Option<string>;
+  /**
+   * Whether Workers Cache runs in front of `BlockServer`: on a preview stage without a
+   * jurisdiction. Local stages do not emulate it, and a restricted Stack turns it off (D49).
+   */
+  readonly workersCache: boolean;
 }
 
 /** The Stack a scenario runs against: `vp run dev`, or a live preview stage. */

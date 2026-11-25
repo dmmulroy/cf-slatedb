@@ -557,3 +557,35 @@ spans (`docs/measurements.md`).
 The measurements changed one setting: the shard router retried a sealed or out-of-range write for 5
 seconds, but a split on `preview-1` takes about 13 seconds (each manifest CAS is about 1.1 s on R2),
 so every write arriving early in a split failed. The window is now 30 seconds (every 250 ms).
+
+## D49. Data residency is per Stack; the per-database option is gone
+
+Dillon chose per-Stack residency (open question 3). One jurisdiction — `eu`, `fedramp`, or none —
+applies to a whole installation: `CF_SLATEDB_JURISDICTION` in the deploy's environment
+(`preview-cli deploy <stage> --jurisdiction eu|fedramp|none`), read with `Config` as
+`lsmJurisdiction` (`lsm-jurisdiction.ts`), so every Worker that reads it at plan time gets it bound and
+reads the same value at runtime. A value other than `eu` or `fedramp` stops the Worker. It is applied
+to:
+
+- **R2:** the LSM bucket and the trace bucket are created with that `jurisdiction`.
+- **Durable Objects:** every client addresses its namespace through `inLsmJurisdiction`
+  (`namespace.jurisdiction(j)`): `WriterServer`, `CompactorServer`, `CompactionBudgetServer`,
+  `ShardDirectoryServer`, and the probe. A name addresses a different object in each jurisdiction, so
+  every Worker must agree, which the single bound setting guarantees.
+- **Workflows:** the compaction Workflow's steps record SST handles, whose first and last keys are
+  data, so it is declared with the jurisdiction. Workflow props are fixed when the class is declared,
+  so this one reads the deploy's environment when the module loads (`lsmJurisdictionAtDeclaration`).
+- **Workers Cache is turned off** in a restricted Stack: its tiered cache keeps `BlockServer`'s
+  responses — raw block bytes — in data centers anywhere. Readers then rely on the L1 isolate cache
+  and R2. L1 holds blocks only in the memory of the isolate serving a request, as any Worker
+  processing the data does.
+
+The jurisdiction is fixed per installation. Changing it replaces both buckets and the Workflow and
+addresses new Durable Objects, so a database does not move with it; `preview-cli deploy` keeps a
+stage's current jurisdiction unless `--jurisdiction` asks for another, and warns when it changes.
+
+The advisory per-database `DatabaseOptions.jurisdiction` (stored, inherited by forks, never enforced)
+is removed: it could only disagree with where the Stack actually stores data. Manifests written
+with it still decode — Schema ignores the unknown field — and the next manifest written drops it
+(`manifest.test.ts`). The public API never accepted it. `forkManifest` copies options unchanged, so
+fork inheritance needs nothing.

@@ -60,6 +60,13 @@ in order.
      writes (D40, D48). **Finding (recorded):** the best-effort `LATEST` hint is ~40% of every CAS and
      the forks' compactor wake-ups add ~4 s to a split; moving them off the critical path is left for a
      change that re-runs the manifest CAS model. CPU comes from a new live-only Tail Worker (D48).
+- **5. Data residency, per Stack.** `CF_SLATEDB_JURISDICTION` (`eu` | `fedramp` | unset;
+  `preview-cli deploy --jurisdiction`) restricts both R2 buckets, every Durable Object namespace
+  (through `inLsmJurisdiction` in each client), and the compaction Workflow, and turns Workers Cache
+  off (it would keep block bytes anywhere). The advisory per-database option is removed; old
+  manifests still decode (D49). **Live:** `preview-2` deployed with `eu`: Cloudflare reports the LSM
+  bucket, the trace bucket, and the Workflow in `eu`; all 11 scenarios pass (the `block-cache`
+  scenario expects no Workers Cache `HIT` there and saw none).
 
 ## Done
 
