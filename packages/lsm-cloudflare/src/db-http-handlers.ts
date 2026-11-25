@@ -66,6 +66,39 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
       .handle("status", ({ params }) =>
         writer.status(params.databaseId).pipe(publicFailures("status")),
       )
+      .handle("createCheckpoint", ({ params, payload }) =>
+        lifecycle.createCheckpoint(params.databaseId, payload).pipe(publicFailures("checkpoint")),
+      )
+      .handle("deleteCheckpoint", ({ params }) =>
+        lifecycle
+          .deleteCheckpoint(params.databaseId, params.checkpointId)
+          .pipe(publicFailures("checkpoint")),
+      )
+      .handle("seal", ({ params, payload }) =>
+        lifecycle.seal(params.databaseId, payload.successors).pipe(
+          Effect.map((flushedSeq) => ({ flushedSeq })),
+          publicFailures("seal"),
+        ),
+      )
+      .handle("fork", ({ params, payload }) =>
+        lifecycle
+          .forkRange({
+            source: params.databaseId,
+            checkpointId: payload.checkpointId,
+            range: payload.range,
+            forkId: payload.forkId,
+          })
+          .pipe(
+            Effect.map((created) => ({
+              databaseId: created.manifest.databaseId,
+              manifestId: created.id,
+            })),
+            publicFailures("fork"),
+          ),
+      )
+      .handle("removeDatabase", ({ params }) =>
+        lifecycle.remove(params.databaseId).pipe(publicFailures("remove")),
+      )
       .handle("compaction", ({ params }) =>
         Effect.gen(function* () {
           const latest = yield* manifests.loadLatest(params.databaseId).pipe(

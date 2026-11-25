@@ -132,6 +132,8 @@ export interface IMemTable {
   readonly truncate: (cut: SeqNum) => Effect.Effect<void, MemTableError>;
   /** Unflushed bytes, row count, and the oldest unflushed commit time. */
   readonly stats: Effect.Effect<MemTableStats, MemTableError>;
+  /** Deletes every row and the writer's identity and sequence state (removal of the database). */
+  readonly clear: Effect.Effect<void, MemTableError>;
 }
 
 /** The contextual memtable. */
@@ -414,6 +416,11 @@ export const makeMemTable = Effect.gen(function* () {
         .pipe(Effect.asVoid, Effect.mapError(failed("truncate")));
     }),
     stats,
+    clear: sql
+      .transaction(
+        Effect.all([sql.exec("DELETE FROM memtable_rows"), sql.exec("DELETE FROM writer_meta")]),
+      )
+      .pipe(Effect.asVoid, Effect.mapError(failed("clear")), Effect.withSpan("MemTable.clear")),
   });
 });
 

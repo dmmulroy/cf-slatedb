@@ -102,4 +102,35 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
       },
     ],
   },
+  {
+    name: "seal-split",
+    spec: "SealSplit.tla",
+    runs: [
+      { config: "SealSplit.cfg", broken: "none", expect: "pass", timeLimitSeconds: 60 },
+      {
+        config: "SealSplit.cfg",
+        broken: "sealWithoutLock",
+        expect: "EveryAckedWriteInExactlyOneSuccessor",
+        timeLimitSeconds: 60,
+      },
+      {
+        config: "SealSplit.cfg",
+        broken: "writerNotFenced",
+        expect: "NoCommitAfterSeal",
+        timeLimitSeconds: 60,
+      },
+      {
+        config: "SealSplit.cfg",
+        broken: "checkpointBeforeSeal",
+        expect: "EveryAckedWriteInExactlyOneSuccessor",
+        timeLimitSeconds: 60,
+      },
+      {
+        config: "SealSplit.cfg",
+        broken: "overlappingRanges",
+        expect: "EveryAckedWriteInExactlyOneSuccessor",
+        timeLimitSeconds: 60,
+      },
+    ],
+  },
 ];

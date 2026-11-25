@@ -214,6 +214,29 @@ describe("planCompactions", () => {
     );
   });
 
+  it("rewrites a fork's external SSTs with one full compaction once nothing else is planned", () => {
+    const external = { ...handle(10), owner: Option.some(DatabaseId.make("source")) };
+    const own = handle(10);
+    const fork = withLsm([own], [{ id: SortedRunId.make(3), ssts: [external] }]);
+    const [job, more] = planCompactions(fork, [], DEFAULT_SIZE_TIERED_COMPACTION_OPTIONS);
+    expect(more).toBeUndefined();
+    expect(job).toEqual({
+      sources: [
+        { _tag: "L0", sstId: own.id },
+        { _tag: "SortedRun", id: 3 },
+      ],
+      destination: 3,
+      isBottom: true,
+    });
+    // Not while another job runs, and never for a database reading only its own SSTs.
+    expect(
+      planCompactions(fork, job === undefined ? [] : [job], DEFAULT_SIZE_TIERED_COMPACTION_OPTIONS),
+    ).toEqual([]);
+    expect(planCompactions(withLsm([own], []), [], DEFAULT_SIZE_TIERED_COMPACTION_OPTIONS)).toEqual(
+      [],
+    );
+  });
+
   it("compacts all L0 SSTs (up to the maximum) into a new, newer sorted run", () => {
     let manifest = empty;
     for (const n of [1, 2, 3, 4, 5]) {

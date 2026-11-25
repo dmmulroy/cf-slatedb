@@ -337,3 +337,44 @@ workerd rejects an explicit `nodejs_compat` flag when a Worker restarts (it is t
 waited out the 10-second flush timeout on every request when no collector listened; the integration
 test now starts its own collector on port 4320 (`test/writer/integration-ports.ts`) and asserts on
 the span names it records. The run dropped from minutes to 14 seconds.
+
+## D37. A fork holds its own checkpoint; the caller's checkpoint stays the caller's
+
+`forkRange(source, checkpoint, range, forkId)` does not adopt the caller's checkpoint. In one CAS on
+the source it re-checks that the caller's checkpoint still exists and adds a separate checkpoint held
+by the fork (`holder = forkId`, no expiry) pinning the same manifest, so GC never sees the manifest
+unpinned and the caller can delete its own checkpoint at any time (a split does, right after its
+forks). The fork's first manifest names that hold in `externalRefs`. A retried fork finds its hold
+and its first manifest and succeeds; a fork id taken by another database fails and the hold is
+released. `forkRange` then wakes the fork's compactor.
+
+`createCheckpoint` flushes the writer first, so a checkpoint (and every fork of it) contains every
+write acknowledged before the call. `ManifestStore.update` now passes the manifest id to the edit,
+so the checkpoint pins exactly the manifest its CAS applied to.
+
+## D38. Forks rewrite external SSTs with one full compaction, then release
+
+Size-tiered planning alone may never touch a fork's bottom run, which would keep the source's files
+alive indefinitely. When nothing else is running or planned and the manifest still reads another
+database's SSTs, `planCompactions` plans one full compaction (every L0 SST and sorted run into the
+lowest run, bottom). After it commits, the compactor's next poll releases each external reference
+that no kept manifest still needs (`releasableExternalRefs`: the newest manifest and the manifests
+its own checkpoints pin, so a fork of a fork keeps its source's reference while its own fork still
+reads the original owner, D13): first the checkpoint in the owner's manifest, then the reference in
+its own, each an idempotent CAS.
+
+## D39. Removal: mark, fence, destroy, release, delete, purge
+
+`remove` first commits `markRemoved` (a new `Removed` database state; refused with
+`DatabaseHasDependentsError` while forks hold checkpoints; increments `writerEpoch`). After it, no
+flush, checkpoint, or fork can commit (`fenceWriter`, `commitL0Flush`, and `addCheckpoint` refuse a
+removed database; writers report it as `DatabaseNotFoundError`). Then: the writer's SQLite state and
+alarm are cleared (`DbWriter.destroy`) and the compactor's state and alarm (`Compactor.destroy`); a
+fork releases the checkpoints it holds on its sources; every object under `db/<id>/` is deleted,
+manifests last (they sort after `compacted/` and `gc/`), so an interrupted removal still has a
+manifest and is retried; and the `db:<id>` cache tag is purged through `BlockServer`. Objects that
+land after the deletes (a compaction step in flight) leave a prefix with no manifest; GC sweeps such
+a prefix once its objects are older than `gcMinAge` (creation writes the first manifest before any
+other object, so a prefix without one is never a database being created). The writer's state is
+cleared with `DELETE`s rather than `deleteAll()`, so its tables survive and the next request starts a
+writer that finds the database gone.

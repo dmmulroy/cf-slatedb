@@ -149,6 +149,13 @@ export class WriterHttpApiGroup extends HttpApiGroup.make("writer")
     }),
   )
   .add(
+    HttpApiEndpoint.post("destroy", "/databases/:databaseId/destroy", {
+      params: DatabaseParams,
+      success: HttpApiSchema.NoContent,
+      error: WRITER_ERRORS,
+    }),
+  )
+  .add(
     HttpApiEndpoint.post("seal", "/databases/:databaseId/seal", {
       params: DatabaseParams,
       payload: SealRequest,

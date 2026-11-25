@@ -1,4 +1,4 @@
-import { DatabaseId } from "@cf-slatedb/lsm-core";
+import { CheckpointId, DatabaseId } from "@cf-slatedb/lsm-core";
 import { Schema } from "effect";
 import { HttpApiSchema } from "effect/http-api";
 
@@ -114,6 +114,16 @@ export class DatabaseHasDependentsPublicError extends Schema.TaggedError<Databas
   },
 ) {}
 
+/** `404` — the checkpoint does not exist (deleted or expired), or its manifest was collected. */
+export class CheckpointNotFoundPublicError extends Schema.TaggedError<CheckpointNotFoundPublicError>()(
+  "CheckpointNotFoundPublicError",
+  {
+    code: Schema.Literal("CheckpointNotFound"),
+    details: Schema.Struct({ databaseId: DatabaseId, checkpointId: CheckpointId }),
+    ...common,
+  },
+) {}
+
 /** `409` — a merge operand cannot be resolved because the database has no merge operator. */
 export class MergeOperatorMissingPublicError extends Schema.TaggedError<MergeOperatorMissingPublicError>()(
   "MergeOperatorMissingPublicError",
@@ -190,6 +200,7 @@ export const DB_PUBLIC_ERRORS = [
   BatchInvalidPublicError.pipe(HttpApiSchema.status(400)),
   DatabaseNotFoundPublicError.pipe(HttpApiSchema.status(404)),
   RouteNotFoundPublicError.pipe(HttpApiSchema.status(404)),
+  CheckpointNotFoundPublicError.pipe(HttpApiSchema.status(404)),
   DatabaseAlreadyExistsPublicError.pipe(HttpApiSchema.status(409)),
   KeyOutOfRangePublicError.pipe(HttpApiSchema.status(409)),
   DatabaseSealedPublicError.pipe(HttpApiSchema.status(409)),
@@ -208,6 +219,7 @@ export type DbPublicError =
   | InvalidRequestPublicError
   | BatchInvalidPublicError
   | DatabaseNotFoundPublicError
+  | CheckpointNotFoundPublicError
   | RouteNotFoundPublicError
   | DatabaseAlreadyExistsPublicError
   | KeyOutOfRangePublicError

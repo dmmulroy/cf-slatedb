@@ -20,6 +20,7 @@ export const writerHttpHandlersLayer = HttpApiBuilder.group(WriterHttpApi, "writ
         writer.changes(params.databaseId, query.afterSeq, query.limit),
       )
       .handle("status", ({ params }) => writer.status(params.databaseId))
+      .handle("destroy", ({ params }) => writer.destroy(params.databaseId))
       .handle("seal", ({ params, payload }) =>
         writer
           .seal(params.databaseId, payload.successors)

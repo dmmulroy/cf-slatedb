@@ -141,10 +141,11 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   each other or a job in flight, have the right destination and `isBottom`; repeatedly committing
   planned jobs converges (fallback consolidation terminates). Shown failing with the size
   threshold ignored and with in-flight sources not reserved (D15).
-- **`DatabaseLifecycle`, `GarbageCollector`, `CompactionBudget`** — `GarbageCollector` and
-  `CompactionBudget` done (`garbage-collector.ts`, `compaction-budget.ts`,
-  `compaction-budget-server.ts`, lsm-core `compaction-budget-ledger.ts`); `DatabaseLifecycle`
-  `create` done, `remove`/`seal`/`forkRange` in Phase 7.
+- **`DatabaseLifecycle`, `GarbageCollector`, `CompactionBudget`** — done. `database-lifecycle.ts`
+  (`create`, `createCheckpoint`, `deleteCheckpoint`, `seal`, `forkRange`, `remove`),
+  `garbage-collector.ts`, `compaction-budget.ts` + `compaction-budget-server.ts` (lsm-core
+  `compaction-budget-ledger.ts`). Tests: `database-lifecycle.test.ts`, `garbage-collector.test.ts`,
+  `compactor.test.ts`, `writer.workerd.ts`.
 
 ## §8 Public API and semantics
 
@@ -162,7 +163,11 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   with and without older data and an operator, matches the oracle; shown failing when deletes are
   dropped above the bottom, an input is skipped, or expired operands are kept),
   `compaction-executor.test.ts` (merges through real SSTs).
-- **Checkpoints, clones (forks), transactions** — partial (edits in `manifest.ts`); Phases 7, 9.
+- **Checkpoints, clones (forks), transactions** — checkpoints and forks done (Phase 7:
+  `createCheckpoint` flushes first and pins the manifest its CAS applied to; `forkRange` takes the
+  fork's own hold on the source; lifetimes expire through GC's `prepareGarbageCollection`);
+  transactions in Phase 9. Tests: `database-lifecycle.test.ts` (fork has a write that was unflushed
+  at checkpoint time, shown failing without the flush; missing checkpoint), `manifest.test.ts`.
 
 ## §9 Effect audit and private gaps
 
@@ -201,16 +206,29 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 - **Key-range bounds (`KeyOutOfRangeError`)** — done (writes). `collapseWriteBatch` checks
   `Manifest.keyRange`; public `KeyOutOfRange` (409). Tests: `write-batch.test.ts`,
   `db-writer.test.ts`.
-- **Seal (`DatabaseSealedError { successors }`)** — partial. `DbWriter.seal` holds the commit lock,
-  flushes, then `sealManifest` (fences the writer); later writes fail with `DatabaseSealedError` and
-  the successors. Tests: `db-writer.test.ts`, `writer-client.test.ts`. Lifecycle orchestration and
-  formal check 5: Phase 7.
-- **Zero-copy `forkRange` (SST views + external references)** — partial (`forkManifest`;
-  `manifest.test.ts`) (D13).
-- **GC per database respecting fork checkpoints** — done for checkpoints (fork release is Phase 7).
-  `garbage-collector.ts` lists only `db/<id>/`; checkpointed manifests and their SSTs are kept
-  (`garbage-collector.test.ts`). Formal: `GcSafety` (`PinnedManifestsComplete`, `ignorePins`).
-- **`DatabaseLifecycle.create`/`remove` (`DatabaseHasDependentsError`, purge `db:<id>`)** — pending.
+- **Seal (`DatabaseSealedError { successors }`)** — done. `DbWriter.seal` holds the commit lock
+  across the final flush and the seal CAS; `DatabaseLifecycle.seal`; `POST /v1/databases/:id/seal`.
+  Tests: `db-writer.test.ts`, `database-lifecycle.test.ts`, `writer.workerd.ts` (late write refused
+  with `DatabaseSealed`). Formal: `SealSplit` (`NoCommitAfterSeal`; `sealWithoutLock`,
+  `writerNotFenced`).
+- **Zero-copy `forkRange` (SST views + external references)** — done. `forkManifest` (lsm-core),
+  `DatabaseLifecycle.forkRange` (hold taken in a CAS that re-checks the caller's checkpoint;
+  idempotent retry; wakes the fork's compactor), fork rewrite (`planCompactions` full compaction
+  while external SSTs remain), release (`releasableExternalRefs`, `Compactor.releaseExternalRefs`,
+  D13 for forks of forks). Tests: `database-lifecycle.test.ts` (split, rewrite, release; shown
+  failing without release or with duplicate holds), `size-tiered-compaction-scheduler.test.ts`,
+  `manifest.test.ts`, `writer.workerd.ts`. Formal: `SealSplit` (`EveryAckedWriteInExactlyOneSuccessor`),
+  `GcSafety` (`PinnedManifestsComplete`). D37, D38.
+- **GC per database respecting fork checkpoints** — done. `garbage-collector.ts` lists only
+  `db/<id>/`; pinned manifests and their SSTs are kept; forks release their holds once rewritten;
+  a prefix left without a manifest (an interrupted removal) is swept after `gcMinAge`
+  (`garbage-collector.test.ts`). Formal: `GcSafety`.
+- **`DatabaseLifecycle.create`/`remove` (`DatabaseHasDependentsError`, purge `db:<id>`)** — done.
+  `markRemoved` (lsm-core: refuses while forks hold checkpoints; fences writers, checkpoints, forks),
+  then writer and compactor state destroyed (`DbWriter.destroy`, `Compactor.destroy`), the fork's
+  holds released, `db/<id>/` deleted (manifests last), and `db:<id>` purged through `BlockServer`.
+  `DELETE /v1/databases/:id`. Tests: `manifest.test.ts`, `database-lifecycle.test.ts`,
+  `writer.workerd.ts` (blocked by dependents, then removed). D39.
 - **`CompactionBudget` by `budgetGroup`** — done. lsm-core `compaction-budget-ledger.ts` (fair share
   among holders and waiting groups, expiring leases; property test against capacity and share,
   shown failing on four mutations), `compaction-budget.ts` (unlimited, ledger, test),
@@ -230,8 +248,9 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `.agents/skills/verify-no-acked-write-lost`. Check 2 (fencing) and 3 (manifest CAS linearizability):
   `tools/formal-verification/specs/ManifestCasFencing.tla`, skill
   `.agents/skills/verify-manifest-cas-fencing`. Check 4 (GC safety): `GcSafety.tla`, skill
-  `.agents/skills/verify-gc-safety`. All run by `vp run verify`, each broken variant shown failing.
-  Checks 5 and 6 pending.
+  `.agents/skills/verify-gc-safety`. Check 5 (seal and split): `SealSplit.tla`, skill
+  `.agents/skills/verify-seal-split`. All run by `vp run verify`, each broken variant shown failing.
+  Check 6 (transactions) pending.
 - **Hardening scenarios** — pending (Phase 10).
 
 ## Phase 6 additions
@@ -247,3 +266,12 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   by `writer.workerd.ts`.
 - **GC operator API and cron** — done. `gc-http-api.ts`, `gc-worker.ts` (`POST /v1/gc/databases/:id`,
   `POST /v1/gc`, cron `*/5 * * * *`); `writer.workerd.ts` collects on demand. D36.
+
+## Phase 7 additions
+
+- **Public lifecycle endpoints** — done. `POST /v1/databases/:id/checkpoints`,
+  `DELETE /v1/databases/:id/checkpoints/:checkpointId`, `POST /v1/databases/:id/seal`,
+  `POST /v1/databases/:id/forks`, `DELETE /v1/databases/:id` (`db-http-api.ts`); errors
+  `CheckpointNotFound` (404) and `DatabaseHasDependents` (409). `writer.workerd.ts`.
+- **`ManifestStore.update` passes the manifest id to the edit** — done (a checkpoint pins exactly
+  the manifest its CAS applied to).

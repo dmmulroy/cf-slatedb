@@ -1,4 +1,4 @@
-import { Arbitrary, Option, Schema } from "effect";
+import { Arbitrary, Option, Result, Schema } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
@@ -128,14 +128,16 @@ describe("planSstCollection", () => {
 
 describe("planManifestCollection", () => {
   it("keeps the latest, checkpoint-pinned, and recently superseded manifests", () => {
-    const latest = addCheckpoint(empty, {
-      id: CheckpointId.make("01JD00000000000000000000CP"),
-      manifestId: ManifestId.make(2),
-      createdAt: Timestamp.make(0),
-      expireAt: Option.none(),
-      holder: Option.some(DatabaseId.make("fork")),
-      name: Option.none(),
-    });
+    const latest = Result.getOrThrow(
+      addCheckpoint(empty, {
+        id: CheckpointId.make("01JD00000000000000000000CP"),
+        manifestId: ManifestId.make(2),
+        createdAt: Timestamp.make(0),
+        expireAt: Option.none(),
+        holder: Option.some(DatabaseId.make("fork")),
+        name: Option.none(),
+      }),
+    );
     const plan = planManifestCollection({
       latestId: ManifestId.make(5),
       latest,

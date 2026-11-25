@@ -2,7 +2,7 @@
 
 ## Current phase
 
-Phase 7: lifecycle (starting). Phases 0–6 are done.
+Phase 8: sharding package (starting). Phases 0–7 are done.
 
 ## Done
 
@@ -114,11 +114,22 @@ Phase 7: lifecycle (starting). Phases 0–6 are done.
   integration test runs four flushes through a real compaction Workflow and an on-demand GC, with
   its own OTLP collector (14 s). Decisions D33–D36.
 
+- **Phase 7 — lifecycle.** lsm-core: `Removed` state, `markRemoved` with
+  `DatabaseHasDependentsError`, `DatabaseRemovedError` from `fenceWriter`/`addCheckpoint`,
+  `releasableExternalRefs`, fork rewrite planning. lsm-cloudflare: `DatabaseLifecycle`
+  `createCheckpoint`/`deleteCheckpoint`/`seal`/`forkRange`/`remove`, writer and compactor `destroy`
+  endpoints, compactor release of fork holds, GC sweep of prefixes without a manifest, public
+  endpoints for checkpoints, seal, forks, and removal. Formal check 5 (`SealSplit.tla`, skill
+  `verify-seal-split`). The workerd test splits a database through the public API: seal, checkpoint,
+  two forks, each key in exactly one successor, removal blocked until the forks' compactors rewrite
+  and release, then removed (15 s). Fixed along the way: the trace CLI ignored unknown keys in
+  assertion files, so a misspelled bound passed vacuously. Decisions D37–D39.
+
 ## Next
 
-- Phase 7: checkpoints API, `DatabaseLifecycle.remove` (`DatabaseHasDependentsError`, purge
-  `db:<id>`), `seal`, `forkRange`, fork checkpoint release once compaction rewrote every external
-  SST; formal check 5 (seal and split).
+- Phase 8: `packages/lsm-sharding` — `ShardDirectoryServer` (range map + version, one DO per
+  group), `ShardRouter` (retry once on `DatabaseSealed` / `KeyOutOfRange`), `ShardSplit` (seal →
+  checkpoint → fork ×2 → publish), public APIs only.
 
 ## Findings
 

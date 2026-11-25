@@ -32,6 +32,13 @@ export class CompactorHttpApiGroup extends HttpApiGroup.make("compactor")
     }),
   )
   .add(
+    HttpApiEndpoint.post("destroy", "/databases/:databaseId/compactor/destroy", {
+      params: DatabaseParams,
+      success: HttpApiSchema.NoContent,
+      error: COMPACTOR_ERRORS,
+    }),
+  )
+  .add(
     HttpApiEndpoint.get("status", "/databases/:databaseId/compactor", {
       params: DatabaseParams,
       success: CompactorStatusResponse,

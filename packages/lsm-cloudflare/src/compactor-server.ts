@@ -32,6 +32,7 @@ export const compactorHttpHandlersLayer = HttpApiBuilder.group(
       const compactor = yield* Compactor;
       return handlers
         .handle("wake", ({ params }) => compactor.wake(params.databaseId))
+        .handle("destroy", ({ params }) => compactor.destroy(params.databaseId))
         .handle("status", ({ params }) =>
           compactor.status(params.databaseId).pipe(Effect.map((state) => ({ state }))),
         );

@@ -16,7 +16,11 @@ import { Clock, Context, Effect, Layer, Metric, Option, Result, Schema } from "e
 
 import { LsmConfiguration, lsmConfigurationTestLayer } from "./lsm-configuration.ts";
 import type { DatabaseNotFoundError } from "./lsm-errors.ts";
-import { ManifestReader, manifestReaderLayerWithoutDependencies } from "./manifest-reader.ts";
+import {
+  ManifestReader,
+  manifestReaderLayerWithoutDependencies,
+  type VersionedManifest,
+} from "./manifest-reader.ts";
 import { ManifestStore, manifestStoreLayerWithoutDependencies } from "./manifest-store.ts";
 import {
   changelogPrefix,
@@ -31,8 +35,8 @@ import { type ObjectInfo, ObjectStore, objectStoreTestLayer } from "./object-sto
 /** What one collection of a database did. */
 export interface GarbageCollectionReport {
   readonly databaseId: DatabaseId;
-  /** The newest manifest when collection ran. */
-  readonly manifestId: ManifestId;
+  /** The newest manifest when collection ran; none for a removed database's leftovers. */
+  readonly manifestId: Option.Option<ManifestId>;
   /** SSTs created before this time and referenced by no retained manifest were deleted. */
   readonly sstBoundary: Timestamp;
   readonly deletedSsts: number;
@@ -134,6 +138,30 @@ export const makeGarbageCollector = Effect.gen(function* () {
       return all;
     });
 
+  /**
+   * A prefix with objects but no manifest is what an interrupted removal (or a compaction that
+   * uploaded during one) left: creation writes the first manifest before anything else, and removal
+   * deletes manifests last. Deletes its objects older than the cutoff.
+   */
+  const sweepLeftovers = (databaseId: DatabaseId, cutoff: Timestamp) =>
+    Effect.gen(function* () {
+      const leftovers = (yield* listAll(databasePrefix(databaseId)).pipe(
+        Effect.catchTags(objectFailures(databaseId)),
+      )).filter((object) => object.uploadedAt < cutoff);
+      yield* objects
+        .delete(leftovers.map((object) => object.key))
+        .pipe(Effect.catchTags(objectFailures(databaseId)));
+      yield* Metric.update(gcDeletedObjects, leftovers.length);
+      yield* Effect.annotateCurrentSpan({ "gc.removed_leftovers": leftovers.length });
+      return {
+        databaseId,
+        manifestId: Option.none<ManifestId>(),
+        sstBoundary: cutoff,
+        deletedSsts: leftovers.length,
+        deletedManifests: 0,
+      };
+    });
+
   const collect = Effect.fn("GarbageCollector.collect")(function* (databaseId: DatabaseId) {
     yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
     const now = Timestamp.make(yield* Clock.currentTimeMillis);
@@ -147,9 +175,15 @@ export const makeGarbageCollector = Effect.gen(function* () {
         ssts.push(...Option.toArray(storedSst(prefix, object)));
       }
     }
-    const latest = yield* reader
-      .loadLatest(databaseId)
-      .pipe(Effect.catchTags({ ManifestReadError: unavailable(databaseId) }));
+    const found = yield* reader.loadLatest(databaseId).pipe(
+      Effect.map(Option.some),
+      Effect.catchTags({
+        ManifestReadError: unavailable(databaseId),
+        DatabaseNotFoundError: () => Effect.succeed(Option.none<VersionedManifest>()),
+      }),
+    );
+    if (Option.isNone(found)) return yield* sweepLeftovers(databaseId, cutoff);
+    const latest = found.value;
     const advanceBoundary = hasSstCollectionCandidates(latest.manifest, ssts, cutoff);
     const committed = yield* manifests
       .update(databaseId, (manifest) =>
@@ -216,7 +250,7 @@ export const makeGarbageCollector = Effect.gen(function* () {
     });
     return {
       databaseId,
-      manifestId: committed.id,
+      manifestId: Option.some(committed.id),
       sstBoundary,
       deletedSsts: deletedSsts.length,
       deletedManifests: plan.deletable.length,

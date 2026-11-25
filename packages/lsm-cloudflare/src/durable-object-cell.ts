@@ -14,6 +14,8 @@ export interface DurableObjectCell<A> {
   readonly get: Effect.Effect<Option.Option<A>>;
   /** Replaces the stored value. */
   readonly set: (value: A) => Effect.Effect<void>;
+  /** Deletes the stored value. */
+  readonly clear: Effect.Effect<void>;
 }
 
 /**
@@ -43,6 +45,7 @@ export const durableObjectCell = <A, I>(
         Effect.flatMap((encoded) => Effect.promise(() => storage.put(key, encoded))),
         Effect.orDie,
       ),
+    clear: Effect.promise(() => storage.delete(key)).pipe(Effect.asVoid),
   };
 };
 
@@ -51,4 +54,5 @@ export const inMemoryCell = <A>(): Effect.Effect<DurableObjectCell<A>> =>
   Effect.map(Ref.make(Option.none<A>()), (ref) => ({
     get: Ref.get(ref),
     set: (value: A) => Ref.set(ref, Option.some(value)),
+    clear: Ref.set(ref, Option.none()),
   }));

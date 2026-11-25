@@ -14,6 +14,7 @@ import {
   compactionTriggerLayer,
   compactorClientLayer,
 } from "./compactor-client.ts";
+import { blockSourceLayer } from "./block-source.ts";
 import { DbClient, dbClientLayerWithoutDependencies } from "./db-client.ts";
 import { dbHttpRouterLayer } from "./db-http-handlers.ts";
 import { dbReaderLayer } from "./db-reader.ts";
@@ -83,16 +84,15 @@ export const dbApiWorkerLayer = (options: DbApiWorkerOptions) =>
       );
       return { fetch: withEventTelemetryFlush(Effect.flatten(router)) };
     }).pipe(
-      // The reader's manifest cache and L1 block cache are built here, once per isolate.
+      // Built once per isolate: the reader's manifest cache and L1 block cache, the lifecycle, and
+      // the writer and compactor clients they share.
       Effect.provide(
-        dbClientLayerWithoutDependencies.pipe(
+        Layer.mergeAll(
+          dbClientLayerWithoutDependencies.pipe(Layer.provide(dbReaderLayer)),
+          databaseLifecycleLayerWithoutDependencies.pipe(Layer.provide(blockSourceLayer)),
+        ).pipe(
           Layer.provideMerge(writerClientLayer),
-          Layer.provide(dbReaderLayer),
-        ),
-      ),
-      Effect.provide(
-        databaseLifecycleLayerWithoutDependencies.pipe(
-          Layer.provide(
+          Layer.provideMerge(
             manifestStoreLayerWithoutDependencies.pipe(
               Layer.provideMerge(manifestReaderLayerWithoutDependencies),
             ),
@@ -100,9 +100,9 @@ export const dbApiWorkerLayer = (options: DbApiWorkerOptions) =>
         ),
       ),
       Effect.provide(writerServerLayerWithoutDependencies),
-      // Writers wake their database's compactor (hosted by CompactorWorker) after flushes.
+      // Writers wake their database's compactor (hosted by CompactorWorker) after flushes; the
+      // lifecycle and the compaction endpoint call it too.
       Effect.provide(compactionTriggerLayer.pipe(Layer.provideMerge(compactorClientLayer))),
-      Effect.provide(manifestReaderLayerWithoutDependencies),
       Effect.provide(Layer.mergeAll(objectStoreLayer, lsmConfigurationLayer)),
       Effect.provide(
         lsmTelemetryLayer({ baseUrl: options.otlpBaseUrl, serviceName: "cf-slatedb-api" }),

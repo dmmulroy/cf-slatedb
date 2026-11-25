@@ -1,4 +1,5 @@
 import type {
+  DatabaseHasDependentsError,
   DatabaseSealedError,
   KeyOutOfRangeError,
   MergeOperatorMissingError,
@@ -10,7 +11,9 @@ import { Option } from "effect";
 
 import {
   BatchInvalidPublicError,
+  CheckpointNotFoundPublicError,
   DatabaseAlreadyExistsPublicError,
+  DatabaseHasDependentsPublicError,
   type DbApiOperation,
   DatabaseNotFoundPublicError,
   type DbPublicError,
@@ -30,6 +33,7 @@ import type {
   WriteStalledError,
 } from "./lsm-errors.ts";
 import type { CompactorUnavailableError } from "./compactor.ts";
+import type { CheckpointNotFoundError } from "./database-lifecycle.ts";
 import type { ReaderUnavailableError } from "./db-reader.ts";
 import type { DatabaseAlreadyExistsError } from "./manifest-store.ts";
 
@@ -47,7 +51,9 @@ export type DbInternalError =
   | MergeOperatorMissingError
   | SstCorruptedError
   | ReaderUnavailableError
-  | CompactorUnavailableError;
+  | CompactorUnavailableError
+  | DatabaseHasDependentsError
+  | CheckpointNotFoundError;
 
 /**
  * Classifies an internal failure as its public error: a stable code, a caller-facing message, the
@@ -153,6 +159,24 @@ export const toPublicError =
               requestId,
               retryable: true,
             });
+      case "DatabaseHasDependentsError":
+        return new DatabaseHasDependentsPublicError({
+          code: "DatabaseHasDependents",
+          operation,
+          message: `Database ${error.databaseId} cannot be removed while forks ${error.dependents.join(", ")} still read its data. Remove them first, or retry after their compactions release it.`,
+          details: { databaseId: error.databaseId, dependents: error.dependents },
+          requestId,
+          retryable: false,
+        });
+      case "CheckpointNotFoundError":
+        return new CheckpointNotFoundPublicError({
+          code: "CheckpointNotFound",
+          operation,
+          message: `Checkpoint ${error.checkpointId} of database ${error.databaseId} does not exist (deleted or expired). Create a new checkpoint.`,
+          details: { databaseId: error.databaseId, checkpointId: error.checkpointId },
+          requestId,
+          retryable: false,
+        });
       case "CompactorUnavailableError":
         return new StorageUnavailablePublicError({
           code: "StorageUnavailable",

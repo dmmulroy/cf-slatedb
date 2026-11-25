@@ -93,6 +93,10 @@ export interface IWriterClient {
   readonly status: (
     databaseId: DatabaseId,
   ) => Effect.Effect<WriterStatus, WriterClientError, WriterClientServices>;
+  /** Deletes the writer's state for a database being removed. Safe to repeat. */
+  readonly destroy: (
+    databaseId: DatabaseId,
+  ) => Effect.Effect<void, WriterClientError, WriterClientServices>;
   /** Flushes everything and seals the database with `successors`. Safe to repeat. */
   readonly seal: (
     databaseId: DatabaseId,
@@ -201,6 +205,13 @@ const writerClientOperations = <E, R>(
       return yield* client.writer
         .status({ params: { databaseId } })
         .pipe(Effect.catchTags(transport(databaseId, "status")), Effect.retry(retryRoutable));
+    }),
+    destroy: Effect.fn("WriterClient.destroy")(function* (databaseId: DatabaseId) {
+      yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
+      const client = yield* writerHttpClient(databaseId);
+      yield* client.writer
+        .destroy({ params: { databaseId } })
+        .pipe(Effect.catchTags(transport(databaseId, "destroy")), Effect.retry(retryRoutable));
     }),
     seal: Effect.fn("WriterClient.seal")(function* (
       databaseId: DatabaseId,

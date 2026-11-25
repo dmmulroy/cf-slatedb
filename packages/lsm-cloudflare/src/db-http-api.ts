@@ -1,10 +1,13 @@
 import {
+  Checkpoint,
+  CheckpointId,
   DatabaseId,
   KeyRange,
   ManifestId,
   MergeOperatorName,
   ReadConsistency,
   RowSchema,
+  SeqNum,
   SortedRunId,
   WriteBatch,
   WriteReceipt,
@@ -66,6 +69,22 @@ export const CompactionStatusResponse = Schema.Struct({
     Schema.Struct({ id: SortedRunId, ssts: Schema.Int, sizeBytes: Schema.Int }),
   ),
   compactor: Schema.OptionFromNullOr(CompactorState),
+});
+
+/** Schema for a checkpoint request: an optional name and lifetime (none: until deleted). */
+export const CreateCheckpointRequest = Schema.Struct({
+  name: Schema.OptionFromNullOr(Schema.String),
+  lifetimeMs: Schema.OptionFromNullOr(Schema.Int.check(Schema.isGreaterThan(0))),
+});
+
+/** Schema for a seal request: the databases that replace the sealed one. */
+export const SealDatabaseRequest = Schema.Struct({ successors: Schema.Array(DatabaseId) });
+
+/** Schema for a fork request: the new database, the source checkpoint, and the key range. */
+export const ForkDatabaseRequest = Schema.Struct({
+  forkId: DatabaseId,
+  checkpointId: CheckpointId,
+  range: KeyRange,
 });
 
 /** Largest page a scan returns. */
@@ -146,6 +165,68 @@ export class DbHttpApiGroup extends HttpApiGroup.make("databases")
         summary: "Read the compaction state",
         description:
           "The newest manifest's L0 SST count and sorted runs, and the compactor's running jobs and epoch.",
+      }),
+    ),
+  )
+  .add(
+    HttpApiEndpoint.post("createCheckpoint", "/databases/:databaseId/checkpoints", {
+      params: DatabaseParams,
+      payload: CreateCheckpointRequest,
+      success: Checkpoint.pipe(HttpApiSchema.status(201)),
+      error: DB_PUBLIC_ERRORS,
+    }).annotateMerge(
+      OpenApi.annotations({
+        summary: "Create a checkpoint",
+        description:
+          "Flushes every acknowledged write, then pins the resulting manifest: its data stays readable and forkable until the checkpoint is deleted or expires.",
+      }),
+    ),
+  )
+  .add(
+    HttpApiEndpoint.delete("deleteCheckpoint", "/databases/:databaseId/checkpoints/:checkpointId", {
+      params: Schema.Struct({ databaseId: DatabaseId, checkpointId: CheckpointId }),
+      success: HttpApiSchema.NoContent,
+      error: DB_PUBLIC_ERRORS,
+    }).annotateMerge(OpenApi.annotations({ summary: "Delete a checkpoint" })),
+  )
+  .add(
+    HttpApiEndpoint.post("seal", "/databases/:databaseId/seal", {
+      params: DatabaseParams,
+      payload: SealDatabaseRequest,
+      success: Schema.Struct({ flushedSeq: SeqNum }),
+      error: DB_PUBLIC_ERRORS,
+    }).annotateMerge(
+      OpenApi.annotations({
+        summary: "Seal a database",
+        description:
+          "Flushes and seals: every acknowledged write is in the sealed manifest, and later writes fail with DatabaseSealed naming the successors.",
+      }),
+    ),
+  )
+  .add(
+    HttpApiEndpoint.post("fork", "/databases/:databaseId/forks", {
+      params: DatabaseParams,
+      payload: ForkDatabaseRequest,
+      success: CreateDatabaseResponse.pipe(HttpApiSchema.status(201)),
+      error: DB_PUBLIC_ERRORS,
+    }).annotateMerge(
+      OpenApi.annotations({
+        summary: "Fork a key range",
+        description:
+          "Creates a new database holding the range's data at a checkpoint, without copying: it reads the source's files until its compaction rewrites them.",
+      }),
+    ),
+  )
+  .add(
+    HttpApiEndpoint.delete("removeDatabase", "/databases/:databaseId", {
+      params: DatabaseParams,
+      success: HttpApiSchema.NoContent,
+      error: DB_PUBLIC_ERRORS,
+    }).annotateMerge(
+      OpenApi.annotations({
+        summary: "Remove a database",
+        description:
+          "Deletes the database and all its data. Fails with DatabaseHasDependents while forks still read it.",
       }),
     ),
   )

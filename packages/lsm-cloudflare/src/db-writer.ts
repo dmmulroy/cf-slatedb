@@ -156,6 +156,11 @@ export interface IDbWriter {
     databaseId: DatabaseId,
     successors: ReadonlyArray<DatabaseId>,
   ) => Effect.Effect<SeqNum, DbWriterError, RuntimeContext>;
+  /**
+   * Deletes the writer's state (the memtable and its sequence state) and its alarm, for a database
+   * being removed; the next request starts a new writer, which finds the database gone.
+   */
+  readonly destroy: (databaseId: DatabaseId) => Effect.Effect<void, DbWriterError, RuntimeContext>;
   /** The alarm handler: flushes when a trigger is due and reschedules. Never fails. */
   readonly runAlarm: Effect.Effect<void, never, RuntimeContext>;
 }
@@ -292,7 +297,14 @@ export const makeDbWriter = Effect.gen(function* () {
             .update(databaseId, (manifest) =>
               manifest.state._tag === "Sealed" ? Result.succeed(manifest) : fenceWriter(manifest),
             )
-            .pipe(Effect.catchTags(manifestFailures(databaseId, "start")));
+            .pipe(
+              Effect.catchTags(manifestFailures(databaseId, "start")),
+              // A database being removed is gone for its writer.
+              Effect.catchTags({
+                DatabaseRemovedError: (error) =>
+                  Effect.fail(new DatabaseNotFoundError({ databaseId, message: error.message })),
+              }),
+            );
           const sealed =
             fenced.manifest.state._tag === "Sealed"
               ? Option.some(fenced.manifest.state.successors)
@@ -708,6 +720,27 @@ export const makeDbWriter = Effect.gen(function* () {
     );
   });
 
+  const destroy = Effect.fn("DbWriter.destroy")(function* (databaseId: DatabaseId) {
+    yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
+    // No write or flush may run while the state is deleted.
+    yield* commitLock.withPermits(1)(
+      flushLock.withPermits(1)(
+        Effect.gen(function* () {
+          const meta = yield* memTable.meta.pipe(
+            Effect.mapError(unavailable(databaseId, "destroy")),
+          );
+          if (Option.isSome(meta.databaseId) && meta.databaseId.value !== databaseId) {
+            return yield* mismatch(databaseId, meta.databaseId.value);
+          }
+          yield* memTable.clear.pipe(Effect.mapError(unavailable(databaseId, "destroy")));
+          yield* alarm.cancel;
+          yield* Ref.set(unflushedBytes, 0);
+          yield* Ref.set(phase, { _tag: "Uninitialized" });
+        }),
+      ),
+    );
+  });
+
   const runAlarm = Effect.gen(function* () {
     const meta = yield* memTable.meta.pipe(Effect.option);
     const databaseId = Option.flatMap(meta, (value) => value.databaseId);
@@ -739,7 +772,7 @@ export const makeDbWriter = Effect.gen(function* () {
     }
   }).pipe(Effect.withSpan("DbWriter.alarm"));
 
-  return DbWriter.of({ write, probe, scan, flush, changes, status, seal, runAlarm });
+  return DbWriter.of({ write, probe, scan, flush, changes, status, seal, destroy, runAlarm });
 });
 
 /** Provides the writer, leaving its memtable, stores, alarm, and settings visible. */

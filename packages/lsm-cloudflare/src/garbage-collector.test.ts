@@ -10,9 +10,10 @@ import {
   manifestSstHandles,
   SeqNum,
   SortedRunId,
+  SstId,
   Timestamp,
 } from "@cf-slatedb/lsm-core";
-import { Effect, Layer, Option, Result, Stream } from "effect";
+import { Effect, Layer, Option, Stream } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -159,7 +160,7 @@ describe("GarbageCollector", () => {
     // The boundary is the newest deleted id: below GC's commit and the manifest it superseded.
     expect(
       Option.map(outcome.boundary, (bytes) => Number(new TextDecoder().decode(bytes))),
-    ).toEqual(Option.some(outcome.old.manifestId - 2));
+    ).toEqual(Option.map(outcome.old.manifestId, (id) => id - 2));
   });
 
   it("keeps the SSTs of a checkpointed manifest however old it is", async () => {
@@ -170,16 +171,14 @@ describe("GarbageCollector", () => {
         const store = yield* ManifestStore;
         const pinned = yield* (yield* ManifestReader).loadLatest(DB);
         yield* store.update(DB, (manifest) =>
-          Result.succeed(
-            addCheckpoint(manifest, {
-              id: CheckpointId.make("01JD00000000000000000000CP"),
-              manifestId: pinned.id,
-              createdAt: Timestamp.make(0),
-              expireAt: Option.none(),
-              holder: Option.none(),
-              name: Option.some("backup"),
-            }),
-          ),
+          addCheckpoint(manifest, {
+            id: CheckpointId.make("01JD00000000000000000000CP"),
+            manifestId: pinned.id,
+            createdAt: Timestamp.make(0),
+            expireAt: Option.none(),
+            holder: Option.none(),
+            name: Option.some("backup"),
+          }),
         );
         yield* compactL0;
         yield* TestClock.adjust(MIN_AGE + 1);
@@ -240,6 +239,25 @@ describe("GarbageCollector", () => {
     expect(outcome.late._tag).toBe("SstBelowGcBoundaryError");
   });
 
+  it("sweeps what a removed database left behind once it is older than gcMinAge", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const objects = yield* ObjectStore;
+        // A compaction output uploaded after removal deleted everything else: no manifest remains.
+        yield* objects.put(sstKey(DB, SstId.make("01JD0000000000000000000ZZZ")), Uint8Array.of(1));
+        const gc = yield* GarbageCollector;
+        const young = yield* gc.collect(DB);
+        yield* TestClock.adjust(MIN_AGE + 1);
+        const old = yield* gc.collect(DB);
+        return { young, old, left: yield* storedKeys(compactedPrefix(DB)) };
+      }),
+    );
+    expect(outcome.young).toMatchObject({ deletedSsts: 0 });
+    expect(outcome.young.manifestId).toEqual(Option.none());
+    expect(outcome.old).toMatchObject({ deletedSsts: 1 });
+    expect(outcome.left).toEqual([]);
+  });
+
   it("collects every database in the bucket", async () => {
     const reports = await run(
       Effect.gen(function* () {
@@ -254,6 +272,9 @@ describe("GarbageCollector", () => {
       }),
     );
     expect(reports.map((report) => report.databaseId).sort()).toEqual(["orders", "users"]);
-    expect(reports.every((report) => report.manifestId === ManifestId.make(1))).toBe(true);
+    expect(reports.map((report) => report.manifestId)).toEqual([
+      Option.some(ManifestId.make(1)),
+      Option.some(ManifestId.make(1)),
+    ]);
   });
 });

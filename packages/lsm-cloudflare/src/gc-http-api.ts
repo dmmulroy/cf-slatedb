@@ -8,7 +8,7 @@ import { DatabaseNotFoundError } from "./lsm-errors.ts";
 /** Schema for what one database's collection did (see `GarbageCollectionReport`). */
 export const GarbageCollectionReportSchema = Schema.Struct({
   databaseId: DatabaseId,
-  manifestId: ManifestId,
+  manifestId: Schema.OptionFromNullOr(ManifestId),
   sstBoundary: Timestamp,
   deletedSsts: Schema.Int,
   deletedManifests: Schema.Int,

@@ -86,8 +86,8 @@ export interface IManifestStore {
    *
    * **Details**
    *
-   * An edit returning the same manifest instance means "already applied": nothing is written and
-   * the current manifest is returned. Conflicts retry with jittered exponential backoff, at most 12
+   * The edit receives the newest manifest and its id. An edit returning the same manifest instance
+   * means "already applied": nothing is written and the current manifest is returned. Conflicts retry with jittered exponential backoff, at most 12
    * attempts.
    *
    * @returns The manifest after the edit, the edit's own error, `DatabaseNotFoundError`,
@@ -95,7 +95,7 @@ export interface IManifestStore {
    */
   readonly update: <E>(
     databaseId: DatabaseId,
-    edit: (manifest: Manifest) => Result.Result<Manifest, E>,
+    edit: (manifest: Manifest, manifestId: ManifestId) => Result.Result<Manifest, E>,
   ) => Effect.Effect<
     VersionedManifest,
     E | DatabaseNotFoundError | ManifestReadError | ManifestWriteError,
@@ -252,7 +252,7 @@ export const makeManifestStore = Effect.gen(function* () {
 
   const update = <E>(
     databaseId: DatabaseId,
-    edit: (manifest: Manifest) => Result.Result<Manifest, E>,
+    edit: (manifest: Manifest, manifestId: ManifestId) => Result.Result<Manifest, E>,
   ) =>
     Effect.gen(function* () {
       yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
@@ -262,7 +262,7 @@ export const makeManifestStore = Effect.gen(function* () {
       const once = Effect.gen(function* () {
         attempt++;
         const current = yield* reader.loadLatest(databaseId);
-        const edited = edit(current.manifest);
+        const edited = edit(current.manifest, current.id);
         if (Result.isFailure(edited)) return Result.fail(edited.failure);
         if (edited.success === current.manifest) return Result.succeed(current);
         const nextId = ManifestId.make(current.id + 1);

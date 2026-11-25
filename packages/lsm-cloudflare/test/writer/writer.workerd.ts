@@ -286,6 +286,95 @@ test.provider(
         expect(yield* readCompacted("k0", consistency)).toEqual(Option.some("v0"));
         expect(yield* readCompacted("log", consistency)).toEqual(Option.some("0123"));
       }
+
+      // Split: seal, one checkpoint, a fork per range. Each fork's compactor rewrites the source's
+      // SSTs and releases its hold; then the source can be removed.
+      const source = DatabaseId.make(`split-${Date.now().toString(36)}`);
+      const left = DatabaseId.make(`${source}-a`);
+      const right = DatabaseId.make(`${source}-b`);
+      yield* client.databases.createDatabase({
+        payload: {
+          databaseId: source,
+          keyRange: Option.none(),
+          mergeOperator: Option.none(),
+          changelogRetentionMs: Option.none(),
+          budgetGroup: Option.none(),
+        },
+      });
+      yield* client.databases.write({
+        params: { databaseId: source },
+        payload: {
+          operations: ["a", "b", "c", "d", "e", "f"].map((key) => ({
+            _tag: "Put" as const,
+            key: bytes(key),
+            value: bytes(key.toUpperCase()),
+            ttlMillis: Option.none(),
+          })),
+        },
+      });
+      yield* client.databases.seal({
+        params: { databaseId: source },
+        payload: { successors: [left, right] },
+      });
+      const late = yield* Effect.flip(
+        client.databases.write({
+          params: { databaseId: source },
+          payload: {
+            operations: [
+              { _tag: "Put", key: bytes("g"), value: bytes("G"), ttlMillis: Option.none() },
+            ],
+          },
+        }),
+      );
+      expect(late._tag).toBe("DatabaseSealedPublicError");
+      const checkpoint = yield* client.databases.createCheckpoint({
+        params: { databaseId: source },
+        payload: { name: Option.some("split"), lifetimeMs: Option.none() },
+      });
+      const split = bytes("d");
+      for (const [forkId, range] of [
+        [left, { start: new Uint8Array(0), end: Option.some(split) }],
+        [right, { start: split, end: Option.none() }],
+      ] as const) {
+        yield* client.databases.fork({
+          params: { databaseId: source },
+          payload: { forkId, checkpointId: checkpoint.id, range },
+        });
+      }
+      const readFork = (databaseId: DatabaseId, key: string) =>
+        client.databases
+          .get({
+            params: { databaseId },
+            payload: { key: bytes(key), consistency: { _tag: "Latest" }, snapshot: Option.none() },
+          })
+          .pipe(Effect.map((response) => Option.isSome(response.row)));
+      for (const key of ["a", "b", "c", "d", "e", "f"]) {
+        const inLeft = yield* readFork(left, key);
+        const inRight = yield* readFork(right, key);
+        // Exactly one successor holds each acknowledged write.
+        expect([key, inLeft !== inRight, inLeft]).toEqual([key, true, key < "d"]);
+      }
+      const blocked = yield* Effect.flip(
+        client.databases.removeDatabase({ params: { databaseId: source } }),
+      );
+      expect(blocked._tag).toBe("DatabaseHasDependentsPublicError");
+      yield* client.databases.deleteCheckpoint({
+        params: { databaseId: source, checkpointId: checkpoint.id },
+      });
+      // The forks' compactors (woken by forkRange) run their rewrite Workflows and release.
+      yield* client.databases.removeDatabase({ params: { databaseId: source } }).pipe(
+        Effect.retry({
+          while: (error) => error._tag === "DatabaseHasDependentsPublicError",
+          schedule: Schedule.spaced("500 millis"),
+          times: 120,
+        }),
+      );
+      const removed = yield* Effect.flip(
+        client.databases.compaction({ params: { databaseId: source } }),
+      );
+      expect(removed._tag).toBe("DatabaseNotFoundPublicError");
+      expect(yield* readFork(left, "b")).toBe(true);
+      expect(yield* readFork(right, "e")).toBe(true);
       yield* stack.destroy();
     }),
   { timeout: 300_000 },

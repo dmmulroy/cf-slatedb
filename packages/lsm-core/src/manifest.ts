@@ -99,10 +99,14 @@ export const ExternalRef = Schema.Struct({ owner: DatabaseId, checkpointId: Chec
 /** A fork's dependency on a checkpoint in its source database. */
 export type ExternalRef = typeof ExternalRef.Type;
 
-/** Schema for a database's lifecycle state: open, or sealed with the databases that replace it. */
+/**
+ * Schema for a database's lifecycle state: open, sealed with the databases that replace it, or
+ * being removed (its objects are deleted next; nothing may write to it or fork from it).
+ */
 export const DatabaseState = Schema.Union([
   Schema.TaggedStruct("Open", {}),
   Schema.TaggedStruct("Sealed", { successors: Schema.Array(DatabaseId) }),
+  Schema.TaggedStruct("Removed", {}),
 ]);
 
 /** A database's lifecycle state. */
@@ -306,6 +310,31 @@ const belowGcBoundary = (
       );
 };
 
+/**
+ * The database is being removed: it accepts no writes, checkpoints, or forks. Not retryable; the
+ * database is gone once removal finishes.
+ */
+export class DatabaseRemovedError extends Schema.TaggedError<DatabaseRemovedError>()(
+  "DatabaseRemovedError",
+  { databaseId: DatabaseId, message: Schema.String },
+) {}
+
+/**
+ * The database cannot be removed while forks still read its SSTs through checkpoints they hold on
+ * it. Not retryable now: remove the forks first, or wait until their compactions rewrite every SST
+ * they read from it (they then release their checkpoints).
+ */
+export class DatabaseHasDependentsError extends Schema.TaggedError<DatabaseHasDependentsError>()(
+  "DatabaseHasDependentsError",
+  { databaseId: DatabaseId, dependents: Schema.Array(DatabaseId), message: Schema.String },
+) {}
+
+const databaseRemoved = (manifest: Manifest) =>
+  new DatabaseRemovedError({
+    databaseId: manifest.databaseId,
+    message: `Database ${manifest.databaseId} is being removed. It accepts no writes, checkpoints, or forks.`,
+  });
+
 const writerFenced = (manifest: Manifest, writerEpoch: WriterEpoch) =>
   new WriterFencedError({
     databaseId: manifest.databaseId,
@@ -353,17 +382,25 @@ export const replaceManifestFields = (manifest: Manifest, fields: Partial<Manife
 /**
  * A new writer takes over: increments `writerEpoch`.
  *
- * @returns The fenced manifest, or `DatabaseSealedError` when the database is sealed (no writer may
- *   start).
+ * @returns The fenced manifest, `DatabaseSealedError` when the database is sealed, or
+ *   `DatabaseRemovedError` when it is being removed (no writer may start).
  */
-export const fenceWriter = (manifest: Manifest): Result.Result<Manifest, DatabaseSealedError> =>
-  manifest.state._tag === "Sealed"
-    ? Result.fail(databaseSealed(manifest, manifest.state.successors))
-    : Result.succeed(
+export const fenceWriter = (
+  manifest: Manifest,
+): Result.Result<Manifest, DatabaseSealedError | DatabaseRemovedError> => {
+  switch (manifest.state._tag) {
+    case "Sealed":
+      return Result.fail(databaseSealed(manifest, manifest.state.successors));
+    case "Removed":
+      return Result.fail(databaseRemoved(manifest));
+    case "Open":
+      return Result.succeed(
         replaceManifestFields(manifest, {
           writerEpoch: WriterEpoch.make(manifest.writerEpoch + 1),
         }),
       );
+  }
+};
 
 /** A new compactor takes over: increments `compactorEpoch`. */
 export const fenceCompactor = (manifest: Manifest): Manifest =>
@@ -396,6 +433,7 @@ export const commitL0Flush = (
   flush: L0Flush,
 ): Result.Result<Manifest, WriterFencedError | DatabaseSealedError | SstBelowGcBoundaryError> => {
   if (manifest.l0.some((sst) => sst.id === flush.sst.id)) return Result.succeed(manifest);
+  // Sealing and removal both increment writerEpoch, so a writer from before either is fenced here.
   if (manifest.writerEpoch !== flush.writerEpoch)
     return Result.fail(writerFenced(manifest, flush.writerEpoch));
   if (manifest.state._tag === "Sealed")
@@ -547,11 +585,57 @@ export const advanceGcSstBoundary = (manifest: Manifest, boundary: Timestamp): M
     ? replaceManifestFields(manifest, { gcSstBoundary: boundary })
     : manifest;
 
-/** Adds a checkpoint; the same manifest when a checkpoint with its id exists. */
-export const addCheckpoint = (manifest: Manifest, checkpoint: Checkpoint): Manifest =>
-  manifest.checkpoints.some((existing) => existing.id === checkpoint.id)
-    ? manifest
-    : replaceManifestFields(manifest, { checkpoints: [...manifest.checkpoints, checkpoint] });
+/**
+ * Adds a checkpoint; the same manifest when a checkpoint with its id exists.
+ *
+ * @returns The manifest, or `DatabaseRemovedError` when the database is being removed (a fork
+ *   could otherwise pin files about to be deleted).
+ */
+export const addCheckpoint = (
+  manifest: Manifest,
+  checkpoint: Checkpoint,
+): Result.Result<Manifest, DatabaseRemovedError> => {
+  if (manifest.checkpoints.some((existing) => existing.id === checkpoint.id))
+    return Result.succeed(manifest);
+  if (manifest.state._tag === "Removed") return Result.fail(databaseRemoved(manifest));
+  return Result.succeed(
+    replaceManifestFields(manifest, { checkpoints: [...manifest.checkpoints, checkpoint] }),
+  );
+};
+
+/** The forks holding checkpoints on this database. */
+export const dependentForks = (manifest: Manifest): ReadonlyArray<DatabaseId> => [
+  ...new Set(manifest.checkpoints.flatMap((checkpoint) => Option.toArray(checkpoint.holder))),
+];
+
+/**
+ * Marks the database as being removed and fences its writer (`writerEpoch + 1`), so no write,
+ * checkpoint, or fork can commit after it.
+ *
+ * @returns The manifest; the same manifest when it is already marked; or
+ *   `DatabaseHasDependentsError` while forks hold checkpoints on it.
+ */
+export const markRemoved = (
+  manifest: Manifest,
+): Result.Result<Manifest, DatabaseHasDependentsError> => {
+  if (manifest.state._tag === "Removed") return Result.succeed(manifest);
+  const dependents = dependentForks(manifest);
+  if (dependents.length > 0) {
+    return Result.fail(
+      new DatabaseHasDependentsError({
+        databaseId: manifest.databaseId,
+        dependents,
+        message: `Database ${manifest.databaseId} cannot be removed: forks ${dependents.join(", ")} still read its SSTs. Remove them first, or wait until their compactions release their checkpoints.`,
+      }),
+    );
+  }
+  return Result.succeed(
+    replaceManifestFields(manifest, {
+      state: { _tag: "Removed" },
+      writerEpoch: WriterEpoch.make(manifest.writerEpoch + 1),
+    }),
+  );
+};
 
 /** Removes a checkpoint; the same manifest when it is absent. */
 export const removeCheckpoint = (manifest: Manifest, checkpointId: CheckpointId): Manifest =>
@@ -657,6 +741,30 @@ export const forkManifest = (
     options: checkpointManifest.options,
     gcSstBoundary: Timestamp.make(0),
   });
+};
+
+/**
+ * The external references a fork can release (a pure function): those whose owner no SST in the
+ * newest manifest or in any manifest its own checkpoints pin still belongs to.
+ *
+ * **Details**
+ *
+ * A fork of a fork keeps reading the original owner's files through handles copied from its
+ * source, and holds a checkpoint only on that source (D13). The source therefore keeps its own
+ * reference to the original owner while any manifest it must keep (including the one its fork pins)
+ * still names that owner.
+ *
+ * @param pinned - The manifests the newest manifest's checkpoints pin.
+ */
+export const releasableExternalRefs = (
+  latest: Manifest,
+  pinned: ReadonlyArray<Manifest>,
+): ReadonlyArray<ExternalRef> => {
+  const stillRead = new Set<DatabaseId>();
+  for (const manifest of [latest, ...pinned]) {
+    for (const owner of externalOwners(manifest)) stillRead.add(owner);
+  }
+  return latest.externalRefs.filter((ref) => !stillRead.has(ref.owner));
 };
 
 /** Owners other than the database itself whose SSTs the manifest still reads. */

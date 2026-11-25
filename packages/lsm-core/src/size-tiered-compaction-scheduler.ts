@@ -1,5 +1,11 @@
 import { SortedRunId, type SstId } from "./ids.ts";
-import type { CompactionJob, CompactionSource, Manifest, SortedRun } from "./manifest.ts";
+import {
+  type CompactionJob,
+  type CompactionSource,
+  externalOwners,
+  type Manifest,
+  type SortedRun,
+} from "./manifest.ts";
 
 /** Options of the size-tiered scheduler (SlateDB's defaults: 4, 8, 4.0). */
 export interface SizeTieredCompactionOptions {
@@ -38,8 +44,9 @@ const sortedRunSize = (run: SortedRun): number =>
  *    `minCompactionSources` runs, merge the oldest `maxCompactionSources` of them into the group's
  *    oldest (lowest) id.
  *
- * Planning repeats until `maxConcurrentCompactions` jobs are running or planned. A job is
- * `isBottom` when no data older than its sources exists. Every planned job's sources are
+ * Planning repeats until `maxConcurrentCompactions` jobs are running or planned. When nothing runs or
+ * is planned and the manifest still reads SSTs another database owns (a fork), one full compaction
+ * rewrites them. A job is `isBottom` when no data older than its sources exists. Every planned job's sources are
  * consecutive and disjoint from every running job's sources and destination.
  */
 export const planCompactions = (
@@ -117,5 +124,30 @@ export const planCompactions = (
     reserve(job);
     planned.push(job);
   }
+  if (running.length === 0 && planned.length === 0) {
+    const rewrite = planExternalRewrite(manifest);
+    if (rewrite !== undefined) planned.push(rewrite);
+  }
   return planned;
+};
+
+/**
+ * A fork's full compaction: once nothing else runs, merge every L0 SST and sorted run into the
+ * lowest run, so the fork stops reading SSTs another database owns and can release its checkpoint
+ * on its source (design §12). Undefined when the manifest reads only its own SSTs.
+ */
+const planExternalRewrite = (manifest: Manifest): CompactionJob | undefined => {
+  if (externalOwners(manifest).size === 0) return undefined;
+  const destination = manifest.sortedRuns.reduce(
+    (min, run) => Math.min(min, run.id),
+    Number.POSITIVE_INFINITY,
+  );
+  return {
+    sources: [
+      ...[...manifest.l0].reverse().map((sst): CompactionSource => ({ _tag: "L0", sstId: sst.id })),
+      ...manifest.sortedRuns.map((run): CompactionSource => ({ _tag: "SortedRun", id: run.id })),
+    ],
+    destination: SortedRunId.make(Number.isFinite(destination) ? destination : 0),
+    isBottom: true,
+  };
 };

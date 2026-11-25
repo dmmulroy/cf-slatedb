@@ -2,9 +2,14 @@ import {
   CompactionJob,
   CompactorEpoch,
   DatabaseId,
+  externalOwners,
   fenceCompactor,
   generateCompactionJobId,
+  type Manifest,
   planCompactions,
+  releasableExternalRefs,
+  removeCheckpoint,
+  removeExternalRef,
   Timestamp,
 } from "@cf-slatedb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
@@ -89,6 +94,13 @@ export interface ICompactor {
   readonly status: (
     databaseId: DatabaseId,
   ) => Effect.Effect<Option.Option<CompactorState>, DatabaseIdMismatchError, RuntimeContext>;
+  /**
+   * Forgets the compactor's state and alarm for a database being removed (its running jobs fail
+   * to commit against the removed manifest). Safe to repeat.
+   */
+  readonly destroy: (
+    databaseId: DatabaseId,
+  ) => Effect.Effect<void, DatabaseIdMismatchError, RuntimeContext>;
   /** The alarm handler: polls, and schedules the next poll while there is work. Never fails. */
   readonly runAlarm: Effect.Effect<void, never, RuntimeContext>;
 }
@@ -165,6 +177,35 @@ export const makeCompactor = Effect.gen(function* () {
     });
 
   /**
+   * A fork releases the checkpoints it holds on sources it no longer reads: once compaction has
+   * rewritten every SST the newest manifest and the manifests its own checkpoints pin take from an
+   * owner (`releasableExternalRefs`), it removes its checkpoint from the owner's manifest, then its
+   * reference from its own. Each step is an idempotent CAS, so a crash between them is retried.
+   */
+  const releaseExternalRefs = (databaseId: DatabaseId, latest: Manifest) =>
+    Effect.gen(function* () {
+      if (latest.externalRefs.length === 0) return;
+      const owners = externalOwners(latest);
+      // Cheap check first: the newest manifest still reads every owner.
+      if (latest.externalRefs.every((ref) => owners.has(ref.owner))) return;
+      const pinned: Array<Manifest> = [];
+      for (const checkpoint of latest.checkpoints) {
+        pinned.push(...Option.toArray(yield* reader.load(databaseId, checkpoint.manifestId)));
+      }
+      for (const ref of releasableExternalRefs(latest, pinned)) {
+        yield* manifests
+          .update(ref.owner, (manifest) =>
+            Result.succeed(removeCheckpoint(manifest, ref.checkpointId)),
+          )
+          .pipe(Effect.catchTags({ DatabaseNotFoundError: () => Effect.void }));
+        yield* manifests.update(databaseId, (manifest) =>
+          Result.succeed(removeExternalRef(manifest, ref)),
+        );
+        yield* Effect.annotateCurrentSpan({ "fork.released_owner": ref.owner });
+      }
+    });
+
+  /**
    * One poll: drop finished jobs, renew the rest, plan and start more.
    *
    * @returns Whether to poll again (jobs running or waiting for budget).
@@ -233,6 +274,7 @@ export const makeCompactor = Effect.gen(function* () {
         });
       }
       yield* cell.set({ ...state, running });
+      if (running.length === 0) yield* releaseExternalRefs(databaseId, latest.manifest);
       yield* Effect.annotateCurrentSpan({
         "database.id": databaseId,
         "manifest.id": latest.id,
@@ -256,18 +298,29 @@ export const makeCompactor = Effect.gen(function* () {
     return state;
   });
 
+  const destroy = Effect.fn("Compactor.destroy")(function* (databaseId: DatabaseId) {
+    yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
+    const state = yield* cell.get;
+    if (Option.isSome(state)) yield* checkDatabase(state.value, databaseId);
+    yield* alarm.cancel;
+    yield* cell.clear;
+  });
+
   const runAlarm = Effect.gen(function* () {
     const state = yield* cell.get;
     if (Option.isNone(state) || state.value.fenced) return;
     const again = yield* poll(state.value).pipe(
       Effect.catchTags({ DatabaseNotFoundError: () => Effect.succeed(false) }),
-      // Manifest unreadable now: poll again later.
-      Effect.catchTags({ ManifestReadError: () => Effect.succeed(true) }),
+      // Manifest unreadable or contended now: poll again later.
+      Effect.catchTags({
+        ManifestReadError: () => Effect.succeed(true),
+        ManifestWriteError: () => Effect.succeed(true),
+      }),
     );
     if (again) yield* pollBy((yield* Clock.currentTimeMillis) + settings.compactorPollInterval);
   }).pipe(Effect.withSpan("Compactor.alarm"));
 
-  return Compactor.of({ wake, status, runAlarm });
+  return Compactor.of({ wake, status, destroy, runAlarm });
 });
 
 /** Provides the compactor, leaving its state cell, alarm, manifests, launcher, and budget visible. */

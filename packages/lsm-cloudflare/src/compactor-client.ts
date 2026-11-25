@@ -1,8 +1,8 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
-import type { DatabaseId } from "@cf-slatedb/lsm-core";
+import { CompactorEpoch, type DatabaseId } from "@cf-slatedb/lsm-core";
 import { makeExecutionMemo } from "alchemy/Runtime/ExecutionMemo";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
-import { Cache, Context, Effect, Layer, type Option, type Scope } from "effect";
+import { Cache, Context, Effect, Layer, Option, Ref, type Scope } from "effect";
 import { HttpApiClient } from "effect/http-api";
 
 import { CompactionTrigger } from "./compaction-trigger.ts";
@@ -21,6 +21,10 @@ export interface ICompactorClient {
   readonly wake: (
     databaseId: DatabaseId,
   ) => Effect.Effect<CompactorState, CompactorError, RuntimeContext | Scope.Scope>;
+  /** Forgets the compactor's state and alarm for a database being removed. */
+  readonly destroy: (
+    databaseId: DatabaseId,
+  ) => Effect.Effect<void, CompactorError, RuntimeContext | Scope.Scope>;
   /** The compactor's state; none if it was never woken. */
   readonly status: (
     databaseId: DatabaseId,
@@ -72,6 +76,15 @@ export const compactorClientLayer = Layer.effect(
           }),
         );
       }),
+      destroy: Effect.fn("CompactorClient.destroy")(function* (databaseId: DatabaseId) {
+        yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
+        yield* (yield* client(databaseId)).compactor.destroy({ params: { databaseId } }).pipe(
+          Effect.catchTags({
+            HttpClientError: unreachable(databaseId),
+            SchemaError: unreachable(databaseId),
+          }),
+        );
+      }),
       status: Effect.fn("CompactorClient.status")(function* (databaseId: DatabaseId) {
         yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
         const response = yield* (yield* client(databaseId)).compactor
@@ -86,6 +99,37 @@ export const compactorClientLayer = Layer.effect(
       }),
     });
   }),
+);
+
+/** The databases the test compactor client was asked to destroy, in order. */
+export class CompactorClientRecord extends Context.Service<
+  CompactorClientRecord,
+  Ref.Ref<ReadonlyArray<DatabaseId>>
+>()("@cf-slatedb/CompactorClientRecord") {}
+
+/**
+ * Provides a compactor client with no compactors: it records the databases it was asked to destroy
+ * (in {@link CompactorClientRecord}, also output), reports no state, and wakes nothing. For tests of
+ * code that only notifies compactors.
+ */
+export const compactorClientTestLayer = Layer.effect(
+  CompactorClient,
+  Effect.gen(function* () {
+    const record = yield* CompactorClientRecord;
+    return CompactorClient.of({
+      wake: (databaseId) =>
+        Effect.succeed({
+          databaseId,
+          compactorEpoch: CompactorEpoch.make(0),
+          running: [],
+          fenced: false,
+        }),
+      destroy: (databaseId) => Ref.update(record, (destroyed) => [...destroyed, databaseId]),
+      status: () => Effect.succeed(Option.none()),
+    });
+  }),
+).pipe(
+  Layer.provideMerge(Layer.effect(CompactorClientRecord, Ref.make<ReadonlyArray<DatabaseId>>([]))),
 );
 
 /**

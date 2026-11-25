@@ -11,7 +11,7 @@ import {
   Timestamp,
   WriterEpoch,
 } from "./ids.ts";
-import { keyRangeContains } from "./key-range.ts";
+import { FULL_KEY_RANGE, keyRangeContains } from "./key-range.ts";
 import { encodeUlid } from "./ulid.ts";
 import {
   addCheckpoint,
@@ -23,6 +23,8 @@ import {
   fenceCompactor,
   fenceWriter,
   forkManifest,
+  markRemoved,
+  releasableExternalRefs,
   initialManifest,
   Manifest,
   ManifestJson,
@@ -188,8 +190,8 @@ describe("manifest edits", () => {
       holder: Option.none(),
       name: Option.none(),
     };
-    const added = addCheckpoint(empty, checkpoint);
-    expect(addCheckpoint(added, checkpoint)).toBe(added);
+    const added = Result.getOrThrow(addCheckpoint(empty, checkpoint));
+    expect(Result.getOrThrow(addCheckpoint(added, checkpoint))).toBe(added);
     expect(removeCheckpoint(added, checkpoint.id).checkpoints).toEqual([]);
     expect(removeCheckpoint(empty, checkpoint.id)).toBe(empty);
   });
@@ -212,5 +214,53 @@ describe("manifest edits", () => {
     expect(
       Option.map(fork.keyRange, (keyRange) => keyRangeContains(keyRange, Uint8Array.of(6))),
     ).toEqual(Option.some(false));
+  });
+
+  it("refuses removal while a fork holds a checkpoint, then fences writers, checkpoints, and forks", () => {
+    const checkpoint = {
+      id: CheckpointId.make("01JD0000000000000000000CP2"),
+      manifestId: ManifestId.make(1),
+      createdAt: Timestamp.make(1),
+      expireAt: Option.none(),
+      holder: Option.some(DatabaseId.make("orders-b")),
+      name: Option.none(),
+    };
+    const held = Result.getOrThrow(addCheckpoint(empty, checkpoint));
+    const refused = markRemoved(held);
+    expect(Result.isFailure(refused) && refused.failure.dependents).toEqual(["orders-b"]);
+    const removed = Result.getOrThrow(markRemoved(removeCheckpoint(held, checkpoint.id)));
+    expect(removed.state._tag).toBe("Removed");
+    expect(removed.writerEpoch).toBe(empty.writerEpoch + 1);
+    expect(Result.getOrThrow(markRemoved(removed))).toBe(removed);
+    const start = fenceWriter(removed);
+    expect(Result.isFailure(start) && start.failure._tag).toBe("DatabaseRemovedError");
+    const pin = addCheckpoint(removed, {
+      ...checkpoint,
+      id: CheckpointId.make("01JD0000000000000000000CP3"),
+    });
+    expect(Result.isFailure(pin) && pin.failure._tag).toBe("DatabaseRemovedError");
+    // A writer from before the removal is fenced.
+    const late = flush(removed, 1, empty.writerEpoch);
+    expect(Result.isFailure(late) && late.failure._tag).toBe("WriterFencedError");
+  });
+
+  it("releases an external reference only once no kept manifest reads the owner's SSTs", () => {
+    let source = empty;
+    source = Result.getOrThrow(flush(source, 1));
+    const checkpointId = CheckpointId.make("01JD0000000000000000000CP4");
+    const fork = forkManifest(source, {
+      databaseId: DatabaseId.make("orders-b"),
+      checkpointId,
+      range: FULL_KEY_RANGE,
+    });
+    expect(releasableExternalRefs(fork, [])).toEqual([]);
+    // Compaction rewrote the external SST into the fork's own.
+    const rewritten = manifestWith(fork, {
+      l0: [],
+      sortedRuns: [{ id: SortedRunId.make(0), ssts: [handle(9, 1, 2)] }],
+    });
+    expect(releasableExternalRefs(rewritten, [])).toEqual([{ owner: DB, checkpointId }]);
+    // But a checkpoint the fork holds pins a manifest that still reads the owner's SST (D13).
+    expect(releasableExternalRefs(rewritten, [fork])).toEqual([]);
   });
 });
