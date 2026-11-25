@@ -2,9 +2,12 @@
 
 Live measurements for design §12 ("Measure before trusting these numbers"), plus the live checks of
 hand-off item 4. Every number here came from the **`preview-1`** stage on Dillon's account
-(`99459fce09d9a9eec83befd957af4ec5`) on 2026-11-25, deployed with the **production settings**
-(`DEFAULT_LSM_SETTINGS`: `l0SstSize` 64 MiB, `maxL0Age` 60 s, `maxUnflushedBytes` 256 MiB) unless a
-row says otherwise. The client was a laptop on a US residential connection calling the Workers'
+(`99459fce09d9a9eec83befd957af4ec5`) on 2026-11-25 with the **production write-path settings**
+(`DEFAULT_LSM_SETTINGS`: `l0SstSize` 64 MiB, `maxL0Age` 60 s, `maxUnflushedBytes` 256 MiB, 4 KiB
+blocks). One correction (D54): an earlier `--dev-timings` deploy's `gcMinAge` (10 s) and
+`compactorPollInterval` (1 s) stayed bound on the Workers during these runs. Neither is on the
+writer's path (writes, flushes, the seal and forks); the faster compactor polling and GC could only
+have added background load. Deploys now bind every setting explicitly. The client was a laptop on a US residential connection calling the Workers'
 `workers.dev` URLs, so client-side latencies include an internet round trip.
 
 Reproduce with:

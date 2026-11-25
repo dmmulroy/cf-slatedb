@@ -9,9 +9,18 @@ export const LsmJurisdiction = Schema.Literals(["eu", "fedramp"]);
 /** A Stack's data-residency jurisdiction. */
 export type LsmJurisdiction = typeof LsmJurisdiction.Type;
 
+/** Schema for the jurisdiction setting's value: a jurisdiction, or `none` for no restriction. */
+const LsmJurisdictionSetting = Schema.Literals(["eu", "fedramp", "none"]);
+
+const jurisdictionOfSetting = (
+  setting: typeof LsmJurisdictionSetting.Type,
+): Option.Option<LsmJurisdiction> => (setting === "none" ? Option.none() : Option.some(setting));
+
 /**
- * Name of the setting that carries the Stack's jurisdiction. Set it in the environment of the
- * deploy (unset means no restriction); Alchemy binds it onto every Worker that reads it.
+ * Name of the setting that carries the Stack's jurisdiction: `eu`, `fedramp`, or `none`. Set it in
+ * the environment of the deploy; Alchemy binds it onto every Worker that reads it. Unset also means
+ * no restriction, but a deploy that stops setting it leaves the previous value bound on the Workers
+ * (Cloudflare keeps a script's secrets across uploads, D54), so deploys set `none` explicitly.
  */
 export const LSM_JURISDICTION_SETTING = "CF_SLATEDB_JURISDICTION";
 
@@ -26,10 +35,13 @@ export const LSM_JURISDICTION_SETTING = "CF_SLATEDB_JURISDICTION";
  * other than `eu` or `fedramp` stops the Worker: a misconfigured residency must not start.
  */
 export const lsmJurisdiction: Effect.Effect<Option.Option<LsmJurisdiction>> = Config.option(
-  Config.schema(LsmJurisdiction, LSM_JURISDICTION_SETTING),
-).pipe(Effect.orDie);
+  Config.schema(LsmJurisdictionSetting, LSM_JURISDICTION_SETTING),
+).pipe(
+  Effect.map((setting) => Option.flatMap(setting, jurisdictionOfSetting)),
+  Effect.orDie,
+);
 
-const decodeJurisdictionText = Schema.decodeUnknownOption(LsmJurisdiction);
+const decodeJurisdictionText = Schema.decodeUnknownOption(LsmJurisdictionSetting);
 
 /**
  * The jurisdiction in the process environment when this module loads, for props that must be known
@@ -37,8 +49,11 @@ const decodeJurisdictionText = Schema.decodeUnknownOption(LsmJurisdiction);
  * the same source {@link lsmJurisdiction} binds from; inside a deployed Worker it is unused.
  */
 export const lsmJurisdictionAtDeclaration: Option.Option<LsmJurisdiction> = Option.flatMap(
-  Option.fromUndefinedOr(globalThis.process?.env?.[LSM_JURISDICTION_SETTING]),
-  decodeJurisdictionText,
+  Option.flatMap(
+    Option.fromUndefinedOr(globalThis.process?.env?.[LSM_JURISDICTION_SETTING]),
+    decodeJurisdictionText,
+  ),
+  jurisdictionOfSetting,
 );
 
 /**

@@ -2,6 +2,7 @@ import { Effect, Option } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  deployEnvironment,
   deployJurisdiction,
   destroyCommand,
   parseStateRead,
@@ -90,5 +91,25 @@ describe("deployJurisdiction", () => {
     expect(deployJurisdiction(Option.some("none"), deployed("eu"))).toBe("none");
     expect(deployJurisdiction(Option.some("fedramp"), Option.some(outputs))).toBe("fedramp");
     expect(deployJurisdiction(Option.none(), Option.some(outputs))).toBe("none");
+  });
+});
+
+describe("deployEnvironment", () => {
+  it("always binds the settings and the jurisdiction explicitly, whatever the shell holds", () => {
+    const shell = {
+      PATH: "/bin",
+      CF_SLATEDB_LSM_SETTINGS: '{"gcMinAge":1}',
+      CF_SLATEDB_JURISDICTION: "eu",
+    };
+    expect(deployEnvironment(shell, { devTimings: false, jurisdiction: "none" })).toEqual({
+      PATH: "/bin",
+      CF_SLATEDB_LSM_SETTINGS: "{}",
+      CF_SLATEDB_JURISDICTION: "none",
+    });
+    expect(deployEnvironment(shell, { devTimings: true, jurisdiction: "fedramp" })).toEqual({
+      PATH: "/bin",
+      CF_SLATEDB_LSM_SETTINGS: '{"gcMinAge":10000,"compactorPollInterval":1000}',
+      CF_SLATEDB_JURISDICTION: "fedramp",
+    });
   });
 });

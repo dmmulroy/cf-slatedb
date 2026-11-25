@@ -36,6 +36,9 @@ describe("Stack jurisdiction", () => {
     expect(unset._tag === "Success" ? unset.value : "failed").toEqual(Option.none());
     const eu = await readJurisdiction({ CF_SLATEDB_JURISDICTION: "eu" });
     expect(eu._tag === "Success" ? eu.value : "failed").toEqual(Option.some("eu"));
+    // Deploys bind `none` explicitly: an unset value would leave the previous one bound (D54).
+    const none = await readJurisdiction({ CF_SLATEDB_JURISDICTION: "none" });
+    expect(none._tag === "Success" ? none.value : "failed").toEqual(Option.none());
     const invalid = await readJurisdiction({ CF_SLATEDB_JURISDICTION: "mars" });
     expect(invalid._tag).toBe("Failure");
   });

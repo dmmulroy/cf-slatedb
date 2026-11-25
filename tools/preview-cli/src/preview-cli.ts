@@ -22,6 +22,7 @@ import { Argument, Command, Flag } from "effect/cli";
 
 import {
   CF_SLATEDB_STACK_NAME,
+  deployEnvironment,
   deployJurisdiction,
   deployTask,
   destroyCommand,
@@ -124,16 +125,7 @@ const deploy = Command.make(
         );
       }
       // Settings come only from the flags: values left in the shell must not change a preview.
-      const {
-        CF_SLATEDB_LSM_SETTINGS: _settings,
-        CF_SLATEDB_JURISDICTION: _jurisdiction,
-        ...inherited
-      } = process.env;
-      const env = {
-        ...inherited,
-        ...(devTimings ? { CF_SLATEDB_LSM_SETTINGS: JSON.stringify(PREVIEW_DEV_TIMINGS) } : {}),
-        ...(residency === "none" ? {} : { CF_SLATEDB_JURISDICTION: residency }),
-      };
+      const env = deployEnvironment(process.env, { devTimings, jurisdiction: residency });
       yield* Console.error(
         `Deploying ${CF_SLATEDB_STACK_NAME} to ${stage} with ${devTimings ? "dev" : "production"} timings, jurisdiction ${residency} (vp run ${deployTask(stage)})`,
       );

@@ -703,3 +703,17 @@ Reads of the SST still fail with `SstCorrupted` (public `StoredDataInvalid`, 500
 `compactor.test.ts` flips one byte of an L0 SST: one job runs, ends `Corrupted` naming that SST and
 `DataBlock`, the compactor records it with its L0 source, plans nothing more, and L0 keeps all four
 SSTs; restoring the defect, or not blocking the source, fails the test.
+
+## D54. Deploys bind every setting explicitly; a setting a deploy stops setting stays bound
+
+Alchemy binds a `Config` value read during a Worker's init as a `secret_text`, and Cloudflare keeps a
+script's secrets across uploads. So when a deploy _stops_ setting a value, nothing replaces it: on
+`preview-1`, `CF_SLATEDB_LSM_SETTINGS` from a `--dev-timings` deploy stayed bound through the next
+deploys without the flag (found by reading the Workers' bindings in the state store). For the
+engine settings that only meant dev GC and compactor timings lingered; for the jurisdiction it would
+mean Workers still addressing EU Durable Objects after a Stack moved out of the EU.
+
+So the preview CLI always sets both explicitly (`deployEnvironment`): `CF_SLATEDB_LSM_SETTINGS` is
+`{}` (no overrides) unless `--dev-timings`, and `CF_SLATEDB_JURISDICTION` is `eu`, `fedramp`, or the
+new value `none`, which `lsmJurisdiction` reads as no restriction. Verified on `preview-1`: every
+Worker's bindings now hold `{}` and `none`. A future production deploy task must do the same.

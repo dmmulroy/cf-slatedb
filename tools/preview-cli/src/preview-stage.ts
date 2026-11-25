@@ -160,6 +160,21 @@ export const previewSecret = Effect.fn("PreviewStage.previewSecret")(function* (
   return Option.some(decoded.attr.text.__redacted__);
 });
 
+/**
+ * The environment a preview deploy runs with: the inherited one, with the engine settings and the
+ * jurisdiction always set explicitly. A value a deploy stops setting stays bound on the Workers
+ * (Cloudflare keeps a script's secrets across uploads, D54), so "no dev timings" is `{}` and "no
+ * jurisdiction" is `none`, never an absent variable.
+ */
+export const deployEnvironment = (
+  inherited: Readonly<Record<string, string | undefined>>,
+  options: { readonly devTimings: boolean; readonly jurisdiction: PreviewJurisdiction },
+): Record<string, string | undefined> => ({
+  ...inherited,
+  CF_SLATEDB_LSM_SETTINGS: options.devTimings ? JSON.stringify(PREVIEW_DEV_TIMINGS) : "{}",
+  CF_SLATEDB_JURISDICTION: options.jurisdiction,
+});
+
 /** The `vp run` task that deploys a stage in place. */
 export const deployTask = (stage: PreviewStage) => `@cf-slatedb/infra#deploy:${stage}`;
 

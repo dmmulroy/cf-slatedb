@@ -84,6 +84,11 @@ in order.
   `Corrupted` outcome (no defect, no retry loop); the compactor reads job outcomes, records the SST
   in its state (`GET …/compaction`), counts and logs it, and never plans its source again until the
   SST leaves the manifest.
+- **Finding (fixed, D54):** a `Config`-bound setting that a later deploy stops setting stays bound on
+  the Workers (Cloudflare keeps secrets across uploads), so `preview-1` kept the dev timings after
+  redeploys without `--dev-timings`. The preview CLI now binds `CF_SLATEDB_LSM_SETTINGS` (`{}` by
+  default) and `CF_SLATEDB_JURISDICTION` (new value `none`) on every deploy; verified in the
+  Workers' bindings. `docs/measurements.md` states which settings applied to its runs.
 
 ## Done
 
