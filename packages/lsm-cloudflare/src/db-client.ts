@@ -35,7 +35,9 @@ import {
 import { compactionTriggerTestLayer } from "./compaction-trigger.ts";
 import { lsmConfigurationTestLayer } from "./lsm-configuration.ts";
 import { manifestCacheLayerWithoutDependencies } from "./manifest-cache.ts";
-import { manifestStoreTestLayer } from "./manifest-store.ts";
+import { manifestReaderLayerWithoutDependencies } from "./manifest-reader.ts";
+import { manifestStoreLayerWithoutDependencies } from "./manifest-store.ts";
+import { ObjectStore, objectStoreTestLayer } from "./object-store.ts";
 import { objectReaderFromObjectStoreLayer } from "./object-reader.ts";
 import type { MemTableCursor } from "./mem-table.ts";
 import {
@@ -655,9 +657,12 @@ export const dbClientLayer = dbClientLayerWithoutDependencies.pipe(
  * Provides a client over one in-memory object store shared by in-process writers (crossing the real
  * writer HTTP API) and the reader (blocks read straight from the store). The Layer also outputs the
  * manifest store, manifest reader, object store, and a recording compaction trigger so tests can
- * inspect them.
+ * inspect them. `objectStore` replaces the in-memory bucket (a fault-injecting one, for example).
  */
-export const dbClientTestLayer = (overrides: Partial<LsmSettings> = {}) =>
+export const dbClientTestLayer = (
+  overrides: Partial<LsmSettings> = {},
+  objectStore: Layer.Layer<ObjectStore> = objectStoreTestLayer,
+) =>
   dbClientLayerWithoutDependencies.pipe(
     Layer.provideMerge(writerClientTestLayer),
     Layer.provideMerge(
@@ -667,7 +672,12 @@ export const dbClientTestLayer = (overrides: Partial<LsmSettings> = {}) =>
         Layer.provide(blockCacheLayerWithoutDependencies.pipe(Layer.provide(blockSourceTestLayer))),
       ),
     ),
-    Layer.provideMerge(manifestStoreTestLayer),
+    Layer.provideMerge(
+      manifestStoreLayerWithoutDependencies.pipe(
+        Layer.provideMerge(manifestReaderLayerWithoutDependencies),
+        Layer.provideMerge(objectStore),
+      ),
+    ),
     Layer.provideMerge(
       Layer.mergeAll(lsmConfigurationTestLayer(overrides), compactionTriggerTestLayer),
     ),

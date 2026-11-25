@@ -6,7 +6,7 @@ import {
   ManifestReader,
   lsmTestRuntimeContextLayer,
 } from "@cf-slatedb/lsm-cloudflare";
-import { Arbitrary, Bytes, Effect, Layer, Option, Schema, Stream } from "effect";
+import { Arbitrary, Bytes, Effect, Fiber, Layer, Option, Schema, Stream } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 
 import { ShardDirectory, shardDirectoryTestLayer } from "./shard-directory.ts";
@@ -169,6 +169,49 @@ describe("sharding", () => {
     expect(outcome.map.shards.length).toBe(2);
     expect(outcome.cross).toBe("CrossShardBatchError");
     expect(outcome.nine).toEqual(Option.some(Uint8Array.of(9)));
+  }, 60_000);
+
+  it("a split under concurrent writes loses no acknowledged write", async () => {
+    const outcome = await Effect.runPromise(
+      provide(
+        Effect.gen(function* () {
+          yield* createGroup;
+          const router = yield* ShardRouter;
+          const acked: Array<number> = [];
+          // A writer keeps writing through the router while the shard is split under it.
+          const writer = yield* Effect.forkChild(
+            Effect.forEach(
+              Array.from({ length: 60 }, (_, index) => index),
+              (n) =>
+                router.put(GROUP, key(n), Uint8Array.of(n)).pipe(
+                  Effect.tap(() => Effect.sync(() => acked.push(n))),
+                  Effect.andThen(Effect.yieldNow),
+                ),
+              { discard: true },
+            ),
+          );
+          yield* Effect.sleep("5 millis");
+          const beforeSplit = acked.length;
+          const map = yield* (yield* ShardSplit).split(GROUP, FIRST, key(30));
+          yield* Fiber.join(writer);
+          // Read straight from the shard the published map names, without the router's cache.
+          const client = yield* DbClient;
+          const missing: Array<number> = [];
+          for (const n of acked) {
+            const shard = Option.getOrUndefined(shardFor(map, key(n)));
+            const got =
+              shard === undefined
+                ? Option.none()
+                : yield* client.get(shard.databaseId, key(n), latest);
+            if (Option.getOrUndefined(Option.map(got, (bytes) => bytes[0])) !== n) missing.push(n);
+          }
+          return { acked: acked.length, missing, shards: map.shards.length, beforeSplit };
+        }),
+      ),
+    );
+    expect(outcome).toMatchObject({ acked: 60, missing: [], shards: 2 });
+    // The writer was still writing when the split began.
+    expect(outcome.beforeSplit).toBeLessThan(60);
   }, 60_000);
 
   it("resumes a split that stopped after sealing, with the same new databases", async () => {

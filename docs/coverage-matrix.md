@@ -15,12 +15,13 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   (`memtable_rows (key, seq DESC)`), `writer-sql-storage.ts`; `WriteReceipt` has only `seq` and
   `createTs`. Tests: `mem-table.test.ts` (real SQLite), `writer.workerd.ts` (DO SQLite).
   Formal: `NoAckedWriteLost`.
-- **Manifest CAS with R2 `If-None-Match: *`** — partial. `lsm-cloudflare/src/object-store.ts`
-  (`putIfAbsent`), `manifest-store.ts` (`create`, `update` with CAS retry). Tests:
-  `manifest-store.test.ts` (32 concurrent create-if-absent → one `Created`; 12 concurrent edits →
-  13 manifests, none lost), `test/object-store/object-store.workerd.ts` against Alchemy's local R2
-  (Headers form; 16 concurrent flush commits). Real-R2 check needs approval. Formal: fencing/CAS
-  model (in progress).
+- **Manifest CAS with R2 `If-None-Match: *`** — done locally; the real-R2 check waits for
+  approval (open question 2). `object-store.ts` (`putIfAbsent`), `manifest-store.ts` (`create`,
+  `update` with CAS retry; RFC 0026 boundary). Tests: `manifest-store.test.ts` (32 concurrent
+  create-if-absent → one `Created`; 12 concurrent edits → 13 manifests, none lost; stale create over
+  a collected id refused), `test/object-store/object-store.workerd.ts` against Alchemy's local R2
+  (Headers form; 16 concurrent flush commits). Formal: `ManifestCasFencing` (`CreateOnce`,
+  `blindCreate`).
 - **Compaction in `CompactorServer` + Workflow** — done. `compactor.ts` (fence once, poll on the
   alarm, plan, lease, launch; idle with no work), `compactor-server.ts`, `compaction-workflow.ts`
   (`CompactionWorkflow`: `prepare`, `output-<n>`, `commit` steps; results encoded with Schema),
@@ -94,10 +95,11 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 
 - **Writer init fencing loop** — done. `ensureReady` (`ManifestStore.update(fenceWriter)` with CAS
   retry, epoch stored in `writer_meta`, sequence oracle and clock seeded from the manifest) (D19).
-- **`manifest/LATEST` hint + probe `id+1`; no LIST on read paths** — partial.
-  `lsm-cloudflare/src/manifest-reader.ts` (`loadLatest`; LIST only to recover when the hint names a
-  collected manifest). `manifest-store.test.ts` covers a lagging hint and a collected hinted
-  manifest. Trace assertion "no `ObjectStore.list` on a read path": Phase 5 scenarios.
+- **`manifest/LATEST` hint + probe `id+1`; no LIST on read paths** — done.
+  `manifest-reader.ts` (`loadLatest`; LIST only to recover when the hint names a collected
+  manifest); GC rewrites the hint before deleting manifests. Tests: `manifest-store.test.ts` (lagging
+  hint, collected hinted manifest). Trace: the `write-read` scenario and the Phase 5 dev check assert
+  no `ObjectStore.list` on a `Flushed` read.
 - **Compactor edit replaces exactly its inputs, else fails** — done. `commitCompaction`
   (`manifest.test.ts`: replace, idempotent retry, `CompactionInputsChangedError`,
   `CompactorFencedError`, `SstBelowGcBoundaryError`); `CompactionExecutor.prepare` re-checks the
@@ -106,10 +108,10 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   the manifest commit; restart drops rows `<= lastL0Seq` (D22); `mergeRowStreams` drops exact
   duplicates. Tests: `db-writer.test.ts` (crash between commit and truncate), `merge-iterator.test.ts`.
   Formal: `NoAckedWriteLost` (`truncateBeforeCommit` fails).
-- **`onlyIf: new Headers({ "If-None-Match": "*" })` (workerd #2572)** — partial.
-  `object-store.ts` `putIfAbsent` passes the Headers form; verified against local R2 in
-  `object-store.workerd.ts` (second create returns `AlreadyExists`, stored bytes unchanged). The
-  real-R2 integration test is prepared as an approval-gated live check.
+- **`onlyIf: new Headers({ "If-None-Match": "*" })` (workerd #2572)** — done locally; real R2
+  pending approval. `object-store.ts` `putIfAbsent` passes the Headers form (and `putIfVersion` the
+  `If-Match` form); verified against local R2 in `object-store.workerd.ts`. The real-R2 run is open
+  question 2.
 
 ## §6 Types
 
@@ -127,13 +129,13 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 
 ## §7 Services
 
-- **`ObjectStore`, `ManifestStore`, `ManifestCache`** — partial. `object-store.ts` (R2 adapter
-  owning `R2Error` → `ObjectStoreUnavailableError` with retry; multipart with abort on failure;
-  faithful in-memory test layer: atomic create-if-absent, ranges, 1000-key pages, 5 MiB part
-  minimum, `Clock` upload times), `manifest-reader.ts`, `manifest-store.ts`
-  (`ManifestConflictError` internal and retried, `ManifestWriteError`, idempotent edits write
-  nothing, `lsm_manifest_cas_conflicts` metric), `manifest-cache.ts` (D17), `lsm-configuration.ts`,
-  `lsm-bucket.ts`, `object-keys.ts`. Tests: `manifest-store.test.ts`, `object-store.workerd.ts`.
+- **`ObjectStore`, `ManifestStore`, `ManifestCache`** — done. `object-store.ts` (R2 adapter
+  owning `R2Error` → `ObjectStoreUnavailableError` with retry; multipart with abort on failure and
+  single-copy re-chunking; versioned reads and `If-Match` writes; delimited listings; faithful
+  in-memory test layer), `manifest-reader.ts`, `manifest-store.ts` (CAS retry, RFC 0026 boundary,
+  `lsm_manifest_cas_conflicts`), `manifest-cache.ts` (D17), `lsm-configuration.ts`, `lsm-bucket.ts`,
+  `object-keys.ts`. Tests: `object-store.test.ts`, `manifest-store.test.ts`,
+  `object-store.workerd.ts`, `fault-injection.test.ts` (R2 outages).
 - **`SstStore`, `BlockCache`, `BlockSource`, `BlockServer`, `DbReader`, `DbClient`** — done
   (`SstStore.openReader` is `BlockCache.meta`/`block`). Execution-scoped HTTP clients:
   `writer-client.ts`, `block-source.ts`.
@@ -157,10 +159,17 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 - **`put`, `delete`, `merge`, `write`, `get`, `getRow`, `scan`, `flush`** — done. `DbClient`
   (plus `scanPrefix`, `snapshot`) and the public `DbHttpApi`. Tests: `db-client.test.ts`,
   `writer-client.test.ts`, `writer.workerd.ts`.
-- **Errors** — partial (public envelope done: `db-public-error.ts`, `db-public-error-translation.ts`, D25; `WriteStalledError`, `WriterUnavailableError`, `DatabaseNotFoundError` in `lsm-errors.ts`). Core: `SstCorruptedError`, `MergeOperatorMissingError`
-  (`lsm-core-errors.ts`), `WriterFencedError`, `CompactorFencedError`, `DatabaseSealedError`,
-  `CompactionInputsChangedError` (`manifest.ts`). Pending: `KeyOutOfRangeError`,
-  `WriteStalledError`, `ManifestConflictError`, `ObjectStoreUnavailableError`, public HTTP errors.
+- **Errors** — done. Core (`Schema.TaggedError`): `SstCorruptedError`, `MergeOperatorMissingError`,
+  `WriterFencedError`, `CompactorFencedError`, `DatabaseSealedError`, `DatabaseRemovedError`,
+  `DatabaseHasDependentsError`, `CompactionInputsChangedError`, `SstBelowGcBoundaryError`,
+  `KeyOutOfRangeError`, `WriteBatchInvalidError`, `TransactionConflictError`. Cloudflare:
+  `WriteStalledError`, `WriterUnavailableError`, `DatabaseNotFoundError`, `DatabaseIdMismatchError`
+  (`lsm-errors.ts`), `ManifestConflictError` (internal, retried), `ManifestWriteError`,
+  `ManifestReadError`, `ObjectStoreUnavailableError`, `ReaderUnavailableError`,
+  `ChangelogUnavailableError`, `CheckpointNotFoundError`, compaction, GC, and budget errors. Public
+  envelope: `db-public-error.ts` + the exhaustive `db-public-error-translation.ts` (D25): every
+  internal error maps to a code, message, request id, and `retryable`. Tests:
+  `writer-client.test.ts`, `writer.workerd.ts` (public errors over HTTP), each module's tests.
 - **Merge operators and TTL during reads and compaction** — done. `lsm-core/src/row-resolution.ts`
   (D10, D11) and `compaction-merge.ts` (`compactRowStreams`). Tests: `row-resolution.test.ts`
   (oracle at any snapshot and time; earliest expiry; `U64Add`; `MergeOperatorMissingError`; raw
@@ -182,7 +191,8 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 
 ## §9 Effect audit and private gaps
 
-- **Sorted map via DO SQLite** — pending (Phase 4).
+- **Sorted map via DO SQLite** — done. `mem-table.ts` (`memtable_rows` with primary key
+  `(key, seq DESC)`, sorted scans as streams, D19). Tests: `mem-table.test.ts`, `db-writer.test.ts`.
 - **k-way merge over `Pull` with a private heap** — done. `lsm-core/src/merge-iterator.ts`.
 - **CRC32C, Bloom filter (double hashing), ULID (`Clock` + `Random`), no compression** — done.
   `crc32c.ts` (check value in `sst-codec.test.ts`); `bloom-filter.ts` (D9) with
@@ -279,7 +289,16 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   split): `SealSplit.tla`, skill `.agents/skills/verify-seal-split`. Check 6 (transactions):
   `Transactions.tla`, skill `.agents/skills/verify-transactions`. All run by `vp run verify`, each
   broken variant shown failing.
-- **Hardening scenarios** — pending (Phase 10).
+- **Hardening scenarios** — done. Writer eviction mid-flush and a crash between the manifest commit
+  and the truncate: `db-writer.test.ts`; a crash between the L0 upload and the manifest commit
+  (orphan left, nothing lost, GC removes it): `fault-injection.test.ts`; CAS races:
+  `manifest-store.test.ts` and `ManifestCasFencing`; a stale writer after fencing:
+  `db-writer.test.ts` and `ManifestCasFencing`; R2 failures (outages and flaky calls never lose or
+  hide an acknowledged write; shown failing with truncate-before-commit):
+  `fault-injection.test.ts`; a compaction resumed after a failed step (finished steps replayed, one
+  commit): `fault-injection.test.ts`; a split under load (a writer through the router during the
+  split loses nothing; shown failing without the seal): `sharding.test.ts`. End to end:
+  `writer.workerd.ts` and the scenario CLI.
 
 ## Phase 6 additions
 
