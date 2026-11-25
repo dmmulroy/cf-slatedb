@@ -7,7 +7,9 @@
     "test": "vp test run"
   },
   "dependencies": {
+    "@cf-slatedb/lsm-cloudflare": "workspace:*",
     "@cf-slatedb/lsm-core": "workspace:*",
+    "@cf-slatedb/sharding": "workspace:*",
     "@effect/platform-node": "catalog:",
     "effect": "catalog:"
   },

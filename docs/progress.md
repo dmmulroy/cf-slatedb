@@ -142,6 +142,11 @@ Phase 10: hardening (starting). Phases 0–9 are done.
   the generator produced mostly one-step schedules; it now requires 20–60 steps, and every mutation
   of the checks is caught. Decision D41.
 
+- **Phase 10 (in progress) — scenario CLI.** `tools/scenario-cli` runs nine end-to-end scenarios
+  against `vp run dev` with trace assertions; all pass. The change feed's read side (D42) landed
+  first. Code is now erasable-syntax-only (`erasableSyntaxOnly`), so Node runs every package's
+  sources directly.
+
 ## Next
 
 - Phase 10: hardening — the scenario CLI (`tools/scenario-cli`) running named scenarios against

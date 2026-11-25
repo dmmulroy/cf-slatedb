@@ -115,10 +115,13 @@ export interface BlockLocation {
 
 /** A decoded, checksum-verified data block that can seek by key. */
 export class DataBlock {
-  constructor(
-    private readonly data: Uint8Array,
-    private readonly restartOffsets: ReadonlyArray<number>,
-  ) {}
+  private readonly data: Uint8Array;
+  private readonly restartOffsets: ReadonlyArray<number>;
+
+  constructor(data: Uint8Array, restartOffsets: ReadonlyArray<number>) {
+    this.data = data;
+    this.restartOffsets = restartOffsets;
+  }
 
   /** Number of restart points (each starts a run of up to 16 rows). */
   get restartCount(): number {

@@ -343,13 +343,6 @@ importers:
         version: 1.2.0(@types/node@24.19.2)(@vitest/ui@5.0.4)(jiti@2.7.0)(typescript@7.0.2)(yaml@2.9.1)
 
   tools/formal-verification:
-    dependencies:
-      '@effect/platform-node':
-        specifier: 'catalog:'
-        version: 4.1.4(effect@4.1.4)(redis@6.4.0)
-      effect:
-        specifier: 'catalog:'
-        version: 4.1.4
     devDependencies:
       '@types/node':
         specifier: 'catalog:'
@@ -363,9 +356,15 @@ importers:
 
   tools/scenario-cli:
     dependencies:
+      '@cf-slatedb/lsm-cloudflare':
+        specifier: workspace:*
+        version: link:../../packages/lsm-cloudflare
       '@cf-slatedb/lsm-core':
         specifier: workspace:*
         version: link:../../packages/lsm-core
+      '@cf-slatedb/sharding':
+        specifier: workspace:*
+        version: link:../../packages/lsm-sharding
       '@effect/platform-node':
         specifier: 'catalog:'
         version: 4.1.4(effect@4.1.4)(redis@6.4.0)

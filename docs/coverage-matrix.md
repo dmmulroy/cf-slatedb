@@ -266,7 +266,12 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 - **OTLP from every Worker and DO, including alarms, flushed before the event settles** — done for
   the probe and smoke Workers; every new handler must use `eventTelemetryFlushForStage` (D5).
   Tests: `lsm-cloudflare/src/lsm-telemetry.test.ts`, `test/telemetry/*.workerd.ts`.
-- **Scenario CLI (write/read, flush, compaction, fork/split, fencing, changelog)** — pending.
+- **Scenario CLI (write/read, flush, compaction, fork/split, fencing, changelog)** — done.
+  `tools/scenario-cli` (`list`, `run [names|all]`): `write-read`, `flush`, `compaction`, `gc`,
+  `fork-split`, `fencing`, `changelog`, `transactions`, `remove`, each checking results through the
+  typed public APIs (`DbHttpApi`, `GcHttpApi`, `ShardedHttpApi`) and its traces through the trace
+  CLI's `assert` (a selection matching no trace fails). All nine pass against `vp run dev` (dev
+  stage: `gcMinAge` 10 s, compactor polls every second).
 - **Formal checks 1–6** — done. Check 1 (no acknowledged write lost or hidden): `NoAckedWriteLost.tla`,
   skill `.agents/skills/verify-no-acked-write-lost`. Check 2 (fencing) and 3 (manifest CAS
   linearizability): `ManifestCasFencing.tla`, skill `.agents/skills/verify-manifest-cas-fencing`.

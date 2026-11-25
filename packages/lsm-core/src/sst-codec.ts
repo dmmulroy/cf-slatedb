@@ -120,7 +120,11 @@ export class SstBuilder {
   private readonly stats = { puts: 0, deletes: 0, merges: 0, keyBytes: 0, valueBytes: 0 };
   private previousFilterKey = Option.none<Uint8Array>();
 
-  constructor(private readonly options: SstBuilderOptions) {}
+  private readonly options: SstBuilderOptions;
+
+  constructor(options: SstBuilderOptions) {
+    this.options = options;
+  }
 
   /** Number of rows added. */
   get count(): number {

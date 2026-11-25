@@ -100,10 +100,10 @@ export class ByteReader {
   /** Current read position. */
   offset: number;
 
-  constructor(
-    private readonly source: Uint8Array,
-    offset = 0,
-  ) {
+  private readonly source: Uint8Array;
+
+  constructor(source: Uint8Array, offset = 0) {
+    this.source = source;
     this.view = new DataView(source.buffer, source.byteOffset, source.byteLength);
     this.offset = offset;
   }
