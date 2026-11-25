@@ -15,8 +15,8 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   (`memtable_rows (key, seq DESC)`), `writer-sql-storage.ts`; `WriteReceipt` has only `seq` and
   `createTs`. Tests: `mem-table.test.ts` (real SQLite), `writer.workerd.ts` (DO SQLite).
   Formal: `NoAckedWriteLost`.
-- **Manifest CAS with R2 `If-None-Match: *`** — done locally; the real-R2 check waits for
-  approval (open question 2). `object-store.ts` (`putIfAbsent`), `manifest-store.ts` (`create`,
+- **Manifest CAS with R2 `If-None-Match: *`** — done, confirmed on real R2 (`preview-1`,
+  scenario `create-race`: 16 concurrent creates, one `Created`). `object-store.ts` (`putIfAbsent`), `manifest-store.ts` (`create`,
   `update` with CAS retry; RFC 0026 boundary). Tests: `manifest-store.test.ts` (32 concurrent
   create-if-absent → one `Created`; 12 concurrent edits → 13 manifests, none lost; stale create over
   a collected id refused), `test/object-store/object-store.workerd.ts` against Alchemy's local R2
@@ -78,13 +78,15 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   stop at the first settled level), `DbReader.scan` (`blocksOverlappingRange`, prefetch of the next
   block). Tests: `sst-codec.test.ts`, `db-client.test.ts`.
 - **L1 `BlockCache` (separate data and metadata caches)** — done. `block-cache.ts` (joined
-  misses, failures not cached, `cache.hit` span attribute, `lsm_block_cache_requests` metric) (D32).
+  misses, failures not cached, `cache.hit` span attribute, `lsm_block_cache_requests` metric;
+  bounded by bytes per `budgetGroup`, D51).
   Trace: the repeat-read assertion (both caches hit, no `BlockServer` span).
 - **L2 Workers Cache in front of `BlockServer`; block/meta/manifest URLs; immutable headers;
-  `Cache-Tag`** — done locally; live hit check pending approval. `block-server-http-api.ts`,
+  `Cache-Tag`** — done, confirmed live. `block-server-http-api.ts`,
   `block-server-http-handlers.ts` (D27, D28). Test: `block-server.test.ts` (status codes,
-  `Cache-Control`, `Cache-Tag: db:<owner>`, latest hint, no short bodies). Live
-  `Cf-Cache-Status: HIT`: open question 1.
+  `Cache-Control`, `Cache-Tag: db:<owner>`, latest hint, no short bodies). Live: scenario
+  `block-cache` on `preview-1` — `Cf-Cache-Status: HIT` (`cache.l2.status` on `BlockSource` spans)
+  for a block another Worker read first; off in a restricted Stack (D49).
 - **`BlockServer`: separate Worker, `crossVersionCache`, `workersDev: false`, `fetch()` not RPC**
   — done. `block-server-worker.ts`, `block-source.ts` (D31). Test: `writer.workerd.ts` reads through
   the binding; trace shows `GET (client)` → `BlockServer.*` on the `cf-slatedb-blocks` service.
@@ -108,10 +110,10 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   the manifest commit; restart drops rows `<= lastL0Seq` (D22); `mergeRowStreams` drops exact
   duplicates. Tests: `db-writer.test.ts` (crash between commit and truncate), `merge-iterator.test.ts`.
   Formal: `NoAckedWriteLost` (`truncateBeforeCommit` fails).
-- **`onlyIf: new Headers({ "If-None-Match": "*" })` (workerd #2572)** — done locally; real R2
-  pending approval. `object-store.ts` `putIfAbsent` passes the Headers form (and `putIfVersion` the
-  `If-Match` form); verified against local R2 in `object-store.workerd.ts`. The real-R2 run is open
-  question 2.
+- **`onlyIf: new Headers({ "If-None-Match": "*" })` (workerd #2572)** — done, confirmed on real R2.
+  `object-store.ts` `putIfAbsent` passes the Headers form (and `putIfVersion` the `If-Match` form);
+  local R2 in `object-store.workerd.ts`; real R2 on `preview-1` (scenario `create-race`: 1
+  `Created`, 15 `AlreadyExists`).
 
 ## §6 Types
 

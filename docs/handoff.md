@@ -3,6 +3,12 @@
 This document lets a new agent, on any machine, pick up cf-slatedb and finish it. Read it in full
 before you change anything. The prompt to start the agent is at the end.
 
+> **Status (2026-11-25): every item under "Remaining work" is done.** The final hand-off — what was
+> built, how to run it locally and on a preview, what is verified, the live results, what is left,
+> and the commands to destroy the previews — is in [`docs/progress.md`](progress.md#hand-off).
+> `preview-1` (unrestricted) and `preview-2` (`eu`) are deployed on production settings; the
+> "State at hand-off" section below describes the state before that work.
+
 ## What cf-slatedb is
 
 A SlateDB-style LSM key-value store on Cloudflare: R2 for SSTs and manifests, a writer Durable Object

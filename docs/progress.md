@@ -2,18 +2,19 @@
 
 ## Current phase
 
-All ten phases are done. Working through the "Remaining work" in [`docs/handoff.md`](handoff.md),
-in order.
+**Done.** All ten phases of the build brief and all seven items of the hand-off's "Remaining
+work" are complete; the final hand-off is below. Nothing is blocked on Dillon; the open
+questions at the end are optional.
 
-| Item                                   | Status  |
-| -------------------------------------- | ------- |
-| 1. Portable Alchemy state for previews | done    |
-| 2. Preview deployment tool             | next    |
-| 3. Traces from previews                | pending |
-| 4. Live checks                         | pending |
-| 5. Data residency, per Stack           | pending |
-| 6. Known gaps                          | pending |
-| 7. Finish                              | pending |
+| Item                                   | Status | Commit                                     |
+| -------------------------------------- | ------ | ------------------------------------------ |
+| 1. Portable Alchemy state for previews | done   | `69ca966`                                  |
+| 2. Preview deployment tool             | done   | `73719e4`                                  |
+| 3. Traces from previews                | done   | `7c80311`                                  |
+| 4. Live checks                         | done   | `18c2024`                                  |
+| 5. Data residency, per Stack           | done   | `52f0133`                                  |
+| 6. Known gaps                          | done   | `a8f3231`, `82fe7f0`, `ac5e0c3`, `e033b20` |
+| 7. Finish                              | done   | this commit                                |
 
 ## Remaining-work log
 
@@ -52,7 +53,8 @@ in order.
      database, exactly one `Created`, 15 `AlreadyExists` on real R2 with the `Headers` form.
   3. **Scenarios: 11/11 pass** on `preview-1` (`run --stage preview-1 all`, `--dev-timings`
      deploy) with trace assertions pulled from the collector, and 11/11 under `vp run dev`.
-  4. **Measurements** (production settings): a writer is CPU-bound at ~2.7k rows/s (100-row
+  4. **Measurements** (production write-path settings; see D54 for the GC and compactor timings
+     that stayed bound): a writer is CPU-bound at ~2.7k rows/s (100-row
      batches) to ~12.3k rows/s (1,000-row batches); a flush costs ~55–90 ms CPU per MiB; a split
      pauses the shard's writes ~13–16 s, because each manifest CAS is ~1.1 s on R2.
      **Finding (fixed):** the shard router's 5 s retry window assumed a local split; live, every write
@@ -89,6 +91,12 @@ in order.
   redeploys without `--dev-timings`. The preview CLI now binds `CF_SLATEDB_LSM_SETTINGS` (`{}` by
   default) and `CF_SLATEDB_JURISDICTION` (new value `none`) on every deploy; verified in the
   Workers' bindings. `docs/measurements.md` states which settings applied to its runs.
+- **Standards review** (`158b6ad`): the traits checker over the new code; the access gate's `401`
+  and the trace collector's errors now use the public error envelope (declared in `DbHttpApi`, no
+  vendor messages), the tools' errors carry typed context, optional Stack outputs decode to
+  `Option`, and a trace pull's cursor advances per export.
+- **7. Finish.** Both previews redeployed with the final code (`preview-1` unrestricted, `preview-2`
+  in `eu`, production settings); this hand-off.
 
 ## Done
 
@@ -237,64 +245,125 @@ in order.
 
 ## Hand-off
 
-**What was built.** cf-slatedb, a SlateDB-style LSM key-value store on Cloudflare:
+### What was built
 
-- `packages/lsm-core` (pure, no Cloudflare): ids, rows and resolution (merge operators, TTL), CRC32C,
-  Bloom filters, block and SST codecs, the k-way merge, the manifest and its pure edits (fencing,
-  flush, compaction, seal, removal, checkpoints, forks, GC boundaries), the size-tiered scheduler,
-  the compaction merge, GC planning, the compaction budget ledger, write batches, read consistency,
-  transactions.
+cf-slatedb, a SlateDB-style LSM key-value store on Cloudflare R2 and Durable Objects:
+
+- `packages/lsm-core` (pure): ids, rows and resolution (merge operators, TTL), CRC32C, Bloom filters,
+  block and SST codecs, the k-way merge, the manifest and its pure edits, the size-tiered scheduler
+  (with blocked sources), the compaction merge, GC planning, the compaction budget ledger, write
+  batches, read consistency, transactions, and the byte-budget LRU behind the L1 cache.
 - `packages/lsm-cloudflare`: `ObjectStore` (R2), manifests (CAS, RFC 0026 boundary), the writer
-  (`WriterServer` Durable Object; SQLite memtable = WAL; flush, backpressure, seal, change feed,
-  transactions), the reader (`DbReader` in the caller's isolate; L1 `BlockCache`; `BlockServer`
-  Worker behind Workers Cache), compaction (`CompactorServer`, `CompactionWorkflow`,
-  `CompactionBudgetServer`), GC (`GarbageCollector`, cron `GcWorker`), `DatabaseLifecycle`
-  (checkpoints, seal, zero-copy forks, removal), `DbClient`, and the public `DbHttpApi` (`/v1`).
-- `packages/lsm-sharding` (public APIs only): range-sharded groups (`ShardDirectoryServer`,
-  `ShardRouter`, resumable `ShardSplit`) and an example `ShardRouterWorker`.
-- `infra/cf-slatedb/alchemy.run.ts`: the Stack (bucket; `DbApiWorker` with `WriterServer`;
-  `BlockServerWorker`; `CompactorWorker`; `GcWorker`; `ShardRouterWorker`; telemetry probe).
-- Tools: `trace-cli`, `scenario-cli`, `formal-verification` (TLC runner), `workspace-boundaries`.
+  (`WriterServer`; the SQLite memtable is the WAL), the reader (`DbReader` in the caller's isolate;
+  L1 `BlockCache` bounded by bytes per `budgetGroup`; `BlockServer` behind Workers Cache),
+  compaction (`CompactorServer`, `CompactionWorkflow`, `CompactionBudgetServer`; corrupted inputs
+  reported and quarantined), GC, `DatabaseLifecycle` (checkpoints, pinned snapshots, seal, forks,
+  removal), `DbClient`, the public `DbHttpApi`, the access gate for live stages, and the Stack's
+  jurisdiction.
+- `packages/lsm-sharding`: range-sharded groups over the public APIs.
+- `infra/cf-slatedb`: the Alchemy Stack. On live stages it adds a `TraceCollector` Worker, a
+  `CpuTailWorker`, and per-stage access and trace tokens; state lives in the account's Cloudflare
+  state store.
+- `tools/`: `trace-cli` (with `pull`/`tail --stage`), `scenario-cli` (11 scenarios; `--stage`;
+  `measure`), `preview-cli`, `formal-verification`, `workspace-boundaries`, `traits`.
 
-**How to run it.**
+### How to run it
 
-- `vp run ready` — format, lint, types, and every test (unit, property, and the workerd
-  integration test, which brings up the whole Stack locally with its own OTLP collector).
-- `vp run verify` — the six formal checks (20 TLC runs, about 2 minutes; downloads a pinned JDK
-  and TLA+ tools into `.tlc/` on first use).
-- `vp run dev` — the full Stack locally (API on `:1337`, BlockServer `:1338`, compactor `:1339`,
-  GC `:1340`, shard router `:1341`; dev settings: `gcMinAge` 10 s, compactor polls every second).
-  With `node tools/trace-cli/src/trace-cli.ts serve` running, `node tools/scenario-cli/src/
-  scenario-cli.ts run all` runs every scenario with trace assertions.
+Locally (no Cloudflare account needed):
 
-**What is verified, and under which bounds.** Each check has a skill in `.agents/skills/verify-*`
-with its bounds, assumptions, covered code, and sync commit; every check was shown failing on
-deliberately broken variants:
+```sh
+vp run ready                                              # format, lint, types, every test
+vp run verify                                             # 20 TLC runs, about 2 minutes
+node tools/trace-cli/src/trace-cli.ts serve &             # OTLP receiver on 127.0.0.1:4318
+vp run dev                                                # API :1337, blocks :1338, compactor :1339, GC :1340, shards :1341
+node tools/scenario-cli/src/scenario-cli.ts run all       # 11 scenarios with trace assertions
+```
+
+Stop every `workerd` process `vp run dev` started when you finish.
+
+On a preview (`preview-1`, `preview-2`, `preview-3`; reuse them, never `production`):
+
+```sh
+P="node tools/preview-cli/src/preview-cli.ts"
+$P deploy preview-1 --dev-timings                      # in place; production settings without the flag
+$P deploy preview-2 --jurisdiction eu                  # eu | fedramp | none; kept on later deploys
+$P status                                              # what is deployed where (any machine)
+$P url preview-1 --json; $P token preview-1            # URLs; the access token for Authorization: Bearer
+node tools/scenario-cli/src/scenario-cli.ts run --stage preview-1 all
+node tools/trace-cli/src/trace-cli.ts pull --stage preview-1   # then list/show/grep/stats/assert
+node tools/scenario-cli/src/scenario-cli.ts measure writes|flush-cpu|split-pause|transactions --stage preview-1
+```
+
+### What is verified, and under which bounds
+
+Formal checks (`vp run verify`, each with a skill in `.agents/skills/verify-*` recording bounds,
+assumptions, covered code, and sync commit; every check fails on its deliberately broken
+variants):
 
 1. No acknowledged write lost or hidden (`NoAckedWriteLost.tla`): 4 writes, 2 crashes, 2 reads.
 2. Fencing and 3. manifest CAS linearizability (`ManifestCasFencing.tla`): 2 writers and 2
    compactors over 9 manifest ids, plus a race config for changed compaction inputs.
-3. GC safety (`GcSafety.tla`): 2 SSTs, clock 0–3, 5 manifests, interleaved GC steps (found that
-   manifest age must be measured from the successor).
+3. GC safety (`GcSafety.tla`): 2 SSTs, clock 0–3, 5 manifests, interleaved GC steps.
 4. Seal and split (`SealSplit.tla`): 3 keys, 4 writes, every interleaving of seal, checkpoint, forks.
-5. Transactions (`Transactions.tla`): 2 keys, 2 transactions, 6 commits; serializable in commit order.
+5. Transactions (`Transactions.tla`): 2 keys, 2 transactions, 6 commits; serializable in commit
+   order. It already lets flushes interleave anywhere, which covers D50's window.
+
+The models assume one writer instance per database (the Durable Object guarantee), durable SQLite
+commits before acknowledgement, and R2 create-if-absent. The last is now confirmed on real R2.
+Nothing in this round changed a covered function; each skill records the re-check.
 
 Code-level properties (codecs, merge, compaction merge, GC plans, ledger, shard map, the client and
-change feed against oracles, transactions, fault injection) are property tests with mutation checks
-(`docs/coverage-matrix.md` names each).
+change feed against oracles, transactions, fault injection, the byte-budget LRU) are property tests
+with mutation checks; `docs/coverage-matrix.md` maps every design item to code and tests.
 
-**Known gaps.**
+### Live results (Dillon's account, 2026-11-25)
 
-- Data residency is advisory (open question 3).
-- The L1 block cache is bounded by entry count, not a per-`budgetGroup` byte budget (D32).
-- Transactions abort when data newer than their reads is flushed during them (D41).
-- Snapshots are protected by `gcMinAge`, not checkpoints (D30); a snapshot older than that may
-  expire (`SnapshotExpired`).
-- A corrupted SST fails its compaction job as a defect; the compactor plans it again (D34).
+Details and methods are in [`docs/measurements.md`](measurements.md).
 
-**Needs a live preview to confirm** (open questions 1, 2, 4): Workers Cache hits on `BlockServer`,
-R2's `If-None-Match` Headers form, and the §12 measurements. Nothing has run against the real
-account.
+- **Workers Cache:** `HIT` on `BlockServer` for a block another Worker had read (`MISS` first).
+- **R2 create-if-absent (`Headers` form):** 16 concurrent creates → 1 `Created`, 15 `AlreadyExists`.
+- **Scenarios:** 11/11 on `preview-1`, 11/11 on `preview-2` in `eu`, 11/11 under `vp run dev`.
+- **Residency:** Cloudflare reports both buckets and the Workflow in `eu` on `preview-2`.
+- **Traces:** spans from Worker fetches, Durable Object fetches, and alarms all arrive (after D47).
+- **Measurements:**
+  - Writes: one writer is CPU-bound at ~2.7k rows/s (100-row batches) up to ~12.3k rows/s
+    (1,000-row batches) for 100-byte values.
+  - Flush: ~55–90 ms CPU per MiB.
+  - Manifest CAS: ~1.1 s on R2.
+  - Split: writes to the splitting shard pause ~13–16 s, with no failed writes after the router fix.
+  - Transactions: 580/580 committed through a 28.7 s flush.
+- **Findings fixed live:**
+  - Worker spans were lost without `global_fetch_strictly_public` (D47).
+  - The router's 5 s split window was too short for a live split (D48).
+  - Unset settings stayed bound on Workers across deploys (D54).
+
+### Anything left (none blocks use)
+
+- Shorten every manifest CAS ~40% by writing the `LATEST` hint off the critical path, and make the
+  forks' compactor wake asynchronous (~4 s per split). Both touch code the manifest CAS model covers;
+  re-run `verify-manifest-cas-fencing` with the change (`docs/measurements.md`).
+- Removing D50's transaction limit for transactions longer than a flush: design recorded in D50.
+- Drop `client.address` and `user_agent.original` from server spans before any production deploy
+  (Findings).
+- Not measured: whether Durable Object SQLite's page cache counts against 128 MB, and the Workflows
+  concurrent-instance limit on the plan.
+- A production deploy task, if ever approved, must bind `CF_SLATEDB_LSM_SETTINGS` and
+  `CF_SLATEDB_JURISDICTION` explicitly (D54) and keep production names and retention
+  (`lsm-bucket.ts`).
+
+### Destroying the previews (Dillon runs these; agents never do)
+
+`preview-1` and `preview-2` are deployed; `preview-3` was never deployed.
+
+```sh
+vp run @cf-slatedb/infra#destroy:preview-1
+vp run @cf-slatedb/infra#destroy:preview-2
+vp run @cf-slatedb/infra#destroy:preview-3   # only if it is ever deployed
+```
+
+`node tools/preview-cli/src/preview-cli.ts destroy-command <stage>` prints the same. Each removes
+the stage's Workers, Durable Objects, Workflow, both buckets (data and traces), and its state
+records; nothing in them is retained.
 
 ## Findings
 
@@ -308,14 +377,17 @@ account.
 - Effect 4.1.4 names HTTP spans by method (`GET`); the trace CLI shows span kind (D7).
 - No Java or mise on this machine; `vp run verify` downloads a pinned JDK and `tla2tools.jar` into
   `.tlc/` (gitignored) and passes `JAVA`/`TLA2TOOLS` to `/statechart` runs.
-- The traits MCP checker is configured (`.pi/mcp.json`) and `TYPESAFE_API_KEY` is set; it runs as an
-  MCP server in the next pi session. Until then, review against `.agents/traits/*.md` by hand.
+- The traits MCP checker (`.pi/mcp.json`) works in pi sessions; it reviewed the code of this round
+  (`158b6ad`). It is a probabilistic classifier per chunk, so read its findings against the trait
+  files rather than chasing every one.
 
 ## Open questions
 
-1. ~~Workers Cache hit on a deployed preview~~ — confirmed (item 4, `docs/measurements.md`).
-2. ~~R2 `If-None-Match: *` with the Headers form on real R2~~ — confirmed (item 4).
-3. ~~Data residency design~~ — Dillon chose per-Stack residency (hand-off item 5).
-4. **Live measurements** — rows/s per writer, flush CPU per MB, and the split pause are measured
-   (`docs/measurements.md`). Still open, if Dillon wants them: whether DO SQLite's page cache counts
-   against 128 MB, and the Workflows concurrent-instance limit on the plan.
+None block anything. Optional, if Dillon wants them:
+
+1. Measure whether Durable Object SQLite's page cache counts against the 128 MB isolate limit, and
+   the Workflows concurrent-instance limit on the plan (both need a dedicated load run on a preview).
+2. Approve the `LATEST`-hint and async-wake optimizations above (they change model-covered code).
+
+Resolved this round: Workers Cache hit and R2 create-if-absent confirmed live; data residency is
+per Stack (Dillon's choice, D49); the §12 write, flush, and split measurements are recorded.
