@@ -10,7 +10,12 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   (`fenceWriter`, `commitL0Flush` epoch check; tested in `manifest.test.ts`). Writer: Phase 4.
   Formal: fencing model (Phase 3).
 - **WAL = DO SQLite memtable; an ack is durable; no `awaitDurable`** — pending (Phase 4).
-- **Manifest CAS with R2 `If-None-Match: *`** — pending (Phase 3).
+- **Manifest CAS with R2 `If-None-Match: *`** — partial. `lsm-cloudflare/src/object-store.ts`
+  (`putIfAbsent`), `manifest-store.ts` (`create`, `update` with CAS retry). Tests:
+  `manifest-store.test.ts` (32 concurrent create-if-absent → one `Created`; 12 concurrent edits →
+  13 manifests, none lost), `test/object-store/object-store.workerd.ts` against Alchemy's local R2
+  (Headers form; 16 concurrent flush commits). Real-R2 check needs approval. Formal: fencing/CAS
+  model (in progress).
 - **Compaction in `CompactorServer` + Workflow** — pending (Phase 6).
 - **Readers in any Worker; `Latest`/`AtLeast` through the writer** — pending (Phase 5).
 
@@ -48,13 +53,19 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 ## §5 Manifest CAS and fencing
 
 - **Writer init fencing loop** — pending (Phase 4).
-- **`manifest/LATEST` hint + probe `id+1`; no LIST on read paths** — pending (Phase 3).
+- **`manifest/LATEST` hint + probe `id+1`; no LIST on read paths** — partial.
+  `lsm-cloudflare/src/manifest-reader.ts` (`loadLatest`; LIST only to recover when the hint names a
+  collected manifest). `manifest-store.test.ts` covers a lagging hint and a collected hinted
+  manifest. Trace assertion "no `ObjectStore.list` on a read path": Phase 5 scenarios.
 - **Compactor edit replaces exactly its inputs, else fails** — partial. `commitCompaction`
   (`manifest.test.ts`: replace, idempotent retry, `CompactionInputsChangedError`,
   `CompactorFencedError`).
 - **Delete-after-commit; duplicate replay is deduplicated** — partial. `mergeRowStreams` drops exact
   duplicates (`merge-iterator.test.ts`, shown failing without the drop). Writer: Phase 4.
-- **`onlyIf: new Headers({ "If-None-Match": "*" })` (workerd #2572)** — pending (Phase 3).
+- **`onlyIf: new Headers({ "If-None-Match": "*" })` (workerd #2572)** — partial.
+  `object-store.ts` `putIfAbsent` passes the Headers form; verified against local R2 in
+  `object-store.workerd.ts` (second create returns `AlreadyExists`, stored bytes unchanged). The
+  real-R2 integration test is prepared as an approval-gated live check.
 
 ## §6 Types
 
@@ -72,13 +83,22 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 
 ## §7 Services
 
-- **`ObjectStore`, `ManifestStore`, `ManifestCache`** — pending (Phase 3).
+- **`ObjectStore`, `ManifestStore`, `ManifestCache`** — partial. `object-store.ts` (R2 adapter
+  owning `R2Error` → `ObjectStoreUnavailableError` with retry; multipart with abort on failure;
+  faithful in-memory test layer: atomic create-if-absent, ranges, 1000-key pages, 5 MiB part
+  minimum, `Clock` upload times), `manifest-reader.ts`, `manifest-store.ts`
+  (`ManifestConflictError` internal and retried, `ManifestWriteError`, idempotent edits write
+  nothing, `lsm_manifest_cas_conflicts` metric), `manifest-cache.ts` (D17), `lsm-configuration.ts`,
+  `lsm-bucket.ts`, `object-keys.ts`. Tests: `manifest-store.test.ts`, `object-store.workerd.ts`.
 - **`SstStore`, `BlockCache`, `BlockSource`, `BlockServer`, `DbReader`, `DbClient`** — pending
   (Phase 5).
 - **`MemTable`, `SeqOracle`, `DbWriter`, `ChangelogExport`** — pending (Phase 4).
 - **`CompactionScheduler` (pure)** — done. `lsm-core/src/size-tiered-compaction-scheduler.ts`;
-  `manifest.test.ts` checks invariants over random manifests from `Arbitrary` (consecutive,
-  conflict-free, bounds, destination, `isBottom`; shown failing on a wrong destination) (D15).
+  `size-tiered-compaction-scheduler.test.ts` over `Arbitrary` manifests and options: jobs are
+  consecutive, all-L0 or all-runs, within min/max sources and `includeSizeThreshold`, never overlap
+  each other or a job in flight, have the right destination and `isBottom`; repeatedly committing
+  planned jobs converges (fallback consolidation terminates). Shown failing with the size
+  threshold ignored and with in-flight sources not reserved (D15).
 - **`DatabaseLifecycle`, `GarbageCollector`, `CompactionBudget`** — pending (Phases 6–7).
 
 ## §8 Public API and semantics
@@ -88,10 +108,13 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   (`lsm-core-errors.ts`), `WriterFencedError`, `CompactorFencedError`, `DatabaseSealedError`,
   `CompactionInputsChangedError` (`manifest.ts`). Pending: `KeyOutOfRangeError`,
   `WriteStalledError`, `ManifestConflictError`, `ObjectStoreUnavailableError`, public HTTP errors.
-- **Merge operators and TTL during reads and compaction** — partial.
-  `lsm-core/src/row-resolution.ts` (D10, D11); `merge-iterator.test.ts` retention properties
-  (newest-snapshot reads unchanged; versions above the floor kept; shown failing when expired
-  values are dropped instead of tombstoned).
+- **Merge operators and TTL during reads and compaction** — partial (wiring in Phases 4–6).
+  `lsm-core/src/row-resolution.ts` (D10, D11). `row-resolution.test.ts`: `resolveVisibleRow`
+  matches a plain oracle for puts, deletes, merges, and TTL at any snapshot and time (shown failing
+  with operands applied newest-first); earliest expiry and newest seq of merge results; `U64Add`;
+  `MergeOperatorMissingError`; compaction without an operator keeps raw operands.
+  `merge-iterator.test.ts` retention properties (newest-snapshot reads unchanged; versions above
+  the floor kept; shown failing when expired values are dropped instead of tombstoned).
 - **Checkpoints, clones (forks), transactions** — partial (edits in `manifest.ts`); Phases 7, 9.
 
 ## §9 Effect audit and private gaps
@@ -99,8 +122,15 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 - **Sorted map via DO SQLite** — pending (Phase 4).
 - **k-way merge over `Pull` with a private heap** — done. `lsm-core/src/merge-iterator.ts`.
 - **CRC32C, Bloom filter (double hashing), ULID (`Clock` + `Random`), no compression** — done.
-  `crc32c.ts`, `bloom-filter.ts` (D9), `ulid.ts` (`key-range.test.ts` uses `TestClock`); SSTs are
-  stored uncompressed.
+  `crc32c.ts` (check value in `sst-codec.test.ts`); `bloom-filter.ts` (D9) with
+  `bloom-filter.test.ts`: no false negatives for any bits per key, false-positive rate within 2x of
+  the optimal-probe theory at 6/10/14 bits per key, order-independent; shown failing with probes
+  collapsed to one position and with one probe instead of `round(b ln 2)`. `ulid.ts` with
+  `ulid.test.ts`: time round trip, valid SST ids, later milliseconds always sort after,
+  `Clock`/`Random`-driven (`TestClock`). SSTs are stored uncompressed.
+- **Varints and fixed-width integers** — done. `byte-codec.ts` (D16) with `byte-codec.test.ts`:
+  every safe integer round-trips in minimal bytes, byte-length boundaries, truncation rejected,
+  u8/u16/u32/u64/length-prefixed round trips; shown failing with an off-by-one continuation bit.
 
 ## §10 Infrastructure
 

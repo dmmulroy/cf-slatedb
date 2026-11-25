@@ -162,3 +162,20 @@ A job's `isBottom` is true when no sorted run older than its destination exists.
 
 Varints live in `ByteWriter`/`ByteReader` (`packages/lsm-core/src/byte-codec.ts`) together with the
 fixed-width little-endian integers every codec needs, rather than in a separate `varint.ts`.
+
+## D17. `ManifestCache` is a lazily refreshed `Ref`, not `Resource.auto`
+
+Design §7 names `Resource.auto` with `Schedule.spaced`. A background refresh fiber would perform
+R2 I/O from an isolate-lifetime fiber, outside any Worker invocation; workerd forbids I/O across
+request contexts. `ManifestCache` instead keeps plain manifests in a `Ref` and refreshes on access
+once an entry is older than `manifestRefreshInterval`, in the caller's fiber. It never returns an
+older manifest than one it already returned. The writer's own manifest (design: `SubscriptionRef`)
+is held by the writer in Phase 4.
+
+## D18. `ManifestReader` is split from `ManifestStore`
+
+Readers in any Worker need `loadLatest`/`load` but must never write manifests, so reading is its
+own service (`manifest-reader.ts`) and `ManifestStore` (`create`, `initialize`, `update`) depends on
+it. `loadLatest` reads the `LATEST` hint and probes `id + 1` (no LIST); only when the hinted manifest
+was already collected does it list the manifest prefix to recover, which never happens on a normal
+read path.

@@ -1,8 +1,6 @@
-import { Arbitrary, Effect, Option, Schema } from "effect";
-import { TestClock } from "effect/testing";
-import { describe, expect, it } from "vite-plus/test";
+import { Arbitrary, Option, Schema } from "effect";
+import { describe, it } from "vite-plus/test";
 
-import { SstId } from "./ids.ts";
 import {
   intersectKeyRanges,
   type KeyRange,
@@ -11,7 +9,6 @@ import {
   keyRangesOverlap,
 } from "./key-range.ts";
 import { assertProperty, keyArbitrary } from "./lsm-core-arbitraries.ts";
-import { generateSstId, ulidTimeMillis } from "./ulid.ts";
 
 const rangeArbitrary: Arbitrary.Arbitrary<KeyRange> = Arbitrary.all({
   start: keyArbitrary,
@@ -49,21 +46,5 @@ describe("key ranges", () => {
       ({ prefix, key }) =>
         keyRangeContains(keyRangeOfPrefix(prefix), key) === startsWith(key, prefix),
     );
-  });
-});
-
-describe("ULIDs", () => {
-  it("are valid SST ids that encode the clock time", async () => {
-    const ids = await Effect.gen(function* () {
-      yield* TestClock.setTime(1_700_000_000_000);
-      const first = yield* generateSstId;
-      yield* TestClock.adjust("1 second");
-      const second = yield* generateSstId;
-      return [first, second] as const;
-    }).pipe(Effect.provide(TestClock.layer()), Effect.runPromise);
-    expect(Schema.is(SstId)(ids[0])).toBe(true);
-    expect(ulidTimeMillis(ids[0])).toBe(1_700_000_000_000);
-    expect(ulidTimeMillis(ids[1])).toBe(1_700_000_001_000);
-    expect(ids[0] < ids[1]).toBe(true);
   });
 });

@@ -47,6 +47,19 @@ Phase 3: object storage and manifests (starting). Phase 2 (lsm-core) is done.
   destination). Decisions D8–D16.
 - `vp run ready` passes.
 
+- **Orchestrator review of Phase 2 addressed.** Dedicated property tests for the scheduler
+  (`size-tiered-compaction-scheduler.test.ts`: overlap/in-flight, min/max, size threshold,
+  convergence), Bloom filter (no false negatives; FP rate vs theory), row resolution (plain oracle
+  for merge/tombstone/TTL), varints (`byte-codec.test.ts`), and ULIDs (round trip, monotonic sort).
+  Each was shown failing on a deliberate break (size threshold ignored, in-flight not reserved,
+  probes collapsed, one probe, varint off-by-one, operand order inverted). Coverage matrix updated.
+- **Phase 3 — in progress.** `ObjectStore` (R2 adapter + faithful in-memory layer),
+  `ManifestReader`, `ManifestStore` (CAS with retry, idempotent edits, `LATEST` hint),
+  `ManifestCache`, `LsmConfiguration`, `LsmBucket`. Local-R2 workerd test shows the Headers
+  `If-None-Match: *` form works and 16 concurrent commits lose nothing. TLA+ model
+  `tools/formal-verification/specs/ManifestCasFencing.tla` written; JDK 21 + tla2tools 1.7.4
+  downloaded to `.tlc/` (gitignored).
+
 ## Next
 
 - Phase 3: `ObjectStore` (R2 adapter + faithful in-memory layer with create-if-absent),

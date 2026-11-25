@@ -1,0 +1,235 @@
+import { Arbitrary, Option, Result, Schema } from "effect";
+import { describe, expect, it } from "vite-plus/test";
+
+import { DatabaseId, SeqNum, SortedRunId, SstId, Timestamp } from "./ids.ts";
+import { assertProperty } from "./lsm-core-arbitraries.ts";
+import {
+  commitCompaction,
+  commitL0Flush,
+  type CompactionJob,
+  DEFAULT_DATABASE_OPTIONS,
+  initialManifest,
+  Manifest,
+  type SortedRun,
+  type SstHandle,
+} from "./manifest.ts";
+import {
+  DEFAULT_SIZE_TIERED_COMPACTION_OPTIONS,
+  planCompactions,
+  type SizeTieredCompactionOptions,
+} from "./size-tiered-compaction-scheduler.ts";
+
+const DB = DatabaseId.make("orders");
+let nextHandle = 0;
+const handle = (sizeBytes: number): SstHandle => ({
+  id: SstId.make(`01JD${String(++nextHandle).padStart(22, "0")}`),
+  firstKey: Uint8Array.of(0),
+  lastKey: Uint8Array.of(255),
+  sizeBytes,
+  rowCount: 1,
+  metaOffset: 0,
+  metaLength: 1,
+  owner: Option.none(),
+  view: Option.none(),
+});
+
+const empty = initialManifest(DB, {
+  keyRange: Option.none(),
+  databaseOptions: DEFAULT_DATABASE_OPTIONS,
+});
+
+const withLsm = (l0: ReadonlyArray<SstHandle>, sortedRuns: ReadonlyArray<SortedRun>): Manifest =>
+  new Manifest({
+    databaseId: empty.databaseId,
+    writerEpoch: empty.writerEpoch,
+    compactorEpoch: empty.compactorEpoch,
+    lastL0Seq: empty.lastL0Seq,
+    lastL0ClockTick: empty.lastL0ClockTick,
+    l0,
+    sortedRuns,
+    checkpoints: [],
+    keyRange: Option.none(),
+    state: { _tag: "Open" },
+    externalRefs: [],
+    changelog: [],
+    options: DEFAULT_DATABASE_OPTIONS,
+  });
+
+const smallInt = (minimum: number, maximum: number) =>
+  Arbitrary.schema(Schema.Int.check(Schema.isBetween({ minimum, maximum })));
+
+/** A random manifest: 0–8 L0 SSTs and 0–12 sorted runs whose sizes cluster, so groups form. */
+const manifestArbitrary = Arbitrary.all({
+  l0Count: smallInt(0, 8),
+  runSizes: Arbitrary.array(smallInt(1, 24), { maxLength: 12 }),
+}).pipe(
+  Arbitrary.map(({ l0Count, runSizes }) =>
+    withLsm(
+      Array.from({ length: l0Count }, () => handle(1000)),
+      runSizes.map((size, index) => ({
+        id: SortedRunId.make(runSizes.length - 1 - index),
+        ssts: [handle(size * 1000)],
+      })),
+    ),
+  ),
+);
+
+const optionsArbitrary: Arbitrary.Arbitrary<SizeTieredCompactionOptions> = Arbitrary.all({
+  minCompactionSources: smallInt(2, 4),
+  extra: smallInt(0, 4),
+  includeSizeThreshold: smallInt(2, 4),
+  maxConcurrentCompactions: smallInt(1, 4),
+}).pipe(
+  Arbitrary.map(
+    ({ minCompactionSources, extra, includeSizeThreshold, maxConcurrentCompactions }) => ({
+      minCompactionSources,
+      maxCompactionSources: minCompactionSources + extra,
+      includeSizeThreshold,
+      maxConcurrentCompactions,
+    }),
+  ),
+);
+
+const sourceKey = (source: CompactionJob["sources"][number]) =>
+  source._tag === "L0" ? `l0:${source.sstId}` : `sr:${source.id}`;
+
+const runSize = (manifest: Manifest, id: number) =>
+  manifest.sortedRuns
+    .find((run) => run.id === id)
+    ?.ssts.reduce((sum, sst) => sum + sst.sizeBytes, 0) ?? 0;
+
+/** Whether one job satisfies the scheduler's invariants against `manifest`. */
+const jobIsValid = (
+  manifest: Manifest,
+  job: CompactionJob,
+  options: SizeTieredCompactionOptions,
+): boolean => {
+  const l0Order = manifest.l0.map((sst) => sst.id);
+  const runOrder = manifest.sortedRuns.map((run) => run.id);
+  const positions = job.sources.map((source) =>
+    source._tag === "L0" ? l0Order.indexOf(source.sstId) : runOrder.indexOf(source.id),
+  );
+  const consecutive = positions.every(
+    (position, index) =>
+      position >= 0 && (index === 0 || position === (positions[index - 1] ?? 0) + 1),
+  );
+  const allL0 = job.sources.every((source) => source._tag === "L0");
+  const allRuns = job.sources.every((source) => source._tag === "SortedRun");
+  const runIds = job.sources.flatMap((source) => (source._tag === "SortedRun" ? [source.id] : []));
+  const sizes = runIds.map((id) => runSize(manifest, id));
+  const withinThreshold = sizes.every((size, index) => {
+    // Every run is within the threshold of the smallest run before it in the group (SlateDB's rule).
+    const smallestBefore = Math.min(...sizes.slice(0, index + 1));
+    return index === 0 || size <= Math.max(1, smallestBefore) * options.includeSizeThreshold;
+  });
+  const destinationOk = allL0
+    ? job.destination > Math.max(-1, ...runOrder) &&
+      positions[positions.length - 1] === l0Order.length - 1
+    : job.destination === Math.min(...runIds);
+  const isBottomOk = allL0
+    ? job.isBottom === (runOrder.length === 0)
+    : job.isBottom === (job.destination === Math.min(...runOrder));
+  return (
+    (allL0 || allRuns) &&
+    consecutive &&
+    withinThreshold &&
+    destinationOk &&
+    isBottomOk &&
+    job.sources.length >= options.minCompactionSources &&
+    job.sources.length <= options.maxCompactionSources
+  );
+};
+
+describe("planCompactions", () => {
+  it("plans valid jobs that never overlap each other or a job in flight", () => {
+    assertProperty(
+      Arbitrary.all({ manifest: manifestArbitrary, options: optionsArbitrary }),
+      ({ manifest, options }) => {
+        const first = planCompactions(manifest, [], options);
+        // Plan again with the first jobs in flight: new jobs must avoid their sources and destinations.
+        const second = planCompactions(manifest, first, {
+          ...options,
+          maxConcurrentCompactions: options.maxConcurrentCompactions * 2,
+        });
+        const busy = new Set(
+          first.flatMap((job) => [...job.sources.map(sourceKey), `sr:${job.destination}`]),
+        );
+        const seen = new Set<string>();
+        const disjoint = first.every((job) =>
+          job.sources.every((source) => {
+            const key = sourceKey(source);
+            const fresh = !seen.has(key);
+            seen.add(key);
+            return fresh;
+          }),
+        );
+        return (
+          first.length <= options.maxConcurrentCompactions &&
+          first.length + second.length <= options.maxConcurrentCompactions * 2 &&
+          disjoint &&
+          [...first, ...second].every((job) => jobIsValid(manifest, job, options)) &&
+          second.every(
+            (job) =>
+              job.sources.every((source) => !busy.has(sourceKey(source))) &&
+              !busy.has(`sr:${job.destination}`),
+          )
+        );
+      },
+      { runs: 400 },
+    );
+  });
+
+  it("converges: committing planned jobs until none remain terminates with fewer sources than the minimum per group", () => {
+    assertProperty(
+      Arbitrary.all({ manifest: manifestArbitrary, options: optionsArbitrary }),
+      ({ manifest, options }) => {
+        let current = manifest;
+        let rounds = 0;
+        for (;;) {
+          const jobs = planCompactions(current, [], options);
+          if (jobs.length === 0) break;
+          for (const job of jobs) {
+            const inputs = job.sources.flatMap((source) =>
+              source._tag === "L0"
+                ? current.l0.filter((sst) => sst.id === source.sstId)
+                : (current.sortedRuns.find((run) => run.id === source.id)?.ssts ?? []),
+            );
+            const output = handle(inputs.reduce((sum, sst) => sum + sst.sizeBytes, 0));
+            current = Result.getOrThrow(
+              commitCompaction(current, {
+                compactorEpoch: current.compactorEpoch,
+                job,
+                outputs: [output],
+              }),
+            );
+          }
+          rounds++;
+          // Each job removes at least minCompactionSources - 1 sources, so this bound cannot be hit.
+          if (rounds > 40) return false;
+        }
+        return current.l0.length < options.minCompactionSources;
+      },
+      { runs: 300 },
+    );
+  });
+
+  it("compacts all L0 SSTs (up to the maximum) into a new, newer sorted run", () => {
+    let manifest = empty;
+    for (const n of [1, 2, 3, 4, 5]) {
+      manifest = Result.getOrThrow(
+        commitL0Flush(manifest, {
+          writerEpoch: manifest.writerEpoch,
+          sst: handle(1000),
+          lastSeq: SeqNum.make(n),
+          clockTick: Timestamp.make(n),
+          changelog: Option.none(),
+        }),
+      );
+    }
+    const [job] = planCompactions(manifest, [], DEFAULT_SIZE_TIERED_COMPACTION_OPTIONS);
+    expect(job?.sources.map((source) => (source._tag === "L0" ? source.sstId : ""))).toEqual(
+      manifest.l0.map((sst) => sst.id),
+    );
+    expect([job?.destination, job?.isBottom]).toEqual([0, true]);
+  });
+});
