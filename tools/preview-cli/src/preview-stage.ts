@@ -35,7 +35,7 @@ export const deployJurisdiction = (
 ): PreviewJurisdiction =>
   Option.getOrElse(requested, () =>
     Option.getOrElse(
-      Option.flatMap(current, (outputs) => Option.fromUndefinedOr(outputs.jurisdiction)),
+      Option.flatMap(current, (outputs) => outputs.jurisdiction),
       () => "none" as const,
     ),
   );
@@ -53,13 +53,16 @@ export const PreviewOutputs = Schema.Struct({
   /** Telemetry probe (Worker plus Durable Object with an alarm). */
   probeUrl: Schema.String,
   /** OTLP receiver of the stage's spans (`TraceCollector`), once the Stack has one. */
-  traceCollectorUrl: Schema.optionalKey(Schema.String),
+  traceCollectorUrl: Schema.OptionFromOptionalKey(Schema.String),
   /** Data-residency jurisdiction (`eu`, `fedramp`, `none`), once the Stack reports one. */
-  jurisdiction: Schema.optionalKey(PreviewJurisdiction),
+  jurisdiction: Schema.OptionFromOptionalKey(PreviewJurisdiction),
 });
 
 /** A deployed preview's Stack outputs. */
 export type PreviewOutputs = typeof PreviewOutputs.Type;
+
+/** Encodes outputs back to the Stack's JSON form, for printing (optional outputs omitted when absent). */
+export const encodePreviewOutputs = Schema.encodeSync(PreviewOutputs);
 
 /** What `status` knows about one preview stage. */
 export interface PreviewStatus {
@@ -78,6 +81,8 @@ export type StateRecords = ReadonlyMap<string, unknown>;
  */
 export class PreviewStateError extends Data.TaggedError("PreviewStateError")<{
   readonly reason: "StateUnreadable" | "StateRecordInvalid";
+  /** The state path read (`CfSlatedb[/<stage>[/<record>]]`). */
+  readonly path: string;
   readonly message: string;
 }> {}
 
@@ -92,6 +97,9 @@ const decodeRedactedText = Schema.decodeUnknownEffect(
 /**
  * Parses the output of `alchemy state read -r <path>` (run through `vp run`, so it may start with
  * the task's banner line): the records under the path, or none when the path does not exist.
+ *
+ * @returns The records by path, or `PreviewStateError` (`StateUnreadable`) when the output is
+ *   neither records nor "path does not exist" (an Alchemy login or network failure, printed whole).
  */
 export const parseStateRead = Effect.fn("PreviewStage.parseStateRead")(function* (
   output: string,
@@ -105,6 +113,7 @@ export const parseStateRead = Effect.fn("PreviewStage.parseStateRead")(function*
       () =>
         new PreviewStateError({
           reason: "StateUnreadable",
+          path,
           message: `The Alchemy state store's records under ${path} could not be read:\n${output.trim()}`,
         }),
     ),
@@ -112,7 +121,12 @@ export const parseStateRead = Effect.fn("PreviewStage.parseStateRead")(function*
   return new Map(Object.entries(records));
 });
 
-/** The Stack outputs of a stage in `records`, or `None` when nothing is deployed there. */
+/**
+ * The Stack outputs of a stage in `records`, or `None` when nothing is deployed there.
+ *
+ * @returns The outputs, or `PreviewStateError` (`StateRecordInvalid`) when the record is not this
+ *   Stack's output; redeploying the stage rewrites it.
+ */
 export const previewOutputs = Effect.fn("PreviewStage.previewOutputs")(function* (
   records: StateRecords,
   stage: PreviewStage,
@@ -126,6 +140,7 @@ export const previewOutputs = Effect.fn("PreviewStage.previewOutputs")(function*
         (error) =>
           new PreviewStateError({
             reason: "StateRecordInvalid",
+            path,
             message: `${path} is not this Stack's output: ${error.message}. Redeploy ${stage} with \`preview-cli deploy ${stage}\`.`,
           }),
       ),
@@ -139,7 +154,12 @@ export const previewOutputs = Effect.fn("PreviewStage.previewOutputs")(function*
  */
 export type PreviewSecret = "LsmAccessToken" | "TraceCollectorToken";
 
-/** A stage's generated secret in `records`, or `None` when the stage has none. */
+/**
+ * A stage's generated secret in `records`, or `None` when the stage has none.
+ *
+ * @returns The secret, or `PreviewStateError` (`StateRecordInvalid`) when the record holds no
+ *   generated value; redeploying the stage regenerates it.
+ */
 export const previewSecret = Effect.fn("PreviewStage.previewSecret")(function* (
   records: StateRecords,
   stage: PreviewStage,
@@ -153,6 +173,7 @@ export const previewSecret = Effect.fn("PreviewStage.previewSecret")(function* (
       () =>
         new PreviewStateError({
           reason: "StateRecordInvalid",
+          path,
           message: `${path} does not hold a generated token. Redeploy ${stage} with \`preview-cli deploy ${stage}\`.`,
         }),
     ),

@@ -11,9 +11,14 @@ import { HttpApiClient } from "effect/http-api";
 
 import { ScenarioStack, uniqueId } from "./scenario.ts";
 
-/** A measurement could not run or its data could not be read. */
+/**
+ * A measurement could not run or its data could not be read: `step` names what it was doing and
+ * `reason` the failure's tag (an API error, or `SchemaError` for data it could not read). Run the
+ * measurement again; it creates its own database each time.
+ */
 export class MeasurementError extends Data.TaggedError("MeasurementError")<{
   readonly step: string;
+  readonly reason: string;
   readonly message: string;
 }> {}
 
@@ -63,7 +68,11 @@ const shardsApi = Effect.gen(function* () {
 const failed =
   (step: string) =>
   (error: { readonly _tag: string; readonly message?: string }): MeasurementError =>
-    new MeasurementError({ step, message: `${error._tag}: ${error.message ?? ""}` });
+    new MeasurementError({
+      step,
+      reason: error._tag,
+      message: `Measurement step "${step}" failed with ${error._tag}: ${error.message ?? "no detail"}. Run the measurement again.`,
+    });
 
 const createDatabase = (databaseId: DatabaseId) =>
   Effect.flatMap(dbApi, (client) =>
@@ -109,6 +118,9 @@ export interface WriteLoad {
 /**
  * Sends batched writes to one new database from `concurrency` loops for `seconds`, and reports the
  * acknowledged rows per second, request latency as the client saw it, and failures by error tag.
+ *
+ * @returns The report (failed writes are counted, not raised), or `MeasurementError` when the
+ *   database cannot be created or read back.
  */
 export const measureWrites = (load: WriteLoad) =>
   Effect.gen(function* () {
@@ -171,14 +183,14 @@ export const measureWrites = (load: WriteLoad) =>
 
 /** Schema of the Tail Worker's invocation records (`infra/cf-slatedb/src/cpu-tail-worker.ts`). */
 const InvocationRecord = Schema.Struct({
-  scriptName: Schema.NullOr(Schema.String),
-  durableObjectId: Schema.NullOr(Schema.String),
+  scriptName: Schema.OptionFromNullOr(Schema.String),
+  durableObjectId: Schema.OptionFromNullOr(Schema.String),
   eventKind: Schema.String,
-  method: Schema.NullOr(Schema.String),
-  path: Schema.NullOr(Schema.String),
-  status: Schema.NullOr(Schema.Number),
+  method: Schema.OptionFromNullOr(Schema.String),
+  path: Schema.OptionFromNullOr(Schema.String),
+  status: Schema.OptionFromNullOr(Schema.Number),
   outcome: Schema.String,
-  eventTimestamp: Schema.NullOr(Schema.Number),
+  eventTimestamp: Schema.OptionFromNullOr(Schema.Number),
   cpuTimeMs: Schema.Number,
   wallTimeMs: Schema.Number,
 });
@@ -194,7 +206,12 @@ const decodeRecords = Schema.decodeUnknownEffect(
   Schema.fromJsonString(Schema.Array(InvocationRecord)),
 );
 
-/** Reads every invocation record the stage's Tail Worker stored after `sinceMs`. */
+/**
+ * Reads every invocation record the stage's Tail Worker stored after `sinceMs`.
+ *
+ * @returns The records, or `MeasurementError` when the collector cannot be read or a stored record
+ *   does not decode.
+ */
 export const readInvocationRecords = (sinceMs: number) =>
   Effect.gen(function* () {
     const collector = yield* MeasurementCollector;
@@ -268,6 +285,9 @@ const pulledSpans = (name: string, databaseId: string) =>
 /**
  * Writes `megabytes` of rows to a new database, flushes it, and reports the CPU time of the writer
  * invocations that flushed (the `/flush` request and any alarm), per MiB of SST written.
+ *
+ * @returns The report, or `MeasurementError` when a write, the flush, or reading tail records or
+ *   spans fails.
  */
 export const measureFlushCpu = (megabytes: number) =>
   Effect.gen(function* () {
@@ -308,17 +328,19 @@ export const measureFlushCpu = (megabytes: number) =>
     const records = yield* readInvocationRecords(since);
     const writerWrites = records.filter(
       (record) =>
-        record.durableObjectId !== null &&
-        record.path !== null &&
-        record.path.includes(`/databases/${databaseId}/batches`),
+        Option.isSome(record.durableObjectId) &&
+        Option.exists(record.path, (path) => path.includes(`/databases/${databaseId}/batches`)),
     );
-    const writer = writerWrites[0]?.durableObjectId ?? null;
+    const writer = Option.flatMap(
+      Option.fromUndefinedOr(writerWrites[0]),
+      (record) => record.durableObjectId,
+    );
     const flushing = records.filter(
       (record) =>
-        record.durableObjectId !== null &&
-        record.durableObjectId === writer &&
+        Option.isSome(writer) &&
+        Option.contains(record.durableObjectId, writer.value) &&
         (record.eventKind === "alarm" ||
-          (record.path !== null && record.path.endsWith(`/databases/${databaseId}/flush`))),
+          Option.exists(record.path, (path) => path.endsWith(`/databases/${databaseId}/flush`))),
     );
     const flushes = yield* pulledSpans("DbWriter.flush", databaseId);
     const sstBytes = flushes.reduce(
@@ -362,6 +384,9 @@ export interface SplitLoad {
  * Writes through the shard router from `writers` loops (one row per request, keys spread over
  * `a`–`z`), splits the shard at `m` midway, and reports how long writes paused: the longest put and
  * the longest gap between acknowledgements while the split ran, against the latency before it.
+ *
+ * @returns The report (failed puts are counted, not raised), or `MeasurementError` when the group
+ *   cannot be created, the split fails, or its spans cannot be read.
  */
 export const measureSplitPause = (load: SplitLoad) =>
   Effect.gen(function* () {
@@ -464,6 +489,9 @@ export interface TransactionLoad {
  * on disjoint keys while plain writes load the same database, and counts how many abort because a
  * flush landed during them (`SnapshotTooOld`, D41/D50). The transactors never conflict with each
  * other or with the writers, so every abort is the flush limit.
+ *
+ * @returns The report (aborts are counted by reason, not raised), or `MeasurementError` when the
+ *   database cannot be created or read back.
  */
 export const measureTransactionAborts = (load: TransactionLoad) =>
   Effect.gen(function* () {

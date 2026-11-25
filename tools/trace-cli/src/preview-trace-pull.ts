@@ -43,6 +43,9 @@ const PREVIEW_CLI = fileURLToPath(new URL("../../preview-cli/src/preview-cli.ts"
 /**
  * Asks the preview CLI (in its own process; it reads the Cloudflare state store) for a stage's
  * collector URL and token.
+ *
+ * @returns The collector, or `PreviewTracePullError` (`CollectorUnknown`) when the stage has no
+ *   deployment or no collector yet; the preview CLI's own message is included.
  */
 export const resolvePreviewCollector = (stage: string) =>
   Effect.gen(function* () {
@@ -55,7 +58,7 @@ export const resolvePreviewCollector = (stage: string) =>
       return yield* new PreviewTracePullError({
         reason: "CollectorUnknown",
         stage,
-        message: `The trace collector of ${stage} could not be found:\n${`${result.stdout}${result.stderr}`.trim()}`,
+        message: `The trace collector of ${stage} could not be found; deploy the stage with \`preview-cli deploy ${stage}\` and pull again:\n${`${result.stdout}${result.stderr}`.trim()}`,
       });
     }
     return yield* decodePreviewCollector(result.stdout.trim()).pipe(
@@ -64,7 +67,7 @@ export const resolvePreviewCollector = (stage: string) =>
           new PreviewTracePullError({
             reason: "CollectorUnknown",
             stage,
-            message: `The preview CLI printed something other than ${stage}'s collector: ${result.stdout.trim()}`,
+            message: `The preview CLI printed something other than ${stage}'s collector; run \`preview-cli collector ${stage} --json\` to see why: ${result.stdout.trim()}`,
           }),
       ),
     );
@@ -97,7 +100,12 @@ export interface PreviewTracePull {
 /**
  * Downloads every export the stage's collector stored since the last pull into the trace store, so
  * `list`, `show`, `grep`, `stats`, `diff`, and `assert` see the stage's spans. The cursor is kept in
- * `<store>/pulls/<stage>.json`, per collector URL: a recreated collector starts from the beginning.
+ * `<store>/pulls/<stage>.json`, per collector URL (a recreated collector starts from the beginning),
+ * and advances after each export is stored, so a failed pull resumes where it stopped.
+ *
+ * @returns What was downloaded, or `PreviewTracePullError`: `CollectorUnauthorized` (the token was
+ *   refused), `CollectorUnavailable` (unreachable or an error status; pull again), or `ExportInvalid`
+ *   (a stored export is not OTLP traces); or `TraceStoreError` when the local store cannot be written.
  */
 export const pullPreviewTraces = (collector: PreviewCollector) =>
   Effect.gen(function* () {
@@ -117,6 +125,14 @@ export const pullPreviewTraces = (collector: PreviewCollector) =>
     );
     let exports = 0;
     let spans = 0;
+    const saveCursor = (key: string) =>
+      Effect.gen(function* () {
+        yield* fs.makeDirectory(path.dirname(cursorFile), { recursive: true });
+        yield* fs.writeFileString(
+          cursorFile,
+          yield* encodePullCursor({ url: collector.url, after: key }),
+        );
+      });
     const unavailable = (message: string) =>
       new PreviewTracePullError({ reason: "CollectorUnavailable", stage, message });
     while (true) {
@@ -131,7 +147,9 @@ export const pullPreviewTraces = (collector: PreviewCollector) =>
         )
         .pipe(
           Effect.mapError((error) =>
-            unavailable(`${stage}'s trace collector could not be reached: ${error.message}.`),
+            unavailable(
+              `${stage}'s trace collector could not be reached (${error.message}). Pull again: it resumes after the last export stored.`,
+            ),
           ),
         );
       if (response.status === 401) {
@@ -143,13 +161,15 @@ export const pullPreviewTraces = (collector: PreviewCollector) =>
       }
       if (response.status !== 200) {
         return yield* unavailable(
-          `${stage}'s trace collector answered ${response.status}. Pull again; nothing was skipped.`,
+          `${stage}'s trace collector answered ${response.status}. Pull again: it resumes after the last export stored.`,
         );
       }
       const page = yield* response.json.pipe(
         Effect.flatMap(decodeCollectorPage),
         Effect.mapError(() =>
-          unavailable(`${stage}'s trace collector returned a page this CLI cannot read.`),
+          unavailable(
+            `${stage}'s trace collector returned a page this CLI cannot read. Redeploy ${stage} so the collector matches this CLI, then pull again.`,
+          ),
         ),
       );
       for (const batch of page.batches) {
@@ -158,7 +178,7 @@ export const pullPreviewTraces = (collector: PreviewCollector) =>
           return yield* new PreviewTracePullError({
             reason: "ExportInvalid",
             stage,
-            message: `Export ${batch.key} is not base64.`,
+            message: `Export ${batch.key} in ${stage}'s trace collector is not base64, so it cannot be read. Delete it from the stage's trace bucket and pull again.`,
           });
         }
         const decoded = yield* (
@@ -171,21 +191,19 @@ export const pullPreviewTraces = (collector: PreviewCollector) =>
               new PreviewTracePullError({
                 reason: "ExportInvalid",
                 stage,
-                message: `Export ${batch.key} is not an OTLP trace export: ${error.message}`,
+                message: `Export ${batch.key} in ${stage}'s trace collector is not an OTLP trace export (${error.message}). Delete it from the stage's trace bucket and pull again.`,
               }),
           ),
         );
         yield* store.append(decoded);
         exports += 1;
         spans += decoded.length;
+        after = Option.some(batch.key);
+        yield* saveCursor(batch.key);
       }
-      if (page.next !== null) after = Option.some(page.next);
-      if (Option.isSome(after)) {
-        yield* fs.makeDirectory(path.dirname(cursorFile), { recursive: true });
-        yield* fs.writeFileString(
-          cursorFile,
-          yield* encodePullCursor({ url: collector.url, after: after.value }),
-        );
+      if (page.next !== null && Option.getOrUndefined(after) !== page.next) {
+        after = Option.some(page.next);
+        yield* saveCursor(page.next);
       }
       if (!page.more || page.batches.length === 0) break;
     }

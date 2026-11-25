@@ -71,8 +71,37 @@ const BatchesQuery = Schema.Struct({
 });
 const decodeBatchesQuery = Schema.decodeUnknownEffect(BatchesQuery);
 
-const failure = (status: number, message: string) =>
-  HttpServerResponse.jsonUnsafe({ message }, { status, headers: { "cache-control": "no-store" } });
+/**
+ * The collector's error body: the public error envelope (code, operation, message, details, request
+ * id, retryability), without vendor messages, which are logged instead.
+ */
+interface TraceCollectorPublicError {
+  readonly code: "InvalidRequest" | "TraceStorageUnavailable";
+  readonly operation: "storeTraces" | "readTraces";
+  readonly message: string;
+  readonly details: Record<string, never>;
+  readonly requestId: string;
+  readonly retryable: boolean;
+}
+
+const failure = (
+  status: 400 | 503,
+  error: Omit<TraceCollectorPublicError, "requestId" | "details" | "retryable">,
+) =>
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const requestId = request.headers["cf-ray"] ?? crypto.randomUUID();
+    const body: TraceCollectorPublicError = {
+      ...error,
+      details: {},
+      requestId,
+      retryable: status === 503,
+    };
+    return HttpServerResponse.jsonUnsafe(body, {
+      status,
+      headers: { "cache-control": "no-store", "x-request-id": requestId },
+    });
+  });
 
 /** `POST /v1/traces`: stores the OTLP/HTTP export (JSON or protobuf) as received. */
 const receiveTraces = Effect.gen(function* () {
@@ -85,10 +114,23 @@ const receiveTraces = Effect.gen(function* () {
   return HttpServerResponse.jsonUnsafe(OTLP_PARTIAL_SUCCESS);
 }).pipe(
   Effect.catchTags({
-    HttpServerError: () => Effect.succeed(failure(400, "The export body could not be read.")),
+    HttpServerError: () =>
+      failure(400, {
+        code: "InvalidRequest",
+        operation: "storeTraces",
+        message:
+          "The trace collector could not read the export's body. Send a complete OTLP export.",
+      }),
     R2Error: (error) =>
-      Effect.succeed(
-        failure(503, `The export could not be stored: ${error.message}. Send it again.`),
+      Effect.logError("The trace collector could not store an export", { cause: error }).pipe(
+        Effect.andThen(
+          failure(503, {
+            code: "TraceStorageUnavailable",
+            operation: "storeTraces",
+            message:
+              "The trace collector could not store the export because trace storage was unavailable. Send the same export again.",
+          }),
+        ),
       ),
   }),
 );
@@ -143,12 +185,21 @@ const readBatchesUnder = (prefix: string) =>
   }).pipe(
     Effect.catchTags({
       SchemaError: () =>
-        Effect.succeed(failure(400, "`after` must be a key and `limit` a number from 1 to 100.")),
+        failure(400, {
+          code: "InvalidRequest",
+          operation: "readTraces",
+          message:
+            "The trace collector could not read the query: `after` must be a stored key and `limit` a number from 1 to 100. Correct it and request again.",
+        }),
       R2Error: (error) =>
-        Effect.succeed(
-          failure(
-            503,
-            `The stored exports could not be read: ${error.message}. Retry the request.`,
+        Effect.logError("The trace collector could not read stored exports", { cause: error }).pipe(
+          Effect.andThen(
+            failure(503, {
+              code: "TraceStorageUnavailable",
+              operation: "readTraces",
+              message:
+                "The trace collector could not read stored exports because trace storage was unavailable. Request the same page again.",
+            }),
           ),
         ),
     }),

@@ -32,6 +32,7 @@ interface Entry<V> {
  * linear in the number of groups.
  */
 export class GroupByteBudgetLru<V> {
+  /** The budgets in force; `groupBytes` is capped at `totalBytes`. */
   readonly budget: GroupByteBudget;
   // Map iteration order is insertion order: re-inserting on access keeps the oldest first.
   private readonly entries = new Map<string, Entry<V>>();
@@ -39,6 +40,7 @@ export class GroupByteBudgetLru<V> {
   private readonly groupUsage = new Map<string, number>();
   private usage = 0;
 
+  /** An empty cache with these budgets. */
   constructor(budget: GroupByteBudget) {
     this.budget = {
       totalBytes: budget.totalBytes,

@@ -32,6 +32,8 @@ import {
   PreviewJurisdiction,
   previewOutputs,
   previewSecret,
+  encodePreviewOutputs,
+  type PreviewOutputs,
   type PreviewStage,
   type PreviewStatus,
   type StateRecords,
@@ -44,6 +46,7 @@ import {
  */
 class PreviewCliError extends Data.TaggedError("PreviewCliError")<{
   readonly reason: "DeployFailed" | "NotDeployed" | "TokenMissing";
+  readonly stage: PreviewStage;
   readonly message: string;
 }> {}
 
@@ -80,6 +83,7 @@ const deployedOutputs = (stage: PreviewStage) =>
     const outputs = yield* previewOutputs(records, stage);
     if (Option.isNone(outputs)) {
       return yield* new PreviewCliError({
+        stage,
         reason: "NotDeployed",
         message: `Nothing is deployed to ${stage}. Deploy it with \`preview-cli deploy ${stage}\`.`,
       });
@@ -87,7 +91,18 @@ const deployedOutputs = (stage: PreviewStage) =>
     return { records, outputs: outputs.value };
   });
 
-const printOutputs = (stage: PreviewStage, outputs: object, json: boolean) =>
+const printOutputs = (
+  stage: PreviewStage,
+  outputs: PreviewOutputs,
+  extra: Readonly<Record<string, string | boolean>>,
+  json: boolean,
+) => printFields(stage, { ...encodePreviewOutputs(outputs), ...extra }, json);
+
+const printFields = (
+  stage: PreviewStage,
+  outputs: Readonly<Record<string, unknown>>,
+  json: boolean,
+) =>
   json
     ? Console.log(JSON.stringify({ stage, ...outputs }))
     : Effect.forEach(Object.entries(outputs), ([name, value]) =>
@@ -116,9 +131,7 @@ const deploy = Command.make(
     Effect.gen(function* () {
       const current = yield* previewOutputs(yield* readStateRecords(Option.some(stage)), stage);
       const residency = deployJurisdiction(jurisdiction, current);
-      const previous = Option.flatMap(current, (outputs) =>
-        Option.fromUndefinedOr(outputs.jurisdiction),
-      );
+      const previous = Option.flatMap(current, (outputs) => outputs.jurisdiction);
       if (Option.isSome(previous) && previous.value !== residency) {
         yield* Console.error(
           `${stage} moves from jurisdiction ${previous.value} to ${residency}: its buckets and Workflow are replaced and new Durable Objects are addressed, so its databases do not carry over.`,
@@ -139,12 +152,13 @@ const deploy = Command.make(
       );
       if (result.status !== 0) {
         return yield* new PreviewCliError({
+          stage,
           reason: "DeployFailed",
           message: `Deploying ${stage} failed (exit ${String(result.status ?? result.signal)}); its log is above. Fix the cause and run the same command again: a deploy is safe to repeat.`,
         });
       }
       const { outputs } = yield* deployedOutputs(stage);
-      yield* printOutputs(stage, { ...outputs, devTimings }, json);
+      yield* printOutputs(stage, outputs, { devTimings }, json);
     }),
 ).pipe(Command.withDescription("Deploy the Stack to a preview stage, in place"));
 
@@ -161,7 +175,7 @@ const status = Command.make("status", { json: jsonFlag }, ({ json }) =>
           statuses.map(({ stage, outputs }) => ({
             stage,
             deployed: Option.isSome(outputs),
-            outputs: Option.getOrNull(outputs),
+            outputs: Option.getOrNull(Option.map(outputs, encodePreviewOutputs)),
           })),
         ),
       );
@@ -169,14 +183,16 @@ const status = Command.make("status", { json: jsonFlag }, ({ json }) =>
     for (const { stage, outputs } of statuses) {
       yield* Option.match(outputs, {
         onNone: () => Console.log(`${stage} not deployed`),
-        onSome: (deployed) => printOutputs(stage, deployed, false),
+        onSome: (deployed) => printOutputs(stage, deployed, {}, false),
       });
     }
   }),
 ).pipe(Command.withDescription("Show what is deployed to each preview stage"));
 
 const url = Command.make("url", { stage: stageArgument, json: jsonFlag }, ({ stage, json }) =>
-  deployedOutputs(stage).pipe(Effect.flatMap(({ outputs }) => printOutputs(stage, outputs, json))),
+  deployedOutputs(stage).pipe(
+    Effect.flatMap(({ outputs }) => printOutputs(stage, outputs, {}, json)),
+  ),
 ).pipe(Command.withDescription("Print a preview stage's API, BlockServer, and other URLs"));
 
 /** A deployed stage's generated secret; fails with `TokenMissing` when the stage has none. */
@@ -189,6 +205,7 @@ const requiredSecret = (
     const value = yield* previewSecret(records, stage, secret);
     if (Option.isNone(value)) {
       return yield* new PreviewCliError({
+        stage,
         reason: "TokenMissing",
         message: `${stage} has no ${secret}. Redeploy it with \`preview-cli deploy ${stage}\`.`,
       });
@@ -214,16 +231,17 @@ const collector = Command.make(
   ({ stage, json }) =>
     Effect.gen(function* () {
       const { records, outputs } = yield* deployedOutputs(stage);
-      if (outputs.traceCollectorUrl === undefined) {
+      if (Option.isNone(outputs.traceCollectorUrl)) {
         return yield* new PreviewCliError({
+          stage,
           reason: "NotDeployed",
           message: `${stage} has no trace collector yet. Redeploy it with \`preview-cli deploy ${stage}\`.`,
         });
       }
       const value = yield* requiredSecret(records, stage, "TraceCollectorToken");
       yield* json
-        ? Console.log(JSON.stringify({ stage, url: outputs.traceCollectorUrl, token: value }))
-        : Console.log(`${outputs.traceCollectorUrl}\n${value}`);
+        ? Console.log(JSON.stringify({ stage, url: outputs.traceCollectorUrl.value, token: value }))
+        : Console.log(`${outputs.traceCollectorUrl.value}\n${value}`);
     }),
 ).pipe(
   Command.withDescription(

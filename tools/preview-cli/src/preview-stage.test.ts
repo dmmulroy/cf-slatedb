@@ -46,7 +46,9 @@ describe("preview state", () => {
         other: yield* previewOutputs(records, "preview-2"),
       };
     }).pipe(Effect.runPromise);
-    expect(parsed.outputs).toEqual(Option.some(outputs));
+    expect(parsed.outputs).toEqual(
+      Option.some({ ...outputs, traceCollectorUrl: Option.none(), jurisdiction: Option.none() }),
+    );
     expect(parsed.token).toEqual(Option.some("f".repeat(64)));
     expect(parsed.collectorToken).toEqual(Option.none());
     expect(parsed.other).toEqual(Option.none());
@@ -82,15 +84,20 @@ describe("preview state", () => {
 });
 
 describe("deployJurisdiction", () => {
+  const decoded = {
+    ...outputs,
+    traceCollectorUrl: Option.none<string>(),
+    jurisdiction: Option.none<"none" | "eu" | "fedramp">(),
+  };
   const deployed = (jurisdiction: "none" | "eu" | "fedramp") =>
-    Option.some({ ...outputs, jurisdiction });
+    Option.some({ ...decoded, jurisdiction: Option.some(jurisdiction) });
 
   it("keeps a stage's jurisdiction unless the deploy asks for another, so a redeploy never moves it", () => {
     expect(deployJurisdiction(Option.none(), Option.none())).toBe("none");
     expect(deployJurisdiction(Option.none(), deployed("eu"))).toBe("eu");
     expect(deployJurisdiction(Option.some("none"), deployed("eu"))).toBe("none");
-    expect(deployJurisdiction(Option.some("fedramp"), Option.some(outputs))).toBe("fedramp");
-    expect(deployJurisdiction(Option.none(), Option.some(outputs))).toBe("none");
+    expect(deployJurisdiction(Option.some("fedramp"), Option.some(decoded))).toBe("fedramp");
+    expect(deployJurisdiction(Option.none(), Option.some(decoded))).toBe("none");
   });
 });
 

@@ -123,7 +123,7 @@ const finishedEarly = (
         "sst.corruption": outcome.reason,
       });
       yield* Effect.logError(
-        `Compaction job ${params.jobId} of database ${params.databaseId} stopped: input SST ${outcome.sstId} is corrupted (${outcome.reason} in ${outcome.section}).`,
+        `Compaction job ${params.jobId} of database ${params.databaseId} stopped: input SST ${outcome.sstId} is corrupted (${outcome.reason} in ${outcome.section}). The compactor stops compacting it; restore the SST or remove it from the manifest.`,
       );
     } else {
       yield* Effect.annotateCurrentSpan({ "compaction.outcome": "Discarded" });

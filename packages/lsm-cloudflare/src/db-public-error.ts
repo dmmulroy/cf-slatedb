@@ -204,6 +204,15 @@ export class StoredDataInvalidPublicError extends Schema.TaggedError<StoredDataI
   },
 ) {}
 
+/**
+ * `401` — the request did not carry the stage's access token (live preview stages only, D44). The
+ * access gate answers it before the request reaches any handler.
+ */
+export class UnauthenticatedPublicError extends Schema.TaggedError<UnauthenticatedPublicError>()(
+  "UnauthenticatedPublicError",
+  { code: Schema.Literal("Unauthenticated"), details: Schema.Struct({}), ...common },
+) {}
+
 /** `500` — an internal failure; contact the operator with the request id. */
 export class InternalFailurePublicError extends Schema.TaggedError<InternalFailurePublicError>()(
   "InternalFailurePublicError",
@@ -214,6 +223,7 @@ export class InternalFailurePublicError extends Schema.TaggedError<InternalFailu
 export const DB_PUBLIC_ERRORS = [
   InvalidRequestPublicError.pipe(HttpApiSchema.status(400)),
   BatchInvalidPublicError.pipe(HttpApiSchema.status(400)),
+  UnauthenticatedPublicError.pipe(HttpApiSchema.status(401)),
   DatabaseNotFoundPublicError.pipe(HttpApiSchema.status(404)),
   RouteNotFoundPublicError.pipe(HttpApiSchema.status(404)),
   CheckpointNotFoundPublicError.pipe(HttpApiSchema.status(404)),
@@ -234,6 +244,7 @@ export const DB_PUBLIC_ERRORS = [
 /** Any public error. */
 export type DbPublicError =
   | InvalidRequestPublicError
+  | UnauthenticatedPublicError
   | BatchInvalidPublicError
   | DatabaseNotFoundPublicError
   | CheckpointNotFoundPublicError

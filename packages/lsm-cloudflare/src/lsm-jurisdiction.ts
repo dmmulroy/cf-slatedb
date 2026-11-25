@@ -31,8 +31,10 @@ export const LSM_JURISDICTION_SETTING = "CF_SLATEDB_JURISDICTION";
  * **Details**
  *
  * Read with `Config`: at plan time from the deploy's environment, which binds it onto the Worker
- * whose init reads it, and at runtime from that binding, so planning and running agree. A value
- * other than `eu` or `fedramp` stops the Worker: a misconfigured residency must not start.
+ * whose init reads it, and at runtime from that binding, so planning and running agree.
+ *
+ * @returns The jurisdiction, or `None` when unset or `none`. Any other value is a defect that stops
+ *   the Worker: a misconfigured residency must not start.
  */
 export const lsmJurisdiction: Effect.Effect<Option.Option<LsmJurisdiction>> = Config.option(
   Config.schema(LsmJurisdictionSetting, LSM_JURISDICTION_SETTING),

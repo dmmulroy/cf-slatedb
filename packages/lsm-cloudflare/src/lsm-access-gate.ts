@@ -4,9 +4,10 @@ import type * as Output from "alchemy/Output";
 import type { Provider } from "alchemy/Provider";
 import { CurrentRuntimeContext } from "alchemy/RuntimeContext";
 import { Stage } from "alchemy/Stage";
-import { Config, Effect, Option, Redacted } from "effect";
+import { Config, Effect, Option, Redacted, Schema } from "effect";
 import { HttpServerRequest, HttpServerResponse } from "effect/http";
 
+import { UnauthenticatedPublicError } from "./db-public-error.ts";
 import { isLocalLsmStage } from "./lsm-stage.ts";
 
 /**
@@ -45,6 +46,8 @@ export type LsmAccessGate = <R>(handler: HttpEffect<R>) => HttpEffect<R>;
  *
  * @param binding - Name of the secret binding that carries the token.
  * @param token - Yields the token's Output at plan time, or `None` when the stage is not gated.
+ * @returns The wrapper. A bound value that is not a valid secret stops the Worker (a defect): a
+ *   misconfigured gate must not start open.
  */
 export const lsmAccessGateFor = <R>(
   binding: string,
@@ -71,9 +74,12 @@ export const lsmAccessGateFor = <R>(
  * **Details**
  *
  * A stand-in for Cloudflare Access on the live preview stages, whose Workers have public
- * `workers.dev` URLs: like Access, it rejects a request before it reaches the API contract, so the
- * `401` body is not one of the API's declared errors. Local stages bind no token and pass every
- * request through. The comparison takes the same time whatever the presented token.
+ * `workers.dev` URLs: like Access, it rejects a request before it reaches any handler, with the
+ * public error envelope (`UnauthenticatedPublicError`, `401`), which `DbHttpApi` declares. Local
+ * stages bind no token and pass every request through. The comparison takes the same time whatever
+ * the presented token.
+ *
+ * @returns The wrapper; it never fails (a request without the token is answered, not failed).
  */
 export const lsmAccessGateForStage = lsmAccessGateFor(LSM_ACCESS_TOKEN_BINDING, LsmAccessToken);
 
@@ -112,15 +118,22 @@ const sameSecret = (presented: string, expected: Redacted.Redacted<string>): boo
   return difference === 0;
 };
 
+const encodeUnauthenticated = Schema.encodeSync(UnauthenticatedPublicError);
+
+/** The public error envelope (`Unauthenticated`, 401) for a request without the token. */
 const unauthenticatedResponse = (requestId: string) =>
   HttpServerResponse.jsonUnsafe(
-    {
-      code: "Unauthenticated",
-      message:
-        "The request was not authenticated. Send the stage's token as `Authorization: Bearer <token>`; `preview-cli token <stage>` prints it.",
-      requestId,
-      retryable: false,
-    },
+    encodeUnauthenticated(
+      new UnauthenticatedPublicError({
+        code: "Unauthenticated",
+        operation: "routeRequest",
+        message:
+          "The request was not authenticated. Send the stage's token as `Authorization: Bearer <token>`; `preview-cli token <stage>` prints it.",
+        details: {},
+        requestId,
+        retryable: false,
+      }),
+    ),
     {
       status: 401,
       headers: {

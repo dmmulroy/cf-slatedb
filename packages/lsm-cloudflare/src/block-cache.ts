@@ -44,13 +44,20 @@ export interface IBlockCache {
   /**
    * An SST's decoded metadata, read once per isolate (one request: `metaOffset`/`metaLength`),
    * charged to `budgetGroup` (the reading database's group, or its id).
+   *
+   * @returns The metadata, or `SstMissingError`, `BlockSourceUnavailableError` (retryable), or
+   *   `SstCorruptedError` (not retryable); failures are never kept.
    */
   readonly meta: (
     owner: DatabaseId,
     handle: SstHandle,
     budgetGroup: string,
   ) => Effect.Effect<SstMeta, BlockReadError, BlockSourceServices>;
-  /** One decoded, checksum-verified data block, charged to `budgetGroup`. */
+  /**
+   * One decoded, checksum-verified data block, charged to `budgetGroup`.
+   *
+   * @returns The block, or the same failures as `meta`; failures are never kept.
+   */
   readonly block: (
     owner: DatabaseId,
     handle: SstHandle,
