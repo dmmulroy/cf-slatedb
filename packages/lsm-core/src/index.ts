@@ -18,4 +18,5 @@ export * from "./read-consistency.ts";
 export * from "./compaction-merge.ts";
 export * from "./garbage-collection-plan.ts";
 export * from "./compaction-budget-ledger.ts";
+export * from "./group-byte-budget-lru.ts";
 export * from "./transaction.ts";

@@ -277,7 +277,7 @@ calls `bindWorker` only to register the binding, reads the raw `Fetcher` from th
 `fromCloudflareFetcher` → `toHttpClient` → the generated `BlockServerHttpApi` client, once per
 invocation. A missing binding is a defect.
 
-## D32. L1 cache budget is by entry count
+## D32. L1 cache budget is by entry count (superseded by D51)
 
 `BlockCache` caps the data cache at 4,096 blocks (~16 MiB at 4 KiB) and the metadata cache at 1,024
 entries, isolate-wide. Design §12 suggests a byte budget per `budgetGroup` (or a `LayerMap` per
@@ -627,3 +627,26 @@ transactions matter.
 
 The model (`Transactions.tla`) already lets `Flush` interleave anywhere, so it covers this exact
 window; no model or code change.
+
+## D51. The L1 block cache is bounded by bytes, per budget group and in total
+
+Replaces D32's entry-count bound. `BlockCache` keeps decoded data blocks and SST metadata in two
+`GroupByteBudgetLru`s (`lsm-core/src/group-byte-budget-lru.ts`), each entry charged its size as
+stored on R2 (a decoded block keeps a view of exactly those bytes; metadata is charged
+`metaLength`):
+
+- `l1DataCacheBytes` (32 MiB) and `l1MetaCacheBytes` (16 MiB) bound each cache for the isolate —
+  about a third of 128 MB. The old metadata bound of 1,024 _entries_ was not a memory bound at all:
+  the index and Bloom filter of one 64 MiB SST are about a megabyte.
+- `l1GroupCacheShare` (0.5) bounds what one `budgetGroup` may hold. A read is charged to the reading
+  database's `budgetGroup`, or its id (a fork's reads of its source's SSTs are charged to the fork).
+  A full group evicts its own least recently used entries, never another group's.
+- When all groups together would exceed the total, the group holding the most bytes gives up its
+  least recently used entry, repeatedly, so a busy tenant shrinks before a quiet one is touched;
+  the entry being added is never the one evicted.
+
+Effect's `Cache` bounds entries, so the cache is now private code with the same contract: concurrent
+misses for one key join one read (a waiter whose reader is interrupted reads again itself), failures
+are never kept, and reads run with the calling invocation's services. Design §12 also offers a
+`LayerMap` per group with idle release; one structure with per-group accounting is simpler and
+lets groups borrow unused room.

@@ -149,6 +149,13 @@ const levels = (manifest: Manifest): ReadonlyArray<ReadonlyArray<SstHandle>> => 
   ...manifest.sortedRuns.map((run) => run.ssts),
 ];
 
+/**
+ * The L1 budget group a read of `databaseId` is charged to: its `budgetGroup`, or its id. Blocks of
+ * a fork's external SSTs are charged to the fork that reads them, not to their owner.
+ */
+const readerBudgetGroup = (databaseId: DatabaseId, manifest: Manifest): string =>
+  Option.getOrElse(manifest.options.budgetGroup, () => databaseId);
+
 /** Constructs the reader over the contextual manifest cache, manifest reader, and block cache. */
 export const makeDbReader = Effect.gen(function* () {
   const manifests = yield* ManifestCache;
@@ -242,10 +249,11 @@ export const makeDbReader = Effect.gen(function* () {
     handle: SstHandle,
     key: Uint8Array,
     snapshotSeq: SeqNum,
+    budgetGroup: string,
   ) =>
     Effect.gen(function* () {
       const owner = sstHandleOwner(handle, databaseId);
-      const meta = yield* blocks.meta(owner, handle);
+      const meta = yield* blocks.meta(owner, handle, budgetGroup);
       if (!sstMayContainKey(meta, key)) {
         yield* Effect.annotateCurrentSpan({ "filter.negative": true });
         return [];
@@ -256,7 +264,7 @@ export const makeDbReader = Effect.gen(function* () {
       for (let index = first.value; index < meta.index.length; index++) {
         const entry = meta.index[index];
         if (entry === undefined) break;
-        const block = yield* blocks.block(owner, handle, entry);
+        const block = yield* blocks.block(owner, handle, entry, budgetGroup);
         let pastKey = false;
         for (const row of block.seek(key)) {
           if (!Bytes.Equivalence(row.key, key)) {
@@ -294,9 +302,13 @@ export const makeDbReader = Effect.gen(function* () {
         );
         if (handle === undefined) continue;
         sstsRead++;
-        const found = yield* sstVersions(databaseId, handle, key, snapshotSeq).pipe(
-          Effect.catchTags(blockFailures(databaseId)),
-        );
+        const found = yield* sstVersions(
+          databaseId,
+          handle,
+          key,
+          snapshotSeq,
+          readerBudgetGroup(databaseId, manifest),
+        ).pipe(Effect.catchTags(blockFailures(databaseId)));
         versions.push(...found);
         if (settled(found)) break;
       }
@@ -318,6 +330,7 @@ export const makeDbReader = Effect.gen(function* () {
     handle: SstHandle,
     range: KeyRange,
     snapshotSeq: SeqNum,
+    budgetGroup: string,
   ) =>
     Stream.unwrap(
       Effect.gen(function* () {
@@ -329,7 +342,7 @@ export const makeDbReader = Effect.gen(function* () {
           return Stream.empty;
         }
         const owner = sstHandleOwner(handle, databaseId);
-        const meta = yield* blocks.meta(owner, handle);
+        const meta = yield* blocks.meta(owner, handle, budgetGroup);
         const indexes = blocksOverlappingRange(meta, effective.value);
         return Stream.fromIterable(indexes).pipe(
           // Fetch the next block while the current one is consumed.
@@ -338,7 +351,9 @@ export const makeDbReader = Effect.gen(function* () {
               const entry = meta.index[index];
               return entry === undefined
                 ? Effect.succeed([])
-                : Effect.map(blocks.block(owner, handle, entry), (block) => [...block.rows()]);
+                : Effect.map(blocks.block(owner, handle, entry, budgetGroup), (block) => [
+                    ...block.rows(),
+                  ]);
             },
             { concurrency: 2 },
           ),
@@ -372,7 +387,15 @@ export const makeDbReader = Effect.gen(function* () {
         );
         const ssts = manifest.l0
           .concat(manifest.sortedRuns.flatMap((run) => run.ssts))
-          .map((handle) => sstRows(databaseId, handle, range, snapshotSeq));
+          .map((handle) =>
+            sstRows(
+              databaseId,
+              handle,
+              range,
+              snapshotSeq,
+              readerBudgetGroup(databaseId, manifest),
+            ),
+          );
         const visible = groupRowsByKey(mergeRowStreams([memtable, ...ssts])).pipe(
           Stream.mapEffect((versions) =>
             Effect.fromResult(resolveVisibleRow(versions, { snapshotSeq, now, mergeOperator })),

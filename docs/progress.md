@@ -72,6 +72,11 @@ in order.
   the whole flush, which takes at least ~1.5 s on R2. Live: 580/580 transactions committed through a
   28.7 s flush under write load (`measure transactions`). The exact alternative (pinned begin
   manifest + caller-side L0 check) is recorded in D50.
+- **6b. L1 cache bounded by bytes per budget group (D51).** `GroupByteBudgetLru` (lsm-core, property
+  tested, four mutations caught) behind `BlockCache`: 32 MiB data and 16 MiB metadata per isolate,
+  half per `budgetGroup`, heaviest group evicts first under pressure; joined misses and
+  never-kept failures preserved (`block-cache.test.ts`). The old metadata bound counted entries,
+  each up to ~1 MB.
 
 ## Done
 

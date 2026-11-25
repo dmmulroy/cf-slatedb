@@ -291,10 +291,13 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `preview-1` (`docs/measurements.md`): a writer is CPU-bound at ~12–15k small rows/s with 1,000-row
   batches; a flush costs ~55–90 ms CPU per MiB; a split pauses writes ~13–16 s. Not measured: SQLite
   page cache against 128 MB, the Workflows concurrency limit.
-- **Shared resources: R2 request rate, Workers Cache per Worker, L1 cache budget** — done with one gap.
+- **Shared resources: R2 request rate, Workers Cache per Worker, L1 cache budget** — done.
   One bucket with `db/<id>/` prefixes and no LIST on read paths; owner database in every block URL
-  (`block-server-http-api.ts`); L1 cache bounded by entry count, not a per-`budgetGroup` byte budget
-  (D32, gap).
+  (`block-server-http-api.ts`); L1 cache bounded by bytes per `budgetGroup` and in total
+  (`group-byte-budget-lru.ts`, `block-cache.ts`; D51). Tests: `group-byte-budget-lru.test.ts`
+  (properties: budgets and accounting, LRU within a group, another group evicted only under total
+  pressure and only while heaviest; four mutations caught), `block-cache.test.ts` (joined misses,
+  failures not kept, a busy group never evicts a quiet one, a lone group held to its share).
 - **Transactions across a flush (known gap, hand-off item 6)** — kept and justified (D50): only a
   transaction outlasting a whole flush aborts; measured 580/580 commits through a 28.7 s flush
   (`scenario-cli measure transactions`). Formal: `Transactions` (`Flush` interleaves anywhere).

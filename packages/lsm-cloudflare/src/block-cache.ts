@@ -2,6 +2,7 @@ import {
   type DataBlock,
   type DatabaseId,
   decodeDataBlock,
+  GroupByteBudgetLru,
   decodeSstMeta,
   type SstCorruptedError,
   type SstHandle,
@@ -9,7 +10,7 @@ import {
   type SstIndexEntry,
   type SstMeta,
 } from "@cf-slatedb/lsm-core";
-import { Cache, Context, Data, Duration, Effect, Exit, Layer, Metric } from "effect";
+import { Cause, Context, Deferred, Effect, Layer, Metric, Option } from "effect";
 
 import {
   BlockSource,
@@ -19,12 +20,11 @@ import {
   blockSourceTestLayer,
   type SstMissingError,
 } from "./block-source.ts";
-
-/** Data blocks the isolate keeps (4 KiB blocks: about 16 MiB). */
-export const DATA_BLOCK_CACHE_CAPACITY = 4096;
-
-/** SST metadata sections (index, filter, footer) the isolate keeps, apart from data blocks. */
-export const META_CACHE_CAPACITY = 1024;
+import {
+  LsmConfiguration,
+  lsmConfigurationLayer,
+  lsmConfigurationTestLayer,
+} from "./lsm-configuration.ts";
 
 /** Block cache lookups by tier and outcome (SlateDB RFC-0021 parity). */
 export const blockCacheRequests = Metric.counter("lsm_block_cache_requests", {
@@ -36,19 +36,26 @@ export type BlockReadError = SstMissingError | BlockSourceUnavailableError | Sst
 
 /**
  * The isolate's L1 block cache: decoded data blocks and SST metadata, in two separate caches so a
- * scan does not evict the indexes and filters point reads need (SlateDB's split cache).
+ * scan does not evict the indexes and filters point reads need (SlateDB's split cache). Both are
+ * bounded by bytes, per `budgetGroup` and in total (`l1DataCacheBytes`, `l1MetaCacheBytes`,
+ * `l1GroupCacheShare`; D51), so one tenant's scans cannot empty another's cache.
  */
 export interface IBlockCache {
-  /** An SST's decoded metadata, read once per isolate (one request: `metaOffset`/`metaLength`). */
+  /**
+   * An SST's decoded metadata, read once per isolate (one request: `metaOffset`/`metaLength`),
+   * charged to `budgetGroup` (the reading database's group, or its id).
+   */
   readonly meta: (
     owner: DatabaseId,
     handle: SstHandle,
+    budgetGroup: string,
   ) => Effect.Effect<SstMeta, BlockReadError, BlockSourceServices>;
-  /** One decoded, checksum-verified data block. */
+  /** One decoded, checksum-verified data block, charged to `budgetGroup`. */
   readonly block: (
     owner: DatabaseId,
     handle: SstHandle,
     entry: SstIndexEntry,
+    budgetGroup: string,
   ) => Effect.Effect<DataBlock, BlockReadError, BlockSourceServices>;
 }
 
@@ -57,93 +64,136 @@ export class BlockCache extends Context.Service<BlockCache, IBlockCache>()(
   "@cf-slatedb/BlockCache",
 ) {}
 
-/** Cache key of a byte range of one SST. */
-class RangeKey extends Data.Class<{
-  readonly owner: DatabaseId;
-  readonly sstId: SstId;
-  readonly offset: number;
-  readonly length: number;
-}> {}
-
-/** Keep successes forever (SSTs are immutable); never keep failures. */
-const keepSuccesses = <A, E>(exit: Exit.Exit<A, E>) =>
-  Exit.isSuccess(exit) ? Duration.infinity : Duration.zero;
+/** Cache key of a byte range of one SST: its owner, id, and range (SSTs are immutable). */
+const rangeKey = (owner: DatabaseId, sstId: SstId, offset: number, length: number) =>
+  `${owner}/${sstId}/${offset}-${length}`;
 
 /**
- * Constructs the L1 cache over the contextual block source. Concurrent misses for one key join one
- * lookup; lookups run with the calling invocation's services.
+ * One L1 cache: decoded values within a {@link GroupByteBudgetLru}, each charged its encoded size,
+ * with concurrent misses for a key joined into one read. Failures are never kept.
+ */
+const makeL1Cache = <A>(budget: { readonly totalBytes: number; readonly groupBytes: number }) => {
+  const held = new GroupByteBudgetLru<A>(budget);
+  const reading = new Map<string, Deferred.Deferred<A, BlockReadError>>();
+  const get = <R>(
+    key: string,
+    budgetGroup: string,
+    bytes: number,
+    read: Effect.Effect<A, BlockReadError, R>,
+  ): Effect.Effect<A, BlockReadError, R> =>
+    Effect.suspend(() => {
+      const cached = held.get(key);
+      if (Option.isSome(cached)) return Effect.succeed(cached.value);
+      const pending = reading.get(key);
+      if (pending !== undefined) {
+        // The read belongs to another invocation: if that one is interrupted, read again here.
+        return Deferred.await(pending).pipe(
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? get(key, budgetGroup, bytes, read)
+              : Effect.failCause(cause),
+          ),
+        );
+      }
+      return Effect.gen(function* () {
+        const deferred = yield* Deferred.make<A, BlockReadError>();
+        reading.set(key, deferred);
+        return yield* read.pipe(
+          Effect.tap((value) => Effect.sync(() => held.set(key, budgetGroup, bytes, value))),
+          Effect.onExit((exit) =>
+            Effect.andThen(
+              Effect.sync(() => reading.delete(key)),
+              Deferred.done(deferred, exit),
+            ),
+          ),
+        );
+      });
+    });
+  return { has: (key: string) => held.has(key), get };
+};
+
+/**
+ * Constructs the L1 cache over the contextual block source and settings. Concurrent misses for one
+ * key join one read; reads run with the calling invocation's services.
  */
 export const makeBlockCache = Effect.gen(function* () {
   const source = yield* BlockSource;
-  const metas = yield* Cache.makeWith(
-    (key: RangeKey) =>
-      source
-        .meta(key.owner, key.sstId, key.offset, key.length)
-        .pipe(Effect.flatMap((bytes) => Effect.fromResult(decodeSstMeta(key.sstId, bytes)))),
-    { capacity: META_CACHE_CAPACITY, timeToLive: keepSuccesses, requireServicesAt: "lookup" },
-  );
-  const blocks = yield* Cache.makeWith(
-    (key: RangeKey) =>
-      source
-        .block(key.owner, key.sstId, key.offset, key.length)
-        .pipe(
-          Effect.flatMap((bytes) =>
-            Effect.fromResult(decodeDataBlock(bytes, { sstId: key.sstId, offset: key.offset })),
-          ),
-        ),
-    { capacity: DATA_BLOCK_CACHE_CAPACITY, timeToLive: keepSuccesses, requireServicesAt: "lookup" },
-  );
+  const settings = yield* LsmConfiguration;
+  const metas = makeL1Cache<SstMeta>({
+    totalBytes: settings.l1MetaCacheBytes,
+    groupBytes: Math.ceil(settings.l1MetaCacheBytes * settings.l1GroupCacheShare),
+  });
+  const blocks = makeL1Cache<DataBlock>({
+    totalBytes: settings.l1DataCacheBytes,
+    groupBytes: Math.ceil(settings.l1DataCacheBytes * settings.l1GroupCacheShare),
+  });
 
-  const lookup = <A, E, R>(
-    cache: Cache.Cache<RangeKey, A, E, R>,
-    key: RangeKey,
+  const observe = (
+    key: string,
+    hit: boolean,
     tier: "meta" | "data",
+    owner: DatabaseId,
+    sstId: SstId,
   ) =>
     Effect.gen(function* () {
-      const hit = yield* Cache.has(cache, key);
       yield* Effect.annotateCurrentSpan({
         "cache.hit": hit,
         "cache.tier": tier,
-        "sst.id": key.sstId,
-        "database.id": key.owner,
+        "sst.id": sstId,
+        "database.id": owner,
       });
       yield* Metric.update(
         Metric.withAttributes(blockCacheRequests, { tier, hit: String(hit) }),
         1,
       );
-      return yield* Cache.get(cache, key);
+      return key;
     });
 
   return BlockCache.of({
-    meta: (owner, handle) =>
-      lookup(
-        metas,
-        new RangeKey({
-          owner,
-          sstId: handle.id,
-          offset: handle.metaOffset,
-          length: handle.metaLength,
-        }),
-        "meta",
-      ).pipe(Effect.withSpan("BlockCache.meta")),
-    block: (owner, handle, entry) =>
-      lookup(
-        blocks,
-        new RangeKey({ owner, sstId: handle.id, offset: entry.offset, length: entry.length }),
-        "data",
-      ).pipe(Effect.withSpan("BlockCache.block")),
+    meta: (owner, handle, budgetGroup) =>
+      Effect.gen(function* () {
+        const key = rangeKey(owner, handle.id, handle.metaOffset, handle.metaLength);
+        yield* observe(key, metas.has(key), "meta", owner, handle.id);
+        return yield* metas.get(
+          key,
+          budgetGroup,
+          handle.metaLength,
+          source
+            .meta(owner, handle.id, handle.metaOffset, handle.metaLength)
+            .pipe(Effect.flatMap((bytes) => Effect.fromResult(decodeSstMeta(handle.id, bytes)))),
+        );
+      }).pipe(Effect.withSpan("BlockCache.meta")),
+    block: (owner, handle, entry, budgetGroup) =>
+      Effect.gen(function* () {
+        const key = rangeKey(owner, handle.id, entry.offset, entry.length);
+        yield* observe(key, blocks.has(key), "data", owner, handle.id);
+        return yield* blocks.get(
+          key,
+          budgetGroup,
+          entry.length,
+          source
+            .block(owner, handle.id, entry.offset, entry.length)
+            .pipe(
+              Effect.flatMap((bytes) =>
+                Effect.fromResult(
+                  decodeDataBlock(bytes, { sstId: handle.id, offset: entry.offset }),
+                ),
+              ),
+            ),
+        );
+      }).pipe(Effect.withSpan("BlockCache.block")),
   });
 });
 
 /** Provides the L1 cache, leaving the block source visible. */
 export const blockCacheLayerWithoutDependencies = Layer.effect(BlockCache, makeBlockCache);
 
-/** Provides the L1 cache over the `BlockServer` service binding. */
+/** Provides the L1 cache over the `BlockServer` service binding and the configured budgets. */
 export const blockCacheLayer = blockCacheLayerWithoutDependencies.pipe(
-  Layer.provide(blockSourceLayer),
+  Layer.provide(Layer.mergeAll(blockSourceLayer, lsmConfigurationLayer)),
 );
 
 /** Provides the L1 cache over the in-memory object store (the test block source). */
 export const blockCacheTestLayer = blockCacheLayerWithoutDependencies.pipe(
-  Layer.provide(blockSourceTestLayer),
+  Layer.provide(Layer.mergeAll(blockSourceTestLayer, lsmConfigurationTestLayer())),
 );
