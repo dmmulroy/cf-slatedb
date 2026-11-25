@@ -88,7 +88,7 @@ stale writer", "serializes concurrent edits", "writes nothing for an already-app
 
 ## Keeping it in step with the code
 
-Sync commit: `SYNC_COMMIT_PLACEHOLDER` (the model was last confirmed to describe the code at this
+Sync commit: `5985e4b` (the model was last confirmed to describe the code at this
 commit). When a covered file changed after it, diff it, update the model so each step still maps
 to one awaited effect in the code, rerun, and show the affected invariant still fails on a broken
 variant. Move the sync commit forward only after confirming the model describes the code at the
