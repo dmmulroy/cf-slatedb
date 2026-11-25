@@ -2,7 +2,7 @@
 
 ## Current phase
 
-Phase 10: hardening (starting). Phases 0–9 are done.
+All ten phases are done. See the hand-off below; open questions need Dillon.
 
 ## Done
 
@@ -142,18 +142,73 @@ Phase 10: hardening (starting). Phases 0–9 are done.
   the generator produced mostly one-step schedules; it now requires 20–60 steps, and every mutation
   of the checks is caught. Decision D41.
 
-- **Phase 10 (in progress) — scenario CLI.** `tools/scenario-cli` runs nine end-to-end scenarios
-  against `vp run dev` with trace assertions; all pass. The change feed's read side (D42) landed
-  first. Code is now erasable-syntax-only (`erasableSyntaxOnly`), so Node runs every package's
-  sources directly.
+- **Phase 10 — hardening.** The change feed's read side (D42); `tools/scenario-cli` (nine
+  end-to-end scenarios against `vp run dev` with trace assertions, all passing); fault injection
+  (R2 outages and flaky calls, a crash between the L0 upload and the manifest commit, a compaction
+  resumed after a failed step) and a split under concurrent writes, each shown failing on a broken
+  variant; erasable-syntax-only TypeScript so Node runs every package directly; the coverage matrix
+  complete (one partial row: data residency, open question 3).
 
-## Next
+## Hand-off
 
-- Phase 10: hardening — the scenario CLI (`tools/scenario-cli`) running named scenarios against
-  `vp run dev` with trace assertions (write/read, flush, compaction, fork/split, fencing, changelog,
-  transactions), failure scenarios (writer eviction mid-flush, crash between L0 upload and commit,
-  CAS races, stale writer, R2 failures, compaction resumed after failure, split under load), the
-  coverage matrix filled, and the hand-off.
+**What was built.** cf-slatedb, a SlateDB-style LSM key-value store on Cloudflare:
+
+- `packages/lsm-core` (pure, no Cloudflare): ids, rows and resolution (merge operators, TTL), CRC32C,
+  Bloom filters, block and SST codecs, the k-way merge, the manifest and its pure edits (fencing,
+  flush, compaction, seal, removal, checkpoints, forks, GC boundaries), the size-tiered scheduler,
+  the compaction merge, GC planning, the compaction budget ledger, write batches, read consistency,
+  transactions.
+- `packages/lsm-cloudflare`: `ObjectStore` (R2), manifests (CAS, RFC 0026 boundary), the writer
+  (`WriterServer` Durable Object; SQLite memtable = WAL; flush, backpressure, seal, change feed,
+  transactions), the reader (`DbReader` in the caller's isolate; L1 `BlockCache`; `BlockServer`
+  Worker behind Workers Cache), compaction (`CompactorServer`, `CompactionWorkflow`,
+  `CompactionBudgetServer`), GC (`GarbageCollector`, cron `GcWorker`), `DatabaseLifecycle`
+  (checkpoints, seal, zero-copy forks, removal), `DbClient`, and the public `DbHttpApi` (`/v1`).
+- `packages/lsm-sharding` (public APIs only): range-sharded groups (`ShardDirectoryServer`,
+  `ShardRouter`, resumable `ShardSplit`) and an example `ShardRouterWorker`.
+- `infra/cf-slatedb/alchemy.run.ts`: the Stack (bucket; `DbApiWorker` with `WriterServer`;
+  `BlockServerWorker`; `CompactorWorker`; `GcWorker`; `ShardRouterWorker`; telemetry probe).
+- Tools: `trace-cli`, `scenario-cli`, `formal-verification` (TLC runner), `workspace-boundaries`.
+
+**How to run it.**
+
+- `vp run ready` — format, lint, types, and every test (unit, property, and the workerd
+  integration test, which brings up the whole Stack locally with its own OTLP collector).
+- `vp run verify` — the six formal checks (20 TLC runs, about 2 minutes; downloads a pinned JDK
+  and TLA+ tools into `.tlc/` on first use).
+- `vp run dev` — the full Stack locally (API on `:1337`, BlockServer `:1338`, compactor `:1339`,
+  GC `:1340`, shard router `:1341`; dev settings: `gcMinAge` 10 s, compactor polls every second).
+  With `node tools/trace-cli/src/trace-cli.ts serve` running, `node tools/scenario-cli/src/
+  scenario-cli.ts run all` runs every scenario with trace assertions.
+
+**What is verified, and under which bounds.** Each check has a skill in `.agents/skills/verify-*`
+with its bounds, assumptions, covered code, and sync commit; every check was shown failing on
+deliberately broken variants:
+
+1. No acknowledged write lost or hidden (`NoAckedWriteLost.tla`): 4 writes, 2 crashes, 2 reads.
+2. Fencing and 3. manifest CAS linearizability (`ManifestCasFencing.tla`): 2 writers and 2
+   compactors over 9 manifest ids, plus a race config for changed compaction inputs.
+3. GC safety (`GcSafety.tla`): 2 SSTs, clock 0–3, 5 manifests, interleaved GC steps (found that
+   manifest age must be measured from the successor).
+4. Seal and split (`SealSplit.tla`): 3 keys, 4 writes, every interleaving of seal, checkpoint, forks.
+5. Transactions (`Transactions.tla`): 2 keys, 2 transactions, 6 commits; serializable in commit order.
+
+Code-level properties (codecs, merge, compaction merge, GC plans, ledger, shard map, the client and
+change feed against oracles, transactions, fault injection) are property tests with mutation checks
+(`docs/coverage-matrix.md` names each).
+
+**Known gaps.**
+
+- Data residency is advisory (open question 3).
+- The L1 block cache is bounded by entry count, not a per-`budgetGroup` byte budget (D32).
+- Transactions abort when data newer than their reads is flushed during them (D41).
+- Snapshots are protected by `gcMinAge`, not checkpoints (D30); a snapshot older than that may
+  expire (`SnapshotExpired`).
+- A corrupted SST fails its compaction job as a defect; the compactor plans it again (D34).
+
+**Needs a live preview to confirm** (open questions 1, 2, 4): Workers Cache hits on `BlockServer`,
+R2's `If-None-Match` Headers form, and the §12 measurements. Nothing has run against the real
+account.
 
 ## Findings
 
@@ -174,3 +229,13 @@ Live checks waiting for Dillon's approval (none has run; none runs from `vp run 
    response (Workers Cache is not emulated by Vitest or `alchemy dev`).
 2. **R2 `If-None-Match: *` with the Headers form on real R2** (workerd #2572). Verified only
    against Alchemy's local R2 (`test/object-store/object-store.workerd.ts`).
+3. **Data residency design.** `DatabaseOptions.jurisdiction` is stored and inherited by forks but
+   not enforced. Per-database residency needs the R2 bucket chosen before the manifest is read (a
+   bucket per jurisdiction keyed by the database id, or a small directory); per-Stack residency
+   (the bucket's and the Durable Objects' jurisdiction set for a whole installation, and `create`
+   refusing a database whose option differs) is simpler. Which one? Until then the option is
+   advisory.
+4. **Live measurements** (design §12, "Measure before trusting these numbers"): rows/s per writer
+   with batched requests, flush CPU per MB, whether DO SQLite's page cache counts against 128 MB, the
+   Workflows concurrent-instance limit on the plan, and the write pause of a seal-then-fork split.
+   Each needs a preview stage on the real account.

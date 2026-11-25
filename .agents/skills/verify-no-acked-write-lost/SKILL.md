@@ -74,6 +74,10 @@ them. The `nonAtomicProbe` variant reproduces it.
 
 ## Maintenance notes
 
+- Checked against `c4ea735` (Phases 9–10). `DbWriter.write` now commits through `commitBatch`
+  (the same commit lock and SQLite commit; the ack after it); `commitTransaction` runs its conflict
+  check inside that lock before the same commit, so it is one more kind of `Commit`/`Write`.
+  `MemTable.clear` runs only on removal. The change feed only reads.
 - Checked against `3226177` (Phases 5–7). A flush whose commit is refused below GC's boundary
   fails before the truncate, leaving the rows in SQLite (the same as a crash between upload and
   commit). Flushes now wake the compactor after the truncate (no state change). `DbWriter.destroy`
@@ -83,7 +87,7 @@ them. The `nonAtomicProbe` variant reproduces it.
 
 ## Keeping it in step with the code
 
-Sync commit: `3226177`. When a covered function changes after it, update the model so
+Sync commit: `c4ea735`. When a covered function changes after it, update the model so
 each action is still one awaited effect in the code, rerun, and show each invariant still fails on a
 broken variant before moving the sync commit. For drift that skipped this skill, use
 `.agents/skills/maintain-formal-verification-skill/SKILL.md`.

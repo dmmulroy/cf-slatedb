@@ -255,6 +255,24 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   shown failing on four mutations), `compaction-budget.ts` (unlimited, ledger, test),
   `compaction-budget-server.ts` (global `CompactionBudgetServer` Durable Object and client).
   `compactor.test.ts`: a second database waits for the first job's lease (D35).
+- **Per-database budget (~1k req/s, single-threaded CPU, 10 GB SQLite, 128 MB)** — done. Reads run
+  in the caller's isolate (`db-reader.ts`), `AtLeast`/`Flushed` skip the writer, batches raise rows per
+  request; `l0SstSize`/`maxL0Age` flush triggers; `maxUnflushedBytes` backpressure far below 10 GB;
+  the memtable lives in SQLite and flushes/compactions stream (no writer block cache). Measurements
+  that need a live preview (rows/s per writer, flush CPU per MB, SQLite page cache against 128 MB,
+  Workflows concurrency, split write pause) wait for approval (open question 4).
+- **Shared resources: R2 request rate, Workers Cache per Worker, L1 cache budget** — done with one gap.
+  One bucket with `db/<id>/` prefixes and no LIST on read paths; owner database in every block URL
+  (`block-server-http-api.ts`); L1 cache bounded by entry count, not a per-`budgetGroup` byte budget
+  (D32, gap).
+- **Data residency (`DatabaseOptions.jurisdiction`; forks inherit it)** — partial. The option is
+  stored in the manifest and forks inherit it (`forkManifest` copies options), but Durable Object
+  placement and R2 residency are not enforced: per-database R2 residency needs the bucket chosen
+  before the manifest can be read (a bucket per jurisdiction keyed by the database id, or a
+  directory), and per-Stack residency (bucket and Durable Object jurisdiction for a whole
+  installation) is the simpler alternative. Waiting on a decision (open question 3).
+- **Removal (fails while forks depend; purges in batches)** — done. `DatabaseLifecycle.remove`
+  (`DatabaseHasDependentsError`; one tag purge per database through `BlockServer`).
 - **Sharding: `ShardDirectory`, `ShardRouter`, `ShardSplit`** — done. `packages/lsm-sharding`:
   `shard-map.ts` (range map, pending split, pure edits), `shard-directory.ts` +
   `shard-directory-server.ts` (one Durable Object per group), `shard-router.ts` (cached map; refresh

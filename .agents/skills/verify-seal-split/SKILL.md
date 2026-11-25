@@ -64,9 +64,16 @@ views and ranges), `writer.workerd.ts` (the same split through the public API).
 - The split order (seal, one checkpoint, forks) is what `ShardSplit` (Phase 8) must follow; the
   model checks that order, not the sharding directory's routing.
 
+## Maintenance notes
+
+- Checked against `c4ea735` (Phases 9–10). `DbWriter.write` now commits through `commitBatch`
+  (the same commit lock and SQLite commit; the ack after it); `commitTransaction` runs its conflict
+  check inside that lock before the same commit, so it is one more kind of `Commit`/`Write`.
+  `MemTable.clear` runs only on removal. The change feed only reads.
+
 ## Keeping it in step with the code
 
-Sync commit: `3226177`. When a covered function changes after it, update the model
+Sync commit: `c4ea735`. When a covered function changes after it, update the model
 so each action is still one awaited effect in the code, rerun, and show each invariant still fails on
 a broken variant before moving the sync commit. For drift that skipped this skill, use
 `.agents/skills/maintain-formal-verification-skill/SKILL.md`.

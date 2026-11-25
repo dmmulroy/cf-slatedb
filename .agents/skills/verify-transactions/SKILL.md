@@ -66,9 +66,16 @@ refuses write skew through the public API.
   (`maxLastL0Seq`, `SnapshotTooOld`), which is what `Read` models when `flushed > readSeq`.
 - One writer instance (fencing is `verify-manifest-cas-fencing`).
 
+## Maintenance notes
+
+- Checked against `c4ea735` (Phase 10). `db-client.ts` and `db-reader.ts` gained the change feed
+  (`changes`, `changelogRows`) and the reader now reads changelog SSTs through `ObjectReader`; the
+  covered functions (`beginTransaction`, `getAt`, `scanAt`, `transaction`, the `maxLastL0Seq` check)
+  did not change, and `vp run verify` passes with both broken variants still failing.
+
 ## Keeping it in step with the code
 
-Sync commit: `a90ad03`. When a covered function changes after it, update the model
+Sync commit: `c4ea735`. When a covered function changes after it, update the model
 so each action is still one awaited effect in the code, rerun, and show each invariant still fails on
 a broken variant before moving the sync commit. For drift that skipped this skill, use
 `.agents/skills/maintain-formal-verification-skill/SKILL.md`.
