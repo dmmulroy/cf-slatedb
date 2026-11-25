@@ -219,6 +219,14 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `tools/preview-cli/src/preview-stage.test.ts` (state parsing, outputs, token, destroy command).
   Live: `preview-1` deployed and redeployed in place (no-op), `status`/`url`/`token` read the
   Cloudflare state store. D45.
+- **Traces from previews** — done. `infra/cf-slatedb/src/trace-collector-worker.ts`
+  (`TraceCollectorWorker`, `TraceBucket`, `TraceCollectorToken`; live stages only),
+  `cf-slatedb-telemetry.ts` (`cfSlatedbTelemetry`), `LsmWorkerTelemetry`/`lsmOtlpTelemetry`
+  (`lsm-telemetry.ts`), `lsmWorkerCompatibility` (`lsm-stage.ts`), `tools/trace-cli/src/
+  preview-trace-pull.ts` (`pull --stage`, `tail --stage`), `preview-cli collector`. Tests:
+  `preview-trace-pull.test.ts` (JSON and protobuf exports across pages, repeated pulls download
+  nothing twice, a refused token). Live (`preview-1`): API Worker → writer DO trees complete, DO
+  alarm spans arrive, 10/10 probe traces complete, unauthenticated reads `401`. D46, D47.
 - **Access gate on live stages' public Workers** — done. `lsm-access-gate.ts`
   (`LsmAccessToken`, `lsmAccessGateForStage`), applied by `db-api-worker.ts`, `gc-worker.ts`,
   `shard-router-worker.ts`, and the telemetry probe. Test: `lsm-access-gate.test.ts`. Live:

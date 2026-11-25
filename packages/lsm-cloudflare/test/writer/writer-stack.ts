@@ -7,12 +7,13 @@ import { GcWorker } from "../../src/gc-worker.ts";
 import testBlockServerLayer from "./block-server-entry.ts";
 import testCompactorLayer from "./compactor-entry.ts";
 import testGcLayer from "./gc-entry.ts";
+import { lsmOtlpTelemetry } from "../../src/lsm-telemetry.ts";
 import { INTEGRATION_OTLP_BASE_URL, INTEGRATION_PORTS } from "./integration-ports.ts";
 
 /** The API Worker of the writer integration test; this module is its bundle entry. */
 const writerTestApiLayer = dbApiWorkerLayer({
   main: import.meta.url,
-  otlpBaseUrl: INTEGRATION_OTLP_BASE_URL,
+  telemetry: lsmOtlpTelemetry(INTEGRATION_OTLP_BASE_URL),
   devPort: INTEGRATION_PORTS.api,
 });
 

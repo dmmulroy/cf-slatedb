@@ -10,14 +10,19 @@ import {
   blockServerHttpRouterLayer,
   databaseCacheTag,
 } from "./block-server-http-handlers.ts";
-import { eventTelemetryFlushForStage, lsmTelemetryLayer } from "./lsm-telemetry.ts";
+import { lsmWorkerCompatibility } from "./lsm-stage.ts";
+import { eventTelemetryFlushForStage, type LsmWorkerTelemetry } from "./lsm-telemetry.ts";
 import { ObjectReader, objectReaderLayer } from "./object-reader.ts";
 
 /** Options of the `BlockServer` Worker. */
-export interface BlockServerWorkerOptions {
+export interface BlockServerWorkerOptions<R = never> {
   /** URL of the module that default-exports this Worker's Layer; the bundle entry. */
   readonly main: string;
-  readonly otlpBaseUrl: string;
+  /**
+   * Builds the Worker's telemetry Layer from its `service.name`: `lsmOtlpTelemetry(url)` locally;
+   * the Stack's own factory on live stages. `R` is what building it needs at plan time.
+   */
+  readonly telemetry: LsmWorkerTelemetry<R>;
   readonly devPort: number;
 }
 
@@ -34,14 +39,16 @@ export class BlockServerWorker extends Cloudflare.Worker<
  * Builds the `BlockServer`: Workers Cache on, shared across deploys (`crossVersionCache`, since the
  * bytes do not depend on the code), no `workers.dev` URL, the bucket bound read-only.
  */
-export const blockServerWorkerLayer = (options: BlockServerWorkerOptions) =>
+export const blockServerWorkerLayer = <R = never>(options: BlockServerWorkerOptions<R>) =>
   BlockServerWorker.make(
-    {
-      main: options.main,
-      workersDev: false,
-      compatibility: { date: "2026-10-15" },
-      dev: { host: "127.0.0.1", port: options.devPort },
-    },
+    Effect.gen(function* () {
+      return {
+        main: options.main,
+        workersDev: false,
+        compatibility: yield* lsmWorkerCompatibility,
+        dev: { host: "127.0.0.1", port: options.devPort },
+      };
+    }),
     Effect.gen(function* () {
       const cache = yield* Cloudflare.cache({ crossVersionCache: true });
       const objects = yield* ObjectReader;
@@ -73,8 +80,6 @@ export const blockServerWorkerLayer = (options: BlockServerWorkerOptions) =>
       return { fetch: withEventTelemetryFlush(Effect.flatten(router)) };
     }).pipe(
       Effect.provide(objectReaderLayer),
-      Effect.provide(
-        lsmTelemetryLayer({ baseUrl: options.otlpBaseUrl, serviceName: "cf-slatedb-blocks" }),
-      ),
+      Effect.provide(options.telemetry("cf-slatedb-blocks")),
     ),
   );

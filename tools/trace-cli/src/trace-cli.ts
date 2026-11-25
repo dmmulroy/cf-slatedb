@@ -4,11 +4,14 @@
  *
  * Usage: `node tools/trace-cli/src/trace-cli.ts <command> [options]`. Every command accepts
  * `--store <dir>` (default `.traces/` at the repository root, or `TRACE_STORE_DIR`) and `--json`
- * for machine-readable output.
+ * for machine-readable output. `pull --stage <stage>` downloads a live preview stage's spans from
+ * its trace collector into the store, and `tail --stage <stage>` follows them live; every other
+ * command then works on them unchanged.
  */
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
 import { Console, Data, Effect, FileSystem, Layer, Option, Schema } from "effect";
 import { Argument, Command, Flag } from "effect/cli";
+import { FetchHttpClient } from "effect/http";
 
 import { CollectedSpan } from "./collected-span.ts";
 import {
@@ -26,6 +29,7 @@ import {
   summarizeTrace,
   type TraceSummary,
 } from "./trace-analysis.ts";
+import { pullPreviewTraces, resolvePreviewCollector } from "./preview-trace-pull.ts";
 import { decodeTraceAssertionJson, evaluateTraceAssertion } from "./trace-assertion.ts";
 import { DEFAULT_TRACE_STORE_DIRECTORY, TraceStore, traceStoreLayer } from "./trace-store.ts";
 
@@ -51,6 +55,10 @@ const jsonFlag = Flag.Boolean("json").pipe(
 );
 const dbFlag = Flag.String("db").pipe(
   Flag.withDescription("Only spans or traces with this database.id attribute"),
+  Flag.optional,
+);
+const stageFlag = Flag.String("stage").pipe(
+  Flag.withDescription("Live preview stage (preview-1, preview-2, preview-3) to pull spans from"),
   Flag.optional,
 );
 const sinceFlag = Flag.Int("since").pipe(
@@ -355,8 +363,9 @@ const tail = Command.make(
     store: storeFlag,
     json: jsonFlag,
     ...filterFlags,
+    stage: stageFlag,
     interval: Flag.Int("interval").pipe(
-      Flag.withDescription("Poll interval in milliseconds"),
+      Flag.withDescription("Poll interval in milliseconds (at least 2000 with --stage)"),
       Flag.withDefault(250),
     ),
   },
@@ -366,11 +375,25 @@ const tail = Command.make(
       Effect.gen(function* () {
         const store = yield* TraceStore;
         const filter = toSpanFilter(flags);
+        const collector = Option.isSome(flags.stage)
+          ? Option.some(yield* resolvePreviewCollector(flags.stage.value))
+          : Option.none();
+        // With a stage, each poll first pulls what its collector received since the last one.
+        const pullOnce = Option.match(collector, {
+          onNone: () => Effect.void,
+          onSome: (target) =>
+            pullPreviewTraces(target).pipe(
+              Effect.catchTag("PreviewTracePullError", (error) => Console.error(error.message)),
+              Effect.asVoid,
+            ),
+        });
+        const interval = Option.isSome(collector) ? Math.max(flags.interval, 2000) : flags.interval;
         const seen = new Map<string, number>();
         for (const id of yield* store.listTraceIds)
           seen.set(id, (yield* store.readTrace(id)).length);
         yield* Effect.forever(
           Effect.gen(function* () {
+            yield* pullOnce;
             for (const id of yield* store.listTraceIds) {
               const spans = yield* store.readTrace(id);
               const previous = seen.get(id) ?? 0;
@@ -386,12 +409,41 @@ const tail = Command.make(
                     );
               }
             }
-            yield* Effect.sleep(flags.interval);
+            yield* Effect.sleep(interval);
           }),
         );
-      }),
+      }).pipe(Effect.provide(FetchHttpClient.layer)),
     ),
-).pipe(Command.withDescription("Follow spans as they arrive"));
+).pipe(Command.withDescription("Follow spans as they arrive (from a preview stage with --stage)"));
+
+const pull = Command.make(
+  "pull",
+  {
+    store: storeFlag,
+    json: jsonFlag,
+    stage: Flag.String("stage").pipe(
+      Flag.withDescription(
+        "Live preview stage (preview-1, preview-2, preview-3) to pull spans from",
+      ),
+    ),
+  },
+  ({ store, json, stage }) =>
+    withStore(
+      store,
+      Effect.gen(function* () {
+        const pulled = yield* pullPreviewTraces(yield* resolvePreviewCollector(stage));
+        yield* json
+          ? Console.log(JSON.stringify(pulled))
+          : Console.log(
+              `Pulled ${pulled.exports} export(s), ${pulled.spans} span(s) from ${stage} into ${store}`,
+            );
+      }).pipe(Effect.provide(FetchHttpClient.layer)),
+    ),
+).pipe(
+  Command.withDescription(
+    "Download a preview stage's spans from its trace collector into the store (only what is new)",
+  ),
+);
 
 const clear = Command.make("clear", { store: storeFlag }, ({ store }) =>
   withStore(
@@ -406,7 +458,7 @@ const clear = Command.make("clear", { store: storeFlag }, ({ store }) =>
 
 const traceCli = Command.make("trace").pipe(
   Command.withDescription("Local OTLP receiver and trace inspection for cf-slatedb"),
-  Command.withSubcommands([serve, list, show, tail, grep, stats, diff, assert, clear]),
+  Command.withSubcommands([serve, pull, list, show, tail, grep, stats, diff, assert, clear]),
 );
 
 Command.run(traceCli, { version: "0.0.0" }).pipe(

@@ -1,12 +1,7 @@
 import { Effect, Option } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 
-import {
-  destroyCommand,
-  parseStateRead,
-  previewAccessToken,
-  previewOutputs,
-} from "./preview-stage.ts";
+import { destroyCommand, parseStateRead, previewOutputs, previewSecret } from "./preview-stage.ts";
 
 const outputs = {
   apiUrl: "https://cfslatedb-dbapiworker-preview-1-abc.example.workers.dev",
@@ -39,12 +34,14 @@ describe("preview state", () => {
       const records = yield* parseStateRead(stateRead, "CfSlatedb/preview-1");
       return {
         outputs: yield* previewOutputs(records, "preview-1"),
-        token: yield* previewAccessToken(records, "preview-1"),
+        token: yield* previewSecret(records, "preview-1", "LsmAccessToken"),
+        collectorToken: yield* previewSecret(records, "preview-1", "TraceCollectorToken"),
         other: yield* previewOutputs(records, "preview-2"),
       };
     }).pipe(Effect.runPromise);
     expect(parsed.outputs).toEqual(Option.some(outputs));
     expect(parsed.token).toEqual(Option.some("f".repeat(64)));
+    expect(parsed.collectorToken).toEqual(Option.none());
     expect(parsed.other).toEqual(Option.none());
   });
 

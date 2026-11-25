@@ -1,6 +1,6 @@
 import { dbApiWorkerLayer } from "@cf-slatedb/lsm-cloudflare";
 
-import { CF_SLATEDB_OTLP_BASE_URL } from "./cf-slatedb-stage.ts";
+import { cfSlatedbTelemetry } from "./cf-slatedb-telemetry.ts";
 
 /** Local dev port of the public API Worker. */
 export const DB_API_DEV_PORT = 1337;
@@ -11,7 +11,7 @@ export const DB_API_DEV_PORT = 1337;
  */
 export const cfSlatedbApiWorkerLayer = dbApiWorkerLayer({
   main: import.meta.url,
-  otlpBaseUrl: CF_SLATEDB_OTLP_BASE_URL,
+  telemetry: cfSlatedbTelemetry,
   devPort: DB_API_DEV_PORT,
 });
 

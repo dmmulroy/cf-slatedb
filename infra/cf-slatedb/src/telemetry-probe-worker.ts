@@ -2,14 +2,14 @@ import * as Cloudflare from "@alchemy.run/cloudflare";
 import {
   eventTelemetryFlushForStage,
   lsmAccessGateForStage,
-  lsmTelemetryLayer,
+  lsmWorkerCompatibility,
 } from "@cf-slatedb/lsm-cloudflare";
 import type { HttpEffect } from "alchemy/Http";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Effect } from "effect";
 import { HttpClientRequest, HttpServerRequest, HttpServerResponse } from "effect/http";
 
-import { CF_SLATEDB_OTLP_BASE_URL } from "./cf-slatedb-stage.ts";
+import { cfSlatedbTelemetry } from "./cf-slatedb-telemetry.ts";
 
 interface TelemetryProbeServerContract {
   readonly fetch: HttpEffect<RuntimeContext>;
@@ -53,11 +53,13 @@ export class TelemetryProbeWorker extends Cloudflare.Worker<
 
 /** Worker Layer for {@link TelemetryProbeWorker}. */
 export const telemetryProbeWorkerLayer = TelemetryProbeWorker.make(
-  {
-    main: import.meta.url,
-    compatibility: { date: "2026-10-15" },
-    dev: { host: "127.0.0.1", port: 8790 },
-  },
+  Effect.gen(function* () {
+    return {
+      main: import.meta.url,
+      compatibility: yield* lsmWorkerCompatibility,
+      dev: { host: "127.0.0.1", port: 8790 },
+    };
+  }),
   Effect.gen(function* () {
     const namespace = yield* TelemetryProbeServer;
     const withEventTelemetryFlush = yield* eventTelemetryFlushForStage;
@@ -79,12 +81,7 @@ export const telemetryProbeWorkerLayer = TelemetryProbeWorker.make(
     };
   }).pipe(
     Effect.provide(telemetryProbeServerLayer),
-    Effect.provide(
-      lsmTelemetryLayer({
-        baseUrl: CF_SLATEDB_OTLP_BASE_URL,
-        serviceName: "cf-slatedb-telemetry-probe",
-      }),
-    ),
+    Effect.provide(cfSlatedbTelemetry("cf-slatedb-telemetry-probe")),
   ),
 );
 

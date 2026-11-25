@@ -39,6 +39,31 @@ export const LsmAccessToken: Effect.Effect<
 export type LsmAccessGate = <R>(handler: HttpEffect<R>) => HttpEffect<R>;
 
 /**
+ * Builds an access check for the Worker being initialized from a token resource: at plan time it
+ * binds the token onto the Worker as the secret `binding`; at runtime it reads the binding back and
+ * returns {@link lsmAccessGate} over it.
+ *
+ * @param binding - Name of the secret binding that carries the token.
+ * @param token - Yields the token's Output at plan time, or `None` when the stage is not gated.
+ */
+export const lsmAccessGateFor = <R>(
+  binding: string,
+  token: Effect.Effect<Option.Option<Output.Output<Redacted.Redacted<string>>>, never, R>,
+) =>
+  Effect.gen(function* () {
+    const phase = yield* Alchemy.ALCHEMY_PHASE;
+    if (phase === "plan") {
+      const planned = yield* token;
+      const runtimeContext = yield* CurrentRuntimeContext;
+      if (Option.isSome(planned) && runtimeContext !== undefined) {
+        yield* runtimeContext.set(binding, planned.value);
+      }
+    }
+    const bound = yield* Config.option(Config.Redacted(binding)).pipe(Effect.orDie);
+    return lsmAccessGate(bound);
+  });
+
+/**
  * Builds the access check for the Worker being initialized: binds the stage's
  * {@link LsmAccessToken} onto the Worker at plan time, and at runtime returns a wrapper that answers
  * every request without `Authorization: Bearer <token>` with `401`.
@@ -50,18 +75,7 @@ export type LsmAccessGate = <R>(handler: HttpEffect<R>) => HttpEffect<R>;
  * `401` body is not one of the API's declared errors. Local stages bind no token and pass every
  * request through. The comparison takes the same time whatever the presented token.
  */
-export const lsmAccessGateForStage = Effect.gen(function* () {
-  const phase = yield* Alchemy.ALCHEMY_PHASE;
-  if (phase === "plan") {
-    const token = yield* LsmAccessToken;
-    const runtimeContext = yield* CurrentRuntimeContext;
-    if (Option.isSome(token) && runtimeContext !== undefined) {
-      yield* runtimeContext.set(LSM_ACCESS_TOKEN_BINDING, token.value);
-    }
-  }
-  const bound = yield* Config.option(Config.Redacted(LSM_ACCESS_TOKEN_BINDING)).pipe(Effect.orDie);
-  return lsmAccessGate(bound);
-});
+export const lsmAccessGateForStage = lsmAccessGateFor(LSM_ACCESS_TOKEN_BINDING, LsmAccessToken);
 
 /**
  * The access check for a token: `None` passes every request through; `Some(token)` requires
@@ -103,7 +117,7 @@ const unauthenticatedResponse = (requestId: string) =>
     {
       code: "Unauthenticated",
       message:
-        "The request was not authenticated. Send the stage's access token as `Authorization: Bearer <token>`; `preview-cli token <stage>` prints it.",
+        "The request was not authenticated. Send the stage's token as `Authorization: Bearer <token>`; `preview-cli token <stage>` prints it.",
       requestId,
       retryable: false,
     },

@@ -36,6 +36,22 @@ export const lsmTelemetryLayer = (options: LsmTelemetryOptions): Layer.Layer<nev
   });
 
 /**
+ * Builds one Worker's telemetry Layer from its `service.name`. Every cf-slatedb Worker layer takes
+ * one, so a Stack chooses where its spans go: a fixed URL locally ({@link lsmOtlpTelemetry}), or a
+ * destination it deploys itself on live stages.
+ *
+ * @template R - What building the Layer needs at plan time, such as the Worker that receives the
+ *   spans; it joins the Worker's own requirements.
+ */
+export type LsmWorkerTelemetry<R = never> = (serviceName: string) => Layer.Layer<never, never, R>;
+
+/** Exports every Worker's spans over OTLP/HTTP to `baseUrl`: the trace CLI receiver, or a test's. */
+export const lsmOtlpTelemetry =
+  (baseUrl: string): LsmWorkerTelemetry =>
+  (serviceName) =>
+    lsmTelemetryLayer({ baseUrl, serviceName });
+
+/**
  * When an event's spans are exported.
  *
  * - `BeforeResponse`: the handler exports its spans before its result is returned, so they survive

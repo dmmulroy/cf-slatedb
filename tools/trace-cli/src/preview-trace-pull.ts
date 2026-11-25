@@ -1,0 +1,194 @@
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+import { Data, Effect, FileSystem, Option, Path, Schema } from "effect";
+import { Base64 } from "effect/encoding";
+import { HttpClient, HttpClientRequest } from "effect/http";
+
+import { decodeOtlpJsonTraces, decodeOtlpProtobufTraces } from "./otlp-trace-decoder.ts";
+import { TraceStore } from "./trace-store.ts";
+
+/**
+ * Downloading a preview stage's traces failed.
+ *
+ * `reason` is `CollectorUnknown` when the preview CLI could not name the stage's collector (nothing
+ * deployed, or no collector yet), `CollectorUnavailable` when the collector could not be reached or
+ * answered with an error, `CollectorUnauthorized` when it refused the token, and `ExportInvalid` when
+ * a stored export is not an OTLP trace export.
+ */
+export class PreviewTracePullError extends Data.TaggedError("PreviewTracePullError")<{
+  readonly reason:
+    | "CollectorUnknown"
+    | "CollectorUnavailable"
+    | "CollectorUnauthorized"
+    | "ExportInvalid";
+  readonly stage: string;
+  readonly message: string;
+}> {}
+
+/** Schema for a preview stage's trace collector, as `preview-cli collector <stage> --json` prints it. */
+const PreviewCollector = Schema.Struct({
+  stage: Schema.String,
+  url: Schema.String,
+  token: Schema.String,
+});
+
+/** A preview stage's trace collector: its URL and bearer token. */
+export type PreviewCollector = typeof PreviewCollector.Type;
+
+const decodePreviewCollector = Schema.decodeUnknownEffect(Schema.fromJsonString(PreviewCollector));
+
+const PREVIEW_CLI = fileURLToPath(new URL("../../preview-cli/src/preview-cli.ts", import.meta.url));
+
+/**
+ * Asks the preview CLI (in its own process; it reads the Cloudflare state store) for a stage's
+ * collector URL and token.
+ */
+export const resolvePreviewCollector = (stage: string) =>
+  Effect.gen(function* () {
+    const result = yield* Effect.sync(() =>
+      spawnSync(process.execPath, [PREVIEW_CLI, "collector", stage, "--json"], {
+        encoding: "utf8",
+      }),
+    );
+    if (result.status !== 0) {
+      return yield* new PreviewTracePullError({
+        reason: "CollectorUnknown",
+        stage,
+        message: `The trace collector of ${stage} could not be found:\n${`${result.stdout}${result.stderr}`.trim()}`,
+      });
+    }
+    return yield* decodePreviewCollector(result.stdout.trim()).pipe(
+      Effect.mapError(
+        () =>
+          new PreviewTracePullError({
+            reason: "CollectorUnknown",
+            stage,
+            message: `The preview CLI printed something other than ${stage}'s collector: ${result.stdout.trim()}`,
+          }),
+      ),
+    );
+  });
+
+/** Schema for one page of `GET /v1/traces/batches` from the collector. */
+const CollectorPage = Schema.Struct({
+  batches: Schema.Array(
+    Schema.Struct({ key: Schema.String, contentType: Schema.String, body: Schema.String }),
+  ),
+  next: Schema.NullOr(Schema.String),
+  more: Schema.Boolean,
+});
+const decodeCollectorPage = Schema.decodeUnknownEffect(CollectorPage);
+
+/** Schema for a stage's pull cursor: where the last pull from that collector stopped. */
+const PullCursor = Schema.Struct({ url: Schema.String, after: Schema.String });
+const decodePullCursor = Schema.decodeUnknownEffect(Schema.fromJsonString(PullCursor));
+const encodePullCursor = Schema.encodeEffect(Schema.fromJsonString(PullCursor));
+
+/** What one pull downloaded. */
+export interface PreviewTracePull {
+  readonly stage: string;
+  /** OTLP exports downloaded. */
+  readonly exports: number;
+  /** Spans stored from them. */
+  readonly spans: number;
+}
+
+/**
+ * Downloads every export the stage's collector stored since the last pull into the trace store, so
+ * `list`, `show`, `grep`, `stats`, `diff`, and `assert` see the stage's spans. The cursor is kept in
+ * `<store>/pulls/<stage>.json`, per collector URL: a recreated collector starts from the beginning.
+ */
+export const pullPreviewTraces = (collector: PreviewCollector) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const store = yield* TraceStore;
+    const client = yield* HttpClient.HttpClient;
+    const { stage } = collector;
+    const cursorFile = path.join(store.directory, "pulls", `${stage}.json`);
+    const saved = yield* fs.readFileString(cursorFile).pipe(
+      Effect.flatMap(decodePullCursor),
+      Effect.map(Option.some),
+      Effect.orElseSucceed(() => Option.none<typeof PullCursor.Type>()),
+    );
+    let after = Option.filter(saved, (cursor) => cursor.url === collector.url).pipe(
+      Option.map((cursor) => cursor.after),
+    );
+    let exports = 0;
+    let spans = 0;
+    const unavailable = (message: string) =>
+      new PreviewTracePullError({ reason: "CollectorUnavailable", stage, message });
+    while (true) {
+      const url = new URL("/v1/traces/batches", collector.url);
+      url.searchParams.set("limit", "100");
+      if (Option.isSome(after)) url.searchParams.set("after", after.value);
+      const response = yield* client
+        .execute(
+          HttpClientRequest.get(url.toString()).pipe(
+            HttpClientRequest.bearerToken(collector.token),
+          ),
+        )
+        .pipe(
+          Effect.mapError((error) =>
+            unavailable(`${stage}'s trace collector could not be reached: ${error.message}.`),
+          ),
+        );
+      if (response.status === 401) {
+        return yield* new PreviewTracePullError({
+          reason: "CollectorUnauthorized",
+          stage,
+          message: `${stage}'s trace collector refused the token. Redeploy ${stage} with \`preview-cli deploy ${stage}\` and pull again.`,
+        });
+      }
+      if (response.status !== 200) {
+        return yield* unavailable(
+          `${stage}'s trace collector answered ${response.status}. Pull again; nothing was skipped.`,
+        );
+      }
+      const page = yield* response.json.pipe(
+        Effect.flatMap(decodeCollectorPage),
+        Effect.mapError(() =>
+          unavailable(`${stage}'s trace collector returned a page this CLI cannot read.`),
+        ),
+      );
+      for (const batch of page.batches) {
+        const body = Base64.decode(batch.body);
+        if (body._tag === "Failure") {
+          return yield* new PreviewTracePullError({
+            reason: "ExportInvalid",
+            stage,
+            message: `Export ${batch.key} is not base64.`,
+          });
+        }
+        const decoded = yield* (
+          batch.contentType.includes("protobuf")
+            ? decodeOtlpProtobufTraces(body.success)
+            : decodeOtlpJsonTraces(new TextDecoder().decode(body.success))
+        ).pipe(
+          Effect.mapError(
+            (error) =>
+              new PreviewTracePullError({
+                reason: "ExportInvalid",
+                stage,
+                message: `Export ${batch.key} is not an OTLP trace export: ${error.message}`,
+              }),
+          ),
+        );
+        yield* store.append(decoded);
+        exports += 1;
+        spans += decoded.length;
+      }
+      if (page.next !== null) after = Option.some(page.next);
+      if (Option.isSome(after)) {
+        yield* fs.makeDirectory(path.dirname(cursorFile), { recursive: true });
+        yield* fs.writeFileString(
+          cursorFile,
+          yield* encodePullCursor({ url: collector.url, after: after.value }),
+        );
+      }
+      if (!page.more || page.batches.length === 0) break;
+    }
+    const pulled: PreviewTracePull = { stage, exports, spans };
+    return pulled;
+  });

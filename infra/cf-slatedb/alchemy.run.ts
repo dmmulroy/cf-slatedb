@@ -4,10 +4,11 @@ import {
   CompactorWorker,
   DbApiWorker,
   GcWorker,
+  isLocalLsmStage,
 } from "@cf-slatedb/lsm-cloudflare";
 import * as Alchemy from "alchemy";
 import { ShardRouterWorker } from "@cf-slatedb/sharding";
-import { Effect } from "effect";
+import { Effect, Layer, Option } from "effect";
 
 import { cfSlatedbBlockServerWorkerLayer } from "./src/block-server-worker-entry.ts";
 import { cfSlatedbCompactorWorkerLayer } from "./src/compactor-worker-entry.ts";
@@ -16,6 +17,30 @@ import { cfSlatedbGcWorkerLayer } from "./src/gc-worker-entry.ts";
 import { cfSlatedbShardRouterWorkerLayer } from "./src/shard-router-worker-entry.ts";
 import { cfSlatedbStateLayer } from "./src/cf-slatedb-stage.ts";
 import { TelemetryProbeWorker, telemetryProbeWorkerLayer } from "./src/telemetry-probe-worker.ts";
+import { TraceCollectorWorker, traceCollectorWorkerLayer } from "./src/trace-collector-worker.ts";
+
+const cfSlatedbWorkersLayer = Layer.mergeAll(
+  cfSlatedbApiWorkerLayer,
+  cfSlatedbBlockServerWorkerLayer,
+  cfSlatedbCompactorWorkerLayer,
+  cfSlatedbGcWorkerLayer,
+  cfSlatedbShardRouterWorkerLayer,
+  telemetryProbeWorkerLayer,
+);
+
+/**
+ * Every Worker of the Stack, plus the trace collector on live stages only: declaring the collector's
+ * Layer deploys it, so local stages leave it out, and `cfSlatedbTelemetry` finds it only where it
+ * exists.
+ */
+const cfSlatedbStackLayer = Layer.unwrap(
+  Effect.gen(function* () {
+    const stage = yield* Alchemy.Stage;
+    return isLocalLsmStage(stage)
+      ? cfSlatedbWorkersLayer
+      : Layer.mergeAll(cfSlatedbWorkersLayer, traceCollectorWorkerLayer);
+  }),
+);
 
 /**
  * Stack that runs cf-slatedb.
@@ -37,6 +62,12 @@ const CfSlatedbStack = Alchemy.Stack(
     const api = yield* DbApiWorker;
     const shards = yield* ShardRouterWorker;
     const probe = yield* TelemetryProbeWorker;
+    // Live stages export spans to their own collector (`cfSlatedbTelemetry`); local stages export
+    // to the trace CLI's receiver and have none.
+    const stage = yield* Alchemy.Stage;
+    const traces = isLocalLsmStage(stage)
+      ? Option.none()
+      : Option.some(yield* Cloudflare.Worker.ref(TraceCollectorWorker));
     return {
       /** URL of the public database API (`/v1`). */
       apiUrl: api.url,
@@ -51,17 +82,10 @@ const CfSlatedbStack = Alchemy.Stack(
       blockServerWorkerName: blocks.workerName,
       /** URL of the telemetry probe Worker. */
       probeUrl: probe.url,
+      /** OTLP receiver of a live stage's spans, read by `trace-cli pull --stage <stage>`. */
+      ...(Option.isSome(traces) ? { traceCollectorUrl: traces.value.url } : {}),
     };
-  }).pipe(
-    Effect.provide([
-      cfSlatedbApiWorkerLayer,
-      cfSlatedbBlockServerWorkerLayer,
-      cfSlatedbCompactorWorkerLayer,
-      cfSlatedbGcWorkerLayer,
-      cfSlatedbShardRouterWorkerLayer,
-      telemetryProbeWorkerLayer,
-    ]),
-  ),
+  }).pipe(Effect.provide(cfSlatedbStackLayer)),
 );
 
 export default CfSlatedbStack;

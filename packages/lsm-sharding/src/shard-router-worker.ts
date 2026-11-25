@@ -6,7 +6,8 @@ import {
   eventTelemetryFlushForStage,
   lsmAccessGateForStage,
   lsmHttpServerLayer,
-  lsmTelemetryLayer,
+  lsmWorkerCompatibility,
+  type LsmWorkerTelemetry,
 } from "@cf-slatedb/lsm-cloudflare";
 import type { HttpEffect } from "alchemy/Http";
 import { makeExecutionMemo } from "alchemy/Runtime/ExecutionMemo";
@@ -251,10 +252,14 @@ const shardedHttpRouterLayer = HttpApiBuilder.layer(ShardedHttpApi).pipe(
 );
 
 /** Options of the shard router Worker. */
-export interface ShardRouterWorkerOptions {
+export interface ShardRouterWorkerOptions<R = never> {
   /** URL of the module that default-exports this Worker's Layer; the bundle entry. */
   readonly main: string;
-  readonly otlpBaseUrl: string;
+  /**
+   * Builds the Worker's telemetry Layer from its `service.name`: `lsmOtlpTelemetry(url)` locally;
+   * the Stack's own factory on live stages. `R` is what building it needs at plan time.
+   */
+  readonly telemetry: LsmWorkerTelemetry<R>;
   readonly devPort: number;
 }
 
@@ -269,13 +274,15 @@ export class ShardRouterWorker extends Cloudflare.Worker<
 >()("ShardRouterWorker") {}
 
 /** Builds the shard router Worker. */
-export const shardRouterWorkerLayer = (options: ShardRouterWorkerOptions) =>
+export const shardRouterWorkerLayer = <R = never>(options: ShardRouterWorkerOptions<R>) =>
   ShardRouterWorker.make(
-    {
-      main: options.main,
-      compatibility: { date: "2026-10-15" },
-      dev: { host: "127.0.0.1", port: options.devPort },
-    },
+    Effect.gen(function* () {
+      return {
+        main: options.main,
+        compatibility: yield* lsmWorkerCompatibility,
+        dev: { host: "127.0.0.1", port: options.devPort },
+      };
+    }),
     Effect.gen(function* () {
       yield* ShardDirectoryServer;
       const withEventTelemetryFlush = yield* eventTelemetryFlushForStage;
@@ -298,8 +305,6 @@ export const shardRouterWorkerLayer = (options: ShardRouterWorkerOptions) =>
         ).pipe(Layer.provideMerge(shardDirectoryLayer), Layer.provideMerge(dbServicesLayer)),
       ),
       Effect.provide(shardDirectoryServerLayer),
-      Effect.provide(
-        lsmTelemetryLayer({ baseUrl: options.otlpBaseUrl, serviceName: "cf-slatedb-shards" }),
-      ),
+      Effect.provide(options.telemetry("cf-slatedb-shards")),
     ),
   );

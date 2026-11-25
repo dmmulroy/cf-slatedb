@@ -39,6 +39,11 @@ from `vp run ready` and never cached. Stages are reused, not destroyed; Dillon t
 
 Never test against `production`, a developer's stage, or another run's stage.
 
+A preview's spans go to its own `TraceCollector` Worker. Run `node tools/trace-cli/src/trace-cli.ts
+pull --stage <stage>` (or `tail --stage <stage>`) to bring them into the local trace store before
+`assert`, `show`, or `stats`. Live Workers export after the response (D5), so pull a few seconds
+after the requests a check asserts on.
+
 ## Faithful local substitutes
 
 - `objectStoreTestLayer` is an in-memory object store with real create-if-absent semantics

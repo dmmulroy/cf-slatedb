@@ -12,8 +12,8 @@ import { GcHttpApi } from "./gc-http-api.ts";
 import { lsmAccessGateForStage } from "./lsm-access-gate.ts";
 import { lsmConfigurationLayer } from "./lsm-configuration.ts";
 import { lsmHttpServerLayer } from "./lsm-http-server.ts";
-import { isLocalLsmStage } from "./lsm-stage.ts";
-import { eventTelemetryFlushForStage, lsmTelemetryLayer } from "./lsm-telemetry.ts";
+import { isLocalLsmStage, lsmWorkerCompatibility } from "./lsm-stage.ts";
+import { eventTelemetryFlushForStage, type LsmWorkerTelemetry } from "./lsm-telemetry.ts";
 import { objectStoreLayer } from "./object-store.ts";
 
 /** Handlers of the GC API, delegating to the contextual `GarbageCollector`. */
@@ -35,10 +35,14 @@ export const gcHttpRouterLayer = HttpApiBuilder.layer(GcHttpApi).pipe(
 );
 
 /** Options of the GC Worker. */
-export interface GcWorkerOptions {
+export interface GcWorkerOptions<R = never> {
   /** URL of the module that default-exports this Worker's Layer; the bundle entry. */
   readonly main: string;
-  readonly otlpBaseUrl: string;
+  /**
+   * Builds the Worker's telemetry Layer from its `service.name`: `lsmOtlpTelemetry(url)` locally;
+   * the Stack's own factory on live stages. `R` is what building it needs at plan time.
+   */
+  readonly telemetry: LsmWorkerTelemetry<R>;
   readonly devPort: number;
   /** Cron expression for collecting every database (`gcInterval` in cron form). */
   readonly schedule: string;
@@ -55,7 +59,7 @@ export class GcWorker extends Cloudflare.Worker<
 >()("GcWorker") {}
 
 /** Builds the GC Worker: the bucket bound read-write, the cron trigger, and the operator API. */
-export const gcWorkerLayer = (options: GcWorkerOptions) =>
+export const gcWorkerLayer = <R = never>(options: GcWorkerOptions<R>) =>
   GcWorker.make(
     Effect.gen(function* () {
       const stage = yield* Alchemy.Stage;
@@ -63,7 +67,7 @@ export const gcWorkerLayer = (options: GcWorkerOptions) =>
         main: options.main,
         // Live stages reach the operator API over workers.dev, behind the access token.
         workersDev: !isLocalLsmStage(stage),
-        compatibility: { date: "2026-10-15" },
+        compatibility: yield* lsmWorkerCompatibility,
         dev: { host: "127.0.0.1", port: options.devPort },
       };
     }),
@@ -84,8 +88,6 @@ export const gcWorkerLayer = (options: GcWorkerOptions) =>
       Effect.provide(Cloudflare.Workers.CronEventSourceLive),
       Effect.provide(garbageCollectorLayerWithoutDependencies),
       Effect.provide(Layer.mergeAll(objectStoreLayer, lsmConfigurationLayer)),
-      Effect.provide(
-        lsmTelemetryLayer({ baseUrl: options.otlpBaseUrl, serviceName: "cf-slatedb-gc" }),
-      ),
+      Effect.provide(options.telemetry("cf-slatedb-gc")),
     ),
   );

@@ -93,7 +93,13 @@ node tools/trace-cli/src/trace-cli.ts grep --name WriterServer.write --db <id>
 node tools/trace-cli/src/trace-cli.ts stats          # latency percentiles per span name
 node tools/trace-cli/src/trace-cli.ts diff <a> <b>   # compare two traces
 node tools/trace-cli/src/trace-cli.ts assert <file.json>  # declarative trace checks
+node tools/trace-cli/src/trace-cli.ts pull --stage preview-1  # download a preview's spans
+node tools/trace-cli/src/trace-cli.ts tail --stage preview-1  # follow a preview's spans live
 ```
+
+On live preview stages every Worker and Durable Object exports to the stage's `TraceCollector`
+Worker instead (D46); `pull` and `tail --stage` bring those spans into the local store, where every
+other command works on them unchanged.
 
 Spans carry only safe identifying attributes (`database.id`, `sst.id`, `manifest.id`, `seq`, sizes,
 cache hit or miss). Never put keys, values, or secrets in span attributes or logs.

@@ -19,8 +19,9 @@ import { DbClient, dbClientLayerWithoutDependencies } from "./db-client.ts";
 import { dbHttpRouterLayer } from "./db-http-handlers.ts";
 import { dbReaderLayer } from "./db-reader.ts";
 import { lsmAccessGateForStage } from "./lsm-access-gate.ts";
+import { lsmWorkerCompatibility } from "./lsm-stage.ts";
 import { lsmConfigurationLayer } from "./lsm-configuration.ts";
-import { eventTelemetryFlushForStage, lsmTelemetryLayer } from "./lsm-telemetry.ts";
+import { eventTelemetryFlushForStage, type LsmWorkerTelemetry } from "./lsm-telemetry.ts";
 import { ManifestReader, manifestReaderLayerWithoutDependencies } from "./manifest-reader.ts";
 import { manifestStoreLayerWithoutDependencies } from "./manifest-store.ts";
 import { objectStoreLayer } from "./object-store.ts";
@@ -28,14 +29,17 @@ import { WriterClient, writerClientLayer } from "./writer-client.ts";
 import { WriterServer, writerServerLayerWithoutDependencies } from "./writer-server.ts";
 
 /** Options of the API Worker. */
-export interface DbApiWorkerOptions {
+export interface DbApiWorkerOptions<R = never> {
   /**
    * URL of the module that default-exports this Worker's Layer (built with the same options); the
    * bundler uses it as the Worker's entry.
    */
   readonly main: string;
-  /** OTLP/HTTP base URL for traces. */
-  readonly otlpBaseUrl: string;
+  /**
+   * Builds the Worker's telemetry Layer from its `service.name`: `lsmOtlpTelemetry(url)` locally;
+   * the Stack's own factory on live stages. `R` is what building it needs at plan time.
+   */
+  readonly telemetry: LsmWorkerTelemetry<R>;
   /** Local dev port. */
   readonly devPort: number;
 }
@@ -57,13 +61,15 @@ export class DbApiWorker extends Cloudflare.Worker<
  * `Latest` probes go to the writer. On live stages every request needs the stage's access token
  * (`lsmAccessGateForStage`).
  */
-export const dbApiWorkerLayer = (options: DbApiWorkerOptions) =>
+export const dbApiWorkerLayer = <R = never>(options: DbApiWorkerOptions<R>) =>
   DbApiWorker.make(
-    {
-      main: options.main,
-      compatibility: { date: "2026-10-15" },
-      dev: { host: "127.0.0.1", port: options.devPort },
-    },
+    Effect.gen(function* () {
+      return {
+        main: options.main,
+        compatibility: yield* lsmWorkerCompatibility,
+        dev: { host: "127.0.0.1", port: options.devPort },
+      };
+    }),
     Effect.gen(function* () {
       yield* WriterServer;
       const withEventTelemetryFlush = yield* eventTelemetryFlushForStage;
@@ -107,8 +113,6 @@ export const dbApiWorkerLayer = (options: DbApiWorkerOptions) =>
       // lifecycle and the compaction endpoint call it too.
       Effect.provide(compactionTriggerLayer.pipe(Layer.provideMerge(compactorClientLayer))),
       Effect.provide(Layer.mergeAll(objectStoreLayer, lsmConfigurationLayer)),
-      Effect.provide(
-        lsmTelemetryLayer({ baseUrl: options.otlpBaseUrl, serviceName: "cf-slatedb-api" }),
-      ),
+      Effect.provide(options.telemetry("cf-slatedb-api")),
     ),
   );

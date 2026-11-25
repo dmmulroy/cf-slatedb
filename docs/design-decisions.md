@@ -488,3 +488,52 @@ short GC and compactor timings (`CF_SLATEDB_LSM_SETTINGS`); the CLI drops any va
 inherited from the shell, so only the flag decides, and a later deploy without the flag restores the
 defaults. `destroy-command <stage>` prints `vp run @cf-slatedb/infra#destroy:<stage>` for Dillon;
 the deployment guard blocks agents from running `alchemy destroy`.
+
+## D46. Live stages send spans to their own TraceCollector Worker; the trace CLI pulls them
+
+Deployed Workers cannot reach the trace CLI's `127.0.0.1:4318`. Every live stage therefore gets a
+`TraceCollectorWorker` (`infra/cf-slatedb/src/trace-collector-worker.ts`), and only live stages do:
+
+- **Receiving.** `POST /v1/traces` stores each OTLP/HTTP export as received (JSON or protobuf, with
+  its content type) in the stage's own `TraceBucket` under `traces/<arrival ms, 15 digits>-<uuid>`,
+  so keys sort by arrival. Nothing is decoded in the Worker. `/v1/logs` and `/v1/metrics` are
+  accepted and discarded, like the local receiver.
+- **Reading.** `GET /v1/traces/batches?after=<key>&limit=<≤100>` returns the stored exports after a
+  key, oldest first, with base64 bodies, the key to continue after, and whether more follow. `trace-cli
+  pull --stage <stage>` decodes them with the same decoders as `serve` and appends the spans to the
+  local store, keeping a cursor per stage and collector URL (`<store>/pulls/<stage>.json`), so a pull
+  downloads only what is new and `list`, `show`, `grep`, `stats`, `diff`, and `assert` work on
+  deployed traces unchanged. `tail --stage` pulls before every poll (at least every 2 s).
+- **Authentication.** Every request needs the stage's `TraceCollectorToken` (a second per-stage
+  `Random`, not the access token of D44, so reading traces grants no access to databases). The
+  Workers send it as a bearer header bound as a secret; the trace CLI asks
+  `preview-cli collector <stage> --json` for the URL and token.
+- **Storage.** A separate bucket rather than a `traces/` prefix in the LSM bucket, so telemetry
+  never mixes with database objects, GC never sees it, and removing a preview's traces cannot touch
+  its data. It is generated-name and not retained, like every preview resource.
+- **Wiring.** Each Worker layer takes an `LsmWorkerTelemetry` factory (a `service.name` → telemetry
+  Layer). Tests pass `lsmOtlpTelemetry(url)`; the Stack passes `cfSlatedbTelemetry`, which on live
+  stages binds the collector's URL and token onto the Worker through `Telemetry.layerOtlp`. It
+  reaches the collector through `Cloudflare.Worker.ref(TraceCollectorWorker)`, not by yielding the
+  class: a same-program ref is bound to the declared Worker (the collector still deploys first), and
+  it adds no requirement, so local stages, which do not declare the collector, still type-check.
+  Declaring a Worker's Layer deploys it — an earlier version provided the collector's Layer on every
+  stage and `vp run dev` started a local collector on the API's port.
+
+D5's question for live stages is answered: spans from Durable Object fetches and alarms, and (with
+D47) from Worker fetches, arrive through the bridge's `waitUntil` flush after the response; ten of
+ten consecutive probe requests on `preview-1` arrived complete.
+
+## D47. Live Workers use `global_fetch_strictly_public`
+
+On `preview-1` every span of a Worker's own fetch events was lost (the API Worker's HTTP server
+span and its client span to the writer), while the writer Durable Object's spans, exported from the
+same script, arrived. The exporter's `fetch()` goes to the collector's `workers.dev` URL on the same
+account, and Cloudflare does not route a Worker's plain `fetch()` to a Worker on its own subdomain.
+With the `global_fetch_strictly_public` compatibility flag the request goes out as a public one and
+every span arrives (probe: 10 of 10 complete traces; API: complete Worker → writer trees).
+
+`lsmWorkerCompatibility` (`lsm-stage.ts`) adds the flag on live stages only, for every Worker that
+exports spans. Calls between cf-slatedb's Workers use service bindings and Durable Object stubs,
+which the flag does not affect. Local stages leave it off, because their spans go to `127.0.0.1`,
+which a strictly public `fetch()` cannot reach.

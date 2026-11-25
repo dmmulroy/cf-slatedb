@@ -1,6 +1,6 @@
 import { shardRouterWorkerLayer } from "@cf-slatedb/sharding";
 
-import { CF_SLATEDB_OTLP_BASE_URL } from "./cf-slatedb-stage.ts";
+import { cfSlatedbTelemetry } from "./cf-slatedb-telemetry.ts";
 
 /** Local dev port of the shard router Worker. */
 export const SHARD_ROUTER_DEV_PORT = 1341;
@@ -11,7 +11,7 @@ export const SHARD_ROUTER_DEV_PORT = 1341;
  */
 export const cfSlatedbShardRouterWorkerLayer = shardRouterWorkerLayer({
   main: import.meta.url,
-  otlpBaseUrl: CF_SLATEDB_OTLP_BASE_URL,
+  telemetry: cfSlatedbTelemetry,
   devPort: SHARD_ROUTER_DEV_PORT,
 });
 

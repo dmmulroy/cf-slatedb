@@ -32,6 +32,16 @@ in order.
   API, and probe with a per-stage bearer token (D44); the GC operator API gets a `workers.dev` URL
   on live stages only. **Live:** `preview-1` deployed (44 s, 9 resources), redeployed in place
   (no-op), answers `401` without the token, and created a database and returned its status with it.
+- **3. Traces from previews.** `TraceCollectorWorker` on live stages only (its own bucket and
+  bearer token; stores raw OTLP exports; pages them out), `trace-cli pull --stage` and
+  `tail --stage`, `preview-cli collector`. Worker layers now take an `LsmWorkerTelemetry` factory;
+  the Stack's binds the collector's URL and token on live stages (D46). **Live findings:**
+  (1) Durable Object fetch and alarm spans arrive after the response through the bridge's
+  `waitUntil` flush, as D5 assumed; (2) every span of a _Worker's_ own fetch events was lost,
+  because a Worker's `fetch()` to another `workers.dev` Worker on the same account is not routed;
+  fixed with `global_fetch_strictly_public` on live stages (D47), after which 10/10 probe traces and
+  the API's Worker → writer traces are complete. (3) A random external client requested the probe's
+  `/favicon.ico` minutes after the first deploy and got `401`, which supports gating previews (D44).
 
 ## Done
 
@@ -240,6 +250,11 @@ R2's `If-None-Match` Headers form, and the §12 measurements. Nothing has run ag
 account.
 
 ## Findings
+
+- Effect's HTTP server middleware records `client.address` (the caller's IP) and
+  `user_agent.original` on server spans. They reach the trace store on live stages. They are not
+  keys, values, or secrets, but they are personal data; before a production deploy, drop them
+  from server spans or keep traces in a store with matching retention.
 
 - alchemy 2.0.0-beta.87 still flushes event telemetry inside `waitUntil` after the event settles;
   worked around in application code (D5), no patch.

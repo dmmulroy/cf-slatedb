@@ -10,6 +10,7 @@
  * - `status` lists each preview stage and its URLs.
  * - `url <stage>` prints one stage's URLs.
  * - `token <stage>` prints the stage's access token (its Workers answer `401` without it).
+ * - `collector <stage>` prints the stage's trace collector URL and token (for `trace-cli pull`).
  * - `destroy-command <stage>` prints the command that tears a stage down. It never runs it.
  */
 import { spawnSync } from "node:child_process";
@@ -26,10 +27,11 @@ import {
   parseStateRead,
   PREVIEW_DEV_TIMINGS,
   PREVIEW_STAGES,
-  previewAccessToken,
   previewOutputs,
+  previewSecret,
   type PreviewStage,
   type PreviewStatus,
+  type StateRecords,
 } from "./preview-stage.ts";
 
 /**
@@ -161,21 +163,55 @@ const url = Command.make("url", { stage: stageArgument, json: jsonFlag }, ({ sta
   deployedOutputs(stage).pipe(Effect.flatMap(({ outputs }) => printOutputs(stage, outputs, json))),
 ).pipe(Command.withDescription("Print a preview stage's API, BlockServer, and other URLs"));
 
-const token = Command.make("token", { stage: stageArgument, json: jsonFlag }, ({ stage, json }) =>
+/** A deployed stage's generated secret; fails with `TokenMissing` when the stage has none. */
+const requiredSecret = (
+  records: StateRecords,
+  stage: PreviewStage,
+  secret: "LsmAccessToken" | "TraceCollectorToken",
+) =>
   Effect.gen(function* () {
-    const { records } = yield* deployedOutputs(stage);
-    const value = yield* previewAccessToken(records, stage);
+    const value = yield* previewSecret(records, stage, secret);
     if (Option.isNone(value)) {
       return yield* new PreviewCliError({
         reason: "TokenMissing",
-        message: `${stage} has no access token. Redeploy it with \`preview-cli deploy ${stage}\`.`,
+        message: `${stage} has no ${secret}. Redeploy it with \`preview-cli deploy ${stage}\`.`,
       });
     }
-    yield* Console.log(json ? JSON.stringify({ stage, token: value.value }) : value.value);
+    return value.value;
+  });
+
+const token = Command.make("token", { stage: stageArgument, json: jsonFlag }, ({ stage, json }) =>
+  Effect.gen(function* () {
+    const { records } = yield* deployedOutputs(stage);
+    const value = yield* requiredSecret(records, stage, "LsmAccessToken");
+    yield* Console.log(json ? JSON.stringify({ stage, token: value }) : value);
   }),
 ).pipe(
   Command.withDescription(
     "Print a preview stage's access token, for `Authorization: Bearer <token>`",
+  ),
+);
+
+const collector = Command.make(
+  "collector",
+  { stage: stageArgument, json: jsonFlag },
+  ({ stage, json }) =>
+    Effect.gen(function* () {
+      const { records, outputs } = yield* deployedOutputs(stage);
+      if (outputs.traceCollectorUrl === undefined) {
+        return yield* new PreviewCliError({
+          reason: "NotDeployed",
+          message: `${stage} has no trace collector yet. Redeploy it with \`preview-cli deploy ${stage}\`.`,
+        });
+      }
+      const value = yield* requiredSecret(records, stage, "TraceCollectorToken");
+      yield* json
+        ? Console.log(JSON.stringify({ stage, url: outputs.traceCollectorUrl, token: value }))
+        : Console.log(`${outputs.traceCollectorUrl}\n${value}`);
+    }),
+).pipe(
+  Command.withDescription(
+    "Print a preview stage's trace collector URL and token (what `trace-cli pull --stage` uses)",
   ),
 );
 
@@ -194,7 +230,7 @@ const destroy = Command.make(
 
 const previewCli = Command.make("preview").pipe(
   Command.withDescription("Deploy and inspect cf-slatedb's live preview stages"),
-  Command.withSubcommands([deploy, status, url, token, destroy]),
+  Command.withSubcommands([deploy, status, url, token, collector, destroy]),
 );
 
 Command.run(previewCli, { version: "0.0.0" }).pipe(

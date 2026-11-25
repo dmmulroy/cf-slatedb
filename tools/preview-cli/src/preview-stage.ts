@@ -110,12 +110,19 @@ export const previewOutputs = Effect.fn("PreviewStage.previewOutputs")(function*
   );
 });
 
-/** The access token of a stage in `records`, or `None` when the stage has none. */
-export const previewAccessToken = Effect.fn("PreviewStage.previewAccessToken")(function* (
+/**
+ * A stage's generated secrets: `LsmAccessToken` gates its public Workers; `TraceCollectorToken`
+ * authenticates span exports to, and reads from, its trace collector.
+ */
+export type PreviewSecret = "LsmAccessToken" | "TraceCollectorToken";
+
+/** A stage's generated secret in `records`, or `None` when the stage has none. */
+export const previewSecret = Effect.fn("PreviewStage.previewSecret")(function* (
   records: StateRecords,
   stage: PreviewStage,
+  secret: PreviewSecret,
 ) {
-  const path = `${CF_SLATEDB_STACK_NAME}/${stage}/LsmAccessToken`;
+  const path = `${CF_SLATEDB_STACK_NAME}/${stage}/${secret}`;
   const record = records.get(path);
   if (record === undefined) return Option.none<string>();
   const decoded = yield* decodeRedactedText(record).pipe(
