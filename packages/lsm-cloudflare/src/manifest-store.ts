@@ -2,8 +2,8 @@ import { type DatabaseId, type Manifest, ManifestId, ManifestJson } from "@cf-sl
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Context, Data, Effect, Layer, Metric, Result, Schedule, Schema } from "effect";
 
+import type { DatabaseNotFoundError } from "./lsm-errors.ts";
 import {
-  type DatabaseNotFoundError,
   ManifestReader,
   type ManifestReadError,
   manifestReaderLayerWithoutDependencies,

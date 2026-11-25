@@ -1,0 +1,729 @@
+import {
+  changelogRowOrder,
+  collapseWriteBatch,
+  commitL0Flush,
+  type DatabaseId,
+  DatabaseSealedError,
+  fenceWriter,
+  type KeyOutOfRangeError,
+  type KeyRange,
+  type Manifest,
+  MERGE_OPERATORS,
+  type Row,
+  rowEncodedSizeEstimate,
+  sealManifest,
+  SeqNum,
+  Timestamp,
+  type WriteBatch,
+  type WriteBatchInvalidError,
+  type WriteReceipt,
+  WriterEpoch,
+  WriterFencedError,
+} from "@cf-slatedb/lsm-core";
+import type { RuntimeContext } from "alchemy/RuntimeContext";
+import {
+  Clock,
+  Context,
+  Effect,
+  Layer,
+  Metric,
+  Option,
+  Ref,
+  Result,
+  Semaphore,
+  Stream,
+} from "effect";
+
+import { LsmConfiguration, lsmConfigurationTestLayer } from "./lsm-configuration.ts";
+import {
+  DatabaseIdMismatchError,
+  DatabaseNotFoundError,
+  WriterUnavailableError,
+  WriteStalledError,
+} from "./lsm-errors.ts";
+import { MemTable, type MemTableCursor, memTableTestLayer } from "./mem-table.ts";
+import type { ManifestReadError, VersionedManifest } from "./manifest-reader.ts";
+import {
+  ManifestStore,
+  manifestStoreTestLayer,
+  type ManifestWriteError,
+} from "./manifest-store.ts";
+import { changelogKey, sstKey } from "./object-keys.ts";
+import { SstStore, sstStoreLayerWithoutDependencies } from "./sst-store.ts";
+import { WriterAlarm, writerAlarmTestLayer } from "./writer-alarm.ts";
+
+/** What a `Latest` read learns from the writer about one key. */
+export interface MemTableProbe {
+  /** The key's unflushed versions at or below `snapshotSeq`, newest first. */
+  readonly versions: ReadonlyArray<Row>;
+  /** The newest committed sequence number: the read's snapshot. */
+  readonly snapshotSeq: SeqNum;
+  /**
+   * Newest sequence number committed to the manifest by a flush. Rows at or below it may already be
+   * gone from the memtable, so the reader needs a manifest with `lastL0Seq >= flushedSeq`.
+   */
+  readonly flushedSeq: SeqNum;
+}
+
+/** One page of a memtable scan. */
+export interface MemTableScanPage {
+  readonly rows: ReadonlyArray<Row>;
+  readonly snapshotSeq: SeqNum;
+  readonly flushedSeq: SeqNum;
+  /** Where the next page starts, or none on the last page. */
+  readonly nextCursor: Option.Option<MemTableCursor>;
+}
+
+/** Unflushed changes in sequence order, for change data capture. */
+export interface ChangesPage {
+  readonly rows: ReadonlyArray<Row>;
+  /** Newest committed sequence number. */
+  readonly lastSeq: SeqNum;
+  readonly flushedSeq: SeqNum;
+}
+
+/** The writer's state, for operators and tests. */
+export interface WriterStatus {
+  readonly databaseId: DatabaseId;
+  readonly writerEpoch: WriterEpoch;
+  readonly lastSeq: SeqNum;
+  readonly flushedSeq: SeqNum;
+  readonly unflushedBytes: number;
+  readonly unflushedRows: number;
+  readonly l0Count: number;
+  readonly sealed: boolean;
+}
+
+/** Every failure a writer operation can report. */
+export type DbWriterError =
+  | DatabaseNotFoundError
+  | DatabaseIdMismatchError
+  | DatabaseSealedError
+  | WriterFencedError
+  | WriteStalledError
+  | WriteBatchInvalidError
+  | KeyOutOfRangeError
+  | WriterUnavailableError;
+
+/**
+ * The database's single writer: it commits write batches to the memtable (the WAL), answers
+ * `Latest` probes, and flushes the memtable to L0.
+ */
+export interface IDbWriter {
+  /**
+   * Commits a batch atomically with one sequence number. Durable when it returns.
+   *
+   * @returns The receipt, or a `DbWriterError`; on failure nothing was written.
+   */
+  readonly write: (
+    databaseId: DatabaseId,
+    batch: WriteBatch,
+  ) => Effect.Effect<WriteReceipt, DbWriterError, RuntimeContext>;
+  /** The key's unflushed versions and the sequence numbers a `Latest` read needs. */
+  readonly probe: (
+    databaseId: DatabaseId,
+    key: Uint8Array,
+  ) => Effect.Effect<MemTableProbe, DbWriterError, RuntimeContext>;
+  /** One page of unflushed rows in `range` at `snapshotSeq` (default: newest). */
+  readonly scan: (
+    databaseId: DatabaseId,
+    request: {
+      readonly range: KeyRange;
+      readonly snapshotSeq: Option.Option<SeqNum>;
+      readonly cursor: Option.Option<MemTableCursor>;
+      readonly limit: number;
+    },
+  ) => Effect.Effect<MemTableScanPage, DbWriterError, RuntimeContext>;
+  /** Flushes every committed row to L0 now. @returns The new `flushedSeq`. */
+  readonly flush: (databaseId: DatabaseId) => Effect.Effect<SeqNum, DbWriterError, RuntimeContext>;
+  /** Unflushed changes after `afterSeq`, in sequence order. */
+  readonly changes: (
+    databaseId: DatabaseId,
+    afterSeq: SeqNum,
+    limit: number,
+  ) => Effect.Effect<ChangesPage, DbWriterError, RuntimeContext>;
+  /** The writer's state. */
+  readonly status: (
+    databaseId: DatabaseId,
+  ) => Effect.Effect<WriterStatus, DbWriterError, RuntimeContext>;
+  /**
+   * Flushes everything, then seals the database with `successors` (which fences this writer). Every
+   * write acknowledged before the seal is in the sealed manifest; later writes fail with
+   * `DatabaseSealedError`. Safe to repeat.
+   */
+  readonly seal: (
+    databaseId: DatabaseId,
+    successors: ReadonlyArray<DatabaseId>,
+  ) => Effect.Effect<SeqNum, DbWriterError, RuntimeContext>;
+  /** The alarm handler: flushes when a trigger is due and reschedules. Never fails. */
+  readonly runAlarm: Effect.Effect<void, never, RuntimeContext>;
+}
+
+/** The contextual database writer. */
+export class DbWriter extends Context.Service<DbWriter, IDbWriter>()("@cf-slatedb/DbWriter") {}
+
+/** Bytes flushed to L0 (SlateDB RFC-0021 parity). */
+export const flushBytes = Metric.counter("lsm_flush_bytes", {
+  description: "Bytes of L0 SSTs written by memtable flushes",
+});
+
+/** Writes refused by backpressure. */
+export const writeStalls = Metric.counter("lsm_write_stalls", {
+  description: "Writes refused with WriteStalledError",
+});
+
+/** How long to wait before retrying a failed flush. */
+const FLUSH_RETRY_MILLIS = 1_000;
+
+type WriterPhase =
+  | { readonly _tag: "Uninitialized" }
+  | {
+      readonly _tag: "Ready";
+      readonly databaseId: DatabaseId;
+      readonly writerEpoch: WriterEpoch;
+      readonly manifest: VersionedManifest;
+      readonly sealed: Option.Option<ReadonlyArray<DatabaseId>>;
+    }
+  | { readonly _tag: "Fenced"; readonly databaseId: DatabaseId; readonly error: WriterFencedError };
+
+/** Constructs the writer over the contextual memtable, manifest store, SST store, alarm, and settings. */
+export const makeDbWriter = Effect.gen(function* () {
+  const memTable = yield* MemTable;
+  const manifests = yield* ManifestStore;
+  const ssts = yield* SstStore;
+  const alarm = yield* WriterAlarm;
+  const settings = yield* LsmConfiguration;
+
+  const phase = yield* Ref.make<WriterPhase>({ _tag: "Uninitialized" });
+  const unflushedBytes = yield* Ref.make(0);
+  const initLock = yield* Semaphore.make(1);
+  const commitLock = yield* Semaphore.make(1);
+  const flushLock = yield* Semaphore.make(1);
+
+  const unavailable =
+    (databaseId: DatabaseId, operation: string) => (error: { readonly message: string }) =>
+      new WriterUnavailableError({
+        databaseId,
+        operation,
+        reason: "StorageUnavailable",
+        message: `The writer of database ${databaseId} could not complete ${operation}: ${error.message}`,
+      });
+
+  /**
+   * `catchTags` handlers that translate manifest failures to `WriterUnavailableError`; an edit's own
+   * errors pass through unchanged.
+   */
+  const manifestFailures = (databaseId: DatabaseId, operation: string) => ({
+    ManifestReadError: (error: ManifestReadError) =>
+      Effect.fail(
+        new WriterUnavailableError({
+          databaseId,
+          operation,
+          reason:
+            error.reason === "StoredManifestInvalid" ? "StoredDataInvalid" : "StorageUnavailable",
+          message: `The writer of database ${databaseId} could not read the manifest during ${operation}: ${error.message}`,
+        }),
+      ),
+    ManifestWriteError: (error: ManifestWriteError) =>
+      Effect.fail(
+        new WriterUnavailableError({
+          databaseId,
+          operation,
+          reason:
+            error.reason === "ContentionPersisted" ? "ManifestContention" : "StorageUnavailable",
+          message: `The writer of database ${databaseId} could not write the manifest during ${operation}: ${error.message}`,
+        }),
+      ),
+  });
+
+  /** Recomputes the in-memory byte counter from SQLite. */
+  const refreshUnflushedBytes = (databaseId: DatabaseId) =>
+    memTable.stats.pipe(
+      Effect.tap((stats) => Ref.set(unflushedBytes, stats.unflushedBytes)),
+      Effect.mapError(unavailable(databaseId, "stats")),
+    );
+
+  /** Schedules the flush alarm for when the oldest unflushed row reaches `maxL0Age`, or now. */
+  const scheduleFlush = (databaseId: DatabaseId) =>
+    Effect.gen(function* () {
+      const stats = yield* memTable.stats.pipe(
+        Effect.mapError(unavailable(databaseId, "scheduleFlush")),
+      );
+      if (stats.rowCount === 0) return;
+      const now = yield* Clock.currentTimeMillis;
+      const due =
+        stats.unflushedBytes >= settings.l0SstSize
+          ? now
+          : Option.match(stats.oldestCreateTs, {
+              onNone: () => now,
+              onSome: (ts) => ts + settings.maxL0Age,
+            });
+      const scheduled = yield* alarm.scheduled;
+      if (Option.isNone(scheduled) || scheduled.value > due) yield* alarm.scheduleAt(due);
+    });
+
+  /**
+   * Starts the writer for `databaseId` once per instance: fences in with a new writer epoch, seeds
+   * the sequence oracle and clock from the manifest, and drops rows a crash left behind after their
+   * flush committed.
+   */
+  const ensureReady = (databaseId: DatabaseId) =>
+    initLock
+      .withPermits(1)(
+        Effect.gen(function* () {
+          const current = yield* Ref.get(phase);
+          if (current._tag === "Fenced") {
+            if (current.databaseId !== databaseId)
+              return yield* mismatch(databaseId, current.databaseId);
+            return yield* Effect.fail(current.error);
+          }
+          if (current._tag === "Ready") {
+            if (current.databaseId !== databaseId)
+              return yield* mismatch(databaseId, current.databaseId);
+            return current;
+          }
+          const meta = yield* memTable.meta.pipe(Effect.mapError(unavailable(databaseId, "start")));
+          if (Option.isSome(meta.databaseId) && meta.databaseId.value !== databaseId) {
+            return yield* mismatch(databaseId, meta.databaseId.value);
+          }
+          const fenced = yield* manifests
+            .update(databaseId, (manifest) =>
+              manifest.state._tag === "Sealed" ? Result.succeed(manifest) : fenceWriter(manifest),
+            )
+            .pipe(Effect.catchTags(manifestFailures(databaseId, "start")));
+          const sealed =
+            fenced.manifest.state._tag === "Sealed"
+              ? Option.some(fenced.manifest.state.successors)
+              : Option.none();
+          const writerEpoch = fenced.manifest.writerEpoch;
+          yield* memTable
+            .setIdentity(databaseId, writerEpoch)
+            .pipe(Effect.mapError(unavailable(databaseId, "start")));
+          yield* memTable
+            .seed({ seq: fenced.manifest.lastL0Seq, clockTick: fenced.manifest.lastL0ClockTick })
+            .pipe(Effect.mapError(unavailable(databaseId, "start")));
+          // Rows at or below lastL0Seq are already in L0: a crash hit between commit and truncate.
+          if (fenced.manifest.lastL0Seq > 0) {
+            yield* memTable
+              .truncate(fenced.manifest.lastL0Seq)
+              .pipe(Effect.mapError(unavailable(databaseId, "start")));
+          }
+          yield* refreshUnflushedBytes(databaseId);
+          const ready: WriterPhase = {
+            _tag: "Ready",
+            databaseId,
+            writerEpoch,
+            manifest: fenced,
+            sealed,
+          };
+          yield* Ref.set(phase, ready);
+          yield* Effect.annotateCurrentSpan({
+            "database.id": databaseId,
+            "writer.epoch": writerEpoch,
+          });
+          if (Option.isNone(sealed)) yield* scheduleFlush(databaseId);
+          return ready;
+        }),
+      )
+      .pipe(Effect.withSpan("DbWriter.start"));
+
+  const mismatch = (databaseId: DatabaseId, served: DatabaseId) =>
+    Effect.fail(
+      new DatabaseIdMismatchError({
+        databaseId,
+        servedDatabaseId: served,
+        message: `A request for database ${databaseId} reached the writer of database ${served}. Route requests by database id.`,
+      }),
+    );
+
+  const sealedError = (databaseId: DatabaseId, successors: ReadonlyArray<DatabaseId>) =>
+    new DatabaseSealedError({
+      databaseId,
+      successors,
+      message: `Database ${databaseId} is sealed and accepts no writes${
+        successors.length > 0 ? `; its successors are ${successors.join(", ")}` : ""
+      }. Send the write to the successor whose key range holds the key.`,
+    });
+
+  const writableReady = (databaseId: DatabaseId) =>
+    Effect.gen(function* () {
+      const ready = yield* ensureReady(databaseId);
+      if (Option.isSome(ready.sealed))
+        return yield* Effect.fail(sealedError(databaseId, ready.sealed.value));
+      return ready;
+    });
+
+  /** Marks this instance fenced: a newer writer serves the database. */
+  const markFenced = (databaseId: DatabaseId, error: WriterFencedError) =>
+    Ref.set(phase, { _tag: "Fenced", databaseId, error });
+
+  const flushNow = (databaseId: DatabaseId) =>
+    flushLock
+      .withPermits(1)(
+        Effect.gen(function* () {
+          const ready = yield* ensureReady(databaseId);
+          const meta = yield* memTable.meta.pipe(Effect.mapError(unavailable(databaseId, "flush")));
+          const cut = meta.lastSeq;
+          yield* Effect.annotateCurrentSpan({ "database.id": databaseId, seq: cut });
+          if (cut <= meta.flushedSeq) return meta.flushedSeq;
+          const options = ready.manifest.manifest.options;
+          const written = yield* ssts
+            .write({
+              owner: databaseId,
+              kind: "Compacted",
+              objectKey: (id) => sstKey(databaseId, id),
+              rows: memTable.rowsUpTo(cut),
+            })
+            .pipe(
+              Effect.catchTags({
+                MemTableError: (error) => Effect.fail(unavailable(databaseId, "flush")(error)),
+                ObjectStoreUnavailableError: (error) =>
+                  Effect.fail(unavailable(databaseId, "flush")(error)),
+              }),
+            );
+          if (Option.isNone(written)) {
+            // Nothing at or below the cut (already truncated): just record it.
+            yield* memTable.truncate(cut).pipe(Effect.mapError(unavailable(databaseId, "flush")));
+            return cut;
+          }
+          const changelog = Option.isSome(options.changelog)
+            ? yield* exportChangelog(databaseId, meta.flushedSeq, cut)
+            : Option.none();
+          const committed = yield* manifests
+            .update(databaseId, (manifest) =>
+              commitL0Flush(manifest, {
+                writerEpoch: ready.writerEpoch,
+                sst: written.value.handle,
+                lastSeq: cut,
+                clockTick: meta.clockTick,
+                changelog,
+              }),
+            )
+            .pipe(
+              Effect.catchTags(manifestFailures(databaseId, "flush")),
+              Effect.tapError((error) =>
+                error._tag === "WriterFencedError" ? markFenced(databaseId, error) : Effect.void,
+              ),
+            );
+          // Delete only after the manifest commit: a crash before this line leaves rows that the next
+          // start drops (they are in L0), or that a later flush writes again with the same sequence
+          // numbers, which merging deduplicates.
+          yield* memTable.truncate(cut).pipe(Effect.mapError(unavailable(databaseId, "flush")));
+          yield* Ref.update(phase, (current) =>
+            current._tag === "Ready" ? { ...current, manifest: committed } : current,
+          );
+          yield* refreshUnflushedBytes(databaseId);
+          yield* Metric.update(flushBytes, written.value.info.sizeBytes);
+          yield* Effect.annotateCurrentSpan({
+            "sst.id": written.value.handle.id,
+            "sst.size": written.value.info.sizeBytes,
+            "manifest.id": committed.id,
+          });
+          return cut;
+        }),
+      )
+      .pipe(Effect.withSpan("DbWriter.flush"));
+
+  /** Exports the flush's rows in sequence order as a changelog SST (change data capture). */
+  const exportChangelog = (databaseId: DatabaseId, afterSeq: SeqNum, cut: SeqNum) =>
+    Effect.gen(function* () {
+      const rows = Stream.paginate(afterSeq, (from) =>
+        memTable.rowsBySeq(from, cut, 1024).pipe(
+          Effect.map((page) => {
+            const last = page[page.length - 1];
+            return [
+              page,
+              page.length === 1024 && last !== undefined ? Option.some(last.seq) : Option.none(),
+            ] as const;
+          }),
+        ),
+      ).pipe(
+        // Rows sharing the last sequence of a page continue on the next page by key order.
+        Stream.filter((row) => row.seq > afterSeq),
+      );
+      const written = yield* ssts
+        .write({
+          owner: databaseId,
+          kind: "Changelog",
+          objectKey: (id) => changelogKey(databaseId, cut, id),
+          rows: rows.pipe(Stream.rechunk(1024)),
+        })
+        .pipe(
+          Effect.catchTags({
+            MemTableError: (error) =>
+              Effect.fail(unavailable(databaseId, "exportChangelog")(error)),
+            ObjectStoreUnavailableError: (error) =>
+              Effect.fail(unavailable(databaseId, "exportChangelog")(error)),
+          }),
+        );
+      const now = Timestamp.make(yield* Clock.currentTimeMillis);
+      return Option.map(written, (sst) => ({
+        sst: sst.handle,
+        firstSeq: sst.info.footer.minSeq,
+        lastSeq: sst.info.footer.maxSeq,
+        createdAt: now,
+      }));
+    }).pipe(Effect.withSpan("ChangelogExport.export"));
+
+  const write = Effect.fn("DbWriter.write")(function* (databaseId: DatabaseId, batch: WriteBatch) {
+    yield* Effect.annotateCurrentSpan({
+      "database.id": databaseId,
+      "batch.operations": batch.operations.length,
+    });
+    const receipt = yield* commitLock.withPermits(1)(
+      Effect.gen(function* () {
+        let ready = yield* writableReady(databaseId);
+        const bytes = yield* Ref.get(unflushedBytes);
+        if (bytes >= settings.maxUnflushedBytes) {
+          yield* Metric.update(writeStalls, 1);
+          yield* scheduleFlush(databaseId);
+          return yield* Effect.fail(
+            new WriteStalledError({
+              databaseId,
+              reason: "UnflushedBytes",
+              retryAfterMs: 1_000,
+              message: `Database ${databaseId} has ${bytes} unflushed bytes, above its ${settings.maxUnflushedBytes} limit, so the write was refused. Retry the same batch after a short wait; nothing was written.`,
+            }),
+          );
+        }
+        if (ready.manifest.manifest.l0.length >= settings.l0MaxSsts) {
+          // The cached manifest may predate compactions: reload before refusing.
+          const latest = yield* manifests
+            .update(databaseId, (manifest) => Result.succeed(manifest))
+            .pipe(Effect.catchTags(manifestFailures(databaseId, "write")));
+          ready = { ...ready, manifest: latest };
+          yield* Ref.set(phase, ready);
+          if (latest.manifest.l0.length >= settings.l0MaxSsts) {
+            yield* Metric.update(writeStalls, 1);
+            return yield* Effect.fail(
+              new WriteStalledError({
+                databaseId,
+                reason: "L0Backlog",
+                retryAfterMs: 5_000,
+                message: `Database ${databaseId} has ${latest.manifest.l0.length} L0 SSTs waiting for compaction, at its ${settings.l0MaxSsts} limit, so the write was refused. Retry the same batch later; nothing was written.`,
+              }),
+            );
+          }
+        }
+        const manifest: Manifest = ready.manifest.manifest;
+        const writes = yield* Effect.fromResult(
+          collapseWriteBatch(batch, {
+            databaseId,
+            keyRange: manifest.keyRange,
+            mergeOperator: Option.map(
+              manifest.options.mergeOperator,
+              (name) => MERGE_OPERATORS[name],
+            ),
+          }),
+        );
+        const meta = yield* memTable.meta.pipe(Effect.mapError(unavailable(databaseId, "write")));
+        // Monotonic clock: never behind the newest tick already handed out or flushed.
+        const now = yield* Clock.currentTimeMillis;
+        const createTs = Timestamp.make(Math.max(now, meta.clockTick));
+        const seq = yield* memTable
+          .commit(writes, createTs)
+          .pipe(Effect.mapError(unavailable(databaseId, "write")));
+        const added = writes.reduce(
+          (sum, item) =>
+            sum +
+            rowEncodedSizeEstimate({
+              key: item.key,
+              seq,
+              value: item.value,
+              createTs: Option.some(createTs),
+              expireTs: Option.none(),
+            }) +
+            24,
+          0,
+        );
+        yield* Ref.update(unflushedBytes, (current) => current + added);
+        return { seq, createTs };
+      }),
+    );
+    yield* scheduleFlush(databaseId).pipe(
+      Effect.catchTags({ WriterUnavailableError: () => Effect.void }),
+    );
+    yield* Effect.annotateCurrentSpan({ seq: receipt.seq });
+    return receipt;
+  });
+
+  const probe = Effect.fn("DbWriter.probe")(function* (databaseId: DatabaseId, key: Uint8Array) {
+    yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
+    yield* ensureReady(databaseId);
+    const meta = yield* memTable.meta.pipe(Effect.mapError(unavailable(databaseId, "probe")));
+    const versions = yield* memTable
+      .versions(key, meta.lastSeq)
+      .pipe(Effect.mapError(unavailable(databaseId, "probe")));
+    yield* Effect.annotateCurrentSpan({
+      seq: meta.lastSeq,
+      "probe.versions": versions.length,
+      "probe.flushed_seq": meta.flushedSeq,
+    });
+    return { versions, snapshotSeq: meta.lastSeq, flushedSeq: meta.flushedSeq };
+  });
+
+  const scan = Effect.fn("DbWriter.scan")(function* (
+    databaseId: DatabaseId,
+    request: {
+      readonly range: KeyRange;
+      readonly snapshotSeq: Option.Option<SeqNum>;
+      readonly cursor: Option.Option<MemTableCursor>;
+      readonly limit: number;
+    },
+  ) {
+    yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
+    yield* ensureReady(databaseId);
+    const meta = yield* memTable.meta.pipe(Effect.mapError(unavailable(databaseId, "scan")));
+    const snapshotSeq = Option.getOrElse(request.snapshotSeq, () => meta.lastSeq);
+    const limit = Math.max(1, Math.min(request.limit, 1000));
+    const rows = yield* memTable
+      .scan(request.range, snapshotSeq, request.cursor, limit)
+      .pipe(Effect.mapError(unavailable(databaseId, "scan")));
+    const last = rows[rows.length - 1];
+    return {
+      rows,
+      snapshotSeq,
+      flushedSeq: meta.flushedSeq,
+      nextCursor:
+        rows.length === limit && last !== undefined
+          ? Option.some({ key: last.key, seq: last.seq })
+          : Option.none(),
+    };
+  });
+
+  const flush = Effect.fn("DbWriter.requestFlush")(function* (databaseId: DatabaseId) {
+    yield* writableReady(databaseId).pipe(
+      Effect.catchTags({ DatabaseSealedError: () => ensureReady(databaseId) }),
+    );
+    return yield* flushNow(databaseId);
+  });
+
+  const changes = Effect.fn("DbWriter.changes")(function* (
+    databaseId: DatabaseId,
+    afterSeq: SeqNum,
+    limit: number,
+  ) {
+    yield* Effect.annotateCurrentSpan({ "database.id": databaseId, seq: afterSeq });
+    yield* ensureReady(databaseId);
+    const meta = yield* memTable.meta.pipe(Effect.mapError(unavailable(databaseId, "changes")));
+    const rows = yield* memTable
+      .rowsBySeq(afterSeq, meta.lastSeq, Math.max(1, Math.min(limit, 1000)))
+      .pipe(Effect.mapError(unavailable(databaseId, "changes")));
+    return {
+      rows: [...rows].sort(changelogRowOrder),
+      lastSeq: meta.lastSeq,
+      flushedSeq: meta.flushedSeq,
+    };
+  });
+
+  const status = Effect.fn("DbWriter.status")(function* (databaseId: DatabaseId) {
+    const ready = yield* ensureReady(databaseId);
+    const meta = yield* memTable.meta.pipe(Effect.mapError(unavailable(databaseId, "status")));
+    const stats = yield* memTable.stats.pipe(Effect.mapError(unavailable(databaseId, "status")));
+    return {
+      databaseId,
+      writerEpoch: ready.writerEpoch,
+      lastSeq: meta.lastSeq,
+      flushedSeq: meta.flushedSeq,
+      unflushedBytes: stats.unflushedBytes,
+      unflushedRows: stats.rowCount,
+      l0Count: ready.manifest.manifest.l0.length,
+      sealed: Option.isSome(ready.sealed),
+    };
+  });
+
+  const seal = Effect.fn("DbWriter.seal")(function* (
+    databaseId: DatabaseId,
+    successors: ReadonlyArray<DatabaseId>,
+  ) {
+    yield* Effect.annotateCurrentSpan({
+      "database.id": databaseId,
+      "seal.successors": successors.length,
+    });
+    // Hold the commit lock: no write can be acknowledged between the final flush and the seal.
+    return yield* commitLock.withPermits(1)(
+      Effect.gen(function* () {
+        const ready = yield* ensureReady(databaseId);
+        if (Option.isSome(ready.sealed)) {
+          const meta = yield* memTable.meta.pipe(Effect.mapError(unavailable(databaseId, "seal")));
+          return meta.flushedSeq;
+        }
+        const flushedSeq = yield* flushNow(databaseId);
+        const sealed = yield* manifests
+          .update(databaseId, (manifest) => {
+            if (manifest.writerEpoch !== ready.writerEpoch) {
+              return Result.fail(
+                new WriterFencedError({
+                  databaseId,
+                  writerEpoch: ready.writerEpoch,
+                  currentWriterEpoch: manifest.writerEpoch,
+                  message: `Writer epoch ${ready.writerEpoch} of database ${databaseId} was fenced by epoch ${manifest.writerEpoch} before it could seal. Retry the seal; the current writer will perform it.`,
+                }),
+              );
+            }
+            return Result.succeed(sealManifest(manifest, successors));
+          })
+          .pipe(Effect.catchTags(manifestFailures(databaseId, "seal")));
+        yield* Ref.set(phase, {
+          _tag: "Ready",
+          databaseId,
+          writerEpoch: WriterEpoch.make(sealed.manifest.writerEpoch),
+          manifest: sealed,
+          sealed: Option.some(successors),
+        });
+        return flushedSeq;
+      }),
+    );
+  });
+
+  const runAlarm = Effect.gen(function* () {
+    const meta = yield* memTable.meta.pipe(Effect.option);
+    const databaseId = Option.flatMap(meta, (value) => value.databaseId);
+    if (Option.isNone(databaseId)) return;
+    const id = databaseId.value;
+    const outcome = yield* Effect.gen(function* () {
+      yield* ensureReady(id);
+      const stats = yield* memTable.stats.pipe(Effect.mapError(unavailable(id, "alarm")));
+      const now = yield* Clock.currentTimeMillis;
+      const due =
+        stats.rowCount > 0 &&
+        (stats.unflushedBytes >= settings.l0SstSize ||
+          Option.match(stats.oldestCreateTs, {
+            onNone: () => true,
+            onSome: (ts) => ts + settings.maxL0Age <= now,
+          }));
+      if (due) yield* flushNow(id);
+      yield* scheduleFlush(id);
+    }).pipe(Effect.exit);
+    if (outcome._tag === "Failure") {
+      const current = yield* Ref.get(phase);
+      if (current._tag !== "Fenced") {
+        const now = yield* Clock.currentTimeMillis;
+        yield* alarm.scheduleAt(now + FLUSH_RETRY_MILLIS);
+      }
+      yield* Effect.logWarning("Writer alarm could not flush; it retries shortly.").pipe(
+        Effect.annotateLogs({ "database.id": id }),
+      );
+    }
+  }).pipe(Effect.withSpan("DbWriter.alarm"));
+
+  return DbWriter.of({ write, probe, scan, flush, changes, status, seal, runAlarm });
+});
+
+/** Provides the writer, leaving its memtable, stores, alarm, and settings visible. */
+export const dbWriterLayerWithoutDependencies = Layer.effect(DbWriter, makeDbWriter);
+
+/**
+ * Provides a writer over an in-memory SQLite memtable, an in-memory object store (shared with the
+ * manifest store, and output so tests can inspect it), a recording alarm, and test settings.
+ */
+export const dbWriterTestLayer = (
+  overrides: Parameters<typeof lsmConfigurationTestLayer>[0] = {},
+) =>
+  dbWriterLayerWithoutDependencies.pipe(
+    Layer.provideMerge(sstStoreLayerWithoutDependencies),
+    Layer.provideMerge(
+      Layer.mergeAll(memTableTestLayer, writerAlarmTestLayer, lsmConfigurationTestLayer(overrides)),
+    ),
+    Layer.provideMerge(manifestStoreTestLayer),
+  );

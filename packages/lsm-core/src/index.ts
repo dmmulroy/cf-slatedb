@@ -13,3 +13,4 @@ export * from "./row.ts";
 export * from "./size-tiered-compaction-scheduler.ts";
 export * from "./sst-codec.ts";
 export * from "./ulid.ts";
+export * from "./write-batch.ts";

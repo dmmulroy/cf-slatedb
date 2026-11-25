@@ -7,8 +7,8 @@ import {
   lsmConfigurationLayer,
   lsmConfigurationTestLayer,
 } from "./lsm-configuration.ts";
+import type { DatabaseNotFoundError } from "./lsm-errors.ts";
 import {
-  type DatabaseNotFoundError,
   ManifestReader,
   type ManifestReadError,
   manifestReaderLayer,

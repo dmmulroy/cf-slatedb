@@ -1,4 +1,4 @@
-import { Data, Option, Result, Schema } from "effect";
+import { Option, Result, Schema } from "effect";
 
 import {
   CheckpointId,
@@ -217,20 +217,26 @@ export const manifestSstHandles = (manifest: Manifest): ReadonlyArray<SstHandle>
  *
  * Not retryable for this writer: it must stop. Its uploaded SSTs are orphans that GC removes.
  */
-export class WriterFencedError extends Data.TaggedError("WriterFencedError")<{
-  readonly databaseId: DatabaseId;
-  readonly writerEpoch: WriterEpoch;
-  readonly currentWriterEpoch: WriterEpoch;
-  readonly message: string;
-}> {}
+export class WriterFencedError extends Schema.TaggedError<WriterFencedError>()(
+  "WriterFencedError",
+  {
+    databaseId: DatabaseId,
+    writerEpoch: WriterEpoch,
+    currentWriterEpoch: WriterEpoch,
+    message: Schema.String,
+  },
+) {}
 
 /** A compactor tried to commit after a newer compactor took over the database. Not retryable. */
-export class CompactorFencedError extends Data.TaggedError("CompactorFencedError")<{
-  readonly databaseId: DatabaseId;
-  readonly compactorEpoch: CompactorEpoch;
-  readonly currentCompactorEpoch: CompactorEpoch;
-  readonly message: string;
-}> {}
+export class CompactorFencedError extends Schema.TaggedError<CompactorFencedError>()(
+  "CompactorFencedError",
+  {
+    databaseId: DatabaseId,
+    compactorEpoch: CompactorEpoch,
+    currentCompactorEpoch: CompactorEpoch,
+    message: Schema.String,
+  },
+) {}
 
 /**
  * The database is sealed: it accepts no more writes. `successors` are the databases that replace it.
@@ -239,20 +245,23 @@ export class CompactorFencedError extends Data.TaggedError("CompactorFencedError
  *
  * Not retryable against this database; route the write to the successor whose key range holds it.
  */
-export class DatabaseSealedError extends Data.TaggedError("DatabaseSealedError")<{
-  readonly databaseId: DatabaseId;
-  readonly successors: ReadonlyArray<DatabaseId>;
-  readonly message: string;
-}> {}
+export class DatabaseSealedError extends Schema.TaggedError<DatabaseSealedError>()(
+  "DatabaseSealedError",
+  {
+    databaseId: DatabaseId,
+    successors: Schema.Array(DatabaseId),
+    message: Schema.String,
+  },
+) {}
 
 /**
  * A compaction's inputs are no longer what the manifest holds (another edit replaced them), so its
  * output must not be committed. Discard the output; GC removes it.
  */
-export class CompactionInputsChangedError extends Data.TaggedError("CompactionInputsChangedError")<{
-  readonly databaseId: DatabaseId;
-  readonly message: string;
-}> {}
+export class CompactionInputsChangedError extends Schema.TaggedError<CompactionInputsChangedError>()(
+  "CompactionInputsChangedError",
+  { databaseId: DatabaseId, message: Schema.String },
+) {}
 
 const writerFenced = (manifest: Manifest, writerEpoch: WriterEpoch) =>
   new WriterFencedError({

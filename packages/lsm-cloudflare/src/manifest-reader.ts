@@ -2,6 +2,7 @@ import { type DatabaseId, Manifest, ManifestId, ManifestJson } from "@cf-slatedb
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Context, Data, Effect, Layer, Option, Schema } from "effect";
 
+import { DatabaseNotFoundError } from "./lsm-errors.ts";
 import { latestManifestKey, manifestKey, manifestPrefix } from "./object-keys.ts";
 import {
   ObjectStore,
@@ -15,18 +16,6 @@ export interface VersionedManifest {
   readonly id: ManifestId;
   readonly manifest: Manifest;
 }
-
-/**
- * No database has this id: it has no manifest.
- *
- * **Details**
- *
- * Not retryable. Create the database first, or check the id.
- */
-export class DatabaseNotFoundError extends Data.TaggedError("DatabaseNotFoundError")<{
-  readonly databaseId: DatabaseId;
-  readonly message: string;
-}> {}
 
 /**
  * A manifest could not be read.
