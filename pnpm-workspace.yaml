@@ -13,8 +13,10 @@ skills:
 catalog:
   "@cloudflare/workers-types": 5.20261015.1
   "@alchemy.run/cloudflare": 2.0.0-beta.87
+  "@alchemy.run/test": 2.0.0-beta.87
   "@effect/ai-typesafe": 4.1.4
   "@effect/platform-node": 4.1.4
+  "@effect/vitest": 4.1.4
   "@types/node": ^24.19.2
   alchemy: 2.0.0-beta.87
   effect: 4.1.4
@@ -39,3 +41,5 @@ permissions:
     skills: true
   traits@file:vendor/traits-0.5.16-pr112.tgz:
     skills: true
+patchedDependencies:
+  alchemy@2.0.0-beta.87: patches/alchemy@2.0.0-beta.87.patch

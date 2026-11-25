@@ -11,11 +11,13 @@
   },
   "devDependencies": {
     "@alchemy.run/cloudflare": "catalog:",
+    "@alchemy.run/test": "catalog:",
     "@cf-slatedb/lsm-cloudflare": "workspace:*",
     "@cf-slatedb/lsm-core": "workspace:*",
     "@cf-slatedb/sharding": "workspace:*",
     "@cloudflare/workers-types": "catalog:",
     "@effect/platform-node": "catalog:",
+    "@effect/vitest": "catalog:",
     "@types/node": "catalog:",
     "alchemy": "catalog:",
     "typescript": "catalog:",

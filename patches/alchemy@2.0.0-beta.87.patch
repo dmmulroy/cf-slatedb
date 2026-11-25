@@ -1,0 +1,120 @@
+diff --git a/lib/TelemetryRuntime.js b/lib/TelemetryRuntime.js
+index ca5c7783ba096c61e33c125203e8269a9b80d401..ee40d789a017b4d4c1ffe0c85e91a070b807fe0d 100644
+--- a/lib/TelemetryRuntime.js
++++ b/lib/TelemetryRuntime.js
+@@ -328,3 +328,16 @@ export const provideProcessTelemetry = (runtimeContext) => (effect) => Effect.ge
+     return yield* Effect.provideContext(effect, telemetry);
+ });
+ //# sourceMappingURL=TelemetryRuntime.js.map
++import * as OtlpExporterForFlush from "effect/observability/OtlpExporter";
++import * as ContextForFlush from "effect/Context";
++/**
++ * cf-slatedb patch: flush an event's buffered OTLP telemetry before the event
++ * settles, bounded by the exporter's shutdown budget, so a runtime torn down
++ * right after the event cannot drop it (alchemy-workerd-otlp-flush-repro).
++ */
++export const flushEventTelemetry = (context) => {
++    const flusher = ContextForFlush.getOrUndefined(context, OtlpExporterForFlush.Flusher);
++    return flusher === undefined
++        ? Effect.void
++        : flusher.flush.pipe(Effect.timeoutOption("10 seconds"), Effect.asVoid);
++};
+diff --git a/lib/Workers/DurableObjectBridge.js b/lib/Workers/DurableObjectBridge.js
+index 09b1ac280a3eceacdcd4965f426f991cfeb2b3f6..acc17918f4e866ce2710ec1a425b235cb01d073e 100644
+--- a/lib/Workers/DurableObjectBridge.js
++++ b/lib/Workers/DurableObjectBridge.js
+@@ -21,7 +21,7 @@ import * as Scope from "effect/Scope";
+ import * as Stream from "effect/Stream";
+ import { rpcMethodOf, serveRpc } from "../Rpc.js";
+ import { RuntimeContext } from "../RuntimeContext.js";
+-import { buildEventTelemetry } from "../TelemetryRuntime.js";
++import { buildEventTelemetry, flushEventTelemetry } from "../TelemetryRuntime.js";
+ import { EventLifetime, makeEventLifetime } from "./EventLifetime.js";
+ import { gateCall, InstanceInputGate, makeInputGate } from "./InputGate.js";
+ import { handleRpcExit } from "./Worker.js";
+@@ -66,6 +66,7 @@ export const makeDurableObjectInstance = ({ build, services: engineServices, wai
+         // Work this call hands to `waitUntil` runs after it returns, in its
+         // context: the call's scope waits for it before closing.
+         const event = makeEventLifetime(scope);
++        let eventTelemetry = undefined;
+         const { instance: shape, services, context, runtime, telemetry } = await instance;
+         // A class given the `InputGate` Layer has a gate; the call runs
+         // through it so storage can't interleave between calls.
+@@ -78,7 +79,7 @@ export const makeDurableObjectInstance = ({ build, services: engineServices, wai
+         // scope by `buildEventTelemetry` so buffered telemetry flushes
+         // when the scope closes into `waitUntil` below (the instance
+         // scope never finalizes on workerd).
+-        Layer.effectContext(buildEventTelemetry(context, scope, telemetry()))).pipe(Layer.provideMerge(Layer.succeedContext(services)), Layer.provideMerge(Layer.succeedContext(context)))), Effect.runPromiseExit)
++        Layer.effectContext(buildEventTelemetry(context, scope, telemetry()).pipe(Effect.tap((telemetryContext) => Effect.sync(() => { eventTelemetry = telemetryContext; }))))).pipe(Layer.provideMerge(Layer.succeedContext(services)), Layer.provideMerge(Layer.succeedContext(context)))), Effect.runPromiseExit)
+             .then((exit) => {
+             event.holdScope();
+             return onExit
+@@ -87,11 +88,12 @@ export const makeDurableObjectInstance = ({ build, services: engineServices, wai
+                     ? Promise.resolve(exit.value)
+                     : Promise.reject(Cause.squash(exit.cause));
+         })
+-            .finally(() => waitUntil(
+-        // Match `processEvent`: yield one macrotask so the
+-        // HttpMiddleware tracer's late span-end reaches the telemetry
+-        // exporter before the scope's flush finalizer.
+-        new Promise((resolve) => setTimeout(resolve, 0)).then(() => Effect.runPromise(Scope.close(scope, Exit.void)))));
++            .finally(() =>
++        // cf-slatedb patch: match `processEvent` — flush the call's telemetry
++        // before it settles, then close the scope into `waitUntil`.
++        new Promise((resolve) => setTimeout(resolve, 0))
++            .then(() => eventTelemetry === undefined ? undefined : Effect.runPromise(flushEventTelemetry(eventTelemetry)))
++            .then(() => waitUntil(Effect.runPromise(Scope.close(scope, Exit.void)))));
+     };
+     const dispatch = (method, parent) => (...args) => execute((shape) => Effect.suspend(() => {
+         if (!Object.hasOwn(shape, method)) {
+diff --git a/lib/Workers/WorkerBridge.js b/lib/Workers/WorkerBridge.js
+index 2ff18a749e0aa0e67dbbf1119bc595f8b2664021..dad9d03dade22ff422d48f46d95704cb919377fb 100644
+--- a/lib/Workers/WorkerBridge.js
++++ b/lib/Workers/WorkerBridge.js
+@@ -3,7 +3,7 @@ import * as Exit from "effect/Exit";
+ import * as Layer from "effect/Layer";
+ import * as Scope from "effect/Scope";
+ import * as Stream from "effect/Stream";
+-import { buildEventTelemetry } from "../TelemetryRuntime.js";
++import { buildEventTelemetry, flushEventTelemetry } from "../TelemetryRuntime.js";
+ import { EventLifetime, makeEventLifetime } from "./EventLifetime.js";
+ /**
+  * Run one event: resolve the shared build (pinned to this event), run the
+@@ -19,6 +19,7 @@ export const processEvent = (build, { makeEffect, services, waitUntil, onExit })
+     // Work the event hands to `waitUntil` runs after it returns, in its
+     // context: the request scope waits for it before closing.
+     const event = makeEventLifetime(scope);
++    let eventTelemetry = undefined;
+     return build(waitUntil)
+         .then((built) => {
+         const [eff, captured] = makeEffect(built);
+@@ -37,7 +38,7 @@ export const processEvent = (build, { makeEffect, services, waitUntil, onExit })
+         // telemetry flushes when the scope closes into `waitUntil`
+         // below — never on the instance scope, which workerd never
+         // finalizes.
+-        Layer.effectContext(buildEventTelemetry(built.context, scope, built.telemetry()))).pipe(Layer.provideMerge(Layer.succeedContext(captured)), Layer.provideMerge(Layer.succeedContext(built.context)))), Effect.runPromiseExit);
++        Layer.effectContext(buildEventTelemetry(built.context, scope, built.telemetry()).pipe(Effect.tap((telemetryContext) => Effect.sync(() => { eventTelemetry = telemetryContext; }))))).pipe(Layer.provideMerge(Layer.succeedContext(captured)), Layer.provideMerge(Layer.succeedContext(built.context)))), Effect.runPromiseExit);
+     }, 
+     // A failed instance build reaches callers as a defect exit so the RPC
+     // path can envelope-encode it like any other handler defect.
+@@ -46,13 +47,13 @@ export const processEvent = (build, { makeEffect, services, waitUntil, onExit })
+         event.holdScope();
+         return onExit(exit, event.lifetime);
+     })
+-        .finally(() => waitUntil(
+-    // The HttpMiddleware tracer ends the request's root span in a
+-    // dispatcher task scheduled after the handler effect resolves.
+-    // Yield one macrotask before closing the scope so that span
+-    // reaches the telemetry exporter's buffer before the scope's
+-    // flush finalizer runs.
+-    new Promise((resolve) => setTimeout(resolve, 0)).then(() => Effect.runPromise(Scope.close(scope, Exit.void)))));
++        .finally(() =>
++    // cf-slatedb patch: yield one macrotask for the HttpMiddleware tracer's
++    // late root span, flush the event's telemetry before the event settles,
++    // then close the scope into `waitUntil` as before.
++    new Promise((resolve) => setTimeout(resolve, 0))
++        .then(() => eventTelemetry === undefined ? undefined : Effect.runPromise(flushEventTelemetry(eventTelemetry)))
++        .then(() => waitUntil(Effect.runPromise(Scope.close(scope, Exit.void)))));
+ };
+ /**
+  * Normalize an RPC dispatcher's return value into the effect the bridge
