@@ -24,6 +24,14 @@ in order.
   `Cloudflare.state({ accountId })` (the account's default state store, pinned to Dillon's account)
   for every live stage. `isLocalLsmStage` (lsm-cloudflare) is now the one local-stage rule, shared
   with the telemetry flush policy. `vp run dev` still runs offline. D43.
+- **2. Preview deployment tool.** `tools/preview-cli`: `deploy <stage> [--dev-timings]` (through
+  the new `deploy:preview-<n>` tasks; production settings by default), `status`, `url <stage>`,
+  `token <stage>`, `destroy-command <stage>`, all with `--json`. Outputs and the access token are
+  read from the Cloudflare state store (`state:read` task), so any machine sees the same previews
+  (D45). Added before the first live deploy: live stages gate the API, shard router, GC operator
+  API, and probe with a per-stage bearer token (D44); the GC operator API gets a `workers.dev` URL
+  on live stages only. **Live:** `preview-1` deployed (44 s, 9 resources), redeployed in place
+  (no-op), answers `401` without the token, and created a database and returned its status with it.
 
 ## Done
 

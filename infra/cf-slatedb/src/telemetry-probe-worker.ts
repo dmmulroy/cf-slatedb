@@ -1,5 +1,9 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
-import { eventTelemetryFlushForStage, lsmTelemetryLayer } from "@cf-slatedb/lsm-cloudflare";
+import {
+  eventTelemetryFlushForStage,
+  lsmAccessGateForStage,
+  lsmTelemetryLayer,
+} from "@cf-slatedb/lsm-cloudflare";
 import type { HttpEffect } from "alchemy/Http";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Effect } from "effect";
@@ -57,19 +61,21 @@ export const telemetryProbeWorkerLayer = TelemetryProbeWorker.make(
   Effect.gen(function* () {
     const namespace = yield* TelemetryProbeServer;
     const withEventTelemetryFlush = yield* eventTelemetryFlushForStage;
+    const withAccessGate = yield* lsmAccessGateForStage;
     return {
-      fetch: Effect.gen(function* () {
-        const request = yield* HttpServerRequest.HttpServerRequest;
-        const client = Cloudflare.toHttpClient(namespace.getByName("probe"));
-        const path = request.url.endsWith("/alarm") ? "/alarm" : "/";
-        const response = yield* client.execute(HttpClientRequest.get(`http://probe${path}`));
-        return HttpServerResponse.text(`worker-saw:${yield* response.text}`);
-      }).pipe(
-        Effect.catchCause(() =>
-          Effect.succeed(HttpServerResponse.text("probe-failed", { status: 500 })),
+      fetch: withAccessGate(
+        Effect.gen(function* () {
+          const request = yield* HttpServerRequest.HttpServerRequest;
+          const client = Cloudflare.toHttpClient(namespace.getByName("probe"));
+          const path = request.url.endsWith("/alarm") ? "/alarm" : "/";
+          const response = yield* client.execute(HttpClientRequest.get(`http://probe${path}`));
+          return HttpServerResponse.text(`worker-saw:${yield* response.text}`);
+        }).pipe(
+          Effect.catchCause(() =>
+            Effect.succeed(HttpServerResponse.text("probe-failed", { status: 500 })),
+          ),
         ),
-        withEventTelemetryFlush,
-      ),
+      ).pipe(withEventTelemetryFlush),
     };
   }).pipe(
     Effect.provide(telemetryProbeServerLayer),

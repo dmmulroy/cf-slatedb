@@ -31,9 +31,9 @@ const CfSlatedbStack = Alchemy.Stack(
   "CfSlatedb",
   { providers: Cloudflare.providers(), state: cfSlatedbStateLayer },
   Effect.gen(function* () {
-    yield* BlockServerWorker;
+    const blocks = yield* BlockServerWorker;
     yield* CompactorWorker;
-    yield* GcWorker;
+    const gc = yield* GcWorker;
     const api = yield* DbApiWorker;
     const shards = yield* ShardRouterWorker;
     const probe = yield* TelemetryProbeWorker;
@@ -42,6 +42,13 @@ const CfSlatedbStack = Alchemy.Stack(
       apiUrl: api.url,
       /** URL of the sharded API (the sharding package's example Worker). */
       shardsUrl: shards.url,
+      /** URL of the GC operator API: the dev port locally, workers.dev on live stages. */
+      gcUrl: gc.url,
+      /**
+       * Physical name of the `BlockServer` Worker. It has no URL: only the API Worker reaches it, over
+       * a service binding, behind Workers Cache.
+       */
+      blockServerWorkerName: blocks.workerName,
       /** URL of the telemetry probe Worker. */
       probeUrl: probe.url,
     };

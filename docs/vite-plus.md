@@ -9,7 +9,7 @@ Vite+ owns repository checks and workspace task execution. The root `vite.config
 - `infra/*` contains independent composition roots, one Alchemy Stack each. They declare no
   `exports` and never depend on each other.
 - `tools/*` contains repository tooling that nothing imports: `tools/trace-cli`,
-  `tools/scenario-cli`, `tools/formal-verification`, `tools/traits` (the Traits configuration the
+  `tools/scenario-cli`, `tools/preview-cli`, `tools/formal-verification`, `tools/traits` (the Traits configuration the
   root `traits.ts` re-exports), and `tools/workspace-boundaries` (the test that enforces these
   rules).
 - Declare every import edge in the importing workspace's `package.json`.
@@ -25,5 +25,8 @@ Cross-workspace infrastructure prerequisites belong in `dependsOn`. An exact `pa
 selector resolves without a `package.json` dependency on that package.
 
 Local first: `vp run dev` runs the Stack under Alchemy's local providers (stage `dev`, local R2,
-Durable Objects, and Workflows). Every task that plans against or changes a live Cloudflare stage
-needs Dillon's approval before it runs, and none of them is reachable from `vp run ready`.
+Durable Objects, and Workflows). `@cf-slatedb/infra#deploy:preview-<n>` deploys one of the three
+approved preview stages (use `tools/preview-cli`); `@cf-slatedb/infra#destroy:preview-<n>` is run
+only by Dillon; `@cf-slatedb/infra#state:read` reads the Cloudflare state store. Every other task
+that plans against or changes a live Cloudflare stage needs Dillon's approval before it runs, and
+none of them is reachable from `vp run ready`.

@@ -4,6 +4,7 @@ import {
   DatabaseLifecycle,
   dbServicesLayer,
   eventTelemetryFlushForStage,
+  lsmAccessGateForStage,
   lsmHttpServerLayer,
   lsmTelemetryLayer,
 } from "@cf-slatedb/lsm-cloudflare";
@@ -278,6 +279,7 @@ export const shardRouterWorkerLayer = (options: ShardRouterWorkerOptions) =>
     Effect.gen(function* () {
       yield* ShardDirectoryServer;
       const withEventTelemetryFlush = yield* eventTelemetryFlushForStage;
+      const withAccessGate = yield* lsmAccessGateForStage;
       const context = yield* Effect.context<
         ShardRouter | ShardSplit | ShardDirectory | DatabaseLifecycle
       >();
@@ -287,7 +289,7 @@ export const shardRouterWorkerLayer = (options: ShardRouterWorkerOptions) =>
           shardedHttpRouterLayer.pipe(Layer.provide(Layer.succeedContext(context))),
         ),
       );
-      return { fetch: withEventTelemetryFlush(Effect.flatten(router)) };
+      return { fetch: withEventTelemetryFlush(withAccessGate(Effect.flatten(router))) };
     }).pipe(
       Effect.provide(
         Layer.mergeAll(

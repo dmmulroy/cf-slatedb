@@ -1,4 +1,5 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
+import * as Alchemy from "alchemy";
 import type { HttpEffect } from "alchemy/Http";
 import { makeExecutionMemo } from "alchemy/Runtime/ExecutionMemo";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
@@ -8,8 +9,10 @@ import { HttpApiBuilder } from "effect/http-api";
 
 import { GarbageCollector, garbageCollectorLayerWithoutDependencies } from "./garbage-collector.ts";
 import { GcHttpApi } from "./gc-http-api.ts";
+import { lsmAccessGateForStage } from "./lsm-access-gate.ts";
 import { lsmConfigurationLayer } from "./lsm-configuration.ts";
 import { lsmHttpServerLayer } from "./lsm-http-server.ts";
+import { isLocalLsmStage } from "./lsm-stage.ts";
 import { eventTelemetryFlushForStage, lsmTelemetryLayer } from "./lsm-telemetry.ts";
 import { objectStoreLayer } from "./object-store.ts";
 
@@ -43,7 +46,8 @@ export interface GcWorkerOptions {
 
 /**
  * Collects every database on a cron schedule (design §2, "GC cron Worker"); its HTTP API lets an
- * operator collect one database now. No `workers.dev` URL.
+ * operator collect one database now. On live stages the API has a `workers.dev` URL behind the
+ * stage's access token; local stages serve it on the dev port.
  */
 export class GcWorker extends Cloudflare.Worker<
   GcWorker,
@@ -53,15 +57,20 @@ export class GcWorker extends Cloudflare.Worker<
 /** Builds the GC Worker: the bucket bound read-write, the cron trigger, and the operator API. */
 export const gcWorkerLayer = (options: GcWorkerOptions) =>
   GcWorker.make(
-    {
-      main: options.main,
-      workersDev: false,
-      compatibility: { date: "2026-10-15" },
-      dev: { host: "127.0.0.1", port: options.devPort },
-    },
+    Effect.gen(function* () {
+      const stage = yield* Alchemy.Stage;
+      return {
+        main: options.main,
+        // Live stages reach the operator API over workers.dev, behind the access token.
+        workersDev: !isLocalLsmStage(stage),
+        compatibility: { date: "2026-10-15" },
+        dev: { host: "127.0.0.1", port: options.devPort },
+      };
+    }),
     Effect.gen(function* () {
       const collector = yield* GarbageCollector;
       const withEventTelemetryFlush = yield* eventTelemetryFlushForStage;
+      const withAccessGate = yield* lsmAccessGateForStage;
       yield* Cloudflare.Workers.cron(options.schedule, () =>
         withEventTelemetryFlush(collector.collectAll),
       );
@@ -70,7 +79,7 @@ export const gcWorkerLayer = (options: GcWorkerOptions) =>
           gcHttpRouterLayer.pipe(Layer.provide(Layer.succeed(GarbageCollector, collector))),
         ),
       );
-      return { fetch: withEventTelemetryFlush(Effect.flatten(router)) };
+      return { fetch: withEventTelemetryFlush(withAccessGate(Effect.flatten(router))) };
     }).pipe(
       Effect.provide(Cloudflare.Workers.CronEventSourceLive),
       Effect.provide(garbageCollectorLayerWithoutDependencies),

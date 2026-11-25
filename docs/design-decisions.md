@@ -451,3 +451,40 @@ that reaches several accounts can never read or write this Stack's state elsewhe
 account's default `alchemy-state-store` Worker rather than a dedicated one: the Stack name
 (`CfSlatedb`) and stage already key its records apart from other projects', and a second store would
 add a second Worker and secret pair to the account for no isolation gain.
+
+## D44. Live stages gate their public Workers with a per-stage access token
+
+On a live stage the API Worker, the shard router, the GC operator API, and the telemetry probe have
+public `workers.dev` URLs, and the design leaves authorization to callers ("Callers authorize access
+to the database before they fetch"). An ungated preview would be a public, writable database API.
+So every live stage generates one access token (`LsmAccessToken`, an Alchemy `Random` of 256 bits,
+created once and kept in the stage's state, so it survives redeploys and every machine reads the
+same value) and binds it to those Workers as a secret (`CF_SLATEDB_ACCESS_TOKEN`).
+`lsmAccessGateForStage` (`lsm-access-gate.ts`) wraps each `fetch` handler: a request without
+`Authorization: Bearer <token>` gets `401` with `WWW-Authenticate: Bearer` and a JSON body
+(`code: "Unauthenticated"`, `requestId`, `retryable: false`). The comparison's time depends only on
+the token's length.
+
+The gate stands in for Cloudflare Access and, like Access, rejects before the API contract, so its
+`401` is not one of `DbHttpApi`'s declared errors (docs/errors.md: "Infrastructure such as Cloudflare
+Access may reject a request before it reaches that application contract"). Local stages bind no
+token and pass every request through, so `vp run dev`, the workerd tests, and the scenario CLI's
+local runs are unchanged. `BlockServer` and the compactor keep `workersDev: false` and are reached
+only over bindings. The GC Worker gains a `workers.dev` URL on live stages only (behind the gate), so
+an operator or the scenario CLI can collect a database on demand; locally it stays on its dev port.
+
+## D45. The preview CLI drives Alchemy through vp tasks and reads outputs from state
+
+`tools/preview-cli` never calls the Alchemy CLI itself. `deploy <stage>` runs
+`vp run @cf-slatedb/infra#deploy:<stage>` (one explicit task per approved stage, so no stage name is
+ever interpolated into a deploy command) with the task's log on stderr, then reads the outputs back.
+`status`, `url`, and `token` read the Cloudflare state store through the read-only
+`@cf-slatedb/infra#state:read` task (`alchemy state read --backend cloudflare -r CfSlatedb[/<stage>]`)
+and parse the Stack output record (`CfSlatedb/<stage>/output`) and the token record; nothing is kept
+on the local machine, so they work wherever the account's Alchemy login does.
+
+A preview's engine settings are the production defaults. `deploy --dev-timings` binds `vp run dev`'s
+short GC and compactor timings (`CF_SLATEDB_LSM_SETTINGS`); the CLI drops any value of that variable
+inherited from the shell, so only the flag decides, and a later deploy without the flag restores the
+defaults. `destroy-command <stage>` prints `vp run @cf-slatedb/infra#destroy:<stage>` for Dillon;
+the deployment guard blocks agents from running `alchemy destroy`.

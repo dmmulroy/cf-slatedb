@@ -24,8 +24,8 @@ tenant concept.
   `ShardRouter`, `ShardSplit`) built only on the public APIs.
 - `infra/cf-slatedb` (`@cf-slatedb/infra`) — the Alchemy Stack: R2 bucket, Durable Objects, the
   `BlockServer` Worker, the API Worker, the compaction Workflow, and the GC cron Worker.
-- `tools/*` — the trace CLI, the scenario CLI, formal verification, Traits, and the workspace
-  boundary check.
+- `tools/*` — the trace CLI, the scenario CLI, the preview CLI, formal verification, Traits, and
+  the workspace boundary check.
 
 Progress, open questions, and the hand-off live in [`docs/progress.md`](docs/progress.md). Every
 judgment call the design did not make is in [`docs/design-decisions.md`](docs/design-decisions.md).
@@ -48,9 +48,16 @@ docs, RFCs, Rust source, and FizzBee specs when you implement the matching part.
 
 - **Local first.** Develop and test against `vp run dev` (Alchemy local providers, stage `dev`:
   local R2, Durable Objects, and Workflows). Workers Cache is not emulated locally.
-- **No live Cloudflare operations without Dillon's approval**: no live deploy, no plan against the
-  live account, no real-cloud test. Write the request under "Open questions" in
+- **Live deploys are approved for the reusable preview stages `preview-1`, `preview-2`, and
+  `preview-3` only**, through `tools/preview-cli` (`node tools/preview-cli/src/preview-cli.ts
+  deploy <stage>`), which runs the `deploy:preview-<n>` tasks. Redeploy a stage in place instead of
+  creating new ones. Never deploy `production` and never run `alchemy destroy` (the
+  `destroy:preview-<n>` tasks are for Dillon; `preview-cli destroy-command <stage>` prints them).
+  Any other live operation needs Dillon's approval: write the request under "Open questions" in
   `docs/progress.md` and keep working on anything not blocked.
+- Live stages keep Alchemy state in the account's Cloudflare state store (D43), and their public
+  Workers require the stage's access token (`Authorization: Bearer $(preview-cli token <stage>)`,
+  D44).
 - Run Alchemy through `vp run` tasks, never the Alchemy CLI directly. Shell commands containing
   Alchemy lifecycle verbs may be blocked by a local deployment guard.
 - Production names and retention follow the stage rules in `docs/coding-standards.md`

@@ -28,11 +28,14 @@ section and its tests are listed in [`coverage-matrix.md`](coverage-matrix.md).
 
 ## Real-cloud tests are opt-in
 
-Real-cloud end-to-end tests deploy a fresh Stack to a unique preview stage, run checks that need
-real Cloudflare (Workers Cache `Cf-Cache-Status: HIT`, R2 `If-None-Match: *` against real R2,
-Workflow limits), and destroy it. They are a separate task that **never runs without Dillon's
-approval**, is not reachable from `vp run ready`, and is never cached. Record every check that is
-waiting on a live run under "Open questions" in [`progress.md`](progress.md).
+Real-cloud checks run against one of the three reusable preview stages (`preview-1`, `preview-2`,
+`preview-3`), which are approved for live deploys. Deploy or redeploy a stage in place with
+`node tools/preview-cli/src/preview-cli.ts deploy <stage>` (add `--dev-timings` for `vp run dev`'s
+short GC and compactor timings; the default is the production settings, so measurements are
+honest), then run checks that need real Cloudflare: Workers Cache `Cf-Cache-Status: HIT`, R2
+`If-None-Match: *` against real R2, Workflow limits, and the scenarios. They are never reachable
+from `vp run ready` and never cached. Stages are reused, not destroyed; Dillon tears them down
+(`preview-cli destroy-command <stage>`).
 
 Never test against `production`, a developer's stage, or another run's stage.
 
@@ -94,6 +97,7 @@ vp run dev                           # the full Stack under alchemy dev (stage d
 node tools/trace-cli/src/trace-cli.ts serve       # OTLP receiver and trace store
 node tools/scenario-cli/src/scenario-cli.ts run all   # every scenario against the local Stack
 vp run verify                        # every formal check
+node tools/preview-cli/src/preview-cli.ts status   # what is deployed to each preview stage
 ```
 
 `vp run ready` is the validation gate. Report a command as passing only when its exit code was

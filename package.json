@@ -8,7 +8,8 @@
     "dev": "vp run @cf-slatedb/infra#dev",
     "verify": "vp run @cf-slatedb/tools-formal-verification#verify",
     "trace": "node tools/trace-cli/src/trace-cli.ts",
-    "scenario": "node tools/scenario-cli/src/scenario-cli.ts"
+    "scenario": "node tools/scenario-cli/src/scenario-cli.ts",
+    "preview": "node tools/preview-cli/src/preview-cli.ts"
   },
   "devDependencies": {
     "@types/node": "catalog:",

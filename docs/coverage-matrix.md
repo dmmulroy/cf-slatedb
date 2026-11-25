@@ -213,6 +213,16 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   (`infra/cf-slatedb/src/cf-slatedb-stage.ts`): local state for `dev`/`test`/`local` stages,
   the account's Cloudflare state store (pinned account) for previews and production. Test:
   `infra/cf-slatedb/src/cf-slatedb-stage.test.ts`; `vp run dev` still runs offline. D43.
+- **Preview deployment tool** — done. `tools/preview-cli` (`deploy`, `status`, `url`, `token`,
+  `destroy-command`; `--json`; `--dev-timings`), tasks `deploy:preview-<n>`, `destroy:preview-<n>`
+  (Dillon only), `state:read` (`infra/cf-slatedb/vite.config.ts`). Test:
+  `tools/preview-cli/src/preview-stage.test.ts` (state parsing, outputs, token, destroy command).
+  Live: `preview-1` deployed and redeployed in place (no-op), `status`/`url`/`token` read the
+  Cloudflare state store. D45.
+- **Access gate on live stages' public Workers** — done. `lsm-access-gate.ts`
+  (`LsmAccessToken`, `lsmAccessGateForStage`), applied by `db-api-worker.ts`, `gc-worker.ts`,
+  `shard-router-worker.ts`, and the telemetry probe. Test: `lsm-access-gate.test.ts`. Live:
+  `preview-1` answers `401` without the token and serves the API with it. D44.
 - **Layout `packages/lsm-core`, `packages/lsm-cloudflare`, `packages/lsm-sharding`,
   `infra/cf-slatedb`** — done. Enforced by `tools/workspace-boundaries` (D1, D2).
 

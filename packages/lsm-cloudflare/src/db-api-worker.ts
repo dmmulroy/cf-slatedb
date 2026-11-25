@@ -18,6 +18,7 @@ import { blockSourceLayer } from "./block-source.ts";
 import { DbClient, dbClientLayerWithoutDependencies } from "./db-client.ts";
 import { dbHttpRouterLayer } from "./db-http-handlers.ts";
 import { dbReaderLayer } from "./db-reader.ts";
+import { lsmAccessGateForStage } from "./lsm-access-gate.ts";
 import { lsmConfigurationLayer } from "./lsm-configuration.ts";
 import { eventTelemetryFlushForStage, lsmTelemetryLayer } from "./lsm-telemetry.ts";
 import { ManifestReader, manifestReaderLayerWithoutDependencies } from "./manifest-reader.ts";
@@ -53,7 +54,8 @@ export class DbApiWorker extends Cloudflare.Worker<
 /**
  * Builds the API Worker: binds the LSM bucket read-write and the `BlockServer` service, hosts
  * `WriterServer`, and serves the public API. Reads run here, in the caller's isolate; writes and
- * `Latest` probes go to the writer.
+ * `Latest` probes go to the writer. On live stages every request needs the stage's access token
+ * (`lsmAccessGateForStage`).
  */
 export const dbApiWorkerLayer = (options: DbApiWorkerOptions) =>
   DbApiWorker.make(
@@ -65,6 +67,7 @@ export const dbApiWorkerLayer = (options: DbApiWorkerOptions) =>
     Effect.gen(function* () {
       yield* WriterServer;
       const withEventTelemetryFlush = yield* eventTelemetryFlushForStage;
+      const withAccessGate = yield* lsmAccessGateForStage;
       const writer = yield* WriterClient;
       const lifecycle = yield* DatabaseLifecycle;
       const client = yield* DbClient;
@@ -82,7 +85,7 @@ export const dbApiWorkerLayer = (options: DbApiWorkerOptions) =>
           ),
         ),
       );
-      return { fetch: withEventTelemetryFlush(Effect.flatten(router)) };
+      return { fetch: withEventTelemetryFlush(withAccessGate(Effect.flatten(router))) };
     }).pipe(
       // Built once per isolate: the reader's manifest cache and L1 block cache, the lifecycle, and
       // the writer and compactor clients they share.

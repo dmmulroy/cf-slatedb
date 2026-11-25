@@ -3,6 +3,7 @@ export * from "./db-api-worker.ts";
 export * from "./db-http-api.ts";
 export * from "./db-public-error.ts";
 export * from "./db-writer.ts";
+export * from "./lsm-access-gate.ts";
 export * from "./lsm-bucket.ts";
 export * from "./lsm-configuration.ts";
 export * from "./lsm-errors.ts";
