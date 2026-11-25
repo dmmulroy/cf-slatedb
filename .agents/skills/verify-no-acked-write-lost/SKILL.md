@@ -72,9 +72,18 @@ them. The `nonAtomicProbe` variant reproduces it.
   models), multi-page scans (the reader uses the largest `flushedSeq` across pages; same argument
   per page).
 
+## Maintenance notes
+
+- Checked against `3226177` (Phases 5–7). A flush whose commit is refused below GC's boundary
+  fails before the truncate, leaving the rows in SQLite (the same as a crash between upload and
+  commit). Flushes now wake the compactor after the truncate (no state change). `DbWriter.destroy`
+  deletes the memtable and `ensureReady` reports a removed database as not found: both run only
+  after `markRemoved` fenced the database for removal, whose purpose is to delete its data (design
+  §12, decision D39), so removal is outside this check.
+
 ## Keeping it in step with the code
 
-Sync commit: `e03f7c8`. When a covered function changes after it, update the model so
+Sync commit: `3226177`. When a covered function changes after it, update the model so
 each action is still one awaited effect in the code, rerun, and show each invariant still fails on a
 broken variant before moving the sync commit. For drift that skipped this skill, use
 `.agents/skills/maintain-formal-verification-skill/SKILL.md`.

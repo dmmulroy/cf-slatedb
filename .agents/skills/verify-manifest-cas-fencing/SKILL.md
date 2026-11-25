@@ -86,9 +86,19 @@ stale writer", "serializes concurrent edits", "writes nothing for an already-app
 - Broken variants (`Broken` constant): `noWriterEpochCheck` → `NoStaleCommit`; `blindCreate` →
   `CreateOnce`; `noInputsCheck` → `AckedDataVisible` (race config).
 
+## Maintenance notes
+
+- Checked against `3226177` (Phases 4–7). `commitL0Flush` and `commitCompaction` gained refusals
+  (`SstBelowGcBoundaryError`, sealed, removed) that only turn commits into failures; seal and removal
+  increment `writerEpoch` like a fence. `ManifestStore.create` re-reads `gc/manifest.boundary` after
+  create-if-absent and reports a conflict at or below it: that path needs GC to have deleted
+  manifests, which this model does not include (no manifest is ever deleted here); it is checked by
+  `manifest-store.test.ts` and assumed by `verify-gc-safety`. Checkpoint, GC-boundary, and
+  fork-release edits change no field this model reads.
+
 ## Keeping it in step with the code
 
-Sync commit: `5985e4b` (the model was last confirmed to describe the code at this
+Sync commit: `3226177` (the model was last confirmed to describe the code at this
 commit). When a covered file changed after it, diff it, update the model so each step still maps
 to one awaited effect in the code, rerun, and show the affected invariant still fails on a broken
 variant. Move the sync commit forward only after confirming the model describes the code at the

@@ -78,9 +78,18 @@ moment ago counted as old and its SSTs could be deleted under a reader. `ownUplo
 - Clocks: GC's clock and the writers' ULID clocks are one clock here; skew beyond `gcMinAge` is not
   modeled (as in SlateDB RFC 0029).
 
+## Maintenance notes
+
+- Checked against `3226177` (Phase 7). `collect` now sweeps a `db/<id>/` prefix that has no
+  manifest (objects older than `gcMinAge`): outside this one-database model. It relies on creation
+  writing the first manifest before any other object and removal deleting manifests last, so such a
+  prefix is only a removed database's leftovers; `garbage-collector.test.ts` covers it. Fork holds
+  are pins here (`Pin`/`Unpin`); a fork releases its hold only once no manifest it keeps reads the
+  source (`releasableExternalRefs`), and removal is refused while holds exist (`markRemoved`).
+
 ## Keeping it in step with the code
 
-Sync commit: `2ae428b`. When a covered function changes after it, update the model
+Sync commit: `3226177`. When a covered function changes after it, update the model
 so each action is still one awaited effect in the code, rerun, and show each invariant still fails on
 a broken variant before moving the sync commit. For drift that skipped this skill, use
 `.agents/skills/maintain-formal-verification-skill/SKILL.md`.
