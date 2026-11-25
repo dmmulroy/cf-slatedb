@@ -2,7 +2,7 @@
 
 ## Current phase
 
-Phase 2: lsm-core (starting). Phase 3 (object storage and manifests) will overlap.
+Phase 3: object storage and manifests (starting). Phase 2 (lsm-core) is done.
 
 ## Done
 
@@ -34,14 +34,24 @@ Phase 2: lsm-core (starting). Phase 3 (object storage and manifests) will overla
     `alchemy dev`; verified with the trace CLI (Worker → DO span nesting, alarm span,
     `assert` pass/fail exit codes).
   - `@cf-slatedb/lsm-cloudflare` `test` now runs unit tests and the workerd suite (`--mode workerd`).
+- **Phase 2 — lsm-core.** Branded ids (`DatabaseId`, `SeqNum`, `SstId` ULID, `ManifestId`,
+  writer/compactor epochs, `SortedRunId`, `CheckpointId`, `Timestamp`), `KeyRange`, `Row`/`RowValue`
+  (`Data.TaggedEnum`), key order via `Bytes.Order` (key asc, seq desc), CRC32C, Bloom filter
+  (hash-pair builder), byte codec (varints), data block codec (SlateDB V2 rows, restart every 16,
+  CRC32C), SST builder (streaming blocks) and metadata reader, k-way merge iterator over `Pull`
+  with a private heap (drops exact duplicates), merge operators (`Concat`, `U64Add`), read
+  resolution (snapshot, TTL, merge) and compaction retention, `Manifest` v1 with pure idempotent
+  edits (flush, compaction, fencing, seal, checkpoints, fork, changelog), size-tiered scheduler,
+  `LsmSettings`, ULIDs. 24 tests, including properties against a `Map` oracle; each property was
+  shown failing on a deliberately broken variant (TTL, restart seek, dedup, retention, scheduler
+  destination). Decisions D8–D16.
 - `vp run ready` passes.
 
 ## Next
 
-- Phase 2: `lsm-core` — ids, `Row`/`RowValue`, key order, CRC32C, Bloom filter, varint, block
-  codec, SST builder/reader, merge iterator, `Manifest` v1 schema and edits, size-tiered
-  scheduler, property tests against a `Map` oracle.
-- Phase 3: `ObjectStore`, `ManifestStore`, `ManifestCache`, epoch fencing.
+- Phase 3: `ObjectStore` (R2 adapter + faithful in-memory layer with create-if-absent),
+  `ManifestStore` (CAS retry, `manifest/LATEST` hint, probe `id+1`), `ManifestCache`, epoch
+  fencing, and the first TLA+ model (manifest CAS + fencing).
 
 ## Findings
 

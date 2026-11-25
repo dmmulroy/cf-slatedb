@@ -1,0 +1,584 @@
+import { Data, Option, Result, Schema } from "effect";
+
+import {
+  CheckpointId,
+  CompactorEpoch,
+  DatabaseId,
+  ManifestId,
+  SeqNum,
+  SortedRunId,
+  SstId,
+  Timestamp,
+  WriterEpoch,
+} from "./ids.ts";
+import {
+  intersectKeyRanges,
+  KeyRange,
+  keyRangeOverlapsClosed,
+  FULL_KEY_RANGE,
+} from "./key-range.ts";
+import { MergeOperatorName } from "./row-resolution.ts";
+import type { SstInfo } from "./sst-codec.ts";
+
+/**
+ * Schema for a reference to one SST as the manifest records it.
+ *
+ * **Details**
+ *
+ * `metaOffset` and `metaLength` locate the metadata section, so one cacheable request opens the SST.
+ * After a fork, `owner` names the database whose `db/<owner>/` prefix stores the SST and `view`
+ * limits the keys this database reads from it; both are none for the database's own SSTs.
+ */
+export const SstHandle = Schema.Struct({
+  id: SstId,
+  firstKey: Schema.Uint8ArrayFromBase64,
+  lastKey: Schema.Uint8ArrayFromBase64,
+  sizeBytes: Schema.Int,
+  rowCount: Schema.Int,
+  metaOffset: Schema.Int,
+  metaLength: Schema.Int,
+  owner: Schema.OptionFromNullOr(DatabaseId),
+  view: Schema.OptionFromNullOr(KeyRange),
+});
+
+/** A reference to one SST. */
+export type SstHandle = typeof SstHandle.Type;
+
+/** Builds the handle of a database's own new SST from its id and {@link SstInfo}. */
+export const sstHandleFromInfo = (id: SstId, info: SstInfo): SstHandle => ({
+  id,
+  firstKey: info.footer.firstKey,
+  lastKey: info.footer.lastKey,
+  sizeBytes: info.sizeBytes,
+  rowCount: info.footer.rowCount,
+  metaOffset: info.metaOffset,
+  metaLength: info.metaLength,
+  owner: Option.none(),
+  view: Option.none(),
+});
+
+/** The key range a handle exposes: its view, or every key. */
+export const sstHandleVisibleRange = (handle: SstHandle): KeyRange =>
+  Option.getOrElse(handle.view, () => FULL_KEY_RANGE);
+
+/** The database that stores an SST: its owner after a fork, else `self`. */
+export const sstHandleOwner = (handle: SstHandle, self: DatabaseId): DatabaseId =>
+  Option.getOrElse(handle.owner, () => self);
+
+/** Schema for a sorted run: non-overlapping SSTs in key order. Higher ids hold newer data. */
+export const SortedRun = Schema.Struct({ id: SortedRunId, ssts: Schema.Array(SstHandle) });
+
+/** A sorted run. */
+export type SortedRun = typeof SortedRun.Type;
+
+/**
+ * Schema for a checkpoint: a pin on one manifest so GC keeps every SST it references.
+ *
+ * **Details**
+ *
+ * `holder` names the fork that holds the checkpoint on this (its source) database; such checkpoints
+ * have no expiry and are released by the fork once compaction has rewritten every SST it reads from
+ * here.
+ */
+export const Checkpoint = Schema.Struct({
+  id: CheckpointId,
+  manifestId: ManifestId,
+  createdAt: Timestamp,
+  expireAt: Schema.OptionFromNullOr(Timestamp),
+  holder: Schema.OptionFromNullOr(DatabaseId),
+  name: Schema.OptionFromNullOr(Schema.String),
+});
+
+/** A checkpoint. */
+export type Checkpoint = typeof Checkpoint.Type;
+
+/** Schema for a fork's dependency on a checkpoint it holds in its source database. */
+export const ExternalRef = Schema.Struct({ owner: DatabaseId, checkpointId: CheckpointId });
+
+/** A fork's dependency on a checkpoint in its source database. */
+export type ExternalRef = typeof ExternalRef.Type;
+
+/** Schema for a database's lifecycle state: open, or sealed with the databases that replace it. */
+export const DatabaseState = Schema.Union([
+  Schema.TaggedStruct("Open", {}),
+  Schema.TaggedStruct("Sealed", { successors: Schema.Array(DatabaseId) }),
+]);
+
+/** A database's lifecycle state. */
+export type DatabaseState = typeof DatabaseState.Type;
+
+/** Schema for one changelog SST exported by a flush (change data capture). */
+export const ChangelogEntry = Schema.Struct({
+  sst: SstHandle,
+  firstSeq: SeqNum,
+  lastSeq: SeqNum,
+  createdAt: Timestamp,
+});
+
+/** One changelog SST. */
+export type ChangelogEntry = typeof ChangelogEntry.Type;
+
+/**
+ * Schema for the options a database is created with; readers, writers, and compactors all read
+ * them from the manifest.
+ */
+export const DatabaseOptions = Schema.Struct({
+  /** Merge operator that resolves merge operands; none makes merge rows unreadable. */
+  mergeOperator: Schema.OptionFromNullOr(MergeOperatorName),
+  /** Group for fair compaction and cache budgets; defaults to the database id. */
+  budgetGroup: Schema.OptionFromNullOr(Schema.String),
+  /** Data residency for the writer and compactor Durable Objects; a fork inherits its source's. */
+  jurisdiction: Schema.OptionFromNullOr(Schema.Literals(["eu", "fedramp"])),
+  /** Changelog export: none disables it; retention is how long GC keeps changelog SSTs. */
+  changelog: Schema.OptionFromNullOr(Schema.Struct({ retentionMs: Schema.Int })),
+});
+
+/** The options a database is created with. */
+export type DatabaseOptions = typeof DatabaseOptions.Type;
+
+/** Default options: no merge operator, budget group = database id, no residency, no changelog. */
+export const DEFAULT_DATABASE_OPTIONS: DatabaseOptions = {
+  mergeOperator: Option.none(),
+  budgetGroup: Option.none(),
+  jurisdiction: Option.none(),
+  changelog: Option.none(),
+};
+
+/**
+ * A database's manifest: the complete, immutable description of one version of the LSM.
+ *
+ * **Details**
+ *
+ * Stored as `db/<id>/manifest/<manifestId>` with create-if-absent, so each id is written once.
+ * `l0` is newest first and may overlap; `sortedRuns` is ordered by id descending (newest first).
+ * `lastL0Seq` is the newest sequence number in L0 or below; `lastL0ClockTick` seeds the writer's
+ * monotonic clock. Lifecycle primitives (`keyRange`, `state`, `externalRefs`, fork `checkpoints`) are
+ * part of v1.
+ */
+export class Manifest extends Schema.Class<Manifest>("Manifest")({
+  databaseId: DatabaseId,
+  writerEpoch: WriterEpoch,
+  compactorEpoch: CompactorEpoch,
+  lastL0Seq: SeqNum,
+  lastL0ClockTick: Timestamp,
+  l0: Schema.Array(SstHandle),
+  sortedRuns: Schema.Array(SortedRun),
+  checkpoints: Schema.Array(Checkpoint),
+  keyRange: Schema.OptionFromNullOr(KeyRange),
+  state: DatabaseState,
+  externalRefs: Schema.Array(ExternalRef),
+  changelog: Schema.Array(ChangelogEntry),
+  options: DatabaseOptions,
+}) {}
+
+/** Codec for a manifest object's body: JSON via `Schema.fromJsonString(Manifest)`. */
+export const ManifestJson = Schema.fromJsonString(Manifest);
+
+/**
+ * Builds the first manifest of a new database: empty LSM, epochs 0, open.
+ */
+export const initialManifest = (
+  databaseId: DatabaseId,
+  options: {
+    readonly keyRange: Option.Option<KeyRange>;
+    readonly databaseOptions: DatabaseOptions;
+  },
+): Manifest =>
+  new Manifest({
+    databaseId,
+    writerEpoch: WriterEpoch.make(0),
+    compactorEpoch: CompactorEpoch.make(0),
+    lastL0Seq: SeqNum.make(0),
+    lastL0ClockTick: Timestamp.make(0),
+    l0: [],
+    sortedRuns: [],
+    checkpoints: [],
+    keyRange: options.keyRange,
+    state: { _tag: "Open" },
+    externalRefs: [],
+    changelog: [],
+    options: options.databaseOptions,
+  });
+
+/** Every SST handle the manifest references: L0 newest first, then each sorted run. */
+export const manifestSstHandles = (manifest: Manifest): ReadonlyArray<SstHandle> => [
+  ...manifest.l0,
+  ...manifest.sortedRuns.flatMap((run) => run.ssts),
+];
+
+// ---------------------------------------------------------------------------------------------
+// Edit errors
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A writer tried to commit after a newer writer took over the database.
+ *
+ * **Details**
+ *
+ * Not retryable for this writer: it must stop. Its uploaded SSTs are orphans that GC removes.
+ */
+export class WriterFencedError extends Data.TaggedError("WriterFencedError")<{
+  readonly databaseId: DatabaseId;
+  readonly writerEpoch: WriterEpoch;
+  readonly currentWriterEpoch: WriterEpoch;
+  readonly message: string;
+}> {}
+
+/** A compactor tried to commit after a newer compactor took over the database. Not retryable. */
+export class CompactorFencedError extends Data.TaggedError("CompactorFencedError")<{
+  readonly databaseId: DatabaseId;
+  readonly compactorEpoch: CompactorEpoch;
+  readonly currentCompactorEpoch: CompactorEpoch;
+  readonly message: string;
+}> {}
+
+/**
+ * The database is sealed: it accepts no more writes. `successors` are the databases that replace it.
+ *
+ * **Details**
+ *
+ * Not retryable against this database; route the write to the successor whose key range holds it.
+ */
+export class DatabaseSealedError extends Data.TaggedError("DatabaseSealedError")<{
+  readonly databaseId: DatabaseId;
+  readonly successors: ReadonlyArray<DatabaseId>;
+  readonly message: string;
+}> {}
+
+/**
+ * A compaction's inputs are no longer what the manifest holds (another edit replaced them), so its
+ * output must not be committed. Discard the output; GC removes it.
+ */
+export class CompactionInputsChangedError extends Data.TaggedError("CompactionInputsChangedError")<{
+  readonly databaseId: DatabaseId;
+  readonly message: string;
+}> {}
+
+const writerFenced = (manifest: Manifest, writerEpoch: WriterEpoch) =>
+  new WriterFencedError({
+    databaseId: manifest.databaseId,
+    writerEpoch,
+    currentWriterEpoch: manifest.writerEpoch,
+    message: `Writer epoch ${writerEpoch} of database ${manifest.databaseId} was fenced by epoch ${manifest.writerEpoch}. This writer must stop; the newer writer serves the database.`,
+  });
+
+const databaseSealed = (manifest: Manifest, successors: ReadonlyArray<DatabaseId>) =>
+  new DatabaseSealedError({
+    databaseId: manifest.databaseId,
+    successors,
+    message: `Database ${manifest.databaseId} is sealed and accepts no writes${
+      successors.length > 0 ? `; its successors are ${successors.join(", ")}` : ""
+    }. Send the write to the successor whose key range holds the key.`,
+  });
+
+/** The successors of a sealed database, or none when it is open. */
+export const sealedSuccessors = (manifest: Manifest): Option.Option<ReadonlyArray<DatabaseId>> =>
+  manifest.state._tag === "Sealed" ? Option.some(manifest.state.successors) : Option.none();
+
+const withFields = (manifest: Manifest, fields: Partial<Manifest>): Manifest =>
+  new Manifest({
+    databaseId: fields.databaseId ?? manifest.databaseId,
+    writerEpoch: fields.writerEpoch ?? manifest.writerEpoch,
+    compactorEpoch: fields.compactorEpoch ?? manifest.compactorEpoch,
+    lastL0Seq: fields.lastL0Seq ?? manifest.lastL0Seq,
+    lastL0ClockTick: fields.lastL0ClockTick ?? manifest.lastL0ClockTick,
+    l0: fields.l0 ?? manifest.l0,
+    sortedRuns: fields.sortedRuns ?? manifest.sortedRuns,
+    checkpoints: fields.checkpoints ?? manifest.checkpoints,
+    keyRange: fields.keyRange ?? manifest.keyRange,
+    state: fields.state ?? manifest.state,
+    externalRefs: fields.externalRefs ?? manifest.externalRefs,
+    changelog: fields.changelog ?? manifest.changelog,
+    options: fields.options ?? manifest.options,
+  });
+
+// ---------------------------------------------------------------------------------------------
+// Edits: each is pure; returning the same `Manifest` instance means "already applied, write nothing".
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A new writer takes over: increments `writerEpoch`.
+ *
+ * @returns The fenced manifest, or `DatabaseSealedError` when the database is sealed (no writer may
+ *   start).
+ */
+export const fenceWriter = (manifest: Manifest): Result.Result<Manifest, DatabaseSealedError> =>
+  manifest.state._tag === "Sealed"
+    ? Result.fail(databaseSealed(manifest, manifest.state.successors))
+    : Result.succeed(
+        withFields(manifest, { writerEpoch: WriterEpoch.make(manifest.writerEpoch + 1) }),
+      );
+
+/** A new compactor takes over: increments `compactorEpoch`. */
+export const fenceCompactor = (manifest: Manifest): Manifest =>
+  withFields(manifest, { compactorEpoch: CompactorEpoch.make(manifest.compactorEpoch + 1) });
+
+/** One memtable flush to commit. */
+export interface L0Flush {
+  readonly writerEpoch: WriterEpoch;
+  readonly sst: SstHandle;
+  /** Newest sequence number in the flushed SST (the flush cut). */
+  readonly lastSeq: SeqNum;
+  /** Newest clock tick of the flushed rows. */
+  readonly clockTick: Timestamp;
+  readonly changelog: Option.Option<ChangelogEntry>;
+}
+
+/**
+ * Commits a memtable flush: prepends the SST to L0 and advances `lastL0Seq` (and appends the
+ * changelog entry, if any).
+ *
+ * @returns The new manifest; the same manifest when this SST is already in L0 (a retried commit
+ *   that had succeeded); `WriterFencedError` when another writer took over; or
+ *   `DatabaseSealedError` when the database was sealed.
+ */
+export const commitL0Flush = (
+  manifest: Manifest,
+  flush: L0Flush,
+): Result.Result<Manifest, WriterFencedError | DatabaseSealedError> => {
+  if (manifest.l0.some((sst) => sst.id === flush.sst.id)) return Result.succeed(manifest);
+  if (manifest.writerEpoch !== flush.writerEpoch)
+    return Result.fail(writerFenced(manifest, flush.writerEpoch));
+  if (manifest.state._tag === "Sealed")
+    return Result.fail(databaseSealed(manifest, manifest.state.successors));
+  return Result.succeed(
+    withFields(manifest, {
+      l0: [flush.sst, ...manifest.l0],
+      lastL0Seq: flush.lastSeq > manifest.lastL0Seq ? flush.lastSeq : manifest.lastL0Seq,
+      lastL0ClockTick:
+        flush.clockTick > manifest.lastL0ClockTick ? flush.clockTick : manifest.lastL0ClockTick,
+      changelog: [...manifest.changelog, ...Option.toArray(flush.changelog)],
+    }),
+  );
+};
+
+/** Schema for one compaction input: an L0 SST or a sorted run. */
+export const CompactionSource = Schema.Union([
+  Schema.TaggedStruct("L0", { sstId: SstId }),
+  Schema.TaggedStruct("SortedRun", { id: SortedRunId }),
+]);
+
+/** One compaction input. */
+export type CompactionSource = typeof CompactionSource.Type;
+
+/**
+ * Schema for a compaction job: merge `sources` into sorted run `destination`.
+ *
+ * **Details**
+ *
+ * `isBottom` is true when no data older than the sources exists, so deletes can be dropped.
+ */
+export const CompactionJob = Schema.Struct({
+  sources: Schema.Array(CompactionSource),
+  destination: SortedRunId,
+  isBottom: Schema.Boolean,
+});
+
+/** A compaction job. */
+export type CompactionJob = typeof CompactionJob.Type;
+
+/** A finished compaction to commit. */
+export interface CompactionCommit {
+  readonly compactorEpoch: CompactorEpoch;
+  readonly job: CompactionJob;
+  /** Output SSTs in key order; may be empty when every row was dropped. */
+  readonly outputs: ReadonlyArray<SstHandle>;
+}
+
+/**
+ * Commits a compaction: replaces exactly its input L0 SSTs and sorted runs with the destination
+ * sorted run.
+ *
+ * @returns The new manifest; the same manifest when the commit already happened; or
+ *   `CompactorFencedError` / `CompactionInputsChangedError` when the compactor was fenced or an input
+ *   is no longer in the manifest. The edit never merges into changed inputs.
+ */
+export const commitCompaction = (
+  manifest: Manifest,
+  commit: CompactionCommit,
+): Result.Result<Manifest, CompactorFencedError | CompactionInputsChangedError> => {
+  const l0Inputs = new Set(
+    commit.job.sources.flatMap((source) => (source._tag === "L0" ? [source.sstId] : [])),
+  );
+  const runInputs = new Set(
+    commit.job.sources.flatMap((source) => (source._tag === "SortedRun" ? [source.id] : [])),
+  );
+  const destination = manifest.sortedRuns.find((run) => run.id === commit.job.destination);
+  const alreadyApplied =
+    commit.outputs.length > 0 &&
+    destination !== undefined &&
+    destination.ssts.length === commit.outputs.length &&
+    destination.ssts.every((sst, index) => sst.id === commit.outputs[index]?.id) &&
+    !manifest.l0.some((sst) => l0Inputs.has(sst.id));
+  if (alreadyApplied) return Result.succeed(manifest);
+  if (manifest.compactorEpoch !== commit.compactorEpoch) {
+    return Result.fail(
+      new CompactorFencedError({
+        databaseId: manifest.databaseId,
+        compactorEpoch: commit.compactorEpoch,
+        currentCompactorEpoch: manifest.compactorEpoch,
+        message: `Compactor epoch ${commit.compactorEpoch} of database ${manifest.databaseId} was fenced by epoch ${manifest.compactorEpoch}. Discard this compaction's output; the newer compactor continues.`,
+      }),
+    );
+  }
+  const presentL0 = manifest.l0.filter((sst) => l0Inputs.has(sst.id)).length;
+  const presentRuns = manifest.sortedRuns.filter((run) => runInputs.has(run.id)).length;
+  if (presentL0 !== l0Inputs.size || presentRuns !== runInputs.size) {
+    return Result.fail(
+      new CompactionInputsChangedError({
+        databaseId: manifest.databaseId,
+        message: `A compaction of database ${manifest.databaseId} cannot commit because its inputs are no longer in the manifest. Its output is discarded; the scheduler plans again from the current manifest.`,
+      }),
+    );
+  }
+  const remainingRuns = manifest.sortedRuns.filter((run) => !runInputs.has(run.id));
+  const sortedRuns =
+    commit.outputs.length === 0
+      ? remainingRuns
+      : [...remainingRuns, { id: commit.job.destination, ssts: commit.outputs }].sort(
+          (left, right) => right.id - left.id,
+        );
+  return Result.succeed(
+    withFields(manifest, { l0: manifest.l0.filter((sst) => !l0Inputs.has(sst.id)), sortedRuns }),
+  );
+};
+
+/**
+ * Seals the database: no more writes; `successors` replace it. Also increments `writerEpoch`, which
+ * fences the current writer.
+ *
+ * @returns The sealed manifest, or the same manifest when it is already sealed with these successors.
+ */
+export const sealManifest = (
+  manifest: Manifest,
+  successors: ReadonlyArray<DatabaseId>,
+): Manifest =>
+  manifest.state._tag === "Sealed" &&
+  manifest.state.successors.length === successors.length &&
+  manifest.state.successors.every((id, index) => id === successors[index])
+    ? manifest
+    : withFields(manifest, {
+        state: { _tag: "Sealed", successors },
+        writerEpoch: WriterEpoch.make(manifest.writerEpoch + 1),
+      });
+
+/** Adds a checkpoint; the same manifest when a checkpoint with its id exists. */
+export const addCheckpoint = (manifest: Manifest, checkpoint: Checkpoint): Manifest =>
+  manifest.checkpoints.some((existing) => existing.id === checkpoint.id)
+    ? manifest
+    : withFields(manifest, { checkpoints: [...manifest.checkpoints, checkpoint] });
+
+/** Removes a checkpoint; the same manifest when it is absent. */
+export const removeCheckpoint = (manifest: Manifest, checkpointId: CheckpointId): Manifest =>
+  manifest.checkpoints.some((existing) => existing.id === checkpointId)
+    ? withFields(manifest, {
+        checkpoints: manifest.checkpoints.filter((existing) => existing.id !== checkpointId),
+      })
+    : manifest;
+
+/** Removes expired checkpoints (fork checkpoints never expire); the same manifest when none expired. */
+export const removeExpiredCheckpoints = (manifest: Manifest, now: Timestamp): Manifest => {
+  const live = manifest.checkpoints.filter(
+    (checkpoint) => Option.isNone(checkpoint.expireAt) || checkpoint.expireAt.value > now,
+  );
+  return live.length === manifest.checkpoints.length
+    ? manifest
+    : withFields(manifest, { checkpoints: live });
+};
+
+/** Removes a fork's external reference to `owner`'s checkpoint; the same manifest when absent. */
+export const removeExternalRef = (manifest: Manifest, ref: ExternalRef): Manifest =>
+  manifest.externalRefs.some(
+    (existing) => existing.owner === ref.owner && existing.checkpointId === ref.checkpointId,
+  )
+    ? withFields(manifest, {
+        externalRefs: manifest.externalRefs.filter(
+          (existing) =>
+            !(existing.owner === ref.owner && existing.checkpointId === ref.checkpointId),
+        ),
+      })
+    : manifest;
+
+/** Drops changelog entries created before `cutoff`; the same manifest when none are that old. */
+export const pruneChangelog = (manifest: Manifest, cutoff: Timestamp): Manifest => {
+  const kept = manifest.changelog.filter((entry) => entry.createdAt >= cutoff);
+  return kept.length === manifest.changelog.length
+    ? manifest
+    : withFields(manifest, { changelog: kept });
+};
+
+/**
+ * Restricts a source handle to `range` for a fork: the fork reads it under the owner's prefix and
+ * only inside the intersection.
+ *
+ * @returns The fork's handle, or none when the SST has no key in `range`.
+ */
+const forkHandle = (
+  handle: SstHandle,
+  source: DatabaseId,
+  range: KeyRange,
+): Option.Option<SstHandle> => {
+  if (!keyRangeOverlapsClosed(range, handle.firstKey, handle.lastKey)) return Option.none();
+  return Option.map(intersectKeyRanges(sstHandleVisibleRange(handle), range), (view) => ({
+    ...handle,
+    owner: Option.some(sstHandleOwner(handle, source)),
+    view: Option.some(view),
+  }));
+};
+
+/**
+ * Builds a fork's first manifest: the SSTs of `checkpointManifest` that overlap `range`, each as a
+ * view of the source's file, bounded to `range`, holding `checkpointId` in the source.
+ *
+ * **Details**
+ *
+ * Zero-copy: no SST is rewritten. The fork inherits the source's options and `lastL0Seq` (its
+ * sequence numbers continue from the source's), starts at epoch 0, and is open. A fork of a fork
+ * keeps each handle's original owner, but holds a checkpoint only on its direct source; the source
+ * keeps its own checkpoints on the original owners while any of its checkpoints (including the one
+ * this fork holds) still references their files (`docs/design-decisions.md`).
+ */
+export const forkManifest = (
+  checkpointManifest: Manifest,
+  fork: {
+    readonly databaseId: DatabaseId;
+    readonly checkpointId: CheckpointId;
+    readonly range: KeyRange;
+  },
+): Manifest => {
+  const source = checkpointManifest.databaseId;
+  const range = Option.match(checkpointManifest.keyRange, {
+    onNone: () => Option.some(fork.range),
+    onSome: (sourceRange) => intersectKeyRanges(sourceRange, fork.range),
+  });
+  const forkRange = Option.getOrElse(range, () => fork.range);
+  const restrict = (handles: ReadonlyArray<SstHandle>) =>
+    handles.flatMap((handle) => Option.toArray(forkHandle(handle, source, forkRange)));
+  return new Manifest({
+    databaseId: fork.databaseId,
+    writerEpoch: WriterEpoch.make(0),
+    compactorEpoch: CompactorEpoch.make(0),
+    lastL0Seq: checkpointManifest.lastL0Seq,
+    lastL0ClockTick: checkpointManifest.lastL0ClockTick,
+    l0: restrict(checkpointManifest.l0),
+    sortedRuns: checkpointManifest.sortedRuns
+      .map((run) => ({ id: run.id, ssts: restrict(run.ssts) }))
+      .filter((run) => run.ssts.length > 0),
+    checkpoints: [],
+    keyRange: Option.some(forkRange),
+    state: { _tag: "Open" },
+    externalRefs: [{ owner: source, checkpointId: fork.checkpointId }],
+    changelog: [],
+    options: checkpointManifest.options,
+  });
+};
+
+/** Owners other than the database itself whose SSTs the manifest still reads. */
+export const externalOwners = (manifest: Manifest): ReadonlySet<DatabaseId> => {
+  const owners = new Set<DatabaseId>();
+  for (const handle of manifestSstHandles(manifest)) {
+    if (Option.isSome(handle.owner) && handle.owner.value !== manifest.databaseId)
+      owners.add(handle.owner.value);
+  }
+  return owners;
+};

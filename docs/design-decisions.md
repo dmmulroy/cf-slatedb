@@ -87,3 +87,78 @@ because no live stage exists and `Cloudflare.state()` needs account credentials.
 Effect 4.1.4 names HTTP client and server spans by method (`GET`, `POST`) and distinguishes them by
 span kind (server 2, client 3). The trace CLI shows the kind next to the name, and trace assertions
 on HTTP spans match on name plus parent rather than on an `http.server` prefix.
+
+## D8. SST file layout details
+
+Design §6 lists `data blocks · bloom · index · stats · footer(JSON via Schema) · u64 metaOffset · u16
+version`. The implementation (`packages/lsm-core/src/sst-codec.ts`) keeps that order with three
+refinements:
+
+- The trailer is `footer length u32 · meta offset u64 · format version u16` (14 bytes). The footer
+  length lets a reader find the JSON footer inside the metadata section without a suffix probe.
+- The stats (puts, deletes, merges, key and value bytes, block count) live in the JSON footer rather
+  than in a separate binary section, since they are small and only read with the footer.
+- Each index entry stores the block's offset, length, first key, and last key, so point reads find
+  the first candidate block by its last key and scans can stop at a block's first key.
+
+Every data block and every metadata section ends with a CRC32C. Data block rows follow SlateDB's
+`SstRowCodecV2` (shared/unshared varints, restart every 16 rows), with a trailer of u32 restart
+offsets and their count. `SstHandle.metaOffset`/`metaLength` cover the whole metadata section, so
+opening an SST is one ranged read.
+
+## D9. Bloom filter hash
+
+"Double hashing over a single 64-bit hash" (§9) is implemented as two independently seeded 32-bit
+MurmurHash3 values (h1, h2|1) forming the 64-bit hash, probing `h1 + i·h2`. The builder keeps only
+the 8-byte hash pair per distinct key, not the keys, so a 64 MiB SST's filter needs little memory.
+
+## D10. TTL is enforced on reads
+
+SlateDB returns expired rows from reads and relies on compaction to delete them. cf-slatedb hides
+them: an expired value reads as a delete and an expired merge operand is skipped
+(`resolveVisibleRow`). Compaction applies SlateDB's rules (expired value → tombstone, expired operand
+dropped; `retainKeyVersions`), so reads before and after compaction agree (property-tested).
+
+## D11. Merge operators are named, built-in, and stored in the manifest
+
+Operators are code, so a database selects one by name in `DatabaseOptions.mergeOperator` (`Concat`
+or `U64Add`), which every reader, writer, and compactor reads from the manifest. Reading a merge
+operand without an operator fails with `MergeOperatorMissingError`; compaction without one keeps
+the operands unchanged rather than failing. Operands over a delete fold into a value (SlateDB:
+"Tombstone → Merge → Merge applies only the newer operands"); operands with no base in the inputs
+stay a single folded operand, because older levels may still hold a base.
+
+## D12. Manifest fields beyond the design's list
+
+`Manifest` has every v1 field from §6 plus `databaseId` (a manifest names its database, which
+guards against reading the wrong prefix), `changelog` (the §3 "changelog += log" entries), and
+`options` (`DatabaseOptions` from §12: merge operator, budget group, jurisdiction, changelog
+retention). `SstHandle` and `Checkpoint` follow §6 and §12; `Checkpoint.holder` marks fork
+checkpoints, which never expire.
+
+## D13. Forks of forks: transitive checkpoint retention
+
+`forkManifest` keeps each handle's original `owner` and holds a checkpoint only on its direct
+source. A source must therefore keep its own checkpoints on the original owners while any of its
+live checkpoints (including one a fork holds) still references their files, not only while its
+current manifest does. The release rule is implemented in Phase 7 and model-checked in the GC
+safety model.
+
+## D14. Manifest edits are pure and idempotent
+
+Every edit is `(Manifest) => Manifest` (or a `Result` with a typed error). Returning the same
+instance means "already applied": `ManifestStore.update` then writes nothing. This makes a retried
+CAS after an ambiguous failure safe (a flush whose SST is already in L0, a compaction whose output
+is already the destination run, a seal with the same successors).
+
+## D15. Scheduler details
+
+`planCompactions` follows SlateDB's size-tiered policy, with two simplifications: at most one L0
+compaction runs at a time (L0 jobs always take the oldest contiguous L0 SSTs, so a second one would
+have to wait anyway), and the backpressure checker is replaced by the writer's `l0MaxSsts` stall.
+A job's `isBottom` is true when no sorted run older than its destination exists.
+
+## D16. `byte-codec.ts` instead of `varint.ts`
+
+Varints live in `ByteWriter`/`ByteReader` (`packages/lsm-core/src/byte-codec.ts`) together with the
+fixed-width little-endian integers every codec needs, rather than in a separate `varint.ts`.
