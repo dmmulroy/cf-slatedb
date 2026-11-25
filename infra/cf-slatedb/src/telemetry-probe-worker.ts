@@ -1,5 +1,5 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
-import { lsmTelemetryLayer } from "@cf-slatedb/lsm-cloudflare";
+import { lsmTelemetryLayer, withEventTelemetryFlush } from "@cf-slatedb/lsm-cloudflare";
 import type { HttpEffect } from "alchemy/Http";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Effect } from "effect";
@@ -29,8 +29,9 @@ const telemetryProbeServerLayer = TelemetryProbeServer.make(
         const request = yield* HttpServerRequest.HttpServerRequest;
         if (request.url.endsWith("/alarm")) yield* state.storage.setAlarm(Date.now() + 50);
         return HttpServerResponse.text("probe-ok");
-      }).pipe(Effect.withSpan("TelemetryProbeServer.fetch")),
-      alarm: () => Effect.void.pipe(Effect.withSpan("TelemetryProbeServer.alarm")),
+      }).pipe(Effect.withSpan("TelemetryProbeServer.fetch"), withEventTelemetryFlush),
+      alarm: () =>
+        Effect.void.pipe(Effect.withSpan("TelemetryProbeServer.alarm"), withEventTelemetryFlush),
     });
   }),
 );
@@ -65,6 +66,7 @@ export const telemetryProbeWorkerLayer = TelemetryProbeWorker.make(
         Effect.catchCause(() =>
           Effect.succeed(HttpServerResponse.text("probe-failed", { status: 500 })),
         ),
+        withEventTelemetryFlush,
       ),
     };
   }).pipe(

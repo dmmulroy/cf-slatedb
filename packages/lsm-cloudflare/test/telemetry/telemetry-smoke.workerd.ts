@@ -14,6 +14,7 @@ interface CollectedSpanTopology {
   readonly name: string;
   /** OTLP span kind: 2 is a server span, 3 a client span. */
   readonly kind: number;
+  readonly traceId: string;
   readonly spanId: string;
   readonly parentSpanId?: string | undefined;
 }
@@ -28,6 +29,7 @@ const OtlpTopology = Schema.fromJsonString(
               Schema.Struct({
                 name: Schema.String,
                 kind: Schema.Number,
+                traceId: Schema.String,
                 spanId: Schema.String,
                 parentSpanId: Schema.optional(Schema.String),
               }),
@@ -96,41 +98,61 @@ const waitFor = (predicate: () => boolean) =>
   );
 
 test.provider(
-  "Worker and Durable Object fetch spans are exported before the event settles",
+  "handler spans are exported before the event settles, even when workerd stops right after",
   (stack) =>
     Effect.gen(function* () {
+      collector.observation.spans.length = 0;
       const deployed = yield* stack.deploy(telemetrySmokeStack);
       const client = yield* HttpClient.HttpClient;
       const response = yield* client.get(workerUrl(deployed.url));
       expect(yield* response.text).toBe("worker-saw:durable-object-ok");
 
-      // Tear workerd down as soon as the sole event settles: a bridge that flushes only inside
-      // `waitUntil` loses the delayed exports; one that flushes before settling does not.
+      // Tear workerd down as soon as the sole event settles. Alchemy's bridge exports only inside
+      // `waitUntil` after the event settles, and the collector answers after 500 ms, so only what
+      // `withEventTelemetryFlush` exported before the response survives.
       yield* stack.destroy();
       yield* waitFor(() => collector.observation.completedRequests >= 2);
 
-      expect(collector.observation.completedRequests).toBe(2);
-      const byId = new Map(collector.observation.spans.map((span) => [span.spanId, span]));
-      // Every span's parent was collected, except the Worker's root server span, whose parent is
-      // the test client's own span (propagated through `traceparent`). Effect names HTTP spans by
-      // method; kind 2 is a server span and kind 3 a client span.
-      const orphans = collector.observation.spans.filter(
+      const spans = collector.observation.spans;
+      // Effect names HTTP spans by method; kind 2 is a server span and kind 3 a client span.
+      const fetchSpan = spans.find((span) => span.name === "TelemetrySmokeServer.fetch");
+      const clientSpan = spans.find((span) => span.kind === 3);
+      expect(fetchSpan).toBeDefined();
+      expect(clientSpan).toBeDefined();
+      // The Durable Object's span continues the Worker's trace through the `traceparent` header.
+      expect(fetchSpan?.traceId).toBe(clientSpan?.traceId);
+    }),
+  { timeout: 120_000 },
+);
+
+test.provider(
+  "with workerd running, Worker and Durable Object spans arrive with intact parentage",
+  (stack) =>
+    Effect.gen(function* () {
+      collector.observation.spans.length = 0;
+      const deployed = yield* stack.deploy(telemetrySmokeStack);
+      const client = yield* HttpClient.HttpClient;
+      const response = yield* client.get(workerUrl(deployed.url));
+      expect(yield* response.text).toBe("worker-saw:durable-object-ok");
+      // The bridge-owned server spans arrive through its own `waitUntil` flush.
+      yield* waitFor(
+        () => collector.observation.spans.filter((span) => span.kind === 2).length >= 2,
+      );
+
+      const spans = collector.observation.spans;
+      const byId = new Map(spans.map((span) => [span.spanId, span]));
+      // Every parent was collected, except the Worker's root server span, whose parent is the test
+      // client's own span.
+      const orphans = spans.filter(
         (span) => span.parentSpanId !== undefined && !byId.has(span.parentSpanId),
       );
       expect(orphans.map((span) => [span.name, span.kind])).toEqual([["GET", 2]]);
-      const fetchSpan = collector.observation.spans.find(
-        (span) => span.name === "TelemetrySmokeServer.fetch",
-      );
-      expect(fetchSpan).toBeDefined();
-      const clientSpans = collector.observation.spans.filter((span) => span.kind === 3);
-      expect(clientSpans.length).toBeGreaterThan(0);
-      for (const clientSpan of clientSpans) {
+      for (const clientSpan of spans.filter((span) => span.kind === 3)) {
         expect(
-          collector.observation.spans.some(
-            (span) => span.kind === 2 && span.parentSpanId === clientSpan.spanId,
-          ),
+          spans.some((span) => span.kind === 2 && span.parentSpanId === clientSpan.spanId),
         ).toBe(true);
       }
+      yield* stack.destroy();
     }),
   { timeout: 120_000 },
 );

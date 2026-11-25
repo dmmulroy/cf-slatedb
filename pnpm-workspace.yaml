@@ -41,5 +41,3 @@ permissions:
     skills: true
   traits@file:vendor/traits-0.5.16-pr112.tgz:
     skills: true
-patchedDependencies:
-  alchemy@2.0.0-beta.87: patches/alchemy@2.0.0-beta.87.patch

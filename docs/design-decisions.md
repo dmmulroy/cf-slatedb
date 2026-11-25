@@ -35,22 +35,36 @@ of `alchemy` into `@alchemy.run/test`; cf-twitch pins the same versions. They ar
 Alchemy and Effect releases, run only locally, and do not change the architecture, so they do not
 need the "Stop and ask" approval for new dependencies.
 
-## D5. Patch: flush OTLP telemetry before an event settles (alchemy 2.0.0-beta.87)
+## D5. Workaround: flush OTLP telemetry before an event settles (alchemy 2.0.0-beta.87)
 
-`patches/alchemy@2.0.0-beta.87.patch` (applied by pnpm `patchedDependencies`) ports the fix from
-`../alchemy-workerd-otlp-flush-repro` to beta.87's bridges: `processEvent` in
-`lib/Workers/WorkerBridge.js` and `execute` in `lib/Workers/DurableObjectBridge.js` capture the
-event's telemetry Context and await `OtlpExporter.Flusher.flush` (bounded at 10 seconds) before
-the event's promise settles, then close the request scope into `waitUntil` as before.
+alchemy 2.0.0-beta.87 still exports an event's telemetry only when the request scope closes inside
+`waitUntil` after the event settles (`processEvent` in `alchemy/src/Workers/WorkerBridge.ts`,
+`execute` in `DurableObjectBridge.ts`), the bug reproduced by `../alchemy-workerd-otlp-flush-repro`.
+Alchemy is **not patched**. Instead every handler is wrapped with `withEventTelemetryFlush`
+(`packages/lsm-cloudflare/src/lsm-telemetry.ts`), which runs the handler and then, in
+`Effect.ensuring`, awaits the event's `OtlpExporter.Flusher.flush` (bounded at 10 seconds). The
+bridge builds that `Flusher` into every event's context, so the handler can reach it.
+
+What it covers: every span that ends inside the handler (`Effect.fn` service spans, the handler's
+own span, outbound HTTP client spans to Durable Objects and `BlockServer`) is exported before the
+event settles. What it cannot cover: the HTTP server span the bridge's tracer middleware opens around
+the handler ends after the handler returns, so it still goes out through the bridge's own
+`waitUntil` flush. While the runtime keeps running (normal `alchemy dev` and production), it arrives;
+if the runtime is torn down immediately after the event, it can be lost, and its children then show
+as roots in the trace CLI. Alarm handlers and Workflow runs have no bridge-owned span, so they are
+fully covered.
+
+Rule: apply `withEventTelemetryFlush` outermost on every `fetch`, `alarm`, Workflow run, and cron
+handler.
 
 Evidence: `packages/lsm-cloudflare/test/telemetry/telemetry-smoke.workerd.ts` tears workerd down
-right after the event with a collector that answers after 500 ms. Without the patch, 0 of 2
-exports complete (red); with it, both do, with intact Worker → Durable Object parentage (green).
-Alarm spans arrive in both cases while workerd stays up.
+right after the event with a collector that answers after 500 ms. With the wrapper, the Durable
+Object's span and the Worker's client span both arrive, in one trace; with the wrapper made a no-op,
+the test fails. A second test checks full parentage, server spans included, while workerd keeps
+running; a third checks alarm spans.
 
-Trade-off: a request's response now waits for its span export. Locally that is a loopback POST to
-the trace CLI. For a live stage, export to a nearby collector or rely on Workers Observability.
-Remove the patch when an Alchemy release flushes before settling.
+Trade-off: a response waits for its span export. Locally that is a loopback POST to the trace CLI.
+Remove the wrapper when an Alchemy release flushes before settling.
 
 ## D6. Local state store for the Stack
 

@@ -4,7 +4,7 @@ import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Effect } from "effect";
 import { HttpClientRequest, HttpServerRequest, HttpServerResponse } from "effect/http";
 
-import { lsmTelemetryLayer } from "../../src/lsm-telemetry.ts";
+import { lsmTelemetryLayer, withEventTelemetryFlush } from "../../src/lsm-telemetry.ts";
 
 /** Port of the delayed OTLP collector the telemetry smoke test starts. */
 export const TELEMETRY_SMOKE_COLLECTOR_PORT = 54329;
@@ -37,8 +37,9 @@ export const telemetrySmokeServerLayer = TelemetrySmokeServer.make(
           yield* state.storage.setAlarm(Date.now() + 100);
         }
         return HttpServerResponse.text("durable-object-ok");
-      }).pipe(Effect.withSpan("TelemetrySmokeServer.fetch")),
-      alarm: () => Effect.void.pipe(Effect.withSpan("TelemetrySmokeServer.alarm")),
+      }).pipe(Effect.withSpan("TelemetrySmokeServer.fetch"), withEventTelemetryFlush),
+      alarm: () =>
+        Effect.void.pipe(Effect.withSpan("TelemetrySmokeServer.alarm"), withEventTelemetryFlush),
     });
   }),
 );
@@ -71,6 +72,7 @@ export const telemetrySmokeWorkerLayer = TelemetrySmokeWorker.make(
         Effect.catchCause(() =>
           Effect.succeed(HttpServerResponse.text("worker-failed", { status: 500 })),
         ),
+        withEventTelemetryFlush,
       ),
     };
   }).pipe(

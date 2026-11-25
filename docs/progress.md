@@ -25,9 +25,11 @@ Phase 2: lsm-core (starting). Phase 3 (object storage and manifests) will overla
   - Review fix: `list` is one pass (summarize, filter, bounded binary-insert top-`limit`) and
     `summarizeTrace` is one pass over spans plus a pass over root candidates only.
   - `lsmTelemetryLayer` (`@cf-slatedb/lsm-cloudflare`) wraps `Telemetry.layerOtlp`.
-  - OTLP flush bug **confirmed on beta.87** and patched (`patches/alchemy@2.0.0-beta.87.patch`,
-    design decision D5): `telemetry-smoke.workerd.ts` is red without the patch (0/2 exports) and
-    green with it; DO alarm spans arrive.
+  - OTLP flush bug **confirmed on beta.87**. Per Dillon's review, Alchemy is not patched; the
+    workaround is `withEventTelemetryFlush` (design decision D5), applied outermost on every
+    handler. `telemetry-smoke.workerd.ts` is red with the wrapper made a no-op and green with it;
+    full parentage and DO alarm spans are covered too. Bridge-owned HTTP server spans still export
+    through Alchemy's `waitUntil` flush (lost only if the runtime is torn down immediately).
   - `infra/cf-slatedb/alchemy.run.ts` + `vp run dev` run a telemetry probe Worker + DO under
     `alchemy dev`; verified with the trace CLI (Worker → DO span nesting, alarm span,
     `assert` pass/fail exit codes).
@@ -44,7 +46,7 @@ Phase 2: lsm-core (starting). Phase 3 (object storage and manifests) will overla
 ## Findings
 
 - alchemy 2.0.0-beta.87 still flushes event telemetry inside `waitUntil` after the event settles;
-  patched (D5).
+  worked around in application code (D5), no patch.
 - Effect 4.1.4 names HTTP spans by method (`GET`); the trace CLI shows span kind (D7).
 - No Java or mise on this machine; TLC needs a JDK. Plan: download a pinned JDK and `tla2tools.jar`
   into a gitignored tool cache from the formal verification task.
