@@ -4,6 +4,7 @@ import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Effect, Layer } from "effect";
 import { HttpRouter } from "effect/http";
 
+import { CompactionTrigger } from "./compaction-trigger.ts";
 import { DbWriter, dbWriterLayerWithoutDependencies } from "./db-writer.ts";
 import { LsmConfiguration, lsmConfigurationLayer } from "./lsm-configuration.ts";
 import { eventTelemetryFlushForStage } from "./lsm-telemetry.ts";
@@ -49,6 +50,7 @@ export const writerServerLayerWithoutDependencies = WriterServer.make(
   Effect.gen(function* () {
     const objects = yield* ObjectStore;
     const settings = yield* LsmConfiguration;
+    const compaction = yield* CompactionTrigger;
     const withEventTelemetryFlush = yield* eventTelemetryFlushForStage;
     const state = yield* Cloudflare.DurableObjectState;
 
@@ -67,6 +69,7 @@ export const writerServerLayerWithoutDependencies = WriterServer.make(
         Layer.provide(durableObjectAlarmLayer(storage)),
         Layer.provide(Layer.succeed(ObjectStore, objects)),
         Layer.provide(Layer.succeed(LsmConfiguration, settings)),
+        Layer.provide(Layer.succeed(CompactionTrigger, compaction)),
       );
       return yield* Effect.gen(function* () {
         const writer = yield* DbWriter;

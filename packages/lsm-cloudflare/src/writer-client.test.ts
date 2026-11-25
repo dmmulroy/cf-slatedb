@@ -9,6 +9,7 @@ import { Effect, Layer, Option } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
+import { compactionTriggerTestLayer } from "./compaction-trigger.ts";
 import { lsmConfigurationTestLayer } from "./lsm-configuration.ts";
 import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
 import { ManifestStore, manifestStoreTestLayer } from "./manifest-store.ts";
@@ -20,7 +21,7 @@ const B = DatabaseId.make("tenant-b");
 
 const layer = writerClientTestLayer.pipe(
   Layer.provideMerge(manifestStoreTestLayer),
-  Layer.provideMerge(lsmConfigurationTestLayer()),
+  Layer.provideMerge(Layer.mergeAll(lsmConfigurationTestLayer(), compactionTriggerTestLayer)),
   Layer.provideMerge(lsmTestRuntimeContextLayer),
 );
 

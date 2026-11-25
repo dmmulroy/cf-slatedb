@@ -2,23 +2,32 @@ import { Effect } from "effect";
 
 import { BlockServerWorker } from "../../src/block-server-worker.ts";
 import { DbApiWorker, dbApiWorkerLayer } from "../../src/db-api-worker.ts";
+import { CompactorWorker } from "../../src/compactor-worker.ts";
+import { GcWorker } from "../../src/gc-worker.ts";
 import testBlockServerLayer from "./block-server-entry.ts";
-
-/** Local port of the writer integration test's API Worker. */
-export const WRITER_TEST_API_PORT = 8793;
+import testCompactorLayer from "./compactor-entry.ts";
+import testGcLayer from "./gc-entry.ts";
+import { INTEGRATION_OTLP_BASE_URL, INTEGRATION_PORTS } from "./integration-ports.ts";
 
 /** The API Worker of the writer integration test; this module is its bundle entry. */
 const writerTestApiLayer = dbApiWorkerLayer({
   main: import.meta.url,
-  otlpBaseUrl: "http://127.0.0.1:4318",
-  devPort: WRITER_TEST_API_PORT,
+  otlpBaseUrl: INTEGRATION_OTLP_BASE_URL,
+  devPort: INTEGRATION_PORTS.api,
 });
 
-/** Stack body for the integration tests: the API Worker (hosting `WriterServer`) and the `BlockServer`. */
+/**
+ * Stack body for the integration tests: the API Worker (hosting `WriterServer`), the `BlockServer`,
+ * the compactor Worker, and the GC Worker.
+ */
 export const writerTestStack = Effect.gen(function* () {
   yield* BlockServerWorker;
+  yield* CompactorWorker;
+  yield* GcWorker;
   const api = yield* DbApiWorker;
-  return { url: api.url };
-}).pipe(Effect.provide([writerTestApiLayer, testBlockServerLayer]));
+  return { url: api.url, gcUrl: `http://127.0.0.1:${INTEGRATION_PORTS.gc}` };
+}).pipe(
+  Effect.provide([writerTestApiLayer, testBlockServerLayer, testCompactorLayer, testGcLayer]),
+);
 
 export default writerTestApiLayer;

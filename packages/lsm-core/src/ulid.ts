@@ -34,6 +34,9 @@ export const generateSstId: Effect.Effect<SstId> = Effect.map(ulidString, (value
   SstId.make(value),
 );
 
+/** Generates a new compaction job id (a ULID, so job ids sort by start time). */
+export const generateCompactionJobId: Effect.Effect<string> = ulidString;
+
 /** Generates a new checkpoint id (a ULID). */
 export const generateCheckpointId: Effect.Effect<CheckpointId> = Effect.map(ulidString, (value) =>
   CheckpointId.make(value),

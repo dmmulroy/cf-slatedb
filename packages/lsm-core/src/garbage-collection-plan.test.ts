@@ -127,7 +127,7 @@ describe("planSstCollection", () => {
 });
 
 describe("planManifestCollection", () => {
-  it("keeps the latest, checkpoint-pinned, and young manifests", () => {
+  it("keeps the latest, checkpoint-pinned, and recently superseded manifests", () => {
     const latest = addCheckpoint(empty, {
       id: CheckpointId.make("01JD00000000000000000000CP"),
       manifestId: ManifestId.make(2),
@@ -146,8 +146,24 @@ describe("planManifestCollection", () => {
       now: Timestamp.make(5000),
       minAge: 1500,
     });
-    // 1 and 3 are old and unpinned; 2 is pinned; 4 is younger than minAge; 5 is the latest.
-    expect(plan).toEqual({ deletable: [1, 3], retained: [2, 4, 5] });
+    // 1 and 2 were superseded by 3000; 2 is pinned; 3 was superseded at 4000, within minAge of
+    // now (5000), so readers may still hold it; 4 was superseded just now; 5 is the latest.
+    expect(plan).toEqual({ deletable: [1], retained: [2, 3, 4, 5] });
+  });
+
+  it("measures a manifest's age from when it was superseded, not when it was written", () => {
+    const plan = planManifestCollection({
+      latestId: ManifestId.make(2),
+      latest: empty,
+      stored: [
+        // The newest manifest for an hour, superseded a moment ago.
+        { id: ManifestId.make(1), uploadedAt: Timestamp.make(0) },
+        { id: ManifestId.make(2), uploadedAt: Timestamp.make(3_600_000) },
+      ],
+      now: Timestamp.make(3_600_500),
+      minAge: 1_000,
+    });
+    expect(plan.deletable).toEqual([]);
   });
 });
 

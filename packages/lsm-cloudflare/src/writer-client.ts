@@ -24,6 +24,7 @@ import {
   type MemTableScanPage,
   type WriterStatus,
 } from "./db-writer.ts";
+import type { CompactionTrigger } from "./compaction-trigger.ts";
 import type { LsmConfiguration } from "./lsm-configuration.ts";
 import {
   type DatabaseIdMismatchError,
@@ -249,14 +250,14 @@ export const writerClientLayer = writerClientLayerWithoutDependencies;
 /**
  * Provides a writer client backed by in-process writers: one `DbWriter` per database, each with its
  * own in-memory SQLite memtable and recording alarm, over the contextual object store, manifest
- * store, and settings. Calls cross the real `WriterHttpApi` (encoding, routing, and error statuses)
+ * store, compaction trigger, and settings. Calls cross the real `WriterHttpApi` (encoding, routing, and error statuses)
  * through `Cloudflare.toHttpClient` over the router.
  */
 export const writerClientTestLayer = Layer.effect(
   WriterClient,
   Effect.gen(function* () {
     const shared = yield* Effect.context<
-      ManifestStore | ManifestReader | ObjectStore | LsmConfiguration
+      ManifestStore | ManifestReader | ObjectStore | LsmConfiguration | CompactionTrigger
     >();
     const runtime = yield* RuntimeContext;
     const scope = yield* Effect.scope;

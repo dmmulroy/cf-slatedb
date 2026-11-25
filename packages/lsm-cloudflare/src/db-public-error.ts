@@ -9,6 +9,7 @@ export const DbApiOperation = Schema.Literals([
   "flush",
   "status",
   "changes",
+  "compaction",
   "get",
   "scan",
   "seal",

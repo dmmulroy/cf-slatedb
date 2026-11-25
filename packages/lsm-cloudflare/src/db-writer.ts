@@ -50,6 +50,7 @@ import {
 } from "./manifest-store.ts";
 import { changelogKey, sstKey } from "./object-keys.ts";
 import { SstStore, sstStoreLayerWithoutDependencies } from "./sst-store.ts";
+import { CompactionTrigger, compactionTriggerTestLayer } from "./compaction-trigger.ts";
 import { DurableObjectAlarm, durableObjectAlarmTestLayer } from "./durable-object-alarm.ts";
 
 /** What a `Latest` read learns from the writer about one key. */
@@ -193,6 +194,7 @@ export const makeDbWriter = Effect.gen(function* () {
   const ssts = yield* SstStore;
   const alarm = yield* DurableObjectAlarm;
   const settings = yield* LsmConfiguration;
+  const compaction = yield* CompactionTrigger;
 
   const phase = yield* Ref.make<WriterPhase>({ _tag: "Uninitialized" });
   const unflushedBytes = yield* Ref.make(0);
@@ -420,6 +422,10 @@ export const makeDbWriter = Effect.gen(function* () {
           );
           yield* refreshUnflushedBytes(databaseId);
           yield* Metric.update(flushBytes, written.value.info.sizeBytes);
+          // Enough L0 SSTs to compact: wake the compactor (an idle database has no compactor alarm).
+          if (committed.manifest.l0.length >= settings.minCompactionSources) {
+            yield* compaction.wake(databaseId);
+          }
           yield* Effect.annotateCurrentSpan({
             "sst.id": written.value.handle.id,
             "sst.size": written.value.info.sizeBytes,
@@ -501,6 +507,8 @@ export const makeDbWriter = Effect.gen(function* () {
           yield* Ref.set(phase, ready);
           if (latest.manifest.l0.length >= settings.l0MaxSsts) {
             yield* Metric.update(writeStalls, 1);
+            // Compaction is behind: make sure the compactor is awake (a lost wake would stall forever).
+            yield* compaction.wake(databaseId);
             return yield* Effect.fail(
               new WriteStalledError({
                 databaseId,
@@ -750,6 +758,7 @@ export const dbWriterTestLayer = (
       Layer.mergeAll(
         memTableTestLayer,
         durableObjectAlarmTestLayer,
+        compactionTriggerTestLayer,
         lsmConfigurationTestLayer(overrides),
       ),
     ),

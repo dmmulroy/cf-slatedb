@@ -29,6 +29,7 @@ import type {
   WriterUnavailableError,
   WriteStalledError,
 } from "./lsm-errors.ts";
+import type { CompactorUnavailableError } from "./compactor.ts";
 import type { ReaderUnavailableError } from "./db-reader.ts";
 import type { DatabaseAlreadyExistsError } from "./manifest-store.ts";
 
@@ -45,7 +46,8 @@ export type DbInternalError =
   | WriterUnavailableError
   | MergeOperatorMissingError
   | SstCorruptedError
-  | ReaderUnavailableError;
+  | ReaderUnavailableError
+  | CompactorUnavailableError;
 
 /**
  * Classifies an internal failure as its public error: a stable code, a caller-facing message, the
@@ -151,6 +153,15 @@ export const toPublicError =
               requestId,
               retryable: true,
             });
+      case "CompactorUnavailableError":
+        return new StorageUnavailablePublicError({
+          code: "StorageUnavailable",
+          operation,
+          message: `Database ${error.databaseId}'s compactor could not be reached. Retry the same request.`,
+          details: { databaseId: error.databaseId },
+          requestId,
+          retryable: true,
+        });
       case "ReaderUnavailableError":
         switch (error.reason) {
           case "SnapshotExpired":

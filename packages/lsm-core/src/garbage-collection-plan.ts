@@ -24,7 +24,10 @@ export interface StoredSst {
 
 /** What one GC pass may delete from a database's manifests. */
 export interface ManifestCollectionPlan {
-  /** Manifests to delete: older than `minAge`, not the latest, and pinned by no checkpoint. */
+  /**
+   * Manifests to delete: superseded more than `minAge` ago, not the latest, and pinned by no
+   * checkpoint.
+   */
   readonly deletable: ReadonlyArray<ManifestId>;
   /** Every other stored manifest; each SST they reference stays. */
   readonly retained: ReadonlyArray<ManifestId>;
@@ -36,9 +39,11 @@ export interface ManifestCollectionPlan {
  *
  * **Details**
  *
- * The latest manifest, every manifest a checkpoint in it pins, and every manifest younger than
- * `minAge` are kept, so a reader holding a manifest for less than `minAge` (a cached manifest or a
- * snapshot) finds every SST it references.
+ * The latest manifest, every manifest a checkpoint in it pins, and every manifest superseded less
+ * than `minAge` ago are kept, so a reader holding a manifest for less than `minAge` after it stopped
+ * being the newest (a cached manifest or a snapshot) finds every SST it references. A manifest is
+ * superseded when the next one is written, so its age is the next stored manifest's, not its own: a
+ * manifest written long ago may have been the newest until a moment ago.
  */
 export const planManifestCollection = (input: {
   readonly latestId: ManifestId;
@@ -48,11 +53,15 @@ export const planManifestCollection = (input: {
   readonly minAge: number;
 }): ManifestCollectionPlan => {
   const pinned = new Set(input.latest.checkpoints.map((checkpoint) => checkpoint.manifestId));
+  const ordered = [...input.stored].sort((left, right) => left.id - right.id);
   const deletable: Array<ManifestId> = [];
   const retained: Array<ManifestId> = [];
-  for (const manifest of input.stored) {
-    const old = manifest.uploadedAt + input.minAge <= input.now;
-    if (manifest.id < input.latestId && old && !pinned.has(manifest.id))
+  for (const [index, manifest] of ordered.entries()) {
+    // Superseded when the next stored manifest was written (later still if some were deleted).
+    const successor = ordered[index + 1];
+    const supersededLongAgo =
+      successor !== undefined && successor.uploadedAt + input.minAge <= input.now;
+    if (manifest.id < input.latestId && supersededLongAgo && !pinned.has(manifest.id))
       deletable.push(manifest.id);
     else retained.push(manifest.id);
   }

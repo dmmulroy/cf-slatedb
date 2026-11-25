@@ -20,7 +20,11 @@ const PositiveNumber = Schema.Number.check(Schema.isGreaterThan(0));
  * - `compactionOutputSstSize`: target size of each compaction output SST.
  * - `multipartPartSize`: multipart upload part size (R2 needs at least 5 MiB except the last).
  * - `manifestRefreshInterval`: how often a reader's cached manifest refreshes.
- * - `compactorPollInterval`: how often the compactor's alarm polls the manifest.
+ * - `compactorPollInterval`: how often the compactor's alarm polls the manifest while it has work.
+ * - `compactionBudgetCapacity`: most compactions running at once across every database sharing the
+ *   compaction budget; groups split it fairly.
+ * - `compactionLeaseMs`: how long a compaction's budget lease lasts without renewal (the compactor
+ *   renews it on every poll), so a lost compaction frees its slot.
  * - `gcMinAge`: GC deletes an unreferenced object only once it is at least this old.
  * - `gcInterval`: how often the GC cron collects each database.
  */
@@ -40,6 +44,8 @@ export const LsmSettings = Schema.Struct({
   multipartPartSize: Schema.Int.check(Schema.isGreaterThanOrEqualTo(5 * 1024 * 1024)),
   manifestRefreshInterval: PositiveInt,
   compactorPollInterval: PositiveInt,
+  compactionBudgetCapacity: PositiveInt,
+  compactionLeaseMs: PositiveInt,
   gcMinAge: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   gcInterval: PositiveInt,
 });
@@ -66,6 +72,8 @@ export const DEFAULT_LSM_SETTINGS: LsmSettings = {
   multipartPartSize: 8 * MiB,
   manifestRefreshInterval: 1_000,
   compactorPollInterval: 5_000,
+  compactionBudgetCapacity: 32,
+  compactionLeaseMs: 900_000,
   gcMinAge: 3_600_000,
   gcInterval: 300_000,
 };

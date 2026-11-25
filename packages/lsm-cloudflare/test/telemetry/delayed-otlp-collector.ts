@@ -66,16 +66,19 @@ export const startDelayedCollector = (delayMs: number) => {
 };
 
 /**
- * Starts a delayed collector on the smoke test's port for the current test file and stops it
- * afterwards.
+ * Starts a delayed collector for the current test file (on the smoke test's port unless `port` is
+ * given) and stops it afterwards.
  */
-export const useDelayedCollector = (delayMs: number) => {
+export const useDelayedCollector = (
+  delayMs: number,
+  port: number = TELEMETRY_SMOKE_COLLECTOR_PORT,
+) => {
   const collector = startDelayedCollector(delayMs);
   beforeAll(
     () =>
       new Promise<void>((resolve, reject) => {
         collector.server.once("error", reject);
-        collector.server.listen(TELEMETRY_SMOKE_COLLECTOR_PORT, "127.0.0.1", resolve);
+        collector.server.listen(port, "127.0.0.1", resolve);
       }),
   );
   afterAll(() => new Promise<void>((resolve) => collector.server.close(() => resolve())));

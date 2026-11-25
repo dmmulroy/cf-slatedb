@@ -1,11 +1,18 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
-import { BlockServerWorker, DbApiWorker } from "@cf-slatedb/lsm-cloudflare";
+import {
+  BlockServerWorker,
+  CompactorWorker,
+  DbApiWorker,
+  GcWorker,
+} from "@cf-slatedb/lsm-cloudflare";
 import * as Alchemy from "alchemy";
 import { localState } from "alchemy/State";
 import { Effect } from "effect";
 
 import { cfSlatedbBlockServerWorkerLayer } from "./src/block-server-worker-entry.ts";
+import { cfSlatedbCompactorWorkerLayer } from "./src/compactor-worker-entry.ts";
 import { cfSlatedbApiWorkerLayer } from "./src/db-api-worker-entry.ts";
+import { cfSlatedbGcWorkerLayer } from "./src/gc-worker-entry.ts";
 import { TelemetryProbeWorker, telemetryProbeWorkerLayer } from "./src/telemetry-probe-worker.ts";
 
 /**
@@ -22,6 +29,8 @@ const CfSlatedbStack = Alchemy.Stack(
   { providers: Cloudflare.providers(), state: localState() },
   Effect.gen(function* () {
     yield* BlockServerWorker;
+    yield* CompactorWorker;
+    yield* GcWorker;
     const api = yield* DbApiWorker;
     const probe = yield* TelemetryProbeWorker;
     return {
@@ -34,6 +43,8 @@ const CfSlatedbStack = Alchemy.Stack(
     Effect.provide([
       cfSlatedbApiWorkerLayer,
       cfSlatedbBlockServerWorkerLayer,
+      cfSlatedbCompactorWorkerLayer,
+      cfSlatedbGcWorkerLayer,
       telemetryProbeWorkerLayer,
     ]),
   ),

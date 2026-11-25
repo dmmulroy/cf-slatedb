@@ -22,6 +22,7 @@ import {
   type DbReadError,
   type ReadView,
 } from "./db-reader.ts";
+import { compactionTriggerTestLayer } from "./compaction-trigger.ts";
 import { lsmConfigurationTestLayer } from "./lsm-configuration.ts";
 import { manifestCacheLayerWithoutDependencies } from "./manifest-cache.ts";
 import { manifestStoreTestLayer } from "./manifest-store.ts";
@@ -280,7 +281,8 @@ export const dbClientLayer = dbClientLayerWithoutDependencies.pipe(
 /**
  * Provides a client over one in-memory object store shared by in-process writers (crossing the real
  * writer HTTP API) and the reader (blocks read straight from the store). The Layer also outputs the
- * manifest store, manifest reader, and object store so tests can inspect them.
+ * manifest store, manifest reader, object store, and a recording compaction trigger so tests can
+ * inspect them.
  */
 export const dbClientTestLayer = (overrides: Partial<LsmSettings> = {}) =>
   dbClientLayerWithoutDependencies.pipe(
@@ -292,5 +294,7 @@ export const dbClientTestLayer = (overrides: Partial<LsmSettings> = {}) =>
       ),
     ),
     Layer.provideMerge(manifestStoreTestLayer),
-    Layer.provideMerge(lsmConfigurationTestLayer(overrides)),
+    Layer.provideMerge(
+      Layer.mergeAll(lsmConfigurationTestLayer(overrides), compactionTriggerTestLayer),
+    ),
   );

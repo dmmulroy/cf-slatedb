@@ -1,0 +1,278 @@
+import {
+  DatabaseId,
+  hasSstCollectionCandidates,
+  type Manifest,
+  ManifestId,
+  planManifestCollection,
+  planSstCollection,
+  prepareGarbageCollection,
+  SstId,
+  type StoredManifest,
+  type StoredSst,
+  Timestamp,
+} from "@cf-slatedb/lsm-core";
+import type { RuntimeContext } from "alchemy/RuntimeContext";
+import { Clock, Context, Effect, Layer, Metric, Option, Result, Schema } from "effect";
+
+import { LsmConfiguration, lsmConfigurationTestLayer } from "./lsm-configuration.ts";
+import type { DatabaseNotFoundError } from "./lsm-errors.ts";
+import { ManifestReader, manifestReaderLayerWithoutDependencies } from "./manifest-reader.ts";
+import { ManifestStore, manifestStoreLayerWithoutDependencies } from "./manifest-store.ts";
+import {
+  changelogPrefix,
+  compactedPrefix,
+  databasePrefix,
+  latestManifestKey,
+  manifestKey,
+  manifestPrefix,
+} from "./object-keys.ts";
+import { type ObjectInfo, ObjectStore, objectStoreTestLayer } from "./object-store.ts";
+
+/** What one collection of a database did. */
+export interface GarbageCollectionReport {
+  readonly databaseId: DatabaseId;
+  /** The newest manifest when collection ran. */
+  readonly manifestId: ManifestId;
+  /** SSTs created before this time and referenced by no retained manifest were deleted. */
+  readonly sstBoundary: Timestamp;
+  readonly deletedSsts: number;
+  readonly deletedManifests: number;
+}
+
+/**
+ * Collection could not complete because storage or the manifest was unavailable. Retryable: the next
+ * run starts over; everything collection does is safe to repeat.
+ */
+export class GarbageCollectorUnavailableError extends Schema.TaggedError<GarbageCollectorUnavailableError>()(
+  "GarbageCollectorUnavailableError",
+  { databaseId: Schema.String, message: Schema.String },
+) {}
+
+/** Objects GC deleted (SlateDB RFC-0021 parity). */
+export const gcDeletedObjects = Metric.counter("lsm_gc_deleted_objects", {
+  description: "SST, changelog, and manifest objects garbage collection deleted",
+});
+
+/**
+ * Deletes a database's unreferenced SSTs and old manifests (design §12: per database, reading only
+ * its own manifests and checkpoints).
+ *
+ * **Details**
+ *
+ * `collect` runs, in order: list SST objects; if any could be collected, advance the manifest's
+ * `gcSstBoundary` to `now - gcMinAge` by CAS (also dropping expired checkpoints and changelog entries
+ * past retention); list manifests and keep the latest, every checkpoint's, and every one younger than
+ * `gcMinAge`; delete SSTs that no kept manifest references and that were created before the
+ * boundary; then advance `gc/manifest.boundary` (SlateDB RFC 0026) and delete the other manifests.
+ * An idle database costs listings and no writes. SSTs a fork reads from its source live under the
+ * source's prefix, which this database's collection never lists.
+ */
+export interface IGarbageCollector {
+  readonly collect: (
+    databaseId: DatabaseId,
+  ) => Effect.Effect<
+    GarbageCollectionReport,
+    GarbageCollectorUnavailableError | DatabaseNotFoundError,
+    RuntimeContext
+  >;
+  /** Collects every database in the bucket, a few at a time; one database's failure is logged. */
+  readonly collectAll: Effect.Effect<
+    ReadonlyArray<GarbageCollectionReport>,
+    GarbageCollectorUnavailableError,
+    RuntimeContext
+  >;
+}
+
+/** The contextual garbage collector. */
+export class GarbageCollector extends Context.Service<GarbageCollector, IGarbageCollector>()(
+  "@cf-slatedb/GarbageCollector",
+) {}
+
+const decodeSstId = Schema.decodeUnknownOption(SstId);
+const decodeDatabaseId = Schema.decodeUnknownOption(DatabaseId);
+const decodeManifestId = Schema.decodeUnknownOption(
+  Schema.NumberFromString.pipe(Schema.decodeTo(ManifestId)),
+);
+
+/** `<ulid>.sst` (compacted) or `<20-digit seq>-<ulid>.sst` (changelog), under `prefix`. */
+const storedSst = (prefix: string, object: ObjectInfo): Option.Option<StoredSst> => {
+  const name = object.key.slice(prefix.length);
+  if (!name.endsWith(".sst")) return Option.none();
+  const stem = name.slice(0, -".sst".length);
+  const id = stem.includes("-") ? stem.slice(stem.lastIndexOf("-") + 1) : stem;
+  return Option.map(decodeSstId(id), (sstId) => ({ key: object.key, sstId }));
+};
+
+/** Constructs the collector over the contextual object store, manifests, and settings. */
+export const makeGarbageCollector = Effect.gen(function* () {
+  const objects = yield* ObjectStore;
+  const reader = yield* ManifestReader;
+  const manifests = yield* ManifestStore;
+  const settings = yield* LsmConfiguration;
+
+  const unavailable = (databaseId: string) => (error: { readonly message: string }) =>
+    Effect.fail(
+      new GarbageCollectorUnavailableError({
+        databaseId,
+        message: `Garbage collection of database ${databaseId} could not reach storage: ${error.message} The next run retries.`,
+      }),
+    );
+  const objectFailures = (databaseId: string) => ({
+    ObjectStoreUnavailableError: unavailable(databaseId),
+  });
+
+  /** Every object under `prefix`, page by page. */
+  const listAll = (prefix: string) =>
+    Effect.gen(function* () {
+      const all: Array<ObjectInfo> = [];
+      let cursor = Option.none<string>();
+      do {
+        const page = yield* objects.list(prefix, cursor);
+        all.push(...page.objects);
+        cursor = page.cursor;
+      } while (Option.isSome(cursor));
+      return all;
+    });
+
+  const collect = Effect.fn("GarbageCollector.collect")(function* (databaseId: DatabaseId) {
+    yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
+    const now = Timestamp.make(yield* Clock.currentTimeMillis);
+    // Nothing is older than gcMinAge yet while the clock itself is younger (fresh test clocks).
+    const cutoff = Timestamp.make(Math.max(0, now - settings.gcMinAge));
+    const objectFailed = objectFailures(databaseId);
+
+    const ssts: Array<StoredSst> = [];
+    for (const prefix of [compactedPrefix(databaseId), changelogPrefix(databaseId)]) {
+      for (const object of yield* listAll(prefix).pipe(Effect.catchTags(objectFailed))) {
+        ssts.push(...Option.toArray(storedSst(prefix, object)));
+      }
+    }
+    const latest = yield* reader
+      .loadLatest(databaseId)
+      .pipe(Effect.catchTags({ ManifestReadError: unavailable(databaseId) }));
+    const advanceBoundary = hasSstCollectionCandidates(latest.manifest, ssts, cutoff);
+    const committed = yield* manifests
+      .update(databaseId, (manifest) =>
+        Result.succeed(prepareGarbageCollection(manifest, { now, cutoff, advanceBoundary })),
+      )
+      .pipe(
+        Effect.catchTags({
+          ManifestReadError: unavailable(databaseId),
+          ManifestWriteError: unavailable(databaseId),
+        }),
+      );
+
+    // Listed after the commit, so every manifest that could reference an SST created before the
+    // boundary is either listed or newer than the commit (and kept).
+    const storedManifests: Array<StoredManifest> = [];
+    for (const object of yield* listAll(manifestPrefix(databaseId)).pipe(
+      Effect.catchTags(objectFailed),
+    )) {
+      const id = decodeManifestId(object.key.slice(manifestPrefix(databaseId).length));
+      if (Option.isSome(id)) storedManifests.push({ id: id.value, uploadedAt: object.uploadedAt });
+    }
+    const plan = planManifestCollection({
+      latestId: committed.id,
+      latest: committed.manifest,
+      stored: storedManifests,
+      now,
+      minAge: settings.gcMinAge,
+    });
+    const retained: Array<Manifest> = [committed.manifest];
+    for (const id of plan.retained) {
+      if (id === committed.id) continue;
+      const manifest = yield* reader
+        .load(databaseId, id)
+        .pipe(Effect.catchTags({ ManifestReadError: unavailable(databaseId) }));
+      retained.push(...Option.toArray(manifest));
+    }
+    const sstBoundary =
+      committed.manifest.gcSstBoundary < cutoff ? committed.manifest.gcSstBoundary : cutoff;
+    const deletedSsts = planSstCollection({ retained, stored: ssts, boundary: sstBoundary });
+    yield* objects
+      .delete(deletedSsts.map((object) => object.key))
+      .pipe(Effect.catchTags(objectFailed));
+
+    const newestDeletable = plan.deletable.reduce((max, id) => Math.max(max, id), 0);
+    if (newestDeletable > 0) {
+      yield* manifests
+        .advanceManifestBoundary(databaseId, ManifestId.make(newestDeletable))
+        .pipe(Effect.catchTags({ ManifestWriteError: unavailable(databaseId) }));
+      // Readers start probing at the LATEST hint; keep it past every manifest about to go.
+      yield* objects
+        .put(latestManifestKey(databaseId), new TextEncoder().encode(String(committed.id)))
+        .pipe(Effect.catchTags(objectFailed));
+      yield* objects
+        .delete(plan.deletable.map((id) => manifestKey(databaseId, id)))
+        .pipe(Effect.catchTags(objectFailed));
+    }
+    yield* Metric.update(gcDeletedObjects, deletedSsts.length + plan.deletable.length);
+    yield* Effect.annotateCurrentSpan({
+      "manifest.id": committed.id,
+      "gc.sst_boundary": sstBoundary,
+      "gc.boundary_advanced": advanceBoundary,
+      "gc.deleted_ssts": deletedSsts.length,
+      "gc.deleted_manifests": plan.deletable.length,
+    });
+    return {
+      databaseId,
+      manifestId: committed.id,
+      sstBoundary,
+      deletedSsts: deletedSsts.length,
+      deletedManifests: plan.deletable.length,
+    };
+  });
+
+  const collectAll = Effect.gen(function* () {
+    const databases: Array<DatabaseId> = [];
+    let cursor = Option.none<string>();
+    do {
+      const page = yield* objects
+        .listPrefixes("db/", cursor)
+        .pipe(Effect.catchTags(objectFailures("*")));
+      for (const prefix of page.prefixes) {
+        const id = decodeDatabaseId(prefix.slice("db/".length, -1));
+        if (Option.isSome(id) && databasePrefix(id.value) === prefix) databases.push(id.value);
+      }
+      cursor = page.cursor;
+    } while (Option.isSome(cursor));
+    const reports = yield* Effect.forEach(
+      databases,
+      (databaseId) =>
+        collect(databaseId).pipe(
+          Effect.map(Option.some),
+          Effect.catchCause((cause) =>
+            Effect.logWarning("Garbage collection of a database failed; the next run retries.", {
+              databaseId,
+              cause,
+            }).pipe(Effect.as(Option.none<GarbageCollectionReport>())),
+          ),
+        ),
+      { concurrency: 4 },
+    );
+    yield* Effect.annotateCurrentSpan({ "gc.databases": databases.length });
+    return reports.flatMap((report) => Option.toArray(report));
+  }).pipe(Effect.withSpan("GarbageCollector.collectAll"));
+
+  return GarbageCollector.of({ collect, collectAll });
+});
+
+/** Provides the collector, leaving the object store and settings visible. */
+export const garbageCollectorLayerWithoutDependencies = Layer.effect(
+  GarbageCollector,
+  makeGarbageCollector,
+).pipe(
+  Layer.provide(
+    manifestStoreLayerWithoutDependencies.pipe(
+      Layer.provideMerge(manifestReaderLayerWithoutDependencies),
+    ),
+  ),
+);
+
+/** Provides the collector over a fresh in-memory object store (also output) and test settings. */
+export const garbageCollectorTestLayer = (
+  overrides: Parameters<typeof lsmConfigurationTestLayer>[0] = {},
+) =>
+  garbageCollectorLayerWithoutDependencies.pipe(
+    Layer.provideMerge(Layer.mergeAll(objectStoreTestLayer, lsmConfigurationTestLayer(overrides))),
+  );

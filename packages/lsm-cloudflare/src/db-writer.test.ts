@@ -12,6 +12,7 @@ import { Context, Effect, Layer, Option, Ref } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
+import { compactionTriggerTestLayer } from "./compaction-trigger.ts";
 import { DbWriter, dbWriterLayerWithoutDependencies, dbWriterTestLayer } from "./db-writer.ts";
 import { lsmConfigurationTestLayer } from "./lsm-configuration.ts";
 import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
@@ -246,7 +247,11 @@ describe("DbWriter fencing and crash recovery", () => {
             Layer.provide(
               memTableLayerWithoutDependencies.pipe(Layer.provide(writerSqlStorageTestLayer)),
             ),
-            Layer.provide([durableObjectAlarmTestLayer, lsmConfigurationTestLayer()]),
+            Layer.provide([
+              durableObjectAlarmTestLayer,
+              compactionTriggerTestLayer,
+              lsmConfigurationTestLayer(),
+            ]),
             Layer.provide(Layer.succeedContext(shared)),
           ),
         ).pipe(Effect.map((context) => Context.get(context, DbWriter)));
@@ -307,7 +312,11 @@ describe("DbWriter fencing and crash recovery", () => {
           dbWriterLayerWithoutDependencies.pipe(
             Layer.provide(sstStoreLayerWithoutDependencies),
             Layer.provide(memTable),
-            Layer.provide([durableObjectAlarmTestLayer, lsmConfigurationTestLayer()]),
+            Layer.provide([
+              durableObjectAlarmTestLayer,
+              compactionTriggerTestLayer,
+              lsmConfigurationTestLayer(),
+            ]),
             Layer.provide(Layer.succeedContext(shared)),
           ),
         ).pipe(Effect.map((context) => Context.get(context, DbWriter)));

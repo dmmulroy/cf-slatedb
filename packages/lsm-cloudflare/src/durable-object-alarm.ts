@@ -7,6 +7,11 @@ export interface IDurableObjectAlarm {
   readonly scheduled: Effect.Effect<Option.Option<number>>;
   /** Replaces the alarm with one at `atMillis`. */
   readonly scheduleAt: (atMillis: number) => Effect.Effect<void>;
+  /**
+   * Removes the alarm. The runtime does this itself when the alarm fires: inside the alarm handler
+   * `scheduled` is none until the handler schedules another.
+   */
+  readonly cancel: Effect.Effect<void>;
 }
 
 /** The contextual Durable Object alarm. */
@@ -21,6 +26,7 @@ export const durableObjectAlarmLayer = (storage: cf.DurableObjectStorage) =>
     DurableObjectAlarm.of({
       scheduled: Effect.promise(() => storage.getAlarm()).pipe(Effect.map(Option.fromNullOr)),
       scheduleAt: (atMillis) => Effect.promise(() => storage.setAlarm(atMillis)),
+      cancel: Effect.promise(() => storage.deleteAlarm()),
     }),
   );
 
@@ -35,6 +41,7 @@ export const durableObjectAlarmTestLayer = Layer.effect(
     return DurableObjectAlarm.of({
       scheduled: Ref.get(at),
       scheduleAt: (atMillis) => Ref.set(at, Option.some(atMillis)),
+      cancel: Ref.set(at, Option.none()),
     });
   }),
 );

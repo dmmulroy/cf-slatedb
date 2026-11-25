@@ -17,3 +17,4 @@ export * from "./write-batch.ts";
 export * from "./read-consistency.ts";
 export * from "./compaction-merge.ts";
 export * from "./garbage-collection-plan.ts";
+export * from "./compaction-budget-ledger.ts";

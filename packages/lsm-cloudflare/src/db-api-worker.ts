@@ -9,12 +9,17 @@ import {
   DatabaseLifecycle,
   databaseLifecycleLayerWithoutDependencies,
 } from "./database-lifecycle.ts";
+import {
+  CompactorClient,
+  compactionTriggerLayer,
+  compactorClientLayer,
+} from "./compactor-client.ts";
 import { DbClient, dbClientLayerWithoutDependencies } from "./db-client.ts";
 import { dbHttpRouterLayer } from "./db-http-handlers.ts";
 import { dbReaderLayer } from "./db-reader.ts";
 import { lsmConfigurationLayer } from "./lsm-configuration.ts";
 import { eventTelemetryFlushForStage, lsmTelemetryLayer } from "./lsm-telemetry.ts";
-import { manifestReaderLayerWithoutDependencies } from "./manifest-reader.ts";
+import { ManifestReader, manifestReaderLayerWithoutDependencies } from "./manifest-reader.ts";
 import { manifestStoreLayerWithoutDependencies } from "./manifest-store.ts";
 import { objectStoreLayer } from "./object-store.ts";
 import { WriterClient, writerClientLayer } from "./writer-client.ts";
@@ -35,7 +40,8 @@ export interface DbApiWorkerOptions {
 
 /**
  * The public database API Worker: serves `DbHttpApi` (`/v1`) and hosts every database's
- * `WriterServer` Durable Object.
+ * `WriterServer` Durable Object. It binds `CompactorWorker`'s `CompactorServer` so writers can wake
+ * compactors.
  */
 export class DbApiWorker extends Cloudflare.Worker<
   DbApiWorker,
@@ -61,6 +67,8 @@ export const dbApiWorkerLayer = (options: DbApiWorkerOptions) =>
       const writer = yield* WriterClient;
       const lifecycle = yield* DatabaseLifecycle;
       const client = yield* DbClient;
+      const compactors = yield* CompactorClient;
+      const manifests = yield* ManifestReader;
       // The router's scope must not outlive the invocation that built it.
       const router = yield* makeExecutionMemo(
         HttpRouter.toHttpEffect(
@@ -68,6 +76,8 @@ export const dbApiWorkerLayer = (options: DbApiWorkerOptions) =>
             Layer.provide(Layer.succeed(WriterClient, writer)),
             Layer.provide(Layer.succeed(DatabaseLifecycle, lifecycle)),
             Layer.provide(Layer.succeed(DbClient, client)),
+            Layer.provide(Layer.succeed(CompactorClient, compactors)),
+            Layer.provide(Layer.succeed(ManifestReader, manifests)),
           ),
         ),
       );
@@ -90,6 +100,9 @@ export const dbApiWorkerLayer = (options: DbApiWorkerOptions) =>
         ),
       ),
       Effect.provide(writerServerLayerWithoutDependencies),
+      // Writers wake their database's compactor (hosted by CompactorWorker) after flushes.
+      Effect.provide(compactionTriggerLayer.pipe(Layer.provideMerge(compactorClientLayer))),
+      Effect.provide(manifestReaderLayerWithoutDependencies),
       Effect.provide(Layer.mergeAll(objectStoreLayer, lsmConfigurationLayer)),
       Effect.provide(
         lsmTelemetryLayer({ baseUrl: options.otlpBaseUrl, serviceName: "cf-slatedb-api" }),

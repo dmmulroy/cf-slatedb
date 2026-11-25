@@ -7,11 +7,22 @@ import { HttpClient } from "effect/http";
 import { HttpApiClient } from "effect/http-api";
 
 import { DbHttpApi } from "../../src/db-http-api.ts";
-import { workerUrl } from "../telemetry/delayed-otlp-collector.ts";
+import { GcHttpApi } from "../../src/gc-http-api.ts";
+import { useDelayedCollector, workerUrl } from "../telemetry/delayed-otlp-collector.ts";
+import { INTEGRATION_PORTS } from "./integration-ports.ts";
 import { writerTestStack } from "./writer-stack.ts";
 
 // Bound into the Worker at deploy time by the settings Config; flush after two seconds of age.
-process.env["CF_SLATEDB_LSM_SETTINGS"] = JSON.stringify({ maxL0Age: 2000 });
+// Compactors poll every half second, and GC may collect what is a second old.
+process.env["CF_SLATEDB_LSM_SETTINGS"] = JSON.stringify({
+  maxL0Age: 2000,
+  compactorPollInterval: 500,
+  gcMinAge: 1000,
+});
+
+// The Workers flush telemetry before responding in test stages; this collector answers at once and
+// records the span names the test asserts on.
+const collector = useDelayedCollector(0, INTEGRATION_PORTS.collector);
 
 const { test } = Test.make({
   providers: Cloudflare.providers(),
@@ -183,7 +194,99 @@ test.provider(
       expect(snapshotKeys).toContain("log");
       expect(snapshotKeys).not.toContain("c");
       expect(yield* read("c", { _tag: "Latest" })).toEqual(Option.some("3"));
+
+      // Compaction: four flushes wake the compactor (CompactorWorker), which runs a Workflow.
+      const compacted = DatabaseId.make(`compaction-${Date.now().toString(36)}`);
+      yield* client.databases.createDatabase({
+        payload: {
+          databaseId: compacted,
+          keyRange: Option.none(),
+          mergeOperator: Option.some("Concat"),
+          changelogRetentionMs: Option.none(),
+          budgetGroup: Option.none(),
+        },
+      });
+      for (const round of [0, 1, 2, 3]) {
+        yield* client.databases.write({
+          params: { databaseId: compacted },
+          payload: {
+            operations: [
+              {
+                _tag: "Put",
+                key: bytes(`k${round}`),
+                value: bytes(`v${round}`),
+                ttlMillis: Option.none(),
+              },
+              {
+                _tag: "Merge",
+                key: bytes("log"),
+                operand: bytes(`${round}`),
+                ttlMillis: Option.none(),
+              },
+            ],
+          },
+        });
+        yield* client.databases.flush({ params: { databaseId: compacted } });
+      }
+      const settled = yield* client.databases
+        .compaction({ params: { databaseId: compacted } })
+        .pipe(
+          Effect.repeat({
+            schedule: Schedule.spaced("500 millis"),
+            until: (status) =>
+              status.l0Ssts === 0 &&
+              status.sortedRuns.length === 1 &&
+              Option.exists(status.compactor, (compactor) => compactor.running.length === 0),
+            times: 120,
+          }),
+        );
+      expect(settled.l0Ssts).toBe(0);
+      expect(Option.map(settled.compactor, (compactor) => compactor.compactorEpoch)).toEqual(
+        Option.some(1),
+      );
+      const readCompacted = (key: string, consistency: ReadConsistency) =>
+        client.databases
+          .get({
+            params: { databaseId: compacted },
+            payload: { key: bytes(key), consistency, snapshot: Option.none() },
+          })
+          .pipe(
+            Effect.map((response) =>
+              Option.map(response.row, (row) =>
+                row.value._tag === "Value"
+                  ? new TextDecoder().decode(row.value.bytes)
+                  : `<${row.value._tag}>`,
+              ),
+            ),
+          );
+      yield* Effect.sleep("1100 millis");
+      for (const consistency of [{ _tag: "Latest" } as const, { _tag: "Flushed" } as const]) {
+        expect(yield* readCompacted("k2", consistency)).toEqual(Option.some("v2"));
+        expect(yield* readCompacted("log", consistency)).toEqual(Option.some("0123"));
+      }
+
+      // GC (on demand through the GC Worker) removes the replaced L0 SSTs; reads are unaffected.
+      const gc = yield* HttpApiClient.makeWith(GcHttpApi, {
+        baseUrl: workerUrl(deployed.gcUrl),
+        httpClient: yield* HttpClient.HttpClient,
+      });
+      const report = yield* gc.gc.collect({ params: { databaseId: compacted } });
+      expect(report.deletedSsts).toBe(4);
+      // The compaction ran as a Workflow in the compactor Worker and committed once.
+      const spanNames = new Set(collector.spans.map((span) => span.name));
+      for (const name of [
+        "Compactor.poll",
+        "CompactionWorkflow.run",
+        "CompactionExecutor.commit",
+        "GarbageCollector.collect",
+      ]) {
+        expect(spanNames.has(name)).toBe(true);
+      }
+      for (const consistency of [{ _tag: "Latest" } as const, { _tag: "Flushed" } as const]) {
+        expect(yield* readCompacted("k0", consistency)).toEqual(Option.some("v0"));
+        expect(yield* readCompacted("log", consistency)).toEqual(Option.some("0123"));
+      }
       yield* stack.destroy();
     }),
-  { timeout: 180_000 },
+  { timeout: 300_000 },
 );

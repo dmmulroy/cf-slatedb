@@ -9,7 +9,10 @@ import { DbHttpRequest, dbHttpRequestMiddlewareLayer } from "./db-http-request.t
 import { type DbApiOperation } from "./db-public-error.ts";
 import { toPublicError, type DbInternalError } from "./db-public-error-translation.ts";
 import { lsmHttpServerLayer } from "./lsm-http-server.ts";
+import { CompactorClient } from "./compactor-client.ts";
+import { CompactorUnavailableError } from "./compactor.ts";
 import { DbClient } from "./db-client.ts";
+import { ManifestReader } from "./manifest-reader.ts";
 import { WriterClient } from "./writer-client.ts";
 
 /** Runs a handler body and classifies its failure as the public error for `operation`. */
@@ -27,6 +30,8 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
     const writer = yield* WriterClient;
     const lifecycle = yield* DatabaseLifecycle;
     const client = yield* DbClient;
+    const compactors = yield* CompactorClient;
+    const manifests = yield* ManifestReader;
     return handlers
       .handle("createDatabase", ({ payload }) =>
         lifecycle
@@ -60,6 +65,32 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
       )
       .handle("status", ({ params }) =>
         writer.status(params.databaseId).pipe(publicFailures("status")),
+      )
+      .handle("compaction", ({ params }) =>
+        Effect.gen(function* () {
+          const latest = yield* manifests.loadLatest(params.databaseId).pipe(
+            Effect.catchTags({
+              ManifestReadError: (error) =>
+                Effect.fail(
+                  new CompactorUnavailableError({
+                    databaseId: params.databaseId,
+                    message: error.message,
+                  }),
+                ),
+            }),
+          );
+          const compactor = yield* compactors.status(params.databaseId).pipe(Effect.scoped);
+          return {
+            manifestId: latest.id,
+            l0Ssts: latest.manifest.l0.length,
+            sortedRuns: latest.manifest.sortedRuns.map((run) => ({
+              id: run.id,
+              ssts: run.ssts.length,
+              sizeBytes: run.ssts.reduce((sum, sst) => sum + sst.sizeBytes, 0),
+            })),
+            compactor,
+          };
+        }).pipe(publicFailures("compaction")),
       )
       .handle("get", ({ params, payload }) =>
         client

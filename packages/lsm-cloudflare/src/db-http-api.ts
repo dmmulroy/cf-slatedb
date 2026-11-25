@@ -1,15 +1,18 @@
 import {
   DatabaseId,
   KeyRange,
+  ManifestId,
   MergeOperatorName,
   ReadConsistency,
   RowSchema,
+  SortedRunId,
   WriteBatch,
   WriteReceipt,
 } from "@cf-slatedb/lsm-core";
 import { Schema } from "effect";
 import { HttpApi, HttpApiEndpoint, HttpApiGroup, HttpApiSchema, OpenApi } from "effect/http-api";
 
+import { CompactorState } from "./compactor.ts";
 import { DbSnapshot } from "./db-client.ts";
 import { DB_PUBLIC_ERRORS } from "./db-public-error.ts";
 import {
@@ -51,6 +54,19 @@ export const GetRequest = Schema.Struct({
 
 /** Schema for a point read's result: the visible row (value, `seq`, timestamps), or null. */
 export const GetResponse = Schema.Struct({ row: Schema.OptionFromNullOr(RowSchema) });
+
+/**
+ * Schema for a database's compaction state: the newest manifest's L0 SST count and sorted runs, and
+ * its compactor's state (null when the compactor was never woken).
+ */
+export const CompactionStatusResponse = Schema.Struct({
+  manifestId: ManifestId,
+  l0Ssts: Schema.Int,
+  sortedRuns: Schema.Array(
+    Schema.Struct({ id: SortedRunId, ssts: Schema.Int, sizeBytes: Schema.Int }),
+  ),
+  compactor: Schema.OptionFromNullOr(CompactorState),
+});
 
 /** Largest page a scan returns. */
 export const MAX_SCAN_PAGE_ROWS = 1000;
@@ -119,6 +135,19 @@ export class DbHttpApiGroup extends HttpApiGroup.make("databases")
       success: WriterStatusResponse,
       error: DB_PUBLIC_ERRORS,
     }).annotateMerge(OpenApi.annotations({ summary: "Read the writer's status" })),
+  )
+  .add(
+    HttpApiEndpoint.get("compaction", "/databases/:databaseId/compaction", {
+      params: DatabaseParams,
+      success: CompactionStatusResponse,
+      error: DB_PUBLIC_ERRORS,
+    }).annotateMerge(
+      OpenApi.annotations({
+        summary: "Read the compaction state",
+        description:
+          "The newest manifest's L0 SST count and sorted runs, and the compactor's running jobs and epoch.",
+      }),
+    ),
   )
   .add(
     HttpApiEndpoint.post("get", "/databases/:databaseId/get", {
