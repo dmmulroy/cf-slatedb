@@ -4,6 +4,9 @@
 
 All ten phases are done. See the hand-off below; open questions need Dillon.
 
+**Next:** the remaining work (preview tooling, traces from previews, approved live checks, per-Stack
+data residency, known gaps) is in [`docs/handoff.md`](handoff.md). Start there.
+
 ## Done
 
 - **Phase 0 — repository setup** (`b3a4e84`). pnpm workspace with iac's catalog (effect 4.1.4,
