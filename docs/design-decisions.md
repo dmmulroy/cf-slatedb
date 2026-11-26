@@ -354,6 +354,9 @@ so the checkpoint pins exactly the manifest its CAS applied to.
 
 ## D38. Forks rewrite external SSTs with one full compaction, then release
 
+> **Release rule corrected by D77.** A fork no longer releases its hold on the compactor's next
+> poll: its own collection releases it once no manifest it keeps names another database's SST.
+
 Size-tiered planning alone may never touch a fork's bottom run, which would keep the source's files
 alive indefinitely. When nothing else is running or planned and the manifest still reads another
 database's SSTs, `planCompactions` plans one full compaction (every L0 SST and sorted run into the
@@ -994,8 +997,9 @@ wall-time limits and silently stop partway.
     `POST /v1/gc` runs one page. A run's cost is bounded by the page, whatever the number of databases.
 - The GC Worker now also reports to the CPU Tail Worker.
 
-Tests: `garbage-collector.test.ts` runs the sweep over 17 databases in pages of 5 and checks every
-database is visited once per cycle (fork woken, piled-up manifests requested, leftovers swept) and
+Tests: `garbage-collector.test.ts` runs the sweep over 18 databases in pages of 5 and checks every
+database is visited once per cycle (fork woken, piled-up manifests and, since D77, a rewritten
+fork still holding its source requested, leftovers swept) and
 that the next run starts over. `compactor.test.ts` shows collection due `gcMinAge` after a
 compaction, run by the alarm, then idle with no alarm. The `gc` scenario asserts that the
 compactor's alarm collected (`GarbageCollector.collect` under `Compactor.alarm` with
@@ -2038,3 +2042,98 @@ variant `noReadUpperBound` fails it, and `noReadHorizonCheck` now fails it too. 
 
 **Not fixed here.** A fork's manifests name its source's SSTs, and the fork released its hold on
 the source too early for readers of its older manifests (D77).
+
+## D77. A fork keeps its hold on its source while a reader may still hold a manifest that reads it
+
+**The defect.** D38 released a fork's hold on its source as soon as the fork's newest manifest,
+and the manifests its own checkpoints pin, no longer named the source's SSTs. It ignored the
+fork's manifests replaced less than `gcMinAge` ago. A reader may hold those: a snapshot from
+`DbClient.snapshot` (promised for `gcMinAge`), a manifest a Worker isolate cached, or a
+transaction's begin manifest. Every other part of the system keeps what such a manifest needs
+(D29, D33, `MayBeHeld` in `GcSafety.tla`). Two scratch tests from an interaction audit proved the
+consequences. Seconds after the fork's rewrite, the hold was gone. The source's collection then
+deleted 5 SSTs the fork's snapshot named, or the source could be removed. The snapshot then
+failed with `StorageUnavailable` on every retry, as did a transaction whose begin manifest was
+the writer's fence-in manifest.
+
+**A second early release, found while fixing it.** A fork of a fork (D13) reads the original
+owner's SSTs under the owner's id, through its hold on the middle database. D38 matched a hold to
+the owners its handles name. So the grandchild's hold on the middle database counted as
+releasable before the grandchild's rewrite: any idle poll could release it, for example one
+waiting for compaction budget. Without that hold the middle database's own hold on the owner
+lapses, and the owner's SSTs can be deleted under the grandchild. The `manifest.test.ts` case
+fails on the code before.
+
+**The rule.** A fork releases its hold only when none of its manifests that a reader may still
+hold names another database's SST. Those manifests are exactly the ones GC keeps:
+
+- the newest;
+- every manifest a checkpoint pins;
+- every manifest superseded less than `gcMinAge` ago, measured from its successor's write time
+  (D33).
+
+A database has at most one external reference: only `forkManifest` creates one, and every other
+database's SST the database reads came through it. So the hold is needed while any kept manifest
+names any other database's SST, whichever owner's id it carries.
+
+**The design: the fork's own collection releases the hold.** `GarbageCollector.collect` already
+computes the kept manifests (`planManifestCollection`) and loads them to plan SST deletes. After
+that, `releasableExternalRefs(newest, kept)` returns the hold when none of them names another
+database's SST. Releasing is two idempotent CAS steps, as before:
+
+1. remove the checkpoint from the owner's manifest;
+2. remove the reference from the fork's own manifest.
+
+A crash between them leaves the reference, and the next collection releases again. If any kept
+manifest cannot be loaded, the collection releases nothing.
+
+A manifest newer than the ones the collection listed names no other database's SST that they do
+not. Flushes and compactions add only the database's own SSTs, `dropSstFromManifest` removes one,
+and no edit after `forkManifest` adds a handle owned by another database. So checking the listed
+kept manifests is enough, and nothing beyond what GC already loads is read.
+
+**What brings the release about.**
+
+- **The compactor's alarm.** The compactor sets a collection due `gcMinAge` after it sees the
+  rewrite finish (D60). That collection finds the pre-rewrite manifests old enough and releases.
+- **The maintenance sweep.** It now asks for a collection of any database that still holds a
+  source but no longer reads another database's SSTs. It still wakes the compactor of one that
+  does. The sweep is the backstop for a lost alarm, and for a middle database whose fork just
+  released its hold on it: that database's collection is not otherwise due. A collection asked
+  for early releases nothing while the pre-rewrite manifests are young.
+
+**Rejected.**
+
+- **A second "may still be held" rule in the compactor**, for example "release `gcMinAge` after
+  the rewrite". It would copy GC's rule and drift from it, and it would not see the fork's own
+  pins.
+- **Loading every kept manifest in the compactor's poll.** That is the collection's work done
+  twice, on every poll.
+- **Delaying source collection or removal instead.** The source cannot know which of the fork's
+  manifests readers may hold; only the fork's collection can.
+
+**What it costs.** The source keeps the SSTs a fork read for about `gcMinAge` longer after the
+fork's rewrite: an hour in production, 10 s with dev timings. For a split, the sealed database
+cannot be removed (`DatabaseHasDependentsError`) until that time has passed for both halves.
+Nothing in a split waits on it: `ShardSplit` never removes the sealed database, and whoever does
+retries the removal later (`writer.workerd.ts` retries it). A middle database of a fork chain
+releases its own hold only at its next collection after its fork's release, which the sweep asks
+for within a sweep cycle.
+
+**Tests and model.**
+
+- `database-lifecycle.test.ts`:
+  - **Split.** Each fork keeps its hold after the rewrite and the source cannot be removed. One
+    `gcMinAge` later the fork's own due collection releases the hold, and the source is removed.
+  - **Snapshot.** A fork's snapshot taken before the rewrite stays readable through the fork's
+    and the source's collections and through an attempt to remove the source. After `gcMinAge`
+    the hold is released, the source is removed, and the snapshot reads `SnapshotExpired`.
+  - **Fork of a fork.** Its holds are kept down the chain while any kept manifest names the
+    original owner.
+- `garbage-collector.test.ts`: the sweep asks a rewritten fork to collect and wakes one still
+  reading its source.
+- `manifest.test.ts`: a fork of a fork's hold is kept before its rewrite.
+- All four `lsm-cloudflare` tests fail on the code before. Seven mutations are each caught.
+- `GcSafety.tla` gains an abstract fork (`GcSafetyFork.cfg`: `ForkStart`, `ForkRewrite`,
+  `ForkRelease`) and the invariant `ForkReadsComplete`. The broken variant `earlyForkRelease`
+  (D38's rule) fails it.

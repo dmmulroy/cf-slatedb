@@ -343,7 +343,8 @@ test.provider(
       }
 
       // Split: seal, one checkpoint, a fork per range. Each fork's compactor rewrites the source's
-      // SSTs and releases its hold; then the source can be removed.
+      // SSTs, and its collection gcMinAge later (1 s here) releases its hold (D77); then the source
+      // can be removed.
       const source = DatabaseId.make(`split-${Date.now().toString(36)}`);
       const left = DatabaseId.make(`${source}-a`);
       const right = DatabaseId.make(`${source}-b`);
@@ -416,7 +417,8 @@ test.provider(
       yield* client.databases.deleteCheckpoint({
         params: { databaseId: source, checkpointId: checkpoint.id },
       });
-      // The forks' compactors (woken by forkRange) run their rewrite Workflows and release.
+      // The forks' compactors (woken by forkRange) run their rewrite Workflows; each releases its
+      // hold from the collection due gcMinAge after the rewrite (D77).
       yield* client.databases.removeDatabase({ params: { databaseId: source } }).pipe(
         Effect.retry({
           while: (error) => error._tag === "DatabaseHasDependentsPublicError",

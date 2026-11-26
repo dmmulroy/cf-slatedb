@@ -311,9 +311,11 @@ describe("DatabaseLifecycle", () => {
         // The fork's compactor rewrites the source's SSTs into its own.
         const left = yield* compactorOf(LEFT);
         const rewritten = (yield* reader.loadLatest(LEFT)).manifest;
-        // The source collects and an operator tries to remove it, seconds after the rewrite.
+        // Seconds after the rewrite the fork collects (an operator's collect-now, or the
+        // maintenance sweep's request), then the source collects and an operator tries to remove it.
+        yield* gc.collect(LEFT);
         yield* gc.collect(SOURCE);
-        const removeRefused = yield* Effect.flip(lifecycle.remove(SOURCE));
+        const removeAttempt = yield* Effect.result(lifecycle.remove(SOURCE));
         const soon = {
           holds: (yield* reader.loadLatest(SOURCE)).manifest.checkpoints.length,
           refs: rewritten.externalRefs.length,
@@ -323,6 +325,7 @@ describe("DatabaseLifecycle", () => {
         // Just under gcMinAge later the snapshot is still promised, and still readable.
         yield* TestClock.adjust(HOUR - 10_000);
         yield* left.runDue;
+        yield* gc.collect(LEFT);
         yield* gc.collect(SOURCE);
         const late = {
           holds: (yield* reader.loadLatest(SOURCE)).manifest.checkpoints.length,
@@ -336,12 +339,13 @@ describe("DatabaseLifecycle", () => {
           holds: (yield* reader.loadLatest(SOURCE)).manifest.checkpoints.length,
           refs: (yield* reader.loadLatest(LEFT)).manifest.externalRefs.length,
         };
-        yield* lifecycle.remove(SOURCE);
+        const finalRemove = yield* Effect.result(lifecycle.remove(SOURCE));
         return {
+          finalRemove: finalRemove._tag,
           rewrittenOwners: manifestSstHandles(rewritten).map((sst) =>
             Option.getOrUndefined(sst.owner),
           ),
-          removeRefused: removeRefused._tag,
+          removeAttempt: removeAttempt._tag === "Success" ? "removed" : removeAttempt.failure._tag,
           soon,
           late,
           released,
@@ -351,12 +355,115 @@ describe("DatabaseLifecycle", () => {
       }),
     );
     expect(outcome.rewrittenOwners.every((owner) => owner === undefined)).toBe(true);
-    expect(outcome.removeRefused).toBe("DatabaseHasDependentsError");
+    expect(outcome.removeAttempt).toBe("DatabaseHasDependentsError");
+    expect(outcome.finalRemove).toBe("Success");
     expect(outcome.soon).toEqual({ holds: 1, refs: 1, read: "B", retry: "B" });
     expect(outcome.late).toEqual({ holds: 1, read: "B" });
     expect(outcome.released).toEqual({ holds: 0, refs: 0 });
     expect(outcome.expired).toBe("SnapshotExpired");
     expect(outcome.latest).toEqual(["a=A", "b=B"]);
+  });
+
+  it("keeps a fork of a fork's holds down the chain while any kept manifest names the original owner (D13, D77)", async () => {
+    const MIDDLE = LEFT;
+    const GRANDCHILD = DatabaseId.make("orders-c");
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const client = yield* DbClient;
+        const reader = yield* ManifestReader;
+        const gc = yield* GarbageCollector;
+        const holdsOn = (databaseId: DatabaseId) =>
+          Effect.map(reader.loadLatest(databaseId), (latest) => latest.manifest.checkpoints.length);
+        const refsOf = (databaseId: DatabaseId) =>
+          Effect.map(
+            reader.loadLatest(databaseId),
+            (latest) => latest.manifest.externalRefs.length,
+          );
+        const forkOf = (source: DatabaseId, forkId: DatabaseId) =>
+          Effect.gen(function* () {
+            const checkpoint = yield* lifecycle.createCheckpoint(source, {
+              name: Option.none(),
+              lifetimeMs: Option.none(),
+            });
+            yield* lifecycle.forkRange({
+              source,
+              checkpointId: checkpoint.id,
+              range: LEFT_RANGE,
+              forkId,
+            });
+            yield* lifecycle.deleteCheckpoint(source, checkpoint.id);
+          });
+        yield* lifecycle.create(SOURCE, {
+          keyRange: Option.none(),
+          databaseOptions: DEFAULT_DATABASE_OPTIONS,
+        });
+        for (const key of ["a", "b"]) {
+          yield* client.put(SOURCE, bytes(key), bytes(key.toUpperCase()));
+        }
+        yield* client.flush(SOURCE);
+        yield* forkOf(SOURCE, MIDDLE);
+        // The grandchild forks the middle database before its rewrite: it reads the original
+        // owner's SSTs under the owner's id, through its hold on the middle database.
+        yield* forkOf(MIDDLE, GRANDCHILD);
+        const grandchildOwners = manifestSstHandles(
+          (yield* reader.loadLatest(GRANDCHILD)).manifest,
+        ).map((sst) => Option.getOrUndefined(sst.owner));
+        // The middle database rewrites; gcMinAge later it still holds the owner, because the
+        // manifest its fork's hold pins names the owner's SSTs. The grandchild's collection before
+        // its own rewrite keeps its hold on the middle database too.
+        const middle = yield* compactorOf(MIDDLE);
+        yield* TestClock.adjust(HOUR);
+        yield* middle.runDue;
+        yield* gc.collect(GRANDCHILD);
+        const middleRewritten = {
+          onOwner: yield* holdsOn(SOURCE),
+          onMiddle: yield* holdsOn(MIDDLE),
+        };
+        // The grandchild rewrites; it keeps its hold on the middle database for gcMinAge.
+        const grandchild = yield* compactorOf(GRANDCHILD);
+        const grandchildRewritten = {
+          onOwner: yield* holdsOn(SOURCE),
+          onMiddle: yield* holdsOn(MIDDLE),
+          removeOwner: (yield* Effect.flip(lifecycle.remove(SOURCE)))._tag,
+        };
+        yield* TestClock.adjust(HOUR);
+        yield* grandchild.runDue;
+        const grandchildReleased = {
+          onOwner: yield* holdsOn(SOURCE),
+          onMiddle: yield* holdsOn(MIDDLE),
+          grandchildRefs: yield* refsOf(GRANDCHILD),
+        };
+        // The middle database's next collection (the maintenance sweep asks for it) releases the
+        // owner: none of its kept manifests names the owner's SSTs any more.
+        yield* gc.collect(MIDDLE);
+        const middleReleased = {
+          onOwner: yield* holdsOn(SOURCE),
+          middleRefs: yield* refsOf(MIDDLE),
+        };
+        yield* lifecycle.remove(SOURCE);
+        return {
+          grandchildOwners,
+          middleRewritten,
+          grandchildRewritten,
+          grandchildReleased,
+          middleReleased,
+          middleValues: yield* valuesIn(MIDDLE),
+          grandchildValues: yield* valuesIn(GRANDCHILD),
+        };
+      }),
+    );
+    expect(outcome.grandchildOwners).toEqual([SOURCE]);
+    expect(outcome.middleRewritten).toEqual({ onOwner: 1, onMiddle: 1 });
+    expect(outcome.grandchildRewritten).toEqual({
+      onOwner: 1,
+      onMiddle: 1,
+      removeOwner: "DatabaseHasDependentsError",
+    });
+    expect(outcome.grandchildReleased).toEqual({ onOwner: 1, onMiddle: 0, grandchildRefs: 0 });
+    expect(outcome.middleReleased).toEqual({ onOwner: 0, middleRefs: 0 });
+    expect(outcome.middleValues).toEqual(["a=A", "b=B"]);
+    expect(outcome.grandchildValues).toEqual(["a=A", "b=B"]);
   });
 
   it("removing a fork releases its hold on the source", async () => {

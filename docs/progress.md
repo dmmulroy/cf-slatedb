@@ -277,6 +277,15 @@ hand-off is below.
   collector URL, so the two forms never store an export twice. `measure` pulls by URL with the
   token in the trace CLI's environment. `docs/operations.md` shows the production and preview
   forms side by side. Not yet tried against a live collector.
+  - **A fork keeps its hold while a reader may hold a manifest that reads the source (D77).** A
+    fork released its hold seconds after its rewrite. Its snapshot from before the rewrite, cached
+    manifests, and fence-in transactions then failed once the source collected or was removed.
+    A fork of a fork could also release its hold on the middle database before its own rewrite.
+    The fork's own collection now releases the hold, once no manifest GC keeps names another
+    database's SST. The source of a split lives about `gcMinAge` longer. Tests in
+    `database-lifecycle.test.ts`, `garbage-collector.test.ts`, and `manifest.test.ts` fail on the
+    code before. `GcSafety` gains `GcSafetyFork.cfg` (`ForkReadsComplete`, broken variant
+    `earlyForkRelease`). Not yet run in workerd or on a preview.
 
 ## Remaining-work log
 

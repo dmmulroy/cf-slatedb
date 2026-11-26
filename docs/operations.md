@@ -102,11 +102,13 @@ creating a new installation and forking or copying databases into it.
   (D60).
 - **The sweep.** A cron every 5 minutes runs a paged maintenance sweep of 50 databases. It removes
   what deleted databases left behind, wakes forks' compactors, and asks for collection where
-  manifests piled up.
+  manifests piled up or where a fork has rewritten its source's SSTs but still holds it.
 - **Collect now:** `POST /v1/gc/databases/<id>` on the GC Worker.
 - **Removing a database:** `DELETE /v1/databases/<id>`. It fails with `DatabaseHasDependents`
-  while forks still read its SSTs. Remove them first, or wait until their compactions have
-  rewritten what they read.
+  while forks still read its SSTs. Remove them first, or wait until each fork has rewritten what it
+  read and `gcMinAge` (1 hour) has passed since. The fork's own collection releases its hold then,
+  once no snapshot or cached manifest of the fork can still read the source (D77). After a split,
+  the sealed database can be removed about an hour after both halves' rewrites.
 
 ## Capacity
 
