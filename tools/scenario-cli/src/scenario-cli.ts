@@ -44,15 +44,17 @@ import {
 } from "./measurement-collector-option.ts";
 import { smoke } from "./smoke.ts";
 import { soak } from "./soak.ts";
+import { soakFailureMessage } from "./soak-report.ts";
 import { ScenarioStack, type ScenarioFailure } from "./scenario.ts";
 import { SCENARIOS } from "./scenarios.ts";
 
 /**
- * Some scenarios failed (`ScenariosFailed`), a name matched no scenario (`UnknownScenario`), or the
- * preview stage could not be resolved (`PreviewUnavailable`). Exits non-zero.
+ * Some scenarios failed (`ScenariosFailed`), a soak did not pass (`SoakFailed`), a name matched no
+ * scenario (`UnknownScenario`), or the preview stage could not be resolved (`PreviewUnavailable`).
+ * Exits non-zero.
  */
 class ScenarioCliError extends Data.TaggedError("ScenarioCliError")<{
-  readonly reason: "ScenariosFailed" | "UnknownScenario" | "PreviewUnavailable";
+  readonly reason: "ScenariosFailed" | "SoakFailed" | "UnknownScenario" | "PreviewUnavailable";
   readonly message: string;
 }> {}
 
@@ -451,18 +453,25 @@ const soakCommand = Command.make(
     reportFile,
     telemetryBudgetMinutes,
   }) =>
-    runMeasurement(
-      stage,
-      soak({
-        minutes,
-        databases,
-        keysPerDatabase,
-        redeployAtMinute: redeployAt,
-        splitAtMinutes: splitAt.split(",").map((minute) => Number(minute.trim())),
-        traceSampleRate,
-        reportFile,
-        telemetryBudgetMinutes,
-      }),
+    // The report is printed whatever the verdict; a soak that did not pass then exits non-zero.
+    soak({
+      minutes,
+      databases,
+      keysPerDatabase,
+      redeployAtMinute: redeployAt,
+      splitAtMinutes: splitAt.split(",").map((minute) => Number(minute.trim())),
+      traceSampleRate,
+      reportFile,
+      telemetryBudgetMinutes,
+    }).pipe(
+      Effect.tap((report) => Console.log(JSON.stringify(report, null, 2))),
+      Effect.provide(Layer.mergeAll(previewStackLayer(stage), collectorLayer(stage))),
+      Effect.flatMap((report) =>
+        Option.match(soakFailureMessage(report), {
+          onNone: () => Effect.void,
+          onSome: (message) => Effect.fail(new ScenarioCliError({ reason: "SoakFailed", message })),
+        }),
+      ),
     ),
 ).pipe(
   Command.withDescription(

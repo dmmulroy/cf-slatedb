@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { Effect, FileSystem, Option } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 
-import { soakPassed, type SoakPhase, writeReportFile } from "./soak-report.ts";
+import { soakFailureMessage, soakPassed, type SoakPhase, writeReportFile } from "./soak-report.ts";
 
 const directory = () => mkdtempSync(join(tmpdir(), "soak-report-"));
 
@@ -91,6 +91,21 @@ describe("the verdict", () => {
     expect(soakPassed({ ...clean, phase: "done" })).toBe(true);
     for (const phase of ["workload", "final-reads", "storage", "telemetry"] as const)
       expect(soakPassed({ ...clean, phase })).toBe(false);
+  });
+
+  it("gives the command a failure to exit with unless the soak passed", () => {
+    expect(soakFailureMessage({ passed: true, mismatches: [], failures: [] })).toEqual(
+      Option.none(),
+    );
+    // Not passed with nothing listed: stopped early, or a health issue or unexpected error span.
+    const stopped = soakFailureMessage({ passed: false, mismatches: [], failures: [] });
+    expect(Option.isSome(stopped)).toBe(true);
+    const failed = soakFailureMessage({
+      passed: false,
+      mismatches: ["key 7"],
+      failures: ["health report: not finished within 1 min", "storage"],
+    });
+    expect(Option.getOrThrow(failed)).toContain("1 mismatch(es), 2 failed check(s)");
   });
 
   it("fails a soak that could not check its telemetry", () => {

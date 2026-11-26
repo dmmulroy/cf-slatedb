@@ -1432,6 +1432,10 @@ with nothing written. Since then (`soak-telemetry.ts`, `soak-report.ts`):
   written to a temporary file and renamed over the path, every minute during the workload and
   after each phase, so a stopped run leaves its last complete report. `passed` is `true` only
   when `phase` is `done` (`soakPassed`). Stdout still prints the final report.
+- **The exit status is the verdict.** The command exits 0 only when `passed` is `true`
+  (`soakFailureMessage`). Before, it exited 0 whenever it could print a report, so a script
+  could take a failed soak for a passed one (seen on the first live run of the rebuilt tool,
+  which printed `passed: false` and exited 0).
 
 Tests: `soak-telemetry.test.ts` (a source that never ends is cut off at its budget and the
 failure says how far it got; a watcher in the middle of an endless read is interrupted when the

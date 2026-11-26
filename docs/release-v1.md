@@ -165,6 +165,8 @@ it runs in phases: `workload`, `final-reads`, `storage`, `telemetry`, `done`.
 - **The report is never lost.** `--report-file` is replaced atomically every minute, at each phase
   change, and at `done`. At `done` it equals what the soak prints.
 - **Late events are skipped.** A split or redeploy planned at or after `--minutes` does not run.
+- **The exit status is the verdict.** The command exits 0 only when the report says
+  `passed: true`.
 
 `passed` is true only at phase `done` with no mismatch, no failed operation, no unexpected error
 span, and a health report with no issue (`soakPassed`, `soak-report.ts`). A health issue is any

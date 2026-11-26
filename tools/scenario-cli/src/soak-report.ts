@@ -29,6 +29,24 @@ export const soakPassed = (inputs: SoakVerdictInputs) =>
   inputs.unexpectedErrors.length === 0 &&
   Option.exists(inputs.healthIssues, (issues) => issues.length === 0);
 
+/** What the command's exit status depends on: the verdict and what to say when it is no. */
+export interface SoakOutcome {
+  readonly passed: boolean;
+  readonly mismatches: ReadonlyArray<string>;
+  readonly failures: ReadonlyArray<string>;
+}
+
+/**
+ * Why the soak command must exit non-zero, or `None` when the soak passed: a release gate that a
+ * script runs must fail by its exit status, not only by a field of the JSON it prints.
+ */
+export const soakFailureMessage = (outcome: SoakOutcome): Option.Option<string> =>
+  outcome.passed
+    ? Option.none()
+    : Option.some(
+        `The soak did not pass (${outcome.mismatches.length} mismatch(es), ${outcome.failures.length} failed check(s)). Its report, printed above, names each one under mismatches, failures, unexpectedErrors, and health.issues. Fix the cause and run the soak again.`,
+      );
+
 let reportWrites = 0;
 
 /**
