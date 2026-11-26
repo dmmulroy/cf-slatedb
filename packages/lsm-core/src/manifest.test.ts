@@ -20,6 +20,7 @@ import {
   commitL0Flush,
   type CompactionJob,
   DEFAULT_DATABASE_OPTIONS,
+  dropSstFromManifest,
   fenceCompactor,
   fenceWriter,
   forkManifest,
@@ -28,6 +29,7 @@ import {
   releasableExternalRefs,
   initialManifest,
   Manifest,
+  MAX_DROPPED_SST_HISTORY,
   ManifestJson,
   removeCheckpoint,
   replaceManifestFields,
@@ -106,6 +108,99 @@ describe("Manifest JSON", () => {
       // The next manifest written from it no longer carries the field.
       expect(Schema.encodeSync(ManifestJson)(decoded)).toBe(current);
     }
+  });
+});
+
+describe("dropSstFromManifest (D62)", () => {
+  const at = Timestamp.make(99);
+  const withRuns = manifestWith(Result.getOrThrow(flush(Result.getOrThrow(flush(empty, 1)), 2)), {
+    sortedRuns: [
+      { id: SortedRunId.make(2), ssts: [handle(10, 10, 19), handle(11, 20, 29)] },
+      { id: SortedRunId.make(1), ssts: [handle(12, 0, 50)] },
+    ],
+  });
+
+  it("drops an L0 SST and records what was lost", () => {
+    const dropped = Result.getOrThrow(
+      dropSstFromManifest(withRuns, { sstId: ulid(1), reason: "Corrupted", droppedAt: at }),
+    );
+    expect(dropped.l0.map((sst) => sst.id)).toEqual([ulid(2)]);
+    expect(dropped.sortedRuns).toEqual(withRuns.sortedRuns);
+    expect(dropped.droppedSsts).toEqual([
+      {
+        sstId: ulid(1),
+        owner: Option.none(),
+        from: { _tag: "L0", sstId: ulid(1) },
+        firstKey: Uint8Array.of(1),
+        lastKey: Uint8Array.of(2),
+        view: Option.none(),
+        rowCount: 10,
+        reason: "Corrupted",
+        droppedAt: at,
+      },
+    ]);
+    // Nothing else changes: epochs, sequence numbers, and the GC boundary stay.
+    expect([dropped.writerEpoch, dropped.compactorEpoch, dropped.lastL0Seq]).toEqual([
+      withRuns.writerEpoch,
+      withRuns.compactorEpoch,
+      withRuns.lastL0Seq,
+    ]);
+  });
+
+  it("drops a sorted run's SST, removing the run when it was the last, and is idempotent", () => {
+    const fromRun = Result.getOrThrow(
+      dropSstFromManifest(withRuns, { sstId: ulid(11), reason: "Forced", droppedAt: at }),
+    );
+    expect(fromRun.sortedRuns.map((run) => [run.id, run.ssts.map((sst) => sst.id)])).toEqual([
+      [2, [ulid(10)]],
+      [1, [ulid(12)]],
+    ]);
+    expect(fromRun.droppedSsts[0]?.from).toEqual({ _tag: "SortedRun", id: SortedRunId.make(2) });
+    const lastOfRun = Result.getOrThrow(
+      dropSstFromManifest(fromRun, { sstId: ulid(12), reason: "Forced", droppedAt: at }),
+    );
+    expect(lastOfRun.sortedRuns.map((run) => run.id)).toEqual([2]);
+    // Applying the same drop again writes nothing.
+    expect(
+      Result.getOrThrow(
+        dropSstFromManifest(lastOfRun, { sstId: ulid(12), reason: "Forced", droppedAt: at }),
+      ),
+    ).toBe(lastOfRun);
+  });
+
+  it("refuses an SST the manifest never held, and a database being removed", () => {
+    const missing = dropSstFromManifest(withRuns, {
+      sstId: ulid(77),
+      reason: "Forced",
+      droppedAt: at,
+    });
+    expect(Result.isFailure(missing) && missing.failure._tag).toBe("SstNotInManifestError");
+    const removed = dropSstFromManifest(Result.getOrThrow(markRemoved(withRuns)), {
+      sstId: ulid(1),
+      reason: "Corrupted",
+      droppedAt: at,
+    });
+    expect(Result.isFailure(removed) && removed.failure._tag).toBe("DatabaseRemovedError");
+  });
+
+  it("keeps the newest drops only, round-trips them, and decodes older manifests with none", () => {
+    let manifest = empty;
+    for (let n = 1; n <= MAX_DROPPED_SST_HISTORY + 3; n++) {
+      manifest = Result.getOrThrow(
+        dropSstFromManifest(Result.getOrThrow(flush(manifest, n)), {
+          sstId: ulid(n),
+          reason: "Corrupted",
+          droppedAt: at,
+        }),
+      );
+    }
+    expect(manifest.droppedSsts.length).toBe(MAX_DROPPED_SST_HISTORY);
+    expect(manifest.droppedSsts[0]?.sstId).toBe(ulid(4));
+    const json = Schema.encodeSync(ManifestJson)(manifest);
+    expect(Schema.decodeSync(ManifestJson)(json).droppedSsts).toEqual(manifest.droppedSsts);
+    const older = JSON.parse(Schema.encodeSync(ManifestJson)(empty));
+    delete older.droppedSsts;
+    expect(Schema.decodeSync(ManifestJson)(JSON.stringify(older)).droppedSsts).toEqual([]);
   });
 });
 

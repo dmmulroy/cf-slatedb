@@ -23,8 +23,8 @@ node tools/formal-verification/src/verify.ts gc-safety   # about 45 seconds
 vp run verify                                            # every formal check
 ```
 
-Expected: four `✓` lines. The code as written passes; `noBoundaryCheck` and `ownUploadAge` fail
-`ReadableManifestsComplete`; `ignorePins` fails `PinnedManifestsComplete`.
+Expected: five `✓` lines. The code as written passes; `noBoundaryCheck`, `ownUploadAge`, and
+`dropDeletesObject` fail `ReadableManifestsComplete`; `ignorePins` fails `PinnedManifestsComplete`.
 
 ## Read a result
 
@@ -38,6 +38,7 @@ step:
 | `Upload(s)` | `SstStore.write` in a flush (`DbWriter.flushNow`) or a compaction step (`CompactionExecutor.writeOutput`): a new ULID, the object uploaded |
 | `CommitFlush(s)` | `ManifestStore.update(commitL0Flush)`; refused below `gcSstBoundary` (`SstBelowGcBoundaryError`) |
 | `CommitCompaction(s, inputs)` | `CompactionExecutor.commit` → `commitCompaction` (exact inputs, boundary check) |
+| `DropSst(s)` | `Compactor.dropSst` → `ManifestStore.update(dropSstFromManifest)` (D62): removes the reference only; the object is left to GC |
 | `Discard(s)` | a refused commit: the SST stays an orphan |
 | `Pin` / `Unpin(p)` | `addCheckpoint` / `removeCheckpoint` (a fork's checkpoint is added by `forkRange` and released when its compaction no longer reads the source) |
 | `GcListSsts` | `GarbageCollector.collect`: `now` read, `compacted/` and `changelog/` listed |
@@ -82,6 +83,11 @@ moment ago counted as old and its SSTs could be deleted under a reader. `ownUplo
 
 ## Maintenance notes
 
+- D62 (v1 workstream 7): an operator's repair, `dropSstFromManifest`, is a commit that removes one
+  SST reference and adds none. Added as `DropSst(s)`, with the broken variant `dropDeletesObject`
+  (the drop also deletes the object at once, as a naive repair would), which fails
+  `ReadableManifestsComplete`: a reader may still hold the manifest before the drop. The code never
+  deletes on drop. The state space grew to ~27M states (about 55 s).
 - D60 (v1 workstream 5): collection now runs on each database's compactor (its alarm, or the
   operator's collect-now through `Compactor.collect`), serialized by the compactor's lock, so the
   model's one-GC-at-a-time assumption holds by construction; `collect`'s steps are unchanged, and it

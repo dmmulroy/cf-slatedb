@@ -5,6 +5,7 @@ import type {
   KeyOutOfRangeError,
   MergeOperatorMissingError,
   SstCorruptedError,
+  SstNotInManifestError,
   WriteBatchInvalidError,
   WriterFencedError,
 } from "@cf-slatedb/lsm-core";
@@ -27,6 +28,8 @@ import {
   StorageUnavailablePublicError,
   StoredDataInvalidPublicError,
   TransactionConflictPublicError,
+  SstDropRefusedPublicError,
+  SstNotFoundPublicError,
   WriteStalledPublicError,
 } from "./db-public-error.ts";
 import type {
@@ -35,7 +38,7 @@ import type {
   WriterUnavailableError,
   WriteStalledError,
 } from "./lsm-errors.ts";
-import type { CompactorUnavailableError } from "./compactor.ts";
+import type { CompactorUnavailableError, SstDropRefusedError } from "./compactor.ts";
 import type { CheckpointNotFoundError } from "./database-lifecycle.ts";
 import type { ChangelogUnavailableError, ReaderUnavailableError } from "./db-reader.ts";
 import type { DatabaseAlreadyExistsError } from "./manifest-store.ts";
@@ -58,7 +61,9 @@ export type DbInternalError =
   | DatabaseHasDependentsError
   | CheckpointNotFoundError
   | TransactionConflictError
-  | ChangelogUnavailableError;
+  | ChangelogUnavailableError
+  | SstNotInManifestError
+  | SstDropRefusedError;
 
 /**
  * Classifies an internal failure as its public error: a stable code, a caller-facing message, the
@@ -199,6 +204,24 @@ export const toPublicError =
           details: { databaseId: error.databaseId, checkpointId: error.checkpointId },
           requestId,
           retryable: false,
+        });
+      case "SstNotInManifestError":
+        return new SstNotFoundPublicError({
+          code: "SstNotFound",
+          operation,
+          message: error.message,
+          details: { databaseId: error.databaseId, sstId: error.sstId },
+          requestId,
+          retryable: false,
+        });
+      case "SstDropRefusedError":
+        return new SstDropRefusedPublicError({
+          code: "SstDropRefused",
+          operation,
+          message: error.message,
+          details: { databaseId: error.databaseId, sstId: error.sstId, reason: error.reason },
+          requestId,
+          retryable: error.reason === "CompactionRunning",
         });
       case "CompactorUnavailableError":
         return new StorageUnavailablePublicError({

@@ -74,6 +74,12 @@ them. The `nonAtomicProbe` variant reproduces it.
 
 ## Maintenance notes
 
+- D62 (v1 workstream 7): `Compactor.dropSst` removes one SST from the manifest at an operator's
+  explicit, confirmed request, after a compaction reported it corrupted (or with `force`). Its rows
+  are lost by design and the manifest records the loss (`droppedSsts`), like removal (D39); the
+  model's property covers the engine, not an operator's repair, so no step changed. Upload integrity
+  (SHA-256 on single-part puts, MD5-checked multipart parts) only makes a flush fail and retry where
+  it would have stored damaged bytes.
 - Checked against the v1 workstream 6 commit (D61). `DbWriter.write` no longer scans the memtable
   to schedule the flush alarm: it reads in-memory counters (oldest unflushed commit time, unflushed
   bytes), refreshed from SQLite at start and after each flush. That only decides *when* a flush

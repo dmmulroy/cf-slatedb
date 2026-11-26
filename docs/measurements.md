@@ -297,6 +297,22 @@ Write CPU per 2,000 × 1 KB batch p50 77 ms, max 617 ms.
 
 **Limits set (P5):** API Worker and its writers 30 s (2 × 9.8 s), compactor 60 s (2 × 17.7 s).
 
+## Upload integrity cost (v1 workstream 7, D62)
+
+`preview-1`, production settings; `measure compaction-cpu --megabytes-per-flush 60` (four 60 MiB
+flushes, then their compaction), after each change to how part MD5s are computed:
+
+| Part digest                          | Flush CPU p50 / max (ms) | Flush wall p50 / p90 (s) | Compaction step CPU (ms) | Multipart parts verified   |
+| ------------------------------------ | -----------------------: | -----------------------: | -----------------------: | -------------------------- |
+| none (D61)                           |            1,150 / 4,345 |              12.7 / 14.4 |                    9,046 | —                          |
+| JavaScript MD5 (`md5Hex`) in workerd |           3,742 / 16,732 |              13.1 / 29.9 |                   11,052 | 8 uploads, all             |
+| WebCrypto MD5 (native)               |              992 / 3,881 |              14.2 / 16.5 |                    9,988 | 16 uploads, 134 parts, all |
+
+**Reading.** The native digest costs nothing measurable. The JavaScript MD5, about 425 MB/s in
+Node, was several times slower inside workerd. It stays only as the fallback where WebCrypto has no
+MD5 (Node, in tests). Every part R2 stored matched the MD5 sent (`object.parts_unverified` 0, no
+re-uploads).
+
 ## Live checks
 
 | Check                                       | Result                         | How                                                                                                                                                                                                                                                                                                                                                                                             |

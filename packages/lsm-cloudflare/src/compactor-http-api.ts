@@ -1,8 +1,14 @@
-import { DatabaseId } from "@cf-slatedb/lsm-core";
+import { DatabaseId, SstNotInManifestError } from "@cf-slatedb/lsm-core";
 import { Schema } from "effect";
 import { HttpApi, HttpApiEndpoint, HttpApiGroup, HttpApiSchema } from "effect/http-api";
 
-import { CompactorState, CompactorUnavailableError } from "./compactor.ts";
+import {
+  CompactorState,
+  CompactorUnavailableError,
+  SstDropRefusedError,
+  SstDropReport,
+  SstDropRequest,
+} from "./compactor.ts";
 import { GarbageCollectorUnavailableError } from "./garbage-collector.ts";
 import { GarbageCollectionReportSchema } from "./gc-http-api.ts";
 import { DatabaseIdMismatchError, DatabaseNotFoundError } from "./lsm-errors.ts";
@@ -55,6 +61,18 @@ export class CompactorHttpApiGroup extends HttpApiGroup.make("compactor")
       params: DatabaseParams,
       success: HttpApiSchema.NoContent,
       error: COMPACTOR_ERRORS,
+    }),
+  )
+  .add(
+    HttpApiEndpoint.post("dropSst", "/databases/:databaseId/compactor/drop-sst", {
+      params: DatabaseParams,
+      payload: SstDropRequest,
+      success: SstDropReport,
+      error: [
+        ...COMPACTOR_ERRORS,
+        SstNotInManifestError.pipe(HttpApiSchema.status(404)),
+        SstDropRefusedError.pipe(HttpApiSchema.status(409)),
+      ],
     }),
   )
   .add(

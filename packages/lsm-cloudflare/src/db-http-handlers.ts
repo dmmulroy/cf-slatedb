@@ -1,4 +1,4 @@
-import { DEFAULT_DATABASE_OPTIONS } from "@cf-slatedb/lsm-core";
+import { DEFAULT_DATABASE_OPTIONS, SstId, sstCreatedAt } from "@cf-slatedb/lsm-core";
 import { Chunk, Stream } from "effect";
 import { Effect, Layer, Option } from "effect";
 import { HttpApiBuilder } from "effect/http-api";
@@ -95,6 +95,30 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
           .pinSnapshot(params.databaseId, payload.lifetimeMs)
           .pipe(publicFailures("checkpoint")),
       )
+      .handle("listCheckpoints", ({ params }) =>
+        Effect.gen(function* () {
+          const latest = yield* manifests.loadLatest(params.databaseId).pipe(
+            Effect.catchTags({
+              ManifestReadError: (error) =>
+                Effect.fail(
+                  new ReaderUnavailableError({
+                    databaseId: params.databaseId,
+                    reason:
+                      error.reason === "StoredManifestInvalid"
+                        ? "StoredManifestInvalid"
+                        : "StorageUnavailable",
+                    message: error.message,
+                  }),
+                ),
+            }),
+          );
+          return {
+            checkpoints: [...latest.manifest.checkpoints].sort(
+              (left, right) => left.createdAt - right.createdAt,
+            ),
+          };
+        }).pipe(publicFailures("checkpoint")),
+      )
       .handle("deleteCheckpoint", ({ params }) =>
         lifecycle
           .deleteCheckpoint(params.databaseId, params.checkpointId)
@@ -168,14 +192,36 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
           return {
             manifestId: latest.id,
             l0Ssts: latest.manifest.l0.length,
+            l0SstIds: latest.manifest.l0.map((sst) => sst.id),
             sortedRuns: latest.manifest.sortedRuns.map((run) => ({
               id: run.id,
               ssts: run.ssts.length,
               sizeBytes: run.ssts.reduce((sum, sst) => sum + sst.sizeBytes, 0),
             })),
             compactor,
+            corruptSsts: Option.match(compactor, {
+              onNone: () => [],
+              onSome: (state) =>
+                state.corruptSsts.map((corrupt) => ({
+                  sstId: SstId.make(corrupt.sstId),
+                  createdAt: sstCreatedAt(SstId.make(corrupt.sstId)),
+                  section: corrupt.section,
+                  reason: corrupt.reason,
+                  detectedAt: corrupt.detectedAt,
+                })),
+            }),
+            droppedSsts: latest.manifest.droppedSsts,
           };
         }).pipe(publicFailures("compaction")),
+      )
+      .handle("dropSst", ({ params, payload }) =>
+        lifecycle
+          .dropSst(params.databaseId, {
+            sstId: params.sstId,
+            confirm: payload.confirm,
+            force: payload.force ?? false,
+          })
+          .pipe(Effect.scoped, publicFailures("dropSst")),
       )
       .handle("get", ({ params, payload }) =>
         client

@@ -37,6 +37,7 @@ export const compactorHttpHandlersLayer = HttpApiBuilder.group(
         .handle("destroy", ({ params }) => compactor.destroy(params.databaseId))
         .handle("collect", ({ params }) => compactor.collect(params.databaseId))
         .handle("requestCollection", ({ params }) => compactor.requestCollection(params.databaseId))
+        .handle("dropSst", ({ params, payload }) => compactor.dropSst(params.databaseId, payload))
         .handle("status", ({ params }) =>
           compactor.status(params.databaseId).pipe(Effect.map((state) => ({ state }))),
         );

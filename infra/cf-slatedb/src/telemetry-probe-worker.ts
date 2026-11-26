@@ -3,6 +3,7 @@ import {
   bindLsmWorkerSettings,
   eventTelemetryFlushForStage,
   inLsmJurisdiction,
+  isLocalLsmStage,
   lsmJurisdiction,
   lsmAccessGateForStage,
   lsmWorkerCompatibility,
@@ -76,6 +77,34 @@ const currentColo = Effect.tryPromise(() =>
   Effect.orElseSucceed(() => Option.none<string>()),
 );
 
+/** Query of `POST /v1/probe/damage`: the object to damage and the byte to invert. */
+const DamageQuery = Schema.Struct({
+  key: Schema.String.check(Schema.isStartingWith("db/")),
+  offset: Schema.NumberFromString.pipe(
+    Schema.decodeTo(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  ),
+});
+const decodeDamageQuery = Schema.decodeUnknownOption(DamageQuery);
+
+/** Inverts one byte of a stored object (`POST /damage`), for scenarios that corrupt an SST (D62). */
+const damageObject = (objects: ObjectStore["Service"], url: URL) =>
+  Effect.gen(function* () {
+    const query = decodeDamageQuery(Object.fromEntries(url.searchParams));
+    if (Option.isNone(query)) {
+      return HttpServerResponse.text("key must start with db/ and offset be a byte index", {
+        status: 400,
+      });
+    }
+    const stored = yield* objects.get(query.value.key);
+    if (Option.isNone(stored) || query.value.offset >= stored.value.length) {
+      return HttpServerResponse.text("no such object, or offset past its end", { status: 404 });
+    }
+    const damaged = Uint8Array.from(stored.value);
+    damaged[query.value.offset] = (damaged[query.value.offset] ?? 0) ^ 0xff;
+    yield* objects.put(query.value.key, damaged);
+    return HttpServerResponse.text("damaged");
+  });
+
 const r2ProbeServerLayer = R2ProbeServer.make(
   Effect.gen(function* () {
     const objects = yield* ObjectStore;
@@ -83,6 +112,8 @@ const r2ProbeServerLayer = R2ProbeServer.make(
     return Effect.succeed({
       fetch: Effect.gen(function* () {
         const request = yield* HttpServerRequest.HttpServerRequest;
+        const url = new URL(request.url, "http://probe");
+        if (url.pathname.endsWith("/damage")) return yield* damageObject(objects, url);
         const query = yield* decodeR2ProbeQuery(
           Object.fromEntries(new URL(request.url, "http://probe").searchParams),
         ).pipe(Effect.option);
@@ -136,6 +167,14 @@ const r2ProbeServerLayer = R2ProbeServer.make(
   }),
 );
 
+/**
+ * Whether a stage deploys the probe Worker, a test tool: local and preview stages only. Production
+ * (and any other live stage) never has it, so its fault injection (`POST /v1/probe/damage`) cannot
+ * reach production data (D62).
+ */
+export const deploysTelemetryProbe = (stage: string): boolean =>
+  isLocalLsmStage(stage) || /^preview-\d+$/.test(stage);
+
 /** Location hints a Durable Object can be created with. */
 const R2ProbeRegion = Schema.Literals([
   "wnam",
@@ -154,7 +193,9 @@ const decodeR2ProbeRegion = Schema.decodeUnknownOption(R2ProbeRegion);
  * Worker serving `GET /v1/probe` and `GET /v1/probe/alarm`, each a traced HTTP call to
  * {@link TelemetryProbeServer}, so the trace CLI can check Worker → Durable Object propagation, and
  * `GET /v1/probe/r2?region=<hint>&samples=<n>`, which measures R2 latency from a
- * {@link R2ProbeServer} created in that region.
+ * {@link R2ProbeServer} created in that region, and `POST /v1/probe/damage?key=<db/...>&offset=<n>`,
+ * which inverts one byte of a stored object, so a scenario can corrupt an SST and exercise the
+ * repair (D62). Deployed on local and preview stages only ({@link deploysTelemetryProbe}).
  */
 export class TelemetryProbeWorker extends Cloudflare.Worker<
   TelemetryProbeWorker,
@@ -184,6 +225,16 @@ export const telemetryProbeWorkerLayer = TelemetryProbeWorker.make(
         Effect.gen(function* () {
           const request = yield* HttpServerRequest.HttpServerRequest;
           const url = new URL(request.url, "http://probe");
+          if (url.pathname.endsWith("/damage") && request.method === "POST") {
+            // The object store needs a Durable Object's runtime context; any R2 probe object will do.
+            const damager = Cloudflare.toHttpClient(
+              inLsmJurisdiction(r2Probes, jurisdiction).getByName("damage"),
+            );
+            const damaged = yield* damager.execute(
+              HttpClientRequest.post(`http://probe/damage${url.search}`),
+            );
+            return HttpServerResponse.text(yield* damaged.text, { status: damaged.status });
+          }
           if (url.pathname.endsWith("/r2")) {
             const region = decodeR2ProbeRegion(url.searchParams.get("region"));
             if (Option.isNone(region)) {

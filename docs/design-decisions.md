@@ -1081,3 +1081,83 @@ measurement overrides (`preview-cli deploy --settings`):
 
 **Also:** `GET /databases/:id/status` now reports `l0Count` from the newest manifest. The writer's
 own view lags a compaction, so a poller waiting for L0 to drain never saw it drain.
+
+## D62. Corruption: prevented at upload, repaired by a confirmed drop through the compactor
+
+D53 made a corrupted input a reported compaction outcome. Nothing prevented corruption at upload,
+and there was no supported repair: a corrupted L0 SST paused L0 compaction until writes stalled.
+
+**Integrity at upload.**
+
+- **Single-part puts** (`put`, `putIfAbsent`, `putIfVersion`, and a multipart upload that fits in
+  one part) send the body's SHA-256. R2 refuses a mismatch, and the write fails and is retried like
+  any storage failure.
+- **Multipart parts.** R2's `uploadPart` takes no checksum, so each part is checked after the fact
+  (`uploadPartVerified`). A probe through R2's S3 API showed that R2 returns a part's MD5 as its
+  ETag and refuses a wrong `Content-MD5` with `BadDigest`. A part whose ETag differs from the MD5
+  of the bytes sent is uploaded again under the same number, up to three times; after that the
+  upload fails and is aborted. The re-uploads are counted in `lsm_object_part_integrity_retries`.
+- **Unverifiable ETags.** Local R2 (Miniflare) returns opaque ETags, so an ETag that is not an MD5
+  cannot be checked. Such a part is accepted, counted in `lsm_object_parts_unverified`, and shown
+  as `object.parts_unverified` on `ObjectStore.putMultipart`. On `preview-1`, 134 parts across 16
+  uploads of 64 MiB SSTs were all verified.
+- **How the MD5 is computed.** The digest is WebCrypto's native MD5, which the Workers runtime
+  offers as a non-standard algorithm. Where WebCrypto has no MD5 (Node, in tests), a private
+  `md5Hex` in lsm-core is used instead; it is tested against RFC 1321's vectors and `node:crypto`.
+  The private JavaScript MD5 was tried first in workerd: it raised 60 MiB flush CPU from p50 1.2 s
+  to 3.7 s (max 16.7 s). With the native digest it is back to p50 1.0 s (max 3.9 s).
+- **The in-memory store** runs the same check. It stores each part as it "arrived" and gives it
+  that MD5 as its ETag. `objectStoreWithTransitCorruptionTestLayer` damages chosen parts.
+
+**A supported repair: drop the SST, explicitly and typed.**
+
+- **The edit.** `dropSstFromManifest` (lsm-core) is a pure edit. It removes one SST from L0 or from
+  its sorted run, and removes a run left empty. It records the drop in the manifest's new
+  `droppedSsts`, which is additive: older manifests decode with none, and only the newest 32 drops
+  are kept. Each entry holds the SST, its owner, where it sat, its key range and view, its row
+  count, the reason (`Corrupted` or `Forced`), and the time. Epochs and sequence numbers are
+  unchanged. Repeating a drop changes nothing. The object is left to GC like any replaced SST, so a
+  reader holding an older manifest is unaffected.
+- **The compactor makes the change** (`Compactor.dropSst`), as it does for collect-now (D60). A
+  drop runs under a new planning lock that `poll` also takes. It refuses an SST whose L0 SST or
+  sorted run a running job reads (`CompactionRunning`): that job's output would bring the rows
+  back, and for a sorted run, `commitCompaction`'s exact-inputs check would not notice, because the
+  run id survives. Without `force`, it refuses an SST no compaction reported
+  (`NotReportedCorrupted`). After committing, it forgets the report and polls, so compaction
+  resumes.
+- **The lifecycle checks the confirmation.** `DatabaseLifecycle.dropSst` requires `confirm` to
+  repeat the SST id (`ConfirmationMismatch`), then delegates to the compactor.
+- **Public endpoints:**
+  - `POST /v1/databases/:id/ssts/:sstId/drop` with `{confirm, force?}`. It returns
+    `{manifestId, dropped}`, `404 SstNotFound`, or `409 SstDropRefused` with a `reason`; only
+    `CompactionRunning` is retryable.
+  - For the runbook's restore-or-drop decision: `GET /v1/databases/:id/compaction` now also reports
+    `corruptSsts` (each with the SST's `createdAt`), `l0SstIds`, and `droppedSsts`, and the new
+    `GET /v1/databases/:id/checkpoints` lists checkpoints. A checkpoint created before a corrupted
+    SST can restore its data by a full-range fork.
+- **Runbook.** `docs/operations.md` ("Corruption runbook"): find the report, decide between
+  restoring and dropping, run the drop, and verify.
+
+**The probe Worker leaves production.** The `repair` scenario corrupts a real SST through a new
+fault-injection endpoint, `POST /v1/probe/damage` on the probe Worker. That Worker is a test tool,
+so the Stack now deploys it only on local and preview stages (`deploysTelemetryProbe`). Production
+has no probe, and its `probeUrl` output is absent.
+
+**Formal model.** `GcSafety.tla` gains `DropSst(s)`, a commit that removes a reference and adds
+none, and the broken variant `dropDeletesObject` (the drop also deletes the object at once). That
+variant fails `ReadableManifestsComplete`. No other model changed (see the skills' notes).
+
+**Tests:**
+
+- `object-store.test.ts`: a part damaged once is re-sent; a part damaged every time fails the upload
+  and stores nothing; the ETag is compared quoted or not; an opaque ETag counts as unverified.
+- `md5.test.ts`: RFC 1321 vectors, a property against `node:crypto` from any buffer offset, and a
+  whole 8 MiB part.
+- `manifest.test.ts`: drops from L0 and from a sorted run, idempotence, refusals, the history cap,
+  and decoding older manifests.
+- `compactor.test.ts`: after the D53 corruption, L0 stays blocked at five SSTs. The drop is refused
+  for a healthy SST without `force`, for an unknown SST, and while a job reads the source. It is
+  then accepted, a repeat returns the same drop, the four healthy SSTs compact, and only the
+  dropped SST's key is gone. Removing each refusal or the report's removal fails the test.
+- `writer.workerd.ts`: a 12 MB flush uploads in parts against local R2.
+- The `repair` scenario passes locally and on `preview-1`.

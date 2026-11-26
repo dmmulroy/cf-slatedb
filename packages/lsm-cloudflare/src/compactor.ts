@@ -3,14 +3,19 @@ import {
   CompactionSource,
   CompactorEpoch,
   DatabaseId,
+  DroppedSst,
+  dropSstFromManifest,
   externalOwners,
   fenceCompactor,
   generateCompactionJobId,
   type Manifest,
+  ManifestId,
   planCompactionsAround,
   releasableExternalRefs,
   removeCheckpoint,
   removeExternalRef,
+  SstId,
+  SstNotInManifestError,
   Timestamp,
 } from "@cf-slatedb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
@@ -96,6 +101,51 @@ export type CompactorError =
   | DatabaseNotFoundError
   | DatabaseIdMismatchError;
 
+/** Schema for an operator's request to drop one SST from the manifest (D62). */
+export const SstDropRequest = Schema.Struct({
+  sstId: SstId,
+  /** Drop it even though no compaction reported it corrupted. */
+  force: Schema.Boolean,
+});
+
+/** An operator's request to drop one SST. */
+export type SstDropRequest = typeof SstDropRequest.Type;
+
+/** Schema for a finished drop: the manifest that no longer holds the SST, and what was lost. */
+export const SstDropReport = Schema.Struct({ manifestId: ManifestId, dropped: DroppedSst });
+
+/** A finished drop. */
+export type SstDropReport = typeof SstDropReport.Type;
+
+/**
+ * An SST drop was refused (D62), and nothing changed.
+ *
+ * **Details**
+ *
+ * - `NotReportedCorrupted`: no compaction reported the SST corrupted. Not retryable as is: check the
+ *   SST id, or send `force` to drop a healthy SST, losing its data.
+ * - `CompactionRunning`: a running compaction reads the SST's source, and its output would bring
+ *   the SST's rows back. Retryable once the compaction finishes (seconds to minutes).
+ * - `ConfirmationMismatch`: `confirm` did not repeat the SST id. Correct it and retry.
+ */
+export class SstDropRefusedError extends Schema.TaggedError<SstDropRefusedError>()(
+  "SstDropRefusedError",
+  {
+    databaseId: DatabaseId,
+    sstId: SstId,
+    reason: Schema.Literals(["NotReportedCorrupted", "CompactionRunning", "ConfirmationMismatch"]),
+    message: Schema.String,
+  },
+) {}
+
+/** Every failure dropping an SST can report. */
+export type SstDropError = CompactorError | SstDropRefusedError | SstNotInManifestError;
+
+/** SSTs operators dropped from manifests (D62). */
+export const sstsDropped = Metric.counter("lsm_ssts_dropped", {
+  description: "SSTs removed from a manifest by an operator's repair",
+});
+
 /** Corrupted SSTs compactions found (D53); each also stops the compactor from reading its source. */
 export const compactionCorruptSsts = Metric.counter("lsm_compaction_corrupt_ssts", {
   description: "Input SSTs a compaction found corrupted",
@@ -116,6 +166,23 @@ const sourceHolding = (
           ),
     ),
   );
+
+/** The L0 SST or sorted run of `manifest` that holds SST `sstId`. */
+const sourceInManifest = (manifest: Manifest, sstId: string): Option.Option<CompactionSource> => {
+  if (manifest.l0.some((sst) => sst.id === sstId)) {
+    return Option.some({ _tag: "L0", sstId: SstId.make(sstId) });
+  }
+  const run = manifest.sortedRuns.find((candidate) =>
+    candidate.ssts.some((sst) => sst.id === sstId),
+  );
+  return run === undefined ? Option.none() : Option.some({ _tag: "SortedRun", id: run.id });
+};
+
+/** Whether two compaction sources name the same L0 SST or sorted run. */
+const sameSource = (left: CompactionSource, right: CompactionSource) =>
+  left._tag === "L0"
+    ? right._tag === "L0" && left.sstId === right.sstId
+    : right._tag === "SortedRun" && left.id === right.id;
 
 /** Whether `manifest` still holds SST `sstId` (the corruption is still there to report). */
 const manifestHolds = (manifest: Manifest, sstId: string) =>
@@ -180,6 +247,25 @@ export interface ICompactor {
     databaseId: DatabaseId,
   ) => Effect.Effect<void, CompactorError, RuntimeContext>;
   /**
+   * Drops one SST from the manifest: the operator's repair of a corrupted SST (D62). Its versions of
+   * the keys it held are lost, and compaction of its source resumes.
+   *
+   * **Details**
+   *
+   * Runs under the planning lock, so no poll plans a job between the checks and the commit. Refuses
+   * an SST no compaction reported corrupted unless `force`, and an SST whose source a running job
+   * reads (that job's output would bring its rows back). Records the drop in the manifest's
+   * `droppedSsts`, forgets the corruption report, and polls. Dropping an SST already dropped
+   * returns the recorded drop.
+   *
+   * @returns The manifest without the SST and what was dropped, `SstDropRefusedError`,
+   *   `SstNotInManifestError`, or a `CompactorError`.
+   */
+  readonly dropSst: (
+    databaseId: DatabaseId,
+    request: SstDropRequest,
+  ) => Effect.Effect<SstDropReport, SstDropError, RuntimeContext>;
+  /**
    * The alarm handler: runs a due collection, polls, and schedules the next poll while there is
    * work and the next collection when one is due. Never fails.
    */
@@ -201,6 +287,8 @@ export const makeCompactor = Effect.gen(function* () {
   const collector = yield* GarbageCollector;
   // One collection per database at a time: the alarm and an operator's request may overlap.
   const collectionLock = yield* Semaphore.make(1);
+  // Planning (a poll) and an operator's SST drop exclude each other (D62).
+  const planLock = yield* Semaphore.make(1);
 
   const unavailable = (databaseId: DatabaseId) => (error: { readonly message: string }) =>
     Effect.fail(
@@ -490,16 +578,22 @@ export const makeCompactor = Effect.gen(function* () {
         }),
       );
     }
-    const state = yield* cell.get;
-    if (Option.isNone(state) || state.value.fenced) return;
-    const again = yield* poll(state.value).pipe(
-      Effect.catchTags({ DatabaseNotFoundError: () => Effect.succeed(false) }),
-      // Manifest unreadable or contended now: poll again later.
-      Effect.catchTags({
-        ManifestReadError: () => Effect.succeed(true),
-        ManifestWriteError: () => Effect.succeed(true),
-      }),
-    );
+    const again = yield* planLock
+      .withPermits(1)(
+        Effect.gen(function* () {
+          const state = yield* cell.get;
+          if (Option.isNone(state) || state.value.fenced) return false;
+          return yield* poll(state.value);
+        }),
+      )
+      .pipe(
+        Effect.catchTags({ DatabaseNotFoundError: () => Effect.succeed(false) }),
+        // Manifest unreadable or contended now: poll again later.
+        Effect.catchTags({
+          ManifestReadError: () => Effect.succeed(true),
+          ManifestWriteError: () => Effect.succeed(true),
+        }),
+      );
     if (again) yield* pollBy((yield* Clock.currentTimeMillis) + settings.compactorPollInterval);
     // A collection still due keeps the alarm set even when compaction is idle.
     const after = yield* cell.get;
@@ -508,7 +602,119 @@ export const makeCompactor = Effect.gen(function* () {
     }
   }).pipe(Effect.withSpan("Compactor.alarm"));
 
-  return Compactor.of({ wake, status, destroy, collect, requestCollection, runAlarm });
+  const dropSst = Effect.fn("Compactor.dropSst")(function* (
+    databaseId: DatabaseId,
+    request: SstDropRequest,
+  ) {
+    yield* Effect.annotateCurrentSpan({
+      "database.id": databaseId,
+      "sst.id": request.sstId,
+      "drop.force": request.force,
+    });
+    const refused = (reason: SstDropRefusedError["reason"], message: string) =>
+      new SstDropRefusedError({ databaseId, sstId: request.sstId, reason, message });
+    return yield* planLock.withPermits(1)(
+      Effect.gen(function* () {
+        const state = yield* ensureState(databaseId);
+        if (state.fenced) {
+          return yield* new CompactorUnavailableError({
+            databaseId,
+            message: `The compactor of database ${databaseId} was replaced by a newer one and cannot drop SSTs. Wake the database's compactor and retry.`,
+          });
+        }
+        const latest = yield* reader
+          .loadLatest(databaseId)
+          .pipe(Effect.catchTags({ ManifestReadError: unavailable(databaseId) }));
+        const source = sourceInManifest(latest.manifest, request.sstId);
+        if (Option.isNone(source)) {
+          // Already dropped (a repeated request): report the recorded drop.
+          const recorded = latest.manifest.droppedSsts.findLast(
+            (dropped) => dropped.sstId === request.sstId,
+          );
+          if (recorded !== undefined) return { manifestId: latest.id, dropped: recorded };
+          return yield* new SstNotInManifestError({
+            databaseId,
+            sstId: request.sstId,
+            message: `SST ${request.sstId} is not in database ${databaseId}'s manifest, so there is nothing to drop. Check the SST id in the compaction status.`,
+          });
+        }
+        const reported = state.corruptSsts.some((corrupt) => corrupt.sstId === request.sstId);
+        if (!reported && !request.force) {
+          return yield* refused(
+            "NotReportedCorrupted",
+            `No compaction reported SST ${request.sstId} of database ${databaseId} corrupted, so it was not dropped. Check the SST id in the compaction status, or send force to drop a healthy SST and lose its rows.`,
+          );
+        }
+        if (
+          state.running.some((job) =>
+            job.job.sources.some((input) => sameSource(input, source.value)),
+          )
+        ) {
+          return yield* refused(
+            "CompactionRunning",
+            `A running compaction of database ${databaseId} reads SST ${request.sstId}'s ${source.value._tag === "L0" ? "L0 SST" : "sorted run"}, so it was not dropped (the compaction would bring its rows back). Retry once the compaction finishes.`,
+          );
+        }
+        const droppedAt = Timestamp.make(yield* Clock.currentTimeMillis);
+        const committed = yield* manifests
+          .update(databaseId, (manifest) =>
+            dropSstFromManifest(manifest, {
+              sstId: request.sstId,
+              reason: reported ? "Corrupted" : "Forced",
+              droppedAt,
+            }),
+          )
+          .pipe(
+            Effect.catchTags({
+              ManifestReadError: unavailable(databaseId),
+              ManifestWriteError: unavailable(databaseId),
+              DatabaseRemovedError: (error) =>
+                Effect.fail(new DatabaseNotFoundError({ databaseId, message: error.message })),
+            }),
+          );
+        const dropped = committed.manifest.droppedSsts.findLast(
+          (entry) => entry.sstId === request.sstId,
+        );
+        if (dropped === undefined) {
+          // A concurrent edit removed the SST some other way (a fork rewrite); nothing was dropped.
+          return yield* new SstNotInManifestError({
+            databaseId,
+            sstId: request.sstId,
+            message: `SST ${request.sstId} left database ${databaseId}'s manifest before it could be dropped, so there is nothing to drop.`,
+          });
+        }
+        const current = yield* cell.get;
+        if (Option.isSome(current)) {
+          yield* cell.set({
+            ...current.value,
+            corruptSsts: current.value.corruptSsts.filter(
+              (corrupt) => corrupt.sstId !== request.sstId,
+            ),
+          });
+        }
+        yield* pollBy(yield* Clock.currentTimeMillis);
+        yield* Metric.update(sstsDropped, 1);
+        yield* Effect.logWarning(
+          `Database ${databaseId}'s SST ${request.sstId} was dropped from manifest ${committed.id} (${dropped.reason}); its rows are lost and compaction of its source resumes.`,
+        );
+        yield* Effect.annotateCurrentSpan({
+          "manifest.id": committed.id,
+          "drop.reason": dropped.reason,
+        });
+        return { manifestId: committed.id, dropped };
+      }),
+    );
+  });
+
+  return Compactor.of({
+    wake,
+    status,
+    destroy,
+    collect,
+    requestCollection,
+    dropSst,
+    runAlarm,
+  });
 });
 
 /** Provides the compactor, leaving its state cell, alarm, manifests, launcher, and budget visible. */

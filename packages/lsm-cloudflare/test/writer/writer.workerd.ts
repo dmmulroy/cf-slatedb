@@ -445,6 +445,46 @@ test.provider(
           skewed.retryable,
         ],
       ).toEqual(["ReadConflict", true]);
+
+      // A flush larger than one multipart part (8 MiB) uploads in parts, each checked against the
+      // MD5 local R2 returns as its ETag (D62); the rows read back from the flushed SST.
+      const large = DatabaseId.make(`writer-large-${Date.now().toString(36)}`);
+      yield* client.databases.createDatabase({
+        payload: {
+          databaseId: large,
+          keyRange: Option.none(),
+          mergeOperator: Option.none(),
+          changelogRetentionMs: Option.none(),
+          budgetGroup: Option.none(),
+        },
+      });
+      const largeValue = new Uint8Array(1000).fill(7);
+      for (let batch = 0; batch < 6; batch++) {
+        yield* client.databases.write({
+          params: { databaseId: large },
+          payload: {
+            operations: Array.from({ length: 2000 }, (_, row) => ({
+              _tag: "Put" as const,
+              key: bytes(`k${batch}-${row.toString().padStart(5, "0")}`),
+              value: largeValue,
+              ttlMillis: Option.none(),
+            })),
+          },
+        });
+      }
+      const largeFlush = yield* client.databases.flush({ params: { databaseId: large } });
+      expect(largeFlush.flushedSeq).toBe(6);
+      const largeRow = yield* client.databases.get({
+        params: { databaseId: large },
+        payload: {
+          key: bytes("k5-01999"),
+          consistency: { _tag: "Flushed" },
+          snapshot: Option.none(),
+        },
+      });
+      expect(
+        Option.map(largeRow.row, (row) => row.value._tag === "Value" && row.value.bytes.length),
+      ).toEqual(Option.some(1000));
       yield* stack.destroy();
     }),
   { timeout: 300_000 },

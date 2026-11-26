@@ -1,4 +1,11 @@
-import { DatabaseId, DEFAULT_DATABASE_OPTIONS, initialManifest } from "@cf-slatedb/lsm-core";
+import {
+  DatabaseId,
+  DEFAULT_DATABASE_OPTIONS,
+  initialManifest,
+  SortedRunId,
+  SstId,
+  Timestamp,
+} from "@cf-slatedb/lsm-core";
 import { Context, Effect, Layer, Option, Ref } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
@@ -14,6 +21,7 @@ import {
 import {
   Compactor,
   compactorLayerWithoutDependencies,
+  CompactorStateCell,
   compactorStateCellTestLayer,
 } from "./compactor.ts";
 import { DbClient, dbClientTestLayer } from "./db-client.ts";
@@ -64,7 +72,7 @@ const startCompactor = Effect.gen(function* () {
   const alarm = Context.get(built, DurableObjectAlarm);
   // As the runtime does: the alarm is cleared when it fires, then the handler runs.
   const fire = Effect.andThen(alarm.cancel, compactor.runAlarm);
-  return { compactor, alarm, fire };
+  return { compactor, alarm, fire, cell: Context.get(built, CompactorStateCell) };
 });
 
 const createWithL0 = (databaseId: DatabaseId, flushes: number) =>
@@ -302,5 +310,121 @@ describe("Compactor", () => {
       ]),
     );
     expect(outcome.l0).toBe(4);
+  });
+
+  it("drops a reported corrupted SST on request, and L0 compaction resumes without its rows (D62)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createWithL0(ORDERS, 4);
+        const objects = yield* ObjectStore;
+        const reader = yield* ManifestReader;
+        const before = yield* reader.loadLatest(ORDERS);
+        const victim = before.manifest.l0[1];
+        const healthy = before.manifest.l0[0];
+        if (victim === undefined || healthy === undefined) {
+          return yield* Effect.die("expected four L0 SSTs");
+        }
+        const stored = yield* objects.get(sstKey(ORDERS, victim.id));
+        if (Option.isNone(stored)) return yield* Effect.die("the SST is missing");
+        const damaged = Uint8Array.from(stored.value);
+        damaged[2] = (damaged[2] ?? 0) ^ 0xff;
+        yield* objects.put(sstKey(ORDERS, victim.id), damaged);
+
+        const { compactor, fire, cell } = yield* startCompactor;
+        yield* compactor.wake(ORDERS);
+        yield* fire;
+        yield* TestClock.adjust("5 seconds");
+        yield* fire;
+        // A fifth flush: L0 stays blocked behind the corrupted SST (merged oldest first).
+        const client = yield* DbClient;
+        yield* client.put(ORDERS, Uint8Array.of(4), Uint8Array.of(4));
+        yield* client.flush(ORDERS);
+        yield* compactor.wake(ORDERS);
+        yield* fire;
+        const blockedL0 = (yield* reader.loadLatest(ORDERS)).manifest.l0.length;
+
+        // Refused, changing nothing: a healthy SST without force, and an SST not in the manifest.
+        const notReported = yield* Effect.flip(
+          compactor.dropSst(ORDERS, { sstId: healthy.id, force: false }),
+        );
+        const unknown = yield* Effect.flip(
+          compactor.dropSst(ORDERS, {
+            sstId: SstId.make("01JD0000000000000000000077"),
+            force: true,
+          }),
+        );
+        // A running job reading the SST's source would bring its rows back: refused even forced.
+        const state = Option.getOrThrow(yield* cell.get);
+        const running = {
+          jobId: "job-reading-victim",
+          job: {
+            sources: [{ _tag: "L0" as const, sstId: victim.id }],
+            destination: SortedRunId.make(9),
+            isBottom: true,
+          },
+          budgetGroup: ORDERS,
+          startedAt: Timestamp.make(0),
+        };
+        yield* cell.set({ ...state, running: [running] });
+        const whileRunning = yield* Effect.flip(
+          compactor.dropSst(ORDERS, { sstId: victim.id, force: true }),
+        );
+        yield* cell.set(state);
+
+        const report = yield* compactor.dropSst(ORDERS, { sstId: victim.id, force: false });
+        const again = yield* compactor.dropSst(ORDERS, { sstId: victim.id, force: false });
+        const statusAfterDrop = yield* compactor.status(ORDERS);
+        // The drop polls: the four healthy L0 SSTs compact.
+        yield* fire;
+        for (let poll = 0; poll < 3; poll++) {
+          yield* TestClock.adjust("5 seconds");
+          yield* fire;
+        }
+        const after = yield* reader.loadLatest(ORDERS);
+        const values = [];
+        for (let key = 0; key < 5; key++) {
+          const row = yield* client.get(ORDERS, Uint8Array.of(key), {
+            consistency: { _tag: "Flushed" },
+            snapshot: Option.none(),
+            refuseSealed: false,
+          });
+          values.push(Option.isSome(row));
+        }
+        return {
+          victim: victim.id,
+          blockedL0,
+          refusals: [
+            notReported._tag === "SstDropRefusedError" && notReported.reason,
+            unknown._tag,
+            whileRunning._tag === "SstDropRefusedError" && whileRunning.reason,
+          ],
+          report,
+          again,
+          corruptAfterDrop: Option.map(statusAfterDrop, (current) => current.corruptSsts.length),
+          l0: after.manifest.l0.length,
+          runs: after.manifest.sortedRuns.length,
+          droppedSsts: after.manifest.droppedSsts.map((dropped) => dropped.sstId),
+          values,
+        };
+      }),
+    );
+    expect(outcome.refusals).toEqual([
+      "NotReportedCorrupted",
+      "SstNotInManifestError",
+      "CompactionRunning",
+    ]);
+    expect(outcome.report.dropped).toMatchObject({
+      sstId: outcome.victim,
+      from: { _tag: "L0", sstId: outcome.victim },
+      reason: "Corrupted",
+    });
+    // A repeated request reports the same drop and commits nothing new.
+    expect(outcome.again).toEqual(outcome.report);
+    expect(outcome.corruptAfterDrop).toEqual(Option.some(0));
+    expect([outcome.l0, outcome.runs]).toEqual([0, 1]);
+    expect(outcome.droppedSsts).toEqual([outcome.victim]);
+    // Key 2 lived only in the dropped SST (L0 is newest first: index 1 is the third flush).
+    expect(outcome.blockedL0).toBe(5);
+    expect(outcome.values).toEqual([true, true, false, true, true]);
   });
 });

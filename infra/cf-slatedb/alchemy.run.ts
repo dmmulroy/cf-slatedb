@@ -22,7 +22,11 @@ import { cfSlatedbGcWorkerLayer } from "./src/gc-worker-entry.ts";
 import { cfSlatedbShardRouterWorkerLayer } from "./src/shard-router-worker-entry.ts";
 import { cfSlatedbStateLayer } from "./src/cf-slatedb-stage.ts";
 import { cfSlatedbStackConfig } from "./src/cf-slatedb-stack-config.ts";
-import { TelemetryProbeWorker, telemetryProbeWorkerLayer } from "./src/telemetry-probe-worker.ts";
+import {
+  deploysTelemetryProbe,
+  TelemetryProbeWorker,
+  telemetryProbeWorkerLayer,
+} from "./src/telemetry-probe-worker.ts";
 import { CPU_TAIL_WORKER_ID } from "./src/cf-slatedb-telemetry.ts";
 import {
   TraceBucket,
@@ -36,7 +40,6 @@ const cfSlatedbWorkersLayer = Layer.mergeAll(
   cfSlatedbCompactorWorkerLayer,
   cfSlatedbGcWorkerLayer,
   cfSlatedbShardRouterWorkerLayer,
-  telemetryProbeWorkerLayer,
 );
 
 /**
@@ -50,17 +53,22 @@ const resolvedCfSlatedbStackConfig = cfSlatedbStackConfig.pipe(
 );
 
 /**
- * Every Worker of the Stack, plus the trace collector on live stages only: declaring the collector's
- * Layer deploys it, so local stages leave it out, and `cfSlatedbTelemetry` finds it only where it
- * exists. The configuration is resolved first, so no Worker is declared under an invalid one.
+ * Every Worker of the Stack, plus the trace collector on live stages only, and the telemetry probe
+ * (a test tool with fault injection) on local and preview stages only: declaring a Worker's Layer
+ * deploys it, so a stage leaves out what it must not run, and `cfSlatedbTelemetry` finds the
+ * collector only where it exists. The configuration is resolved first, so no Worker is declared
+ * under an invalid one.
  */
 const cfSlatedbStackLayer = Layer.unwrap(
   Effect.gen(function* () {
     const stage = yield* Alchemy.Stage;
     yield* resolvedCfSlatedbStackConfig;
+    const withProbe = deploysTelemetryProbe(stage)
+      ? Layer.mergeAll(cfSlatedbWorkersLayer, telemetryProbeWorkerLayer)
+      : cfSlatedbWorkersLayer;
     return isLocalLsmStage(stage)
-      ? cfSlatedbWorkersLayer
-      : Layer.mergeAll(cfSlatedbWorkersLayer, traceCollectorWorkerLayer);
+      ? withProbe
+      : Layer.mergeAll(withProbe, traceCollectorWorkerLayer);
   }),
 );
 
@@ -87,11 +95,13 @@ const CfSlatedbStack = Alchemy.Stack(
     const gc = yield* GcWorker;
     const api = yield* DbApiWorker;
     const shards = yield* ShardRouterWorker;
-    const probe = yield* TelemetryProbeWorker;
     // Live stages export spans to their own collector (`cfSlatedbTelemetry`); local stages export
     // to the trace CLI's receiver and have none.
     const stage = yield* Alchemy.Stage;
     const config = yield* resolvedCfSlatedbStackConfig;
+    const probe = deploysTelemetryProbe(stage)
+      ? Option.some(yield* Cloudflare.Worker.ref(TelemetryProbeWorker))
+      : Option.none();
     const traces = isLocalLsmStage(stage)
       ? Option.none()
       : Option.some(yield* Cloudflare.Worker.ref(TraceCollectorWorker));
@@ -120,8 +130,8 @@ const CfSlatedbStack = Alchemy.Stack(
        * a service binding, behind Workers Cache.
        */
       blockServerWorkerName: blocks.workerName,
-      /** URL of the telemetry probe Worker. */
-      probeUrl: probe.url,
+      /** URL of the telemetry probe Worker (local and preview stages only). */
+      ...(Option.isSome(probe) ? { probeUrl: probe.value.url } : {}),
       /** OTLP receiver of a live stage's spans, read by `trace-cli pull --stage <stage>`. */
       ...(Option.isSome(traces) ? { traceCollectorUrl: traces.value.url } : {}),
     };

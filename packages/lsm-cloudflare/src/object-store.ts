@@ -1,7 +1,19 @@
-import { Timestamp } from "@cf-slatedb/lsm-core";
+import { md5Hex, Timestamp } from "@cf-slatedb/lsm-core";
 import * as Cloudflare from "@alchemy.run/cloudflare";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
-import { Bytes, Clock, Context, Data, Effect, Layer, Option, Ref, Schedule, Stream } from "effect";
+import {
+  Bytes,
+  Clock,
+  Context,
+  Data,
+  Effect,
+  Layer,
+  Metric,
+  Option,
+  Ref,
+  Schedule,
+  Stream,
+} from "effect";
 
 import { LsmBucketClient, lsmBucketClientLayer } from "./lsm-bucket.ts";
 import { objectKindOfKey } from "./object-keys.ts";
@@ -191,9 +203,112 @@ export const toUniformParts = <E, R>(body: Stream.Stream<Uint8Array, E, R>, part
     ),
   );
 
+/** Attempts to store one multipart part intact before the upload fails (D62). */
+export const PART_INTEGRITY_ATTEMPTS = 3;
+
+/** Multipart parts R2 stored with a different checksum than was sent, then uploaded again. */
+export const objectPartIntegrityRetries = Metric.counter("lsm_object_part_integrity_retries", {
+  description: "Multipart parts whose stored MD5 differed from the part sent, uploaded again",
+});
+
+/**
+ * Multipart parts stored without a check, because the store's ETag was not an MD5 (local R2 returns
+ * opaque ETags; real R2 returns each part's MD5).
+ */
+export const objectPartsUnverified = Metric.counter("lsm_object_parts_unverified", {
+  description: "Multipart parts whose ETag was not an MD5, so their integrity was not checked",
+});
+
+/** The hex digest in an ETag: R2 quotes it, and a part's ETag is its MD5. */
+const etagDigest = (etag: string) => etag.replaceAll('"', "").toLowerCase();
+
+/** Lowercase hex of a digest. */
+const toHex = (digest: ArrayBuffer) =>
+  Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+
+/**
+ * The MD5 of a part as lowercase hex: the runtime's native digest where WebCrypto offers MD5 (the
+ * Workers runtime does, as a non-standard algorithm), else the portable `md5Hex` (Node, in tests).
+ * The JavaScript digest cost several seconds of CPU per 64 MiB SST in workerd (D62).
+ */
+const partMd5 = (part: Uint8Array) =>
+  Effect.tryPromise(() => crypto.subtle.digest("MD5", part)).pipe(
+    Effect.map(toHex),
+    Effect.orElseSucceed(() => md5Hex(part)),
+  );
+
+/** Whether an ETag digest has an MD5's shape (32 hex digits). */
+const isMd5Digest = (digest: string) => /^[0-9a-f]{32}$/.test(digest);
+
+/**
+ * Uploads one multipart part and checks that what R2 stored is what was sent (D62).
+ *
+ * **Details**
+ *
+ * R2 returns a part's MD5 as its ETag; `uploadPart` cannot send a checksum, so the check is after
+ * the fact: a part whose ETag differs from the MD5 of `part` changed in transit, and is uploaded
+ * again under the same part number (which replaces it), up to {@link PART_INTEGRITY_ATTEMPTS}
+ * times. A mismatch every time fails the upload, which is then aborted; nothing references it.
+ *
+ * An ETag that is not an MD5 at all (local R2's are opaque) cannot be checked: the part is accepted
+ * as `verified: false` and counted in `lsm_object_parts_unverified`, so a store that stops
+ * reporting digests shows up rather than silently passing.
+ *
+ * @param upload - Uploads `part` as `partNumber` (with R2's own transient-failure retries).
+ * @returns The uploaded part to complete the upload with and whether it was checked, or
+ *   `ObjectStoreUnavailableError`.
+ */
+export const uploadPartVerified = <E extends { readonly message: string }, R>(
+  key: string,
+  partNumber: number,
+  part: Uint8Array,
+  upload: (
+    partNumber: number,
+    part: Uint8Array,
+  ) => Effect.Effect<{ readonly partNumber: number; readonly etag: string }, E, R>,
+) =>
+  Effect.gen(function* () {
+    const expected = yield* partMd5(part);
+    let stored = "";
+    for (let attempt = 1; attempt <= PART_INTEGRITY_ATTEMPTS; attempt++) {
+      const uploaded = yield* upload(partNumber, part).pipe(
+        Effect.mapError(
+          (error) =>
+            new ObjectStoreUnavailableError({
+              operation: "putMultipart",
+              key,
+              message: `Object storage putMultipart of ${key} failed after retries: ${error.message}. Retry the operation; it is safe to repeat.`,
+            }),
+        ),
+      );
+      stored = etagDigest(uploaded.etag);
+      if (stored === expected) return { uploaded, verified: true };
+      if (!isMd5Digest(stored)) {
+        yield* Metric.update(objectPartsUnverified, 1);
+        return { uploaded, verified: false };
+      }
+      yield* Metric.update(objectPartIntegrityRetries, 1);
+      yield* Effect.logWarning(
+        `Part ${partNumber} of ${key} was stored with MD5 ${stored}, not the ${expected} sent; uploading it again.`,
+      );
+    }
+    return yield* new ObjectStoreUnavailableError({
+      operation: "putMultipart",
+      key,
+      message: `Object storage putMultipart of ${key} stored part ${partNumber} with MD5 ${stored} instead of ${expected} on ${PART_INTEGRITY_ATTEMPTS} attempts, so the upload was aborted. Retry the operation; it is safe to repeat.`,
+    });
+  });
+
+/**
+ * The SHA-256 of `body`, sent with single-part puts so R2 refuses a body that changed in transit
+ * (D62).
+ */
+const sha256Of = (body: Uint8Array) => Effect.promise(() => crypto.subtle.digest("SHA-256", body));
+
 /**
  * Constructs the object store over the contextual R2 bucket client; it owns `R2Error` translation
- * and retries.
+ * and retries. Every write carries an integrity check (D62): single-part puts send their SHA-256
+ * (R2 refuses a mismatch), and multipart parts are checked against the MD5 R2 returns.
  */
 export const makeObjectStore = Effect.gen(function* () {
   const bucket = yield* LsmBucketClient;
@@ -253,8 +368,9 @@ export const makeObjectStore = Effect.gen(function* () {
       version: string,
     ) {
       yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
+      const sha256 = yield* sha256Of(body);
       const written = yield* bucket
-        .put(key, body, { onlyIf: new Headers({ "If-Match": version }) })
+        .put(key, body, { onlyIf: new Headers({ "If-Match": version }), sha256 })
         .pipe(Effect.retry(r2RetrySchedule), Effect.mapError(unavailable("putIfVersion", key)));
       const outcome: PutIfVersionOutcome = written === null ? "VersionChanged" : "Written";
       yield* Effect.annotateCurrentSpan({ "object.outcome": outcome });
@@ -271,8 +387,9 @@ export const makeObjectStore = Effect.gen(function* () {
       yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
       // The Headers form, not the `R2Conditional` object: the object form once treated `*` as a
       // literal etag (workerd #2572).
+      const sha256 = yield* sha256Of(body);
       const written = yield* bucket
-        .put(key, body, { onlyIf: new Headers({ "If-None-Match": "*" }) })
+        .put(key, body, { onlyIf: new Headers({ "If-None-Match": "*" }), sha256 })
         .pipe(Effect.retry(r2RetrySchedule), Effect.mapError(unavailable("putIfAbsent", key)));
       const outcome: PutIfAbsentOutcome = written === null ? "AlreadyExists" : "Created";
       yield* Effect.annotateCurrentSpan({ "object.outcome": outcome, "object.size": body.length });
@@ -281,8 +398,9 @@ export const makeObjectStore = Effect.gen(function* () {
     put: Effect.fn("ObjectStore.put")(function* (key: string, body: Uint8Array) {
       yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
       yield* Effect.annotateCurrentSpan({ "object.size": body.length });
+      const sha256 = yield* sha256Of(body);
       yield* bucket
-        .put(key, body)
+        .put(key, body, { sha256 })
         .pipe(Effect.retry(r2RetrySchedule), Effect.mapError(unavailable("put", key)));
     }),
     putMultipart: <E, R>(key: string, body: Stream.Stream<Uint8Array, E, R>, partSize: number) =>
@@ -291,13 +409,15 @@ export const makeObjectStore = Effect.gen(function* () {
         let upload = Option.none<Cloudflare.R2.MultipartUpload>();
         let pendingFirstPart = Option.none<Uint8Array>();
         const uploaded: Array<Cloudflare.R2.UploadedPart> = [];
+        let unverified = 0;
         let sizeBytes = 0;
         const uploadPart = (multipart: Cloudflare.R2.MultipartUpload, part: Uint8Array) =>
-          multipart.uploadPart(uploaded.length + 1, part).pipe(
-            Effect.retry(r2RetrySchedule),
-            Effect.mapError(unavailable("putMultipart", key)),
+          uploadPartVerified(key, uploaded.length + 1, part, (partNumber, bytes) =>
+            multipart.uploadPart(partNumber, bytes).pipe(Effect.retry(r2RetrySchedule)),
+          ).pipe(
             Effect.map((result) => {
-              uploaded.push(result);
+              uploaded.push(result.uploaded);
+              if (!result.verified) unverified++;
             }),
           );
         const write = Effect.gen(function* () {
@@ -322,11 +442,10 @@ export const makeObjectStore = Effect.gen(function* () {
           );
           if (Option.isNone(upload)) {
             // Fits in one part: one PUT, no multipart upload.
+            const single = Option.getOrElse(pendingFirstPart, () => new Uint8Array(0));
+            const sha256 = yield* sha256Of(single);
             yield* bucket
-              .put(
-                key,
-                Option.getOrElse(pendingFirstPart, () => new Uint8Array(0)),
-              )
+              .put(key, single, { sha256 })
               .pipe(
                 Effect.retry(r2RetrySchedule),
                 Effect.mapError(unavailable("putMultipart", key)),
@@ -342,6 +461,7 @@ export const makeObjectStore = Effect.gen(function* () {
           yield* Effect.annotateCurrentSpan({
             "object.size": sizeBytes,
             "object.parts": Math.max(1, uploaded.length),
+            "object.parts_unverified": unverified,
           });
           return sizeBytes;
         });
@@ -412,6 +532,19 @@ export const objectStoreLayer = objectStoreLayerWithoutDependencies.pipe(
 /** R2's smallest multipart part, except the last: 5 MiB. */
 const R2_MIN_PART_SIZE = 5 * 1024 * 1024;
 
+/** Fault injection for the in-memory store. */
+interface InMemoryObjectStoreOptions {
+  /** Whether attempt `attempt` of part `partNumber` of `key` arrives changed. */
+  readonly corruptPartInTransit: (key: string, partNumber: number, attempt: number) => boolean;
+}
+
+/** A copy of `bytes` with its first byte inverted: a part damaged in transit. */
+const flipFirstByte = (bytes: Uint8Array) => {
+  const copy = bytes.slice();
+  if (copy.length > 0) copy[0] = (copy[0] ?? 0) ^ 0xff;
+  return copy;
+};
+
 /** One object held by the in-memory store. */
 interface StoredObject {
   readonly bytes: Uint8Array;
@@ -426,156 +559,198 @@ interface StoredObject {
  * idempotent, upload times come from the contextual `Clock`, and multipart uploads must use uniform
  * parts of at least 5 MiB (except the last). Stored bytes are copied in and out.
  */
-const inMemoryObjectStore = Effect.gen(function* () {
-  const objects = yield* Ref.make(new Map<string, StoredObject>());
-  let nextVersion = 1;
-  const stored = (bytes: Uint8Array, uploadedAt: Timestamp): StoredObject => ({
-    bytes: bytes.slice(),
-    uploadedAt,
-    version: nextVersion++,
-  });
-  const store = (key: string, bytes: Uint8Array) =>
-    Effect.gen(function* () {
-      const uploadedAt = Timestamp.make(yield* Clock.currentTimeMillis);
-      yield* Ref.update(objects, (current) => new Map(current).set(key, stored(bytes, uploadedAt)));
+const inMemoryObjectStore = (options: InMemoryObjectStoreOptions) =>
+  Effect.gen(function* () {
+    const objects = yield* Ref.make(new Map<string, StoredObject>());
+    let nextVersion = 1;
+    const stored = (bytes: Uint8Array, uploadedAt: Timestamp): StoredObject => ({
+      bytes: bytes.slice(),
+      uploadedAt,
+      version: nextVersion++,
     });
-  const read = (key: string) =>
-    Ref.get(objects).pipe(Effect.map((current) => Option.fromUndefinedOr(current.get(key))));
-
-  return ObjectStore.of({
-    get: Effect.fn("ObjectStore.get")(function* (key: string) {
-      yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
-      return Option.map(yield* read(key), (object) => object.bytes.slice());
-    }),
-    getRange: Effect.fn("ObjectStore.getRange")(function* (key: string, range: ByteRange) {
-      yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
-      yield* Effect.annotateCurrentSpan({
-        "object.offset": range.offset,
-        "object.length": range.length,
-      });
-      return Option.map(yield* read(key), (object) =>
-        object.bytes.slice(range.offset, range.offset + range.length),
-      );
-    }),
-    getVersioned: Effect.fn("ObjectStore.getVersioned")(function* (key: string) {
-      yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
-      return Option.map(yield* read(key), (object) => ({
-        bytes: object.bytes.slice(),
-        version: `"${object.version}"`,
-      }));
-    }),
-    putIfVersion: Effect.fn("ObjectStore.putIfVersion")(function* (
-      key: string,
-      body: Uint8Array,
-      version: string,
-    ) {
-      yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
-      const uploadedAt = Timestamp.make(yield* Clock.currentTimeMillis);
-      const outcome = yield* Ref.modify(
-        objects,
-        (current): readonly [PutIfVersionOutcome, Map<string, StoredObject>] => {
-          const existing = current.get(key);
-          return existing !== undefined && `"${existing.version}"` === version
-            ? ["Written", new Map(current).set(key, stored(body, uploadedAt))]
-            : ["VersionChanged", current];
-        },
-      );
-      yield* Effect.annotateCurrentSpan({ "object.outcome": outcome });
-      return outcome;
-    }),
-    head: Effect.fn("ObjectStore.head")(function* (key: string) {
-      yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
-      return Option.map(yield* read(key), (object) => ({
-        key,
-        sizeBytes: object.bytes.length,
-        uploadedAt: object.uploadedAt,
-      }));
-    }),
-    putIfAbsent: Effect.fn("ObjectStore.putIfAbsent")(function* (key: string, body: Uint8Array) {
-      yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
-      const uploadedAt = Timestamp.make(yield* Clock.currentTimeMillis);
-      const outcome = yield* Ref.modify(
-        objects,
-        (current): readonly [PutIfAbsentOutcome, Map<string, StoredObject>] =>
-          current.has(key)
-            ? ["AlreadyExists", current]
-            : ["Created", new Map(current).set(key, stored(body, uploadedAt))],
-      );
-      yield* Effect.annotateCurrentSpan({ "object.outcome": outcome, "object.size": body.length });
-      return outcome;
-    }),
-    put: Effect.fn("ObjectStore.put")(function* (key: string, body: Uint8Array) {
-      yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
-      yield* Effect.annotateCurrentSpan({ "object.size": body.length });
-      yield* store(key, body);
-    }),
-    putMultipart: <E, R>(key: string, body: Stream.Stream<Uint8Array, E, R>, partSize: number) =>
+    const store = (key: string, bytes: Uint8Array) =>
       Effect.gen(function* () {
-        yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
-        const parts = yield* Stream.runCollect(toUniformParts(body, partSize));
-        if (parts.length > 1 && partSize < R2_MIN_PART_SIZE) {
-          return yield* Effect.die(
-            new Error(
-              `Multipart part size ${partSize} is below R2's 5 MiB minimum for non-final parts.`,
-            ),
-          );
-        }
-        const bytes = Bytes.concat(parts);
-        yield* store(key, bytes);
-        yield* Effect.annotateCurrentSpan({
-          "object.size": bytes.length,
-          "object.parts": Math.max(1, parts.length),
-        });
-        return bytes.length;
-      }).pipe(Effect.withSpan("ObjectStore.putMultipart")),
-    list: Effect.fn("ObjectStore.list")(function* (prefix: string, cursor: Option.Option<string>) {
-      const current = yield* Ref.get(objects);
-      const keys = [...current.keys()]
-        .filter((key) => key.startsWith(prefix) && (Option.isNone(cursor) || key > cursor.value))
-        .sort();
-      const page = keys.slice(0, 1000);
-      return {
-        objects: page.flatMap((key) => {
-          const object = current.get(key);
-          return object === undefined
-            ? []
-            : [{ key, sizeBytes: object.bytes.length, uploadedAt: object.uploadedAt }];
-        }),
-        cursor: keys.length > 1000 ? Option.fromUndefinedOr(page[page.length - 1]) : Option.none(),
-      };
-    }),
-    listPrefixes: Effect.fn("ObjectStore.listPrefixes")(function* (
-      prefix: string,
-      after: Option.Option<string>,
-      limit: number,
-    ) {
-      const current = yield* Ref.get(objects);
-      const prefixes = new Set<string>();
-      for (const key of current.keys()) {
-        if (!key.startsWith(prefix)) continue;
-        const slash = key.indexOf("/", prefix.length);
-        if (slash !== -1) prefixes.add(key.slice(0, slash + 1));
-      }
-      const sorted = [...prefixes]
-        .sort()
-        .filter((candidate) => Option.isNone(after) || candidate > after.value);
-      const pageLimit = Math.max(1, Math.min(limit, 1000));
-      const page = sorted.slice(0, pageLimit);
-      return {
-        prefixes: page,
-        cursor:
-          sorted.length > pageLimit ? Option.fromUndefinedOr(page[page.length - 1]) : Option.none(),
-      };
-    }),
-    delete: Effect.fn("ObjectStore.delete")(function* (keys: ReadonlyArray<string>) {
-      yield* Ref.update(objects, (current) => {
-        const next = new Map(current);
-        for (const key of keys) next.delete(key);
-        return next;
+        const uploadedAt = Timestamp.make(yield* Clock.currentTimeMillis);
+        yield* Ref.update(objects, (current) =>
+          new Map(current).set(key, stored(bytes, uploadedAt)),
+        );
       });
-    }),
+    const read = (key: string) =>
+      Ref.get(objects).pipe(Effect.map((current) => Option.fromUndefinedOr(current.get(key))));
+
+    return ObjectStore.of({
+      get: Effect.fn("ObjectStore.get")(function* (key: string) {
+        yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
+        return Option.map(yield* read(key), (object) => object.bytes.slice());
+      }),
+      getRange: Effect.fn("ObjectStore.getRange")(function* (key: string, range: ByteRange) {
+        yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
+        yield* Effect.annotateCurrentSpan({
+          "object.offset": range.offset,
+          "object.length": range.length,
+        });
+        return Option.map(yield* read(key), (object) =>
+          object.bytes.slice(range.offset, range.offset + range.length),
+        );
+      }),
+      getVersioned: Effect.fn("ObjectStore.getVersioned")(function* (key: string) {
+        yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
+        return Option.map(yield* read(key), (object) => ({
+          bytes: object.bytes.slice(),
+          version: `"${object.version}"`,
+        }));
+      }),
+      putIfVersion: Effect.fn("ObjectStore.putIfVersion")(function* (
+        key: string,
+        body: Uint8Array,
+        version: string,
+      ) {
+        yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
+        const uploadedAt = Timestamp.make(yield* Clock.currentTimeMillis);
+        const outcome = yield* Ref.modify(
+          objects,
+          (current): readonly [PutIfVersionOutcome, Map<string, StoredObject>] => {
+            const existing = current.get(key);
+            return existing !== undefined && `"${existing.version}"` === version
+              ? ["Written", new Map(current).set(key, stored(body, uploadedAt))]
+              : ["VersionChanged", current];
+          },
+        );
+        yield* Effect.annotateCurrentSpan({ "object.outcome": outcome });
+        return outcome;
+      }),
+      head: Effect.fn("ObjectStore.head")(function* (key: string) {
+        yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
+        return Option.map(yield* read(key), (object) => ({
+          key,
+          sizeBytes: object.bytes.length,
+          uploadedAt: object.uploadedAt,
+        }));
+      }),
+      putIfAbsent: Effect.fn("ObjectStore.putIfAbsent")(function* (key: string, body: Uint8Array) {
+        yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
+        const uploadedAt = Timestamp.make(yield* Clock.currentTimeMillis);
+        const outcome = yield* Ref.modify(
+          objects,
+          (current): readonly [PutIfAbsentOutcome, Map<string, StoredObject>] =>
+            current.has(key)
+              ? ["AlreadyExists", current]
+              : ["Created", new Map(current).set(key, stored(body, uploadedAt))],
+        );
+        yield* Effect.annotateCurrentSpan({
+          "object.outcome": outcome,
+          "object.size": body.length,
+        });
+        return outcome;
+      }),
+      put: Effect.fn("ObjectStore.put")(function* (key: string, body: Uint8Array) {
+        yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
+        yield* Effect.annotateCurrentSpan({ "object.size": body.length });
+        yield* store(key, body);
+      }),
+      putMultipart: <E, R>(key: string, body: Stream.Stream<Uint8Array, E, R>, partSize: number) =>
+        Effect.gen(function* () {
+          yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
+          const sent = yield* Stream.runCollect(toUniformParts(body, partSize));
+          if (sent.length > 1 && partSize < R2_MIN_PART_SIZE) {
+            return yield* Effect.die(
+              new Error(
+                `Multipart part size ${partSize} is below R2's 5 MiB minimum for non-final parts.`,
+              ),
+            );
+          }
+          // Like R2: each part is stored as it arrived and its ETag is the MD5 of what was stored.
+          const storedParts = new Map<number, Uint8Array>();
+          const attempts = new Map<number, number>();
+          for (const [index, part] of sent.entries()) {
+            yield* uploadPartVerified(key, index + 1, part, (partNumber, bytes) =>
+              Effect.sync(() => {
+                const attempt = (attempts.get(partNumber) ?? 0) + 1;
+                attempts.set(partNumber, attempt);
+                const arrived = options.corruptPartInTransit(key, partNumber, attempt)
+                  ? flipFirstByte(bytes)
+                  : bytes.slice();
+                storedParts.set(partNumber, arrived);
+                return { partNumber, etag: `"${md5Hex(arrived)}"` };
+              }),
+            );
+          }
+          const bytes = Bytes.concat(
+            sent.map((_, index) => storedParts.get(index + 1) ?? new Uint8Array(0)),
+          );
+          yield* store(key, bytes);
+          yield* Effect.annotateCurrentSpan({
+            "object.size": bytes.length,
+            "object.parts": Math.max(1, sent.length),
+          });
+          return bytes.length;
+        }).pipe(Effect.withSpan("ObjectStore.putMultipart")),
+      list: Effect.fn("ObjectStore.list")(function* (
+        prefix: string,
+        cursor: Option.Option<string>,
+      ) {
+        const current = yield* Ref.get(objects);
+        const keys = [...current.keys()]
+          .filter((key) => key.startsWith(prefix) && (Option.isNone(cursor) || key > cursor.value))
+          .sort();
+        const page = keys.slice(0, 1000);
+        return {
+          objects: page.flatMap((key) => {
+            const object = current.get(key);
+            return object === undefined
+              ? []
+              : [{ key, sizeBytes: object.bytes.length, uploadedAt: object.uploadedAt }];
+          }),
+          cursor:
+            keys.length > 1000 ? Option.fromUndefinedOr(page[page.length - 1]) : Option.none(),
+        };
+      }),
+      listPrefixes: Effect.fn("ObjectStore.listPrefixes")(function* (
+        prefix: string,
+        after: Option.Option<string>,
+        limit: number,
+      ) {
+        const current = yield* Ref.get(objects);
+        const prefixes = new Set<string>();
+        for (const key of current.keys()) {
+          if (!key.startsWith(prefix)) continue;
+          const slash = key.indexOf("/", prefix.length);
+          if (slash !== -1) prefixes.add(key.slice(0, slash + 1));
+        }
+        const sorted = [...prefixes]
+          .sort()
+          .filter((candidate) => Option.isNone(after) || candidate > after.value);
+        const pageLimit = Math.max(1, Math.min(limit, 1000));
+        const page = sorted.slice(0, pageLimit);
+        return {
+          prefixes: page,
+          cursor:
+            sorted.length > pageLimit
+              ? Option.fromUndefinedOr(page[page.length - 1])
+              : Option.none(),
+        };
+      }),
+      delete: Effect.fn("ObjectStore.delete")(function* (keys: ReadonlyArray<string>) {
+        yield* Ref.update(objects, (current) => {
+          const next = new Map(current);
+          for (const key of keys) next.delete(key);
+          return next;
+        });
+      }),
+    });
   });
-});
 
 /** Provides a fresh, faithful in-memory object store (see `inMemoryObjectStore`). */
-export const objectStoreTestLayer = Layer.effect(ObjectStore, inMemoryObjectStore);
+export const objectStoreTestLayer = Layer.effect(
+  ObjectStore,
+  inMemoryObjectStore({ corruptPartInTransit: () => false }),
+);
+
+/**
+ * Provides an in-memory object store whose multipart parts arrive changed whenever
+ * `corruptPartInTransit(key, partNumber, attempt)` says so, as a part damaged between the Worker
+ * and R2 would (attempts count from 1).
+ */
+export const objectStoreWithTransitCorruptionTestLayer = (
+  corruptPartInTransit: InMemoryObjectStoreOptions["corruptPartInTransit"],
+) => Layer.effect(ObjectStore, inMemoryObjectStore({ corruptPartInTransit }));

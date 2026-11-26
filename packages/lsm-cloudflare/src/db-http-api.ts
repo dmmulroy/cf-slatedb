@@ -2,6 +2,7 @@ import {
   Checkpoint,
   CheckpointId,
   DatabaseId,
+  DroppedSst,
   KeyRange,
   ManifestId,
   MergeOperatorName,
@@ -12,11 +13,13 @@ import {
   TransactionCommit,
   WriteBatch,
   WriteReceipt,
+  SstId,
+  Timestamp,
 } from "@cf-slatedb/lsm-core";
 import { Schema } from "effect";
 import { HttpApi, HttpApiEndpoint, HttpApiGroup, HttpApiSchema, OpenApi } from "effect/http-api";
 
-import { CompactorState } from "./compactor.ts";
+import { CompactorState, SstDropReport } from "./compactor.ts";
 import { PinnedSnapshot } from "./database-lifecycle.ts";
 import { DbSnapshot } from "./db-client.ts";
 import { DB_PUBLIC_ERRORS } from "./db-public-error.ts";
@@ -62,11 +65,39 @@ export const GetResponse = Schema.Struct({ row: Schema.OptionFromNullOr(RowSchem
 export const CompactionStatusResponse = Schema.Struct({
   manifestId: ManifestId,
   l0Ssts: Schema.Int,
+  /** The L0 SSTs' ids, newest first: what a corruption report or a drop names. */
+  l0SstIds: Schema.Array(SstId),
   sortedRuns: Schema.Array(
     Schema.Struct({ id: SortedRunId, ssts: Schema.Int, sizeBytes: Schema.Int }),
   ),
   compactor: Schema.OptionFromNullOr(CompactorState),
+  /**
+   * SSTs a compaction found corrupted and the manifest still holds (D62), with each SST's creation
+   * time: a checkpoint created before it can restore the data it held.
+   */
+  corruptSsts: Schema.Array(
+    Schema.Struct({
+      sstId: SstId,
+      createdAt: Timestamp,
+      section: Schema.String,
+      reason: Schema.String,
+      detectedAt: Timestamp,
+    }),
+  ),
+  /** SSTs an operator dropped (D62), newest last. */
+  droppedSsts: Schema.Array(DroppedSst),
 });
+
+/** Schema for an SST drop request (D62). */
+export const DropSstRequest = Schema.Struct({
+  /** Must repeat the SST id in the path: dropping loses the SST's rows. */
+  confirm: Schema.String,
+  /** Drop the SST even though no compaction reported it corrupted. */
+  force: Schema.optionalKey(Schema.Boolean),
+});
+
+/** Schema for a database's checkpoints, oldest first (including forks' holds on it). */
+export const CheckpointsResponse = Schema.Struct({ checkpoints: Schema.Array(Checkpoint) });
 
 /** Schema for a checkpoint request: an optional name and lifetime (none: until deleted). */
 export const CreateCheckpointRequest = Schema.Struct({
@@ -214,6 +245,20 @@ export class DbHttpApiGroup extends HttpApiGroup.make("databases")
     ),
   )
   .add(
+    HttpApiEndpoint.post("dropSst", "/databases/:databaseId/ssts/:sstId/drop", {
+      params: Schema.Struct({ databaseId: DatabaseId, sstId: SstId }),
+      payload: DropSstRequest,
+      success: SstDropReport,
+      error: DB_PUBLIC_ERRORS,
+    }).annotateMerge(
+      OpenApi.annotations({
+        summary: "Drop a corrupted SST (repair)",
+        description:
+          "Removes an SST that compaction reported corrupted from the manifest, so compaction resumes. Its rows are lost: older versions of its keys show again. `confirm` must repeat the SST id; `force` drops an SST no compaction reported. To lose nothing newer than a checkpoint instead, fork the full range from that checkpoint into a new database.",
+      }),
+    ),
+  )
+  .add(
     HttpApiEndpoint.post("createCheckpoint", "/databases/:databaseId/checkpoints", {
       params: DatabaseParams,
       payload: CreateCheckpointRequest,
@@ -224,6 +269,19 @@ export class DbHttpApiGroup extends HttpApiGroup.make("databases")
         summary: "Create a checkpoint",
         description:
           "Flushes every acknowledged write, then pins the resulting manifest: its data stays readable and forkable until the checkpoint is deleted or expires.",
+      }),
+    ),
+  )
+  .add(
+    HttpApiEndpoint.get("listCheckpoints", "/databases/:databaseId/checkpoints", {
+      params: DatabaseParams,
+      success: CheckpointsResponse,
+      error: DB_PUBLIC_ERRORS,
+    }).annotateMerge(
+      OpenApi.annotations({
+        summary: "List checkpoints",
+        description:
+          "Every checkpoint the newest manifest holds, including forks' holds, with the manifest each pins and when it expires.",
       }),
     ),
   )

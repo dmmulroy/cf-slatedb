@@ -1,4 +1,4 @@
-import { Option, Result, Schema } from "effect";
+import { Effect, Option, Result, Schema } from "effect";
 
 import {
   CheckpointId,
@@ -152,6 +152,42 @@ export const DEFAULT_DATABASE_OPTIONS: DatabaseOptions = {
   changelog: Option.none(),
 };
 
+/** Schema for one compaction input: an L0 SST or a sorted run. */
+export const CompactionSource = Schema.Union([
+  Schema.TaggedStruct("L0", { sstId: SstId }),
+  Schema.TaggedStruct("SortedRun", { id: SortedRunId }),
+]);
+
+/** One compaction input. */
+export type CompactionSource = typeof CompactionSource.Type;
+
+/**
+ * Schema for an SST an operator removed from the manifest (D62): which SST, where it was, the keys
+ * it covered (its versions of those keys are gone; older versions below it show again), why, and
+ * when.
+ */
+export const DroppedSst = Schema.Struct({
+  sstId: SstId,
+  /** The database whose prefix stores it: none for the database's own SSTs. */
+  owner: Schema.OptionFromNullOr(DatabaseId),
+  /** The L0 SST or the sorted run that held it. */
+  from: CompactionSource,
+  /** The keys it held, [firstKey, lastKey]; the database read only those inside `view` (if any). */
+  firstKey: Schema.Uint8ArrayFromBase64,
+  lastKey: Schema.Uint8ArrayFromBase64,
+  view: Schema.OptionFromNullOr(KeyRange),
+  rowCount: Schema.Int,
+  /** `Corrupted`: the compactor had reported it; `Forced`: dropped without that report. */
+  reason: Schema.Literals(["Corrupted", "Forced"]),
+  droppedAt: Timestamp,
+});
+
+/** An SST an operator removed from the manifest. */
+export type DroppedSst = typeof DroppedSst.Type;
+
+/** How many dropped SSTs a manifest remembers, newest last; older entries fall off. */
+export const MAX_DROPPED_SST_HISTORY = 32;
+
 /**
  * A database's manifest: the complete, immutable description of one version of the LSM.
  *
@@ -166,6 +202,9 @@ export const DEFAULT_DATABASE_OPTIONS: DatabaseOptions = {
  * `gcSstBoundary` is GC's SST deletion boundary: GC advances it (by CAS) before deleting unreferenced
  * SSTs created before it, and commits reject new SSTs created before it (`SstBelowGcBoundaryError`),
  * so an SST that is uploaded but not yet committed is never deleted out from under its commit.
+ *
+ * `droppedSsts` records SSTs an operator removed (D62), newest last; manifests written before it
+ * decode with none.
  */
 export class Manifest extends Schema.Class<Manifest>("Manifest")({
   databaseId: DatabaseId,
@@ -182,6 +221,7 @@ export class Manifest extends Schema.Class<Manifest>("Manifest")({
   changelog: Schema.Array(ChangelogEntry),
   options: DatabaseOptions,
   gcSstBoundary: Timestamp,
+  droppedSsts: Schema.Array(DroppedSst).pipe(Schema.withDecodingDefaultKey(Effect.succeed([]))),
 }) {}
 
 /** Codec for a manifest object's body: JSON via `Schema.fromJsonString(Manifest)`. */
@@ -212,6 +252,7 @@ export const initialManifest = (
     changelog: [],
     options: options.databaseOptions,
     gcSstBoundary: Timestamp.make(0),
+    droppedSsts: [],
   });
 
 /** Every SST handle the manifest references: L0 newest first, then each sorted run. */
@@ -332,6 +373,15 @@ export class DatabaseHasDependentsError extends Schema.TaggedError<DatabaseHasDe
   { databaseId: DatabaseId, dependents: Schema.Array(DatabaseId), message: Schema.String },
 ) {}
 
+/**
+ * The SST is not in the database's newest manifest, so it cannot be dropped. Not retryable: check
+ * the SST id against `GET /v1/databases/:id/compaction`.
+ */
+export class SstNotInManifestError extends Schema.TaggedError<SstNotInManifestError>()(
+  "SstNotInManifestError",
+  { databaseId: DatabaseId, sstId: SstId, message: Schema.String },
+) {}
+
 const databaseRemoved = (manifest: Manifest) =>
   new DatabaseRemovedError({
     databaseId: manifest.databaseId,
@@ -376,6 +426,7 @@ export const replaceManifestFields = (manifest: Manifest, fields: Partial<Manife
     changelog: fields.changelog ?? manifest.changelog,
     options: fields.options ?? manifest.options,
     gcSstBoundary: fields.gcSstBoundary ?? manifest.gcSstBoundary,
+    droppedSsts: fields.droppedSsts ?? manifest.droppedSsts,
   });
 
 // ---------------------------------------------------------------------------------------------
@@ -456,15 +507,6 @@ export const commitL0Flush = (
     }),
   );
 };
-
-/** Schema for one compaction input: an L0 SST or a sorted run. */
-export const CompactionSource = Schema.Union([
-  Schema.TaggedStruct("L0", { sstId: SstId }),
-  Schema.TaggedStruct("SortedRun", { id: SortedRunId }),
-]);
-
-/** One compaction input. */
-export type CompactionSource = typeof CompactionSource.Type;
 
 /**
  * Schema for a compaction job: merge `sources` into sorted run `destination`.
@@ -802,6 +844,8 @@ export const forkManifest = (
     changelog: [],
     options: checkpointManifest.options,
     gcSstBoundary: Timestamp.make(0),
+    // A fork starts its own repair history.
+    droppedSsts: [],
   });
 };
 
@@ -837,4 +881,77 @@ export const externalOwners = (manifest: Manifest): ReadonlySet<DatabaseId> => {
       owners.add(handle.owner.value);
   }
   return owners;
+};
+
+/** How to record an SST being dropped (see {@link dropSstFromManifest}). */
+export interface SstDrop {
+  readonly sstId: SstId;
+  readonly reason: DroppedSst["reason"];
+  readonly droppedAt: Timestamp;
+}
+
+/**
+ * Removes one SST from the manifest and records it in `droppedSsts` (D62): an operator's repair of
+ * a corrupted SST. Its versions of the keys it covered are lost; older versions of those keys in
+ * lower levels show again. A sorted run left empty is removed.
+ *
+ * **Details**
+ *
+ * The SST's object stays until GC finds it unreferenced, like any replaced SST, so readers holding
+ * an older manifest are unaffected. The edit does not touch epochs: a running compaction that read
+ * a dropped L0 SST fails to commit (its inputs changed); the compactor refuses to drop from a source
+ * a running job reads, which covers sorted runs.
+ *
+ * @returns The manifest without the SST; the same manifest when it was already dropped;
+ *   `SstNotInManifestError` when the manifest never held it (or forgot the drop); or
+ *   `DatabaseRemovedError` when the database is being removed.
+ */
+export const dropSstFromManifest = (
+  manifest: Manifest,
+  drop: SstDrop,
+): Result.Result<Manifest, SstNotInManifestError | DatabaseRemovedError> => {
+  if (manifest.state._tag === "Removed") return Result.fail(databaseRemoved(manifest));
+  const inL0 = manifest.l0.find((sst) => sst.id === drop.sstId);
+  const run = manifest.sortedRuns.find((candidate) =>
+    candidate.ssts.some((sst) => sst.id === drop.sstId),
+  );
+  const handle = inL0 ?? run?.ssts.find((sst) => sst.id === drop.sstId);
+  if (handle === undefined) {
+    return manifest.droppedSsts.some((dropped) => dropped.sstId === drop.sstId)
+      ? Result.succeed(manifest)
+      : Result.fail(
+          new SstNotInManifestError({
+            databaseId: manifest.databaseId,
+            sstId: drop.sstId,
+            message: `SST ${drop.sstId} is not in database ${manifest.databaseId}'s manifest, so there is nothing to drop. Check the SST id in the compaction status.`,
+          }),
+        );
+  }
+  const dropped: DroppedSst = {
+    sstId: drop.sstId,
+    owner: handle.owner,
+    from:
+      inL0 !== undefined || run === undefined
+        ? { _tag: "L0", sstId: drop.sstId }
+        : { _tag: "SortedRun", id: run.id },
+    firstKey: handle.firstKey,
+    lastKey: handle.lastKey,
+    view: handle.view,
+    rowCount: handle.rowCount,
+    reason: drop.reason,
+    droppedAt: drop.droppedAt,
+  };
+  return Result.succeed(
+    replaceManifestFields(manifest, {
+      l0: manifest.l0.filter((sst) => sst.id !== drop.sstId),
+      sortedRuns: manifest.sortedRuns
+        .map((candidate) =>
+          candidate === run
+            ? { id: candidate.id, ssts: candidate.ssts.filter((sst) => sst.id !== drop.sstId) }
+            : candidate,
+        )
+        .filter((candidate) => candidate.ssts.length > 0),
+      droppedSsts: [...manifest.droppedSsts, dropped].slice(-MAX_DROPPED_SST_HISTORY),
+    }),
+  );
 };

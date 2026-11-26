@@ -122,6 +122,12 @@ a flush commits from its own view with one create and no `ManifestReader.loadLat
 
 ## Maintenance notes
 
+- D62 (v1 workstream 7): one more manifest edit, `dropSstFromManifest`, committed by
+  `ManifestStore.update` (reload and reapply on conflict) from the compactor, under its planning
+  lock; it changes no epoch, so fencing is unaffected. A compaction that read a dropped L0 SST fails
+  `commitCompaction`'s exact-inputs check; one reading a dropped sorted run SST cannot be running
+  (the compactor refuses the drop, and plans nothing while it holds the lock). No model step
+  changed.
 - D56 (v1 workstream 2): optimistic `updateFrom`, the background monotonic hint, `loadLatest` from
   `max(hint, boundary + 1)`, GC and hint actions, `CommitOnce`, `LoadFindsHead`, the GC config and
   two broken variants. Every step still maps to one awaited effect.

@@ -14,6 +14,7 @@ import {
   ManifestId,
   markRemoved,
   removeCheckpoint,
+  type SstId,
   Timestamp,
 } from "@cf-slatedb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
@@ -24,7 +25,12 @@ import { BlockSource, type BlockSourceServices } from "./block-source.ts";
 import { CompactorClient } from "./compactor-client.ts";
 import { DbSnapshot } from "./db-client.ts";
 import type { SealReceipt } from "./db-writer.ts";
-import type { CompactorError } from "./compactor.ts";
+import {
+  type CompactorError,
+  type SstDropError,
+  SstDropRefusedError,
+  type SstDropReport,
+} from "./compactor.ts";
 import { DatabaseNotFoundError, WriterUnavailableError } from "./lsm-errors.ts";
 import {
   ManifestReader,
@@ -83,6 +89,15 @@ export class CheckpointNotFoundError extends Schema.TaggedError<CheckpointNotFou
   "CheckpointNotFoundError",
   { databaseId: DatabaseId, checkpointId: CheckpointId, message: Schema.String },
 ) {}
+
+/** An operator's request to drop one SST (see {@link IDatabaseLifecycle.dropSst}). */
+export interface DropSstOptions {
+  readonly sstId: SstId;
+  /** Must repeat `sstId`: dropping loses data, so the caller names the SST twice. */
+  readonly confirm: string;
+  /** Drop it even though no compaction reported it corrupted. */
+  readonly force: boolean;
+}
 
 /** Every failure a lifecycle operation can report. */
 export type DatabaseLifecycleError =
@@ -174,6 +189,26 @@ export interface IDatabaseLifecycle {
   readonly remove: (
     databaseId: DatabaseId,
   ) => Effect.Effect<void, DatabaseLifecycleError, DatabaseLifecycleServices>;
+  /**
+   * Repairs a database around a corrupted SST (D62): removes it from the manifest, recording what
+   * was lost in the manifest's `droppedSsts`, so compaction of its source resumes.
+   *
+   * **Details**
+   *
+   * The SST's versions of the keys it held are lost; older versions of those keys show again. The
+   * alternative that loses nothing newer than a checkpoint is restoring: fork the full key range
+   * from a checkpoint taken before the corruption into a new database. `confirm` must repeat the
+   * SST id. Without `force`, only an SST a compaction reported corrupted is dropped. The database's
+   * compactor makes the change, so it never races a compaction of the same SST. Safe to retry.
+   *
+   * @returns The manifest without the SST and what was dropped; `SstDropRefusedError` (not
+   *   reported, confirmation mismatch, or a compaction reading it), `SstNotInManifestError`, or a
+   *   `CompactorError`.
+   */
+  readonly dropSst: (
+    databaseId: DatabaseId,
+    request: DropSstOptions,
+  ) => Effect.Effect<SstDropReport, SstDropError, DatabaseLifecycleServices>;
 }
 
 /** The contextual database lifecycle. */
@@ -491,6 +526,22 @@ export const makeDatabaseLifecycle = Effect.gen(function* () {
     yield* Effect.annotateCurrentSpan({ "remove.objects": deleted, "cache.purged": purged });
   });
 
+  const dropSst = Effect.fn("DatabaseLifecycle.dropSst")(function* (
+    databaseId: DatabaseId,
+    request: DropSstOptions,
+  ) {
+    yield* Effect.annotateCurrentSpan({ "database.id": databaseId, "sst.id": request.sstId });
+    if (request.confirm !== request.sstId) {
+      return yield* new SstDropRefusedError({
+        databaseId,
+        sstId: request.sstId,
+        reason: "ConfirmationMismatch",
+        message: `Dropping SST ${request.sstId} of database ${databaseId} loses its rows, so confirm must repeat the SST id. Nothing was dropped; send confirm equal to the SST id to proceed.`,
+      });
+    }
+    return yield* compactors.dropSst(databaseId, { sstId: request.sstId, force: request.force });
+  });
+
   return DatabaseLifecycle.of({
     create,
     createCheckpoint,
@@ -499,6 +550,7 @@ export const makeDatabaseLifecycle = Effect.gen(function* () {
     seal,
     forkRange,
     remove,
+    dropSst,
   });
 });
 

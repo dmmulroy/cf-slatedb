@@ -1,4 +1,4 @@
-import { DatabaseId, ManifestId, SstId } from "@cf-slatedb/lsm-core";
+import { DatabaseId, ManifestId, md5Hex, SstId } from "@cf-slatedb/lsm-core";
 import { Arbitrary, Bytes, Effect, Option, Schema, Stream } from "effect";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { describe, expect, it } from "vite-plus/test";
@@ -11,7 +11,14 @@ import {
   objectKindOfKey,
   sstKey,
 } from "./object-keys.ts";
-import { ObjectStore, objectStoreTestLayer, toUniformParts } from "./object-store.ts";
+import {
+  ObjectStore,
+  objectStoreTestLayer,
+  objectStoreWithTransitCorruptionTestLayer,
+  PART_INTEGRITY_ATTEMPTS,
+  toUniformParts,
+  uploadPartVerified,
+} from "./object-store.ts";
 
 const smallInt = (minimum: number, maximum: number) =>
   Arbitrary.schema(Schema.Int.check(Schema.isBetween({ minimum, maximum })));
@@ -96,6 +103,76 @@ describe("ObjectStore (in-memory)", () => {
       }),
     );
     expect(prefixes).toEqual({ prefixes: ["db/a/", "db/b/"], cursor: Option.none() });
+  });
+});
+
+describe("multipart part integrity (D62)", () => {
+  const PART = 5 * 1024 * 1024;
+  const body = Uint8Array.from({ length: 2 * PART + 1234 }, (_, index) => (index * 131) & 0xff);
+  const upload = (corrupt: (key: string, partNumber: number, attempt: number) => boolean) =>
+    Effect.gen(function* () {
+      const store = yield* ObjectStore;
+      const written = yield* Effect.result(
+        store.putMultipart("db/a/sst/x.sst", Stream.make(body), PART),
+      );
+      return { written, stored: yield* store.get("db/a/sst/x.sst") };
+    }).pipe(
+      Effect.provide(objectStoreWithTransitCorruptionTestLayer(corrupt)),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.runPromise,
+    );
+
+  it("uploads a part that arrived changed again, storing exactly what was sent", async () => {
+    const { written, stored } = await upload(
+      (_, partNumber, attempt) => partNumber === 2 && attempt === 1,
+    );
+    expect(written._tag).toBe("Success");
+    // Compared by digest: a deep comparison of 10 MiB is slow.
+    expect(Option.map(stored, md5Hex)).toEqual(Option.some(md5Hex(body)));
+  });
+
+  it("fails the upload, storing nothing, when a part arrives changed on every attempt", async () => {
+    const { written, stored } = await upload((_, partNumber) => partNumber === 3);
+    expect(written._tag).toBe("Failure");
+    if (written._tag === "Failure") {
+      expect(written.failure._tag).toBe("ObjectStoreUnavailableError");
+      expect(written.failure.message).toContain(`on ${PART_INTEGRITY_ATTEMPTS} attempts`);
+    }
+    expect(stored).toEqual(Option.none());
+  });
+
+  it("checks the ETag R2 returns, quoted or not, against the MD5 of the part", async () => {
+    const part = Uint8Array.of(1, 2, 3);
+    const attempts: Array<number> = [];
+    const result = await Effect.runPromise(
+      uploadPartVerified("k", 1, part, (partNumber) =>
+        Effect.sync(() => {
+          attempts.push(partNumber);
+          // R2's ETag for the bytes 1,2,3, quoted and upper-cased on the second attempt.
+          return {
+            partNumber,
+            etag:
+              attempts.length === 1
+                ? '"00000000000000000000000000000000"'
+                : '"5289DF737DF57326FCDD22597AFB1FAC"',
+          };
+        }),
+      ),
+    );
+    expect(result).toEqual({
+      uploaded: { partNumber: 1, etag: '"5289DF737DF57326FCDD22597AFB1FAC"' },
+      verified: true,
+    });
+    expect(attempts).toEqual([1, 1]);
+  });
+
+  it("accepts a part as unverified when the ETag is not an MD5 (local R2's are opaque)", async () => {
+    const result = await Effect.runPromise(
+      uploadPartVerified("k", 1, Uint8Array.of(1, 2, 3), (partNumber) =>
+        Effect.succeed({ partNumber, etag: "77qvic6fgjffwykb1nrhrj3nbtji-opaque" }),
+      ),
+    );
+    expect(result.verified).toBe(false);
   });
 });
 

@@ -390,6 +390,19 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   use the primary key and no temp B-tree), `sst-codec.test.ts` (`groupBlockReads` property),
   `cf-slatedb-stack-config.test.ts` (limits and refusals), `preview-stage.test.ts` (overrides over
   dev timings). Live: `docs/measurements.md` "Writer throughput and limits".
+- **Corruption: prevent, detect, repair (v1 workstream 7)** — done (D62). Upload integrity in
+  `object-store.ts` (`sha256` on single-part puts; `uploadPartVerified` with native WebCrypto MD5,
+  falling back to lsm-core `md5Hex`; `lsm_object_part_integrity_retries`,
+  `lsm_object_parts_unverified`; `objectStoreWithTransitCorruptionTestLayer`). Repair:
+  lsm-core `dropSstFromManifest`, `DroppedSst`, `Manifest.droppedSsts`, `SstNotInManifestError`;
+  `Compactor.dropSst` under the planning lock (`SstDropRefusedError`), `CompactorClient.dropSst`,
+  `DatabaseLifecycle.dropSst` (confirmation); public `POST /v1/databases/:id/ssts/:sstId/drop`
+  (`SstNotFound`, `SstDropRefused`), `GET /v1/databases/:id/checkpoints`, and compaction status
+  `corruptSsts`, `l0SstIds`, `droppedSsts`. Runbook: `docs/operations.md`. The probe Worker's
+  `POST /v1/probe/damage` exists on local and preview stages only (`deploysTelemetryProbe`). Tests:
+  `object-store.test.ts`, `md5.test.ts`, `manifest.test.ts`, `compactor.test.ts`,
+  `writer.workerd.ts` (multipart flush on local R2), the `repair` scenario. Formal: `GcSafety`
+  `DropSst` with broken variant `dropDeletesObject`.
 - **Routed reads see writes across a split (stale maps)** — done (D59). `DbWriter.probe`/`scan`
   report `sealedSuccessors`; `ReadOptions.refuseSealed` (`db-client.ts`); `ShardRouter` gets route
   through `withRouting` and scans resume shard by shard (`scanFrom`). Test: `sharding.test.ts` (a

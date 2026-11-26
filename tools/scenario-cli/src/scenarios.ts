@@ -1,8 +1,8 @@
 import { DatabaseId, SeqNum } from "@cf-slatedb/lsm-core";
-import { DbHttpApi, GcHttpApi } from "@cf-slatedb/lsm-cloudflare";
+import { DbHttpApi, GcHttpApi, sstKey } from "@cf-slatedb/lsm-cloudflare";
 import { ShardedHttpApi, ShardGroup } from "@cf-slatedb/sharding";
 import { Effect, Option } from "effect";
-import { HttpClient } from "effect/http";
+import { HttpClient, HttpClientRequest } from "effect/http";
 import { HttpApiClient } from "effect/http-api";
 
 import {
@@ -629,6 +629,130 @@ const createRace: Scenario = {
   }),
 };
 
+/** Inverts one byte of a stored object through the probe Worker (local and preview stages only). */
+const damageObject = (key: string, offset: number) =>
+  Effect.gen(function* () {
+    const { probe } = yield* ScenarioStack;
+    const http = yield* HttpClient.HttpClient;
+    const response = yield* step(
+      `damage ${key}`,
+      http.execute(
+        HttpClientRequest.post(`${probe}/v1/probe/damage`).pipe(
+          HttpClientRequest.setUrlParams({ key, offset: String(offset) }),
+        ),
+      ),
+    );
+    yield* expectEqual(`damage ${key}`, response.status, 200);
+  });
+
+const repair: Scenario = {
+  name: "repair",
+  description:
+    "A corrupted L0 SST stops L0 compaction and is reported; the operator's drop (confirm repeating the SST id) removes it, compaction resumes, and only its rows are gone (D62).",
+  run: Effect.gen(function* () {
+    const databaseId = DatabaseId.make(uniqueId("sc-repair"));
+    yield* createDatabase(databaseId);
+    const client = yield* api;
+    // A checkpoint before any data: created before every SST, so it could restore any of them.
+    const checkpoint = yield* step(
+      "checkpoint",
+      client.databases.createCheckpoint({
+        params: { databaseId },
+        payload: { name: Option.some("before"), lifetimeMs: Option.some(600_000) },
+      }),
+    );
+    yield* put(databaseId, "k0", "v0");
+    yield* flush(databaseId);
+    const first = yield* step(
+      "compaction status",
+      client.databases.compaction({ params: { databaseId } }),
+    );
+    const victim = first.l0SstIds[0];
+    if (victim === undefined) {
+      return yield* expectThat("one L0 SST", false, "the flush left no L0 SST");
+    }
+    // Byte 2 is inside the first data block: its checksum no longer matches.
+    yield* damageObject(sstKey(databaseId, victim), 2);
+    for (const round of [1, 2, 3]) {
+      yield* put(databaseId, `k${round}`, `v${round}`);
+      yield* flush(databaseId);
+    }
+    const reported = yield* eventually(
+      "the compactor reports the corrupted SST",
+      step("compaction status", client.databases.compaction({ params: { databaseId } })),
+      (status) =>
+        Option.exists(status.compactor, (compactor) =>
+          compactor.corruptSsts.some((corrupt) => corrupt.sstId === victim),
+        ),
+    );
+    yield* expectEqual("L0 is blocked behind it", reported.l0Ssts, 4);
+    const corrupt = reported.corruptSsts.find((entry) => entry.sstId === victim);
+    const listed = yield* step(
+      "list checkpoints",
+      client.databases.listCheckpoints({ params: { databaseId } }),
+    );
+    yield* expectThat(
+      "the checkpoint predates the corrupted SST (restoring from it is possible)",
+      corrupt !== undefined &&
+        listed.checkpoints.some(
+          (entry) => entry.id === checkpoint.id && entry.createdAt < corrupt.createdAt,
+        ),
+      JSON.stringify({ corrupt: corrupt?.createdAt, checkpoints: listed.checkpoints.length }),
+    );
+    // A fifth flush: still blocked (L0 merges oldest first); after the drop, four compact.
+    yield* put(databaseId, "k4", "v4");
+    yield* flush(databaseId);
+    const mismatch = yield* expectFailure(
+      "a drop without the confirmation",
+      step(
+        "drop without confirm",
+        client.databases.dropSst({
+          params: { databaseId, sstId: victim },
+          payload: { confirm: "yes" },
+        }),
+      ),
+    );
+    yield* expectThat(
+      "refused as a confirmation mismatch",
+      mismatch.message.includes("SstDropRefused"),
+      mismatch.message,
+    );
+    const report = yield* step(
+      "drop the corrupted SST",
+      client.databases.dropSst({
+        params: { databaseId, sstId: victim },
+        payload: { confirm: victim },
+      }),
+    );
+    yield* expectEqual("dropped as corrupted", report.dropped.reason, "Corrupted");
+    const settled = yield* compacted(databaseId);
+    yield* expectEqual(
+      "the drop is recorded",
+      settled.droppedSsts.map((dropped) => dropped.sstId),
+      [victim],
+    );
+    yield* expectEqual(
+      "k0 lived only in the dropped SST",
+      yield* read(databaseId, "k0", "Latest"),
+      undefined,
+    );
+    for (const round of [1, 2, 3, 4]) {
+      yield* expectEqual(`k${round}`, yield* read(databaseId, `k${round}`, "Latest"), `v${round}`);
+    }
+    yield* assertTraces("the compactor dropped it by one manifest commit", {
+      select: { databaseId, containing: { name: "Compactor.dropSst" } },
+      checks: [
+        {
+          _tag: "SpanExists",
+          span: { name: "Compactor.dropSst", attributes: { "drop.reason": "Corrupted" } },
+        },
+        { _tag: "SpanCount", span: { name: "ManifestStore.create" }, count: { equals: 1 } },
+        { _tag: "NoErrorStatus" },
+      ],
+    });
+  }),
+};
+
 /** Every scenario, in the order `run all` runs them. */
 export const SCENARIOS: ReadonlyArray<Scenario> = [
   writeRead,
@@ -642,4 +766,5 @@ export const SCENARIOS: ReadonlyArray<Scenario> = [
   removal,
   blockCache,
   createRace,
+  repair,
 ];

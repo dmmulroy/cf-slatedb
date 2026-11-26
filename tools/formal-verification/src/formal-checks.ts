@@ -124,6 +124,12 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
         expect: "PinnedManifestsComplete",
         timeLimitSeconds: 60,
       },
+      {
+        config: "GcSafety.cfg",
+        broken: "dropDeletesObject",
+        expect: "ReadableManifestsComplete",
+        timeLimitSeconds: 60,
+      },
     ],
   },
   {

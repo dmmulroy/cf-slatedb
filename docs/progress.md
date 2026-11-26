@@ -12,9 +12,9 @@ checklist and Dillon's go-ahead (P6). The decisions asked of Dillon are under "O
 | 3. Splits pause briefly, never fail       | done        | `393758c`            |
 | 4. Transactions exact across flushes      | done        | `5f2850b`, `5df4099` |
 | 5. GC and maintenance that scale          | done        | `e06f3eb`            |
-| 6. Writer throughput and limits           | done        | this commit          |
-| 7. Corruption: prevent, detect, repair    | next        |                      |
-| 8. Production telemetry                   | not started |                      |
+| 6. Writer throughput and limits           | done        | `308defd`            |
+| 7. Corruption: prevent, detect, repair    | done        | this commit          |
+| 8. Production telemetry                   | next        |                      |
 | 9. Production readiness                   | not started |                      |
 | 10. Soak, release checklist, the go-ahead | not started |                      |
 
@@ -113,6 +113,25 @@ hand-off is below.
 
   Results: 11/11 scenarios passed locally and on `preview-1` (`--dev-timings`). Both previews were
   then redeployed with production settings.
+
+- **7. Corruption: prevent, detect, repair (D62).**
+  - **Prevent.** Single-part puts send their SHA-256. Multipart parts are checked against the MD5
+    R2 returns as their ETag and re-sent on a mismatch. A probe through R2's S3 API confirmed both
+    behaviors.
+  - **Repair.** An operator can drop a reported-corrupted SST with
+    `POST /v1/databases/:id/ssts/:sstId/drop`, where `confirm` repeats the SST id. The compactor
+    makes the change under a lock shared with planning, refuses while a job reads the SST's source,
+    records the drop in `droppedSsts`, and compaction resumes. Two new operator views support the
+    restore-or-drop decision: compaction status `corruptSsts` (with each SST's creation time) and
+    `GET …/checkpoints`. The runbook is in the new `docs/operations.md`.
+  - **Probe Worker.** It has a `damage` endpoint for the new `repair` scenario and is now deployed
+    on local and preview stages only.
+  - **Model.** `GcSafety` gained `DropSst` and the broken variant `dropDeletesObject`.
+  - **Finding (fixed before commit).** A private JavaScript MD5 tripled 60 MiB flush CPU in workerd
+    (p50 3.7 s, max 16.7 s), though it is fast in Node. The native WebCrypto MD5 is back at baseline
+    (p50 1.0 s, max 3.9 s), and all 134 parts were verified on R2.
+  - **Results.** 12/12 scenarios locally and on `preview-1` (`--dev-timings`), which was then
+    redeployed with production settings.
 
 ## Remaining-work log
 

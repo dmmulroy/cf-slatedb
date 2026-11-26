@@ -1,4 +1,4 @@
-import { CheckpointId, DatabaseId } from "@cf-slatedb/lsm-core";
+import { CheckpointId, DatabaseId, SstId } from "@cf-slatedb/lsm-core";
 import { Schema } from "effect";
 import { HttpApiSchema } from "effect/http-api";
 
@@ -18,6 +18,7 @@ export const DbApiOperation = Schema.Literals([
   "checkpoint",
   "transaction",
   "routeRequest",
+  "dropSst",
 ]);
 
 /** A public database API operation name. */
@@ -120,6 +121,38 @@ export class CheckpointNotFoundPublicError extends Schema.TaggedError<Checkpoint
   {
     code: Schema.Literal("CheckpointNotFound"),
     details: Schema.Struct({ databaseId: DatabaseId, checkpointId: CheckpointId }),
+    ...common,
+  },
+) {}
+
+/** `404` — the SST is not in the database's manifest (wrong id, or already replaced). */
+export class SstNotFoundPublicError extends Schema.TaggedError<SstNotFoundPublicError>()(
+  "SstNotFoundPublicError",
+  {
+    code: Schema.Literal("SstNotFound"),
+    details: Schema.Struct({ databaseId: DatabaseId, sstId: SstId }),
+    ...common,
+  },
+) {}
+
+/**
+ * `409` — an SST drop was refused and nothing changed: no compaction reported the SST corrupted
+ * (send `force` to drop it anyway), `confirm` did not repeat the SST id, or a running compaction
+ * reads it (retry once it finishes).
+ */
+export class SstDropRefusedPublicError extends Schema.TaggedError<SstDropRefusedPublicError>()(
+  "SstDropRefusedPublicError",
+  {
+    code: Schema.Literal("SstDropRefused"),
+    details: Schema.Struct({
+      databaseId: DatabaseId,
+      sstId: SstId,
+      reason: Schema.Literals([
+        "NotReportedCorrupted",
+        "CompactionRunning",
+        "ConfirmationMismatch",
+      ]),
+    }),
     ...common,
   },
 ) {}
@@ -227,6 +260,7 @@ export const DB_PUBLIC_ERRORS = [
   DatabaseNotFoundPublicError.pipe(HttpApiSchema.status(404)),
   RouteNotFoundPublicError.pipe(HttpApiSchema.status(404)),
   CheckpointNotFoundPublicError.pipe(HttpApiSchema.status(404)),
+  SstNotFoundPublicError.pipe(HttpApiSchema.status(404)),
   DatabaseAlreadyExistsPublicError.pipe(HttpApiSchema.status(409)),
   KeyOutOfRangePublicError.pipe(HttpApiSchema.status(409)),
   DatabaseSealedPublicError.pipe(HttpApiSchema.status(409)),
@@ -235,6 +269,7 @@ export const DB_PUBLIC_ERRORS = [
   TransactionConflictPublicError.pipe(HttpApiSchema.status(409)),
   SnapshotExpiredPublicError.pipe(HttpApiSchema.status(409)),
   ChangelogUnavailablePublicError.pipe(HttpApiSchema.status(409)),
+  SstDropRefusedPublicError.pipe(HttpApiSchema.status(409)),
   WriteStalledPublicError.pipe(HttpApiSchema.status(503)),
   StorageUnavailablePublicError.pipe(HttpApiSchema.status(503)),
   StoredDataInvalidPublicError.pipe(HttpApiSchema.status(500)),
@@ -257,6 +292,8 @@ export type DbPublicError =
   | TransactionConflictPublicError
   | SnapshotExpiredPublicError
   | ChangelogUnavailablePublicError
+  | SstNotFoundPublicError
+  | SstDropRefusedPublicError
   | WriteStalledPublicError
   | StorageUnavailablePublicError
   | StoredDataInvalidPublicError

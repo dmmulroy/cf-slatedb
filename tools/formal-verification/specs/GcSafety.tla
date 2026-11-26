@@ -18,6 +18,8 @@
 (*    CAS-advance the boundary to now - gcMinAge if there are candidates;  *)
 (*    list manifests; delete SSTs created before min(boundary, cutoff)     *)
 (*    that no retained manifest references; delete old manifests.          *)
+(*  - lsm-core dropSstFromManifest (D62): an operator's repair removes one *)
+(*    SST from the newest manifest and adds none (DropSst).                *)
 (*  - Writers and compactors commit by manifest CAS (ManifestStore.update),*)
 (*    which this model makes atomic (ManifestCasFencing checks CAS).       *)
 (*                                                                         *)
@@ -32,12 +34,15 @@
 (*   "ignorePins"       GC deletes checkpointed manifests and their SSTs   *)
 (*   "noMinBoundary"    SSTs are deleted below the cutoff, not             *)
 (*                      min(boundary, cutoff) (expected redundant)         *)
+(*   "dropDeletesObject" an SST drop also deletes the SST's object at once *)
+(*                      instead of leaving it to GC                        *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
 CONSTANTS Ssts, MaxTime, MinAge, MaxManifests, Broken
 
-ASSUME Broken \in {"none", "noBoundaryCheck", "ownUploadAge", "ignorePins", "noMinBoundary"}
+ASSUME Broken \in {"none", "noBoundaryCheck", "ownUploadAge", "ignorePins", "noMinBoundary",
+                   "dropDeletesObject"}
 ASSUME MinAge >= 1
 
 NotMinted == MaxTime + 1
@@ -102,6 +107,14 @@ CommitCompaction(s, inputs) ==
   /\ pending' = pending \ {s}
   /\ Commit([Latest EXCEPT !.ssts = (@ \ inputs) \cup {s}])
   /\ UNCHANGED <<now, created, objects>> /\ UNCHANGED gcVars
+
+\* An operator drops one SST from the newest manifest (D62): it loses its last reference here, and
+\* GC may delete it only once no manifest a reader may hold or a checkpoint pins references it.
+DropSst(s) ==
+  /\ CanAppend /\ s \in Latest.ssts
+  /\ Commit([Latest EXCEPT !.ssts = @ \ {s}])
+  /\ objects' = IF Broken = "dropDeletesObject" THEN objects \ {s} ELSE objects
+  /\ UNCHANGED <<now, created, pending>> /\ UNCHANGED gcVars
 
 \* A refused commit (fenced, inputs changed, or below the boundary): the SST is an orphan.
 Discard(s) ==
@@ -189,7 +202,7 @@ GcDeleteManifests ==
 
 Next ==
   \/ Tick
-  \/ \E s \in Ssts : Upload(s) \/ CommitFlush(s) \/ Discard(s)
+  \/ \E s \in Ssts : Upload(s) \/ CommitFlush(s) \/ Discard(s) \/ DropSst(s)
   \/ \E s \in Ssts, inputs \in SUBSET Ssts : CommitCompaction(s, inputs)
   \/ Pin
   \/ \E p \in 1..MaxManifests : Unpin(p)

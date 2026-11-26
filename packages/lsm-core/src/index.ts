@@ -2,6 +2,7 @@ export * from "./block-codec.ts";
 export * from "./bloom-filter.ts";
 export * from "./byte-codec.ts";
 export * from "./crc32c.ts";
+export * from "./md5.ts";
 export * from "./ids.ts";
 export * from "./key-range.ts";
 export * from "./lsm-core-errors.ts";

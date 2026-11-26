@@ -10,6 +10,9 @@ import {
   type CompactorError,
   type CompactorState,
   CompactorUnavailableError,
+  type SstDropError,
+  type SstDropReport,
+  type SstDropRequest,
 } from "./compactor.ts";
 import { CompactorHttpApi } from "./compactor-http-api.ts";
 import type {
@@ -46,6 +49,11 @@ export interface ICompactorClient {
   readonly requestCollection: (
     databaseId: DatabaseId,
   ) => Effect.Effect<void, CompactorError, RuntimeContext | Scope.Scope>;
+  /** Has the database's compactor drop one SST from the manifest (`Compactor.dropSst`, D62). */
+  readonly dropSst: (
+    databaseId: DatabaseId,
+    request: SstDropRequest,
+  ) => Effect.Effect<SstDropReport, SstDropError, RuntimeContext | Scope.Scope>;
 }
 
 /** The contextual compactor client. */
@@ -141,6 +149,20 @@ export const compactorClientLayer = Layer.effect(
             }),
           );
       }),
+      dropSst: Effect.fn("CompactorClient.dropSst")(function* (
+        databaseId: DatabaseId,
+        request: SstDropRequest,
+      ) {
+        yield* Effect.annotateCurrentSpan({ "database.id": databaseId, "sst.id": request.sstId });
+        return yield* (yield* client(databaseId)).compactor
+          .dropSst({ params: { databaseId }, payload: request })
+          .pipe(
+            Effect.catchTags({
+              HttpClientError: unreachable(databaseId),
+              SchemaError: unreachable(databaseId),
+            }),
+          );
+      }),
     });
   }),
 );
@@ -194,6 +216,13 @@ export const compactorClientTestLayer = Layer.effect(
           ...calls,
           collectionsRequested: [...calls.collectionsRequested, databaseId],
         })),
+      dropSst: (databaseId) =>
+        Effect.fail(
+          new CompactorUnavailableError({
+            databaseId,
+            message: `The test compactor client drops no SSTs of database ${databaseId}.`,
+          }),
+        ),
     });
   }),
 ).pipe(
