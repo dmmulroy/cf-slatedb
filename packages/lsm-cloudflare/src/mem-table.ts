@@ -63,13 +63,26 @@ export interface MemTableRetention {
 
 /** Size and age of the unflushed rows (above `flushedSeq`), and the size of the retained ones. */
 export interface MemTableStats {
+  /** Bytes of the unflushed rows, each counted as {@link memTableWriteBytes} counts it. */
   readonly unflushedBytes: number;
   readonly rowCount: number;
-  /** Bytes of flushed rows still kept for transactions (`retainedFromSeq < seq <= flushedSeq`). */
-  readonly retainedBytes: number;
   /** Commit time of the oldest unflushed row. */
   readonly oldestCreateTs: Option.Option<Timestamp>;
 }
+
+/**
+ * The bytes one write adds to the memtable's unflushed size: its key, its payload, and a fixed
+ * overhead per row. The same figure `MemTable.stats` sums in SQLite, so a counter kept by adding
+ * this for each committed write equals what a scan would report (D74).
+ */
+export const memTableWriteBytes = (write: CollapsedWrite): number =>
+  write.key.length +
+  (write.value._tag === "Value"
+    ? write.value.bytes.length
+    : write.value._tag === "Merge"
+      ? write.value.operand.length
+      : 0) +
+  ROW_OVERHEAD_BYTES;
 
 /** A scan position: the last returned row's key and sequence number. */
 export interface MemTableCursor {
@@ -171,7 +184,10 @@ export interface IMemTable {
    * @returns The new `retainedFromSeq`.
    */
   readonly trim: (retention: MemTableRetention) => Effect.Effect<SeqNum, MemTableError>;
-  /** Unflushed bytes, row count, the oldest unflushed commit time, and retained bytes. */
+  /**
+   * Unflushed bytes, row count, and the oldest unflushed commit time, read by scanning every
+   * unflushed row: for a writer's start and the end of a flush, never per request (D74).
+   */
   readonly stats: Effect.Effect<MemTableStats, MemTableError>;
   /** Deletes every row and the writer's identity and sequence state (removal of the database). */
   readonly clear: Effect.Effect<void, MemTableError>;
@@ -328,16 +344,10 @@ export const makeMemTable = Effect.gen(function* () {
 
   const rowBytes = `COALESCE(SUM(LENGTH(key) + LENGTH(payload) + ${ROW_OVERHEAD_BYTES}), 0)`;
   const stats = Effect.gen(function* () {
-    const { flushedSeq, retainedFromSeq } = yield* meta;
+    const { flushedSeq } = yield* meta;
     const [totals] = yield* exec(
       "stats",
       `SELECT COUNT(*) AS row_count, ${rowBytes} AS bytes FROM memtable_rows WHERE seq > ?`,
-      flushedSeq,
-    );
-    const [retained] = yield* exec(
-      "stats",
-      `SELECT ${rowBytes} AS bytes FROM memtable_rows WHERE seq > ? AND seq <= ?`,
-      retainedFromSeq,
       flushedSeq,
     );
     const [oldest] = yield* exec(
@@ -347,12 +357,10 @@ export const makeMemTable = Effect.gen(function* () {
     );
     const rowCount = totals?.["row_count"];
     const bytes = totals?.["bytes"];
-    const retainedBytes = retained?.["bytes"];
     const createTs = oldest?.["create_ts"];
     return {
       unflushedBytes: typeof bytes === "number" ? bytes : 0,
       rowCount: typeof rowCount === "number" ? rowCount : 0,
-      retainedBytes: typeof retainedBytes === "number" ? retainedBytes : 0,
       oldestCreateTs:
         typeof createTs === "number" ? Option.some(Timestamp.make(createTs)) : Option.none(),
     };

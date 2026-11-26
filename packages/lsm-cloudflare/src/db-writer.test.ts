@@ -192,6 +192,149 @@ describe("DbWriter", () => {
     expect([outcome.early, outcome.late]).toEqual([0, 1]);
   });
 
+  it("counts unflushed bytes and rows exactly as a scan of the memtable does, across writes and flushes (D74)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createDatabase();
+        const writer = yield* DbWriter;
+        const memTable = yield* MemTable;
+        const counted = Effect.gen(function* () {
+          const status = yield* writer.status(DB);
+          const scanned = yield* memTable.stats;
+          return [
+            [status.unflushedBytes, status.unflushedRows],
+            [scanned.unflushedBytes, scanned.rowCount],
+          ];
+        });
+        // Rows of every kind and of very different sizes: short keys with long values, long keys
+        // with none, a delete, a merge operand, a value that expires.
+        const batches: ReadonlyArray<WriteBatch> = [
+          put("a", "x".repeat(900)),
+          put("k".repeat(200), ""),
+          {
+            operations: [
+              { _tag: "Delete", key: bytes("a") },
+              { _tag: "Merge", key: bytes("m"), operand: bytes("op"), ttlMillis: Option.none() },
+              { _tag: "Put", key: bytes("t"), value: bytes("v"), ttlMillis: Option.some(5_000) },
+            ],
+          },
+        ];
+        const afterEach: Array<ReadonlyArray<ReadonlyArray<number>>> = [];
+        for (const batch of batches) {
+          yield* writer.write(DB, batch);
+          afterEach.push(yield* counted);
+        }
+        yield* writer.flush(DB);
+        const afterFlush = yield* counted;
+        yield* writer.write(DB, put("z", "y".repeat(50)));
+        const afterNextWrite = yield* counted;
+        return { afterEach, afterFlush, afterNextWrite };
+      }),
+    );
+    for (const [counters, scan] of [
+      ...outcome.afterEach,
+      outcome.afterFlush,
+      outcome.afterNextWrite,
+    ]) {
+      expect(counters).toEqual(scan);
+    }
+    expect(outcome.afterFlush).toEqual([
+      [0, 0],
+      [0, 0],
+    ]);
+    expect(outcome.afterNextWrite[0]?.[1]).toBe(1);
+  });
+
+  it("an alarm set for the size threshold flushes; one set for age does not fire a flush early or set itself again for now (D74)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createDatabase();
+        const writer = yield* DbWriter;
+        const alarm = yield* DurableObjectAlarm;
+        yield* TestClock.setTime(10_000);
+        // 1,033 unflushed bytes as SQLite counts them (1 + 1,000 + 32), under the 1,040-byte
+        // threshold. The writer's counter once used another formula that counted more, so it
+        // set the alarm for "now"; the alarm, scanning 1,033, did not flush and was set for
+        // "now" again: a loop of memtable scans until the age limit.
+        yield* writer.write(DB, put("a", "x".repeat(1_000)));
+        const underThreshold = yield* alarm.scheduled;
+        yield* writer.runAlarm;
+        const afterEarlyAlarm = {
+          flushedSeq: (yield* writer.status(DB)).flushedSeq,
+          scheduled: yield* alarm.scheduled,
+        };
+        // One more small row passes the threshold, and the alarm it is set for flushes.
+        yield* writer.write(DB, put("b", "y".repeat(6)));
+        const atThreshold = yield* alarm.scheduled;
+        yield* writer.runAlarm;
+        const afterDueAlarm = (yield* writer.status(DB)).flushedSeq;
+        return { underThreshold, afterEarlyAlarm, atThreshold, afterDueAlarm };
+      }),
+      { l0SstSize: 1_040, maxUnflushedBytes: 100_000 },
+    );
+    expect(outcome.underThreshold).toEqual(Option.some(10_000 + 60_000));
+    expect(outcome.afterEarlyAlarm).toEqual({
+      flushedSeq: 0,
+      scheduled: Option.some(10_000 + 60_000),
+    });
+    expect(outcome.atThreshold).toEqual(Option.some(10_000));
+    expect(outcome.afterDueAlarm).toBe(2);
+  });
+
+  it("a write, a status read, and an alarm that is not due never scan the memtable (D74)", async () => {
+    const outcome = await Effect.gen(function* () {
+      yield* createDatabase();
+      const shared = yield* Effect.context<ManifestStore | ManifestReader | ObjectStore>();
+      // SQLite storage that records every statement the writer runs.
+      const statements: Array<string> = [];
+      const recordingStorage = Layer.effect(
+        WriterSqlStorage,
+        Effect.map(WriterSqlStorage, (storage) =>
+          WriterSqlStorage.of({
+            ...storage,
+            exec: (query, ...bindings) => {
+              statements.push(query);
+              return storage.exec(query, ...bindings);
+            },
+          }),
+        ),
+      ).pipe(Layer.provide(writerSqlStorageTestLayer));
+      const writer = yield* Layer.build(
+        dbWriterLayerWithoutDependencies.pipe(
+          Layer.provide(sstStoreLayerWithoutDependencies),
+          Layer.provide(memTableLayerWithoutDependencies.pipe(Layer.provide(recordingStorage))),
+          Layer.provide([
+            durableObjectAlarmTestLayer,
+            compactionTriggerTestLayer,
+            backgroundWorkTestLayer,
+            lsmConfigurationTestLayer(),
+          ]),
+          Layer.provide(Layer.succeedContext(shared)),
+        ),
+      ).pipe(Effect.map((context) => Context.get(context, DbWriter)));
+      // A scan of the memtable is an aggregate over its rows.
+      const scans = () => statements.filter((query) => /SUM\(|COUNT\(/.test(query)).length;
+      // The first request starts the writer, which reads its counters from SQLite once.
+      yield* writer.write(DB, put("a", "1"));
+      const atStart = scans();
+      yield* writer.write(DB, put("b", "2"));
+      const status = yield* writer.status(DB);
+      yield* writer.runAlarm;
+      const whileIdle = scans() - atStart;
+      // A flush reads them again once when it ends, and its trim sums the rows it keeps.
+      yield* writer.flush(DB);
+      const afterFlush = scans() - atStart;
+      return { atStart, whileIdle, afterFlush, rows: status.unflushedRows };
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(manifestStoreTestLayer),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.provide(TestClock.layer()),
+      Effect.runPromise,
+    );
+    expect(outcome).toEqual({ atStart: 1, whileIdle: 0, afterFlush: 2, rows: 2 });
+  });
+
   it("seals: flushes every acknowledged write, then refuses writes with the successors", async () => {
     const outcome = await run(
       Effect.gen(function* () {

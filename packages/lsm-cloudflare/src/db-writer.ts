@@ -15,7 +15,6 @@ import {
   ManifestId,
   MERGE_OPERATORS,
   type Row,
-  rowEncodedSizeEstimate,
   sealManifest,
   SeqNum,
   successorHoldsOf,
@@ -50,7 +49,12 @@ import {
   WriterUnavailableError,
   WriteStalledError,
 } from "./lsm-errors.ts";
-import { MemTable, type MemTableCursor, memTableTestLayer } from "./mem-table.ts";
+import {
+  MemTable,
+  type MemTableCursor,
+  memTableTestLayer,
+  memTableWriteBytes,
+} from "./mem-table.ts";
 import type { ManifestReadError, VersionedManifest } from "./manifest-reader.ts";
 import {
   ManifestStore,
@@ -283,10 +287,13 @@ export const makeDbWriter = Effect.gen(function* () {
     background.run("wakeCompactor", compaction.wake(databaseId));
 
   const phase = yield* Ref.make<WriterPhase>({ _tag: "Uninitialized" });
+  // The unflushed rows' bytes and count, and the commit time of the oldest: everything the flush
+  // scheduler, the alarm, backpressure, and `status` need. Kept in memory so that none of them
+  // scans the memtable: read from SQLite at start and after each flush, and advanced by each
+  // commit with the same per-row figure SQLite sums (`memTableWriteBytes`), so the counters
+  // always equal what a scan would report (D74).
   const unflushedBytes = yield* Ref.make(0);
-  // Commit time of the oldest unflushed row: with the byte counter, all the flush scheduler needs,
-  // kept in memory so a write never scans the memtable (refreshed from SQLite at start and after
-  // each flush).
+  const unflushedRows = yield* Ref.make(0);
   const oldestUnflushed = yield* Ref.make(Option.none<Timestamp>());
   const initLock = yield* Semaphore.make(1);
   const commitLock = yield* Semaphore.make(1);
@@ -334,6 +341,7 @@ export const makeDbWriter = Effect.gen(function* () {
       Effect.tap((stats) =>
         Effect.all([
           Ref.set(unflushedBytes, stats.unflushedBytes),
+          Ref.set(unflushedRows, stats.rowCount),
           Ref.set(oldestUnflushed, stats.oldestCreateTs),
         ]),
       ),
@@ -705,20 +713,9 @@ export const makeDbWriter = Effect.gen(function* () {
           const seq = yield* memTable
             .commit(writes, createTs)
             .pipe(Effect.mapError(unavailable(databaseId, "write")));
-          const added = writes.reduce(
-            (sum, item) =>
-              sum +
-              rowEncodedSizeEstimate({
-                key: item.key,
-                seq,
-                value: item.value,
-                createTs: Option.some(createTs),
-                expireTs: Option.none(),
-              }) +
-              24,
-            0,
-          );
+          const added = writes.reduce((sum, item) => sum + memTableWriteBytes(item), 0);
           yield* Ref.update(unflushedBytes, (current) => current + added);
+          yield* Ref.update(unflushedRows, (current) => current + writes.length);
           yield* Ref.update(oldestUnflushed, (current) =>
             Option.isSome(current) ? current : Option.some(createTs),
           );
@@ -920,7 +917,7 @@ export const makeDbWriter = Effect.gen(function* () {
   const status = Effect.fn("DbWriter.status")(function* (databaseId: DatabaseId) {
     const ready = yield* ensureReady(databaseId);
     const meta = yield* memTable.meta.pipe(Effect.mapError(unavailable(databaseId, "status")));
-    const stats = yield* memTable.stats.pipe(Effect.mapError(unavailable(databaseId, "status")));
+    // From the counters, not a scan: a transaction begins with this call.
     return {
       databaseId,
       writerEpoch: ready.writerEpoch,
@@ -928,8 +925,8 @@ export const makeDbWriter = Effect.gen(function* () {
       flushedSeq: meta.flushedSeq,
       retainedFromSeq: meta.retainedFromSeq,
       flushedManifestId: meta.flushedManifestId,
-      unflushedBytes: stats.unflushedBytes,
-      unflushedRows: stats.rowCount,
+      unflushedBytes: yield* Ref.get(unflushedBytes),
+      unflushedRows: yield* Ref.get(unflushedRows),
       l0Count: ready.manifest.manifest.l0.length,
       sealed: Option.isSome(ready.sealed),
     };
@@ -1031,6 +1028,8 @@ export const makeDbWriter = Effect.gen(function* () {
           yield* memTable.clear.pipe(Effect.mapError(unavailable(databaseId, "destroy")));
           yield* alarm.cancel;
           yield* Ref.set(unflushedBytes, 0);
+          yield* Ref.set(unflushedRows, 0);
+          yield* Ref.set(oldestUnflushed, Option.none());
           yield* Ref.set(phase, { _tag: "Uninitialized" });
         }),
       ),
@@ -1044,15 +1043,15 @@ export const makeDbWriter = Effect.gen(function* () {
     const id = databaseId.value;
     const outcome = yield* Effect.gen(function* () {
       yield* ensureReady(id);
-      const stats = yield* memTable.stats.pipe(Effect.mapError(unavailable(id, "alarm")));
+      // The same counters `scheduleFlush` set this alarm from, so the two always agree on
+      // whether a flush is due. Deciding here from a scan of the memtable, with a figure the
+      // scheduler did not share, made the alarm fire, scan, and be set again without flushing.
+      const oldest = yield* Ref.get(oldestUnflushed);
       const now = yield* Clock.currentTimeMillis;
       const due =
-        stats.rowCount > 0 &&
-        (stats.unflushedBytes >= settings.l0SstSize ||
-          Option.match(stats.oldestCreateTs, {
-            onNone: () => true,
-            onSome: (ts) => ts + settings.maxL0Age <= now,
-          }));
+        Option.isSome(oldest) &&
+        ((yield* Ref.get(unflushedBytes)) >= settings.l0SstSize ||
+          oldest.value + settings.maxL0Age <= now);
       if (due) yield* flushNow(id);
       yield* scheduleFlush(id);
     }).pipe(Effect.exit);
