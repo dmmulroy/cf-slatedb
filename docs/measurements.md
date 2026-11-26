@@ -462,10 +462,16 @@ then as now. The limits were set from the largest single invocation and stand.
 | Before D74, run 1            |                   20 s |                 5 |       1.6 s | no                                  |
 | Before D74, runs 2, 3, and 5 |           202 to 223 s |        125 to 141 |       1.5 s | no                                  |
 | Before D74, two at once      |                   15 s |                35 |       1.4 s | yes: 45 writes refused as retryable |
+| D74, two at once, six runs   |             17 to 29 s |         2 per run |  0.01–0.5 s | no                                  |
 
 In the slow runs the alarm fired, scanned the memtable, did not flush, and was set again for now
-(D74). One `status` call on the full memtable used 1.58 s of CPU. A writer that was reset lost
-nothing it had acknowledged: 182.9 MB were unflushed in SQLite when it answered again.
+(D74). One `status` call on the full memtable used 1.58 s of CPU before D74 and 3 to 204 ms
+after. A writer that was reset lost nothing it had acknowledged: 182.9 MB were unflushed in SQLite
+when it answered again. With D74 every run accepted its 128 batches, refused 4 at the cap with
+`WriteStalled` (the intended backpressure), and flushed 269 MB in one request of 6 to 17 s of CPU.
+
+**D61's memory question, answered again.** Two writers each holding 256 MiB unflushed at the
+same time, six runs: no `exceededMemory` and no reset. The one reset seen was the alarm loop.
 
 ## Live checks
 

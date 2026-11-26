@@ -197,10 +197,52 @@ hand-off is below.
     start. The scenario runner reports what caused a failed request.
   - **Verified.** `vp run ready` exit 0; `vp run verify` exit 0 (27/27); 13/13 scenarios under
     `vp run dev` (exit 0). Eleven mutations of the new read path are each caught by a test.
-  - **Not reproduced.** Twice, the first `run all` after a fresh `vp run dev` failed the `flush`
-    scenario's first request with a transport error, right after a `write-read` that ran 6 s
-    long; three further fresh starts and two full runs passed. The runner now prints the cause
-    chain, so the next occurrence names it.
+  - **The transport error, found.** The first request of a scenario sometimes failed with
+    "other side closed": while the runner blocked on trace assertions, the Workers closed its
+    idle connections. The runner now reopens them before each scenario; three full local runs
+    since passed.
+- **10, continued: experiments run in parallel on the three previews (D70–D74).** Dillon asked
+  for experiments, measurements, and prototypes in parallel. Each prototype was built and tested
+  in its own git worktree; each A/B ran both variants on two stages in opposite order; deploys
+  from the main checkout were serialized.
+  - **A correctness bug, found by adding compaction to the model (D70).** A `Latest` read could
+    load a manifest flushed and compacted past the snapshot the writer gave it, and return "not
+    found" for a key that always had a value. Present since Phase 5; needs a rewrite, a flush,
+    and a compaction inside the tens of milliseconds between the writer's answer and the manifest
+    load; no soak showed it. A read now refuses such a manifest and asks the writer again. A
+    transaction scan from a caller without a begin manifest had a related gap, also fixed.
+  - **A flush writes only the versions a read can reach (D70).** One row per rewritten key
+    instead of one per write: the soak's databases stored 0.44 MB instead of 4.4 MB.
+  - **Reads (D72).** A manifest refresh in one round trip from the manifest held; a slow block
+    read hedged with a read straight from the bucket; scans stop reading when they have their
+    rows. `preview-3`, p50 / p90 / p99 in ms, before → after: `Flushed` get 81 / 162 / 515 →
+    5 / 113 / 243; scan 76 / 555 / 2,146 → 60 / 257 / 983; block fetch p99 439 → 101.
+  - **Flushes (D73).** The compactor wake left the flush (it waited 5 to 9 s for an idle
+    compactor); blocks are encoded a chunk of rows at a time. 16 KiB blocks cost a flush no more
+    CPU than 4 KiB. Concurrent part uploads were measured and declined.
+  - **The writer's alarm and `status` scanned the memtable (D74).** Two different figures for
+    "unflushed bytes" made the alarm fire, scan, and be set again without flushing: a 267 MB flush
+    took 200 s instead of 20 s, and two such writers at once were reset. Every transaction begin
+    paid the same scan through `status` (1.58 s of CPU on a full memtable). One figure and
+    counters now; six runs of two full writers at once: 2 alarms each, no reset.
+  - **Telemetry (D71).** Tail records are sampled like traces, except those that did not end
+    `ok`. Unsampled, a busy stage wrote them as fast as they could be read back.
+  - **Corrected.** D61's and D62's "flush CPU p50" (about 1 s for 60 MiB) was a median over
+    alarm and request records, each part of a flush. Per flush it is about 4 s. The limits were
+    set from the largest single invocation and stand.
+  - **The 2-hour soak on the D67 code did not report.** Its workload ran its 130 minutes; its
+    final checks then waited behind the tail-record backlog (D71's finding) for another 80
+    minutes, and it was stopped because the code it tested was superseded. What its pulled spans
+    show: 12,997 sampled gets and 879 scans (6,016 and 399 after minute 70), 16 sampled
+    collections that deleted 48 SSTs, and no error span other than the remover's deliberate
+    `DatabaseNotFound`. The release soaks are rerun on the final code.
+  - **Lessons for running in parallel.** TLC on every core starves a client-driven measurement
+    on the same laptop (transport errors, one failed run): run it niced and apart from timed
+    runs. A tool started while a deploy has the checkout on another ref loads a mix of two
+    trees. A shell script edited while it runs re-executes lines.
+  - **Verified.** `vp run ready` exit 0, `vp run verify` exit 0 (28/28), 13/13 scenarios locally
+    and on `preview-3` (`--dev-timings`), 5-minute soaks passing on `preview-2` and `preview-3`
+    for each arm. Forty-four mutations of the new code are each caught by a test.
 
 ## Remaining-work log
 

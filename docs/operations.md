@@ -41,14 +41,14 @@ Every Worker is bound its complete settings on every deploy (D55).
 Settings come from the deploy's environment. All are optional; defaults are in
 `infra/shaledb/src/shaledb-stack-config.ts`:
 
-| Variable                                         | Default (production)   | What it sets                                                                                       |
-| ------------------------------------------------ | ---------------------- | -------------------------------------------------------------------------------------------------- |
-| `SHALEDB_LSM_SETTINGS`                           | none (engine defaults) | JSON overrides of engine settings. Invalid combinations refuse the plan                            |
-| `SHALEDB_JURISDICTION`                           | `none`                 | `eu` or `fedramp` restricts every bucket, Durable Object, and the Workflow. Fixed per installation |
-| `SHALEDB_BUCKET_LOCATION`                        | `auto`                 | R2 location hint for the LSM bucket (unrestricted Stacks). Fixed per installation                  |
-| `SHALEDB_TRACE_SAMPLE_RATE`                      | `0.1`                  | Fraction of traces kept                                                                            |
-| `SHALEDB_TRACE_RETENTION_DAYS`                   | `14`                   | Days traces and tail records are kept                                                              |
-| `SHALEDB_API_CPU_MS`, `SHALEDB_COMPACTOR_CPU_MS` | `30000`, `60000`       | CPU limit per invocation                                                                           |
+| Variable                                         | Default (production)   | What it sets                                                                                                                                            |
+| ------------------------------------------------ | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SHALEDB_LSM_SETTINGS`                           | none (engine defaults) | JSON overrides of engine settings, for example `{"blockReadHedgeAfterMs":0}` to turn off hedged block reads (D72). Invalid combinations refuse the plan |
+| `SHALEDB_JURISDICTION`                           | `none`                 | `eu` or `fedramp` restricts every bucket, Durable Object, and the Workflow. Fixed per installation                                                      |
+| `SHALEDB_BUCKET_LOCATION`                        | `auto`                 | R2 location hint for the LSM bucket (unrestricted Stacks). Fixed per installation                                                                       |
+| `SHALEDB_TRACE_SAMPLE_RATE`                      | `0.1`                  | Fraction of traces kept                                                                                                                                 |
+| `SHALEDB_TRACE_RETENTION_DAYS`                   | `14`                   | Days traces and tail records are kept                                                                                                                   |
+| `SHALEDB_API_CPU_MS`, `SHALEDB_COMPACTOR_CPU_MS` | `30000`, `60000`       | CPU limit per invocation                                                                                                                                |
 
 The API's URL is the API Worker's `workers.dev` URL, printed as `apiUrl` when the deploy finishes.
 
@@ -145,7 +145,9 @@ stores them in the stage's trace bucket (D63):
 - **Retention.** The trace bucket deletes `traces/` and `tails/` objects after 14 days
   (`SHALEDB_TRACE_RETENTION_DAYS`).
 - **Tail records.** The API, compactor, and GC Workers' invocations (their outcome, CPU time, and
-  wall time) are stored unsampled under `tails/`.
+  wall time) are stored under `tails/`. Every invocation that did not end `ok` is kept; of the
+  rest, the same fraction as traces (D71). Each record carries the rate it was kept at, and
+  `measure health` scales its counts back up.
 
 The telemetry probe Worker, a test tool, is not deployed to production.
 
