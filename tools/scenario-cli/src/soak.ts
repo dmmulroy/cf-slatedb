@@ -1086,6 +1086,14 @@ export const soak = (options: SoakOptions) =>
       onSome: (spans) => spans.length,
     });
     if (spansChecked === 0) ledger.failures.push("no spans from the soak's window were read");
-    yield* enter("done");
-    return yield* report;
+    // The file at `done` holds exactly the report printed. A report-file failure found here is
+    // recorded first, so the printed report and its verdict include it.
+    phase = "done";
+    yield* saveReport;
+    const finalReport = yield* report;
+    yield* Option.match(options.reportFile, {
+      onNone: () => Effect.void,
+      onSome: (path) => Effect.ignore(writeReportFile(path, finalReport)),
+    });
+    return finalReport;
   });
