@@ -61,9 +61,20 @@ export type CorruptSst = typeof CorruptSst.Type;
 
 /**
  * Schema for a compactor's durable state: the database it serves, its epoch, its running jobs,
- * whether a newer compactor fenced it, the corrupted SSTs it found (absent in state written before
+ * whether a newer epoch fenced it, the corrupted SSTs it found (absent in state written before
  * D53, which decodes as none), and when its database's garbage collection is next due (absent in
  * state written before D60: none until the next compaction or request).
+ *
+ * **Details**
+ *
+ * Every write goes through `updateState`, which applies a function to the stored state and writes
+ * the result with no other work in between (D78). Each field has owners, and a writer changes only
+ * its own fields of the state it is given:
+ *
+ * - `compactorEpoch`, `fenced`: the fence-in (`ensureState`), and a poll that finds a newer epoch.
+ * - `running`, `corruptSsts`: a poll, and an SST drop (`corruptSsts` only); both under `planLock`.
+ * - `collectionDueAt`: `requestCollection` and a poll only bring it forward; a collection sets it
+ *   from its report unless a request arrived while it ran; the alarm's retry sets it.
  */
 export const CompactorState = Schema.Struct({
   /** The format it was written in ({@link COMPACTOR_STATE_FORMAT_VERSION}); 1 when absent (D64). */
@@ -204,8 +215,9 @@ export const compactionsStarted = Metric.counter("lsm_compactions_started", {
  * **Details**
  *
  * On its first wake it fences in (increments `compactorEpoch` by manifest CAS) and keeps the epoch
- * in durable storage, so jobs it started stay valid across evictions; a newer compactor fences it
- * and it stops. While jobs run or wait for budget, its alarm polls every `compactorPollInterval`:
+ * in durable storage, so jobs it started stay valid across evictions. Concurrent first callers
+ * share one fence-in. A compactor that finds a newer epoch stops its jobs, and its next start
+ * (a wake, a requested collection, an SST drop, or its alarm) fences in again (D78). While jobs run or wait for budget, its alarm polls every `compactorPollInterval`:
  * it drops finished jobs (releasing their budget leases), renews the rest, and plans more. With no
  * work it sets no alarm, so an idle database costs nothing; the writer wakes it after a flush.
  *
@@ -214,7 +226,7 @@ export const compactionsStarted = Metric.counter("lsm_compactions_started", {
  * something it kept becomes collectable. The alarm runs it; one collection runs at a time.
  */
 export interface ICompactor {
-  /** Fences in on first use and polls now. @returns The state after waking. */
+  /** Fences in on first use (or again after being fenced) and polls now. @returns The state. */
   readonly wake: (
     databaseId: DatabaseId,
   ) => Effect.Effect<CompactorState, CompactorError, RuntimeContext>;
@@ -289,10 +301,59 @@ export const makeCompactor = Effect.gen(function* () {
   const budget = yield* CompactionBudget;
   const settings = yield* LsmConfiguration;
   const collector = yield* GarbageCollector;
-  // One collection per database at a time: the alarm and an operator's request may overlap.
-  const collectionLock = yield* Semaphore.make(1);
-  // Planning (a poll) and an operator's SST drop exclude each other (D62).
+  // Locks, always taken in this order, none of them held while waiting for a later one's holder
+  // to take an earlier one (Effect's semaphores are not reentrant):
+  //
+  // 1. `planLock`: planning (a poll) and an operator's SST drop exclude each other (D62).
+  // 2. `collectionLock`: one collection per database at a time (the alarm and an operator's
+  //    request may overlap). Never held together with `planLock` or `startLock`.
+  // 3. `startLock`: one fence-in at a time; concurrent first callers share its result (D78). Taken
+  //    under `planLock` by an SST drop.
+  // 4. `stateLock`: one read-modify-write of the state cell at a time, around no other I/O.
   const planLock = yield* Semaphore.make(1);
+  const collectionLock = yield* Semaphore.make(1);
+  const startLock = yield* Semaphore.make(1);
+  const stateLock = yield* Semaphore.make(1);
+
+  /**
+   * Applies `update` to the stored state and writes the result, with no other work in between:
+   * the only way the state is written (D78). `update` returns none to leave the state as it is.
+   *
+   * @returns The state stored afterwards.
+   */
+  const updateState = (
+    update: (current: Option.Option<CompactorState>) => Option.Option<CompactorState>,
+  ) =>
+    stateLock.withPermits(1)(
+      Effect.gen(function* () {
+        const current = yield* cell.get;
+        const next = update(current);
+        if (Option.isNone(next)) return current;
+        yield* cell.set(next.value);
+        return next;
+      }),
+    );
+
+  /** `updateState` for a change to an existing state of `databaseId`; none leaves no state. */
+  const updateExisting = (
+    databaseId: DatabaseId,
+    update: (current: CompactorState) => CompactorState,
+  ) =>
+    updateState((current) =>
+      Option.filter(current, (state) => state.databaseId === databaseId).pipe(Option.map(update)),
+    );
+
+  /** Whether two optional times are the same. */
+  const sameTime = (left: Option.Option<Timestamp>, right: Option.Option<Timestamp>) =>
+    Option.isNone(left) ? Option.isNone(right) : Option.contains(right, left.value);
+
+  /** The earlier of two optional times; none is never. */
+  const earlier = (left: Option.Option<Timestamp>, right: Option.Option<Timestamp>) =>
+    Option.isNone(left)
+      ? right
+      : Option.isNone(right)
+        ? left
+        : Option.some(Timestamp.make(Math.min(left.value, right.value)));
 
   const unavailable = (databaseId: DatabaseId) => (error: { readonly message: string }) =>
     Effect.fail(
@@ -326,39 +387,75 @@ export const makeCompactor = Effect.gen(function* () {
           }),
         );
 
-  /** The state, fencing in first when this compactor has none. */
+  /**
+   * The state, fencing in first when this compactor has none or was fenced: the compactor's start.
+   *
+   * **Details**
+   *
+   * Single-flight (`startLock`, D78): concurrent first callers share one `fenceCompactor` commit.
+   * Without it, two cold wakes each fenced in, and the older epoch's state, written back by a poll
+   * that began before the newer fence, left the compactor fenced by itself for good.
+   *
+   * A fenced state is the compactor process that exited, as in SlateDB: the next start fences in
+   * again with a new epoch. That discards every job of an older epoch (`commitCompaction` checks
+   * the epoch), and their budget leases are released here. Only this Durable Object fences in for
+   * its database, so a newer epoch it did not store means its own state was lost or overwritten,
+   * and fencing in again is the repair. No second live instance exists to fence it back.
+   */
   const ensureState = (databaseId: DatabaseId) =>
-    Effect.gen(function* () {
-      const existing = yield* cell.get;
-      if (Option.isSome(existing)) {
-        yield* checkDatabase(existing.value, databaseId);
-        yield* checkFormat(existing.value);
-        return existing.value;
-      }
-      const fenced = yield* manifests
-        .update(databaseId, (manifest) => Result.succeed(fenceCompactor(manifest)))
-        .pipe(
-          Effect.catchTags({
-            ManifestReadError: unavailable(databaseId),
-            ManifestWriteError: unavailable(databaseId),
-          }),
+    startLock.withPermits(1)(
+      Effect.gen(function* () {
+        const existing = yield* cell.get;
+        if (Option.isSome(existing)) {
+          yield* checkDatabase(existing.value, databaseId);
+          yield* checkFormat(existing.value);
+          if (!existing.value.fenced) return existing.value;
+          for (const job of existing.value.running)
+            yield* Effect.ignore(budget.release(holder(existing.value, job.jobId)));
+        }
+        const fenced = yield* manifests
+          .update(databaseId, (manifest) => Result.succeed(fenceCompactor(manifest)))
+          .pipe(
+            Effect.catchTags({
+              ManifestReadError: unavailable(databaseId),
+              ManifestWriteError: unavailable(databaseId),
+            }),
+          );
+        const stored = yield* updateState((current) =>
+          Option.some(
+            Option.match(
+              Option.filter(current, (state) => state.databaseId === databaseId),
+              {
+                onNone: (): CompactorState => ({
+                  formatVersion: COMPACTOR_STATE_FORMAT_VERSION,
+                  databaseId,
+                  compactorEpoch: fenced.manifest.compactorEpoch,
+                  running: [],
+                  fenced: false,
+                  corruptSsts: [],
+                  collectionDueAt: Option.none(),
+                }),
+                // Fencing in again keeps what is still true: corruption reports (a poll drops
+                // those whose SST left the manifest) and when collection is due.
+                onSome: (state): CompactorState => ({
+                  ...state,
+                  formatVersion: COMPACTOR_STATE_FORMAT_VERSION,
+                  compactorEpoch: fenced.manifest.compactorEpoch,
+                  running: [],
+                  fenced: false,
+                }),
+              },
+            ),
+          ),
         );
-      const state: CompactorState = {
-        formatVersion: COMPACTOR_STATE_FORMAT_VERSION,
-        databaseId,
-        compactorEpoch: fenced.manifest.compactorEpoch,
-        running: [],
-        fenced: false,
-        corruptSsts: [],
-        collectionDueAt: Option.none(),
-      };
-      yield* cell.set(state);
-      yield* Effect.annotateCurrentSpan({
-        "compactor.epoch": state.compactorEpoch,
-        "manifest.id": fenced.id,
-      });
-      return state;
-    });
+        yield* Effect.annotateCurrentSpan({
+          "compactor.epoch": fenced.manifest.compactorEpoch,
+          "compactor.refenced": Option.isSome(existing),
+          "manifest.id": fenced.id,
+        });
+        return Option.getOrThrow(stored);
+      }),
+    );
 
   /** Polls at `atMillis` unless a poll is already due sooner. */
   const pollBy = (atMillis: number) =>
@@ -378,10 +475,14 @@ export const makeCompactor = Effect.gen(function* () {
       const latest = yield* reader.loadLatest(databaseId);
       const group = Option.getOrElse(latest.manifest.options.budgetGroup, () => databaseId);
       if (latest.manifest.compactorEpoch !== state.compactorEpoch) {
-        // A newer compactor took over: its epoch fences every job this one started.
+        // A newer epoch fences every job this one started. The next start fences in again (D78).
         for (const job of state.running)
           yield* Effect.ignore(budget.release(holder(state, job.jobId)));
-        yield* cell.set({ ...state, running: [], fenced: true });
+        yield* updateExisting(databaseId, (current) =>
+          current.compactorEpoch === state.compactorEpoch
+            ? { ...current, running: [], fenced: true }
+            : current,
+        );
         yield* Effect.annotateCurrentSpan({ "compactor.fenced": true });
         return false;
       }
@@ -471,17 +572,30 @@ export const makeCompactor = Effect.gen(function* () {
       const anyFinished = state.running.some(
         (job) => !running.some((still) => still.jobId === job.jobId),
       );
-      const collectionDueAt = anyFinished
-        ? Option.some(
-            Timestamp.make(
-              Math.min(
-                Option.getOrElse(state.collectionDueAt, () => Number.POSITIVE_INFINITY),
-                (yield* Clock.currentTimeMillis) + settings.gcMinAge,
-              ),
-            ),
-          )
-        : state.collectionDueAt;
-      yield* cell.set({ ...state, running, corruptSsts, collectionDueAt });
+      const finishedDueAt = anyFinished
+        ? Option.some(Timestamp.make((yield* Clock.currentTimeMillis) + settings.gcMinAge))
+        : Option.none<Timestamp>();
+      // Written onto the state as it is now, not as it was when the poll began: a request or a
+      // collection may have changed `collectionDueAt` meanwhile (D78). A fence-in since then owns
+      // the state; this poll's jobs carry the old epoch and will be discarded.
+      const stored = yield* updateExisting(databaseId, (current) =>
+        current.compactorEpoch === state.compactorEpoch && !current.fenced
+          ? {
+              ...current,
+              running,
+              corruptSsts,
+              collectionDueAt: earlier(current.collectionDueAt, finishedDueAt),
+            }
+          : current,
+      );
+      const kept = Option.exists(
+        stored,
+        (current) => current.compactorEpoch === state.compactorEpoch && !current.fenced,
+      );
+      if (!kept) {
+        for (const job of running) yield* Effect.ignore(budget.release(holder(state, job.jobId)));
+        return false;
+      }
       yield* Effect.annotateCurrentSpan({
         "database.id": databaseId,
         "manifest.id": latest.id,
@@ -497,7 +611,7 @@ export const makeCompactor = Effect.gen(function* () {
   const wake = Effect.fn("Compactor.wake")(function* (databaseId: DatabaseId) {
     yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
     const state = yield* ensureState(databaseId);
-    if (!state.fenced) yield* pollBy(yield* Clock.currentTimeMillis);
+    yield* pollBy(yield* Clock.currentTimeMillis);
     return state;
   });
 
@@ -512,19 +626,26 @@ export const makeCompactor = Effect.gen(function* () {
     const state = yield* cell.get;
     if (Option.isSome(state)) yield* checkDatabase(state.value, databaseId);
     yield* alarm.cancel;
-    yield* cell.clear;
+    yield* stateLock.withPermits(1)(cell.clear);
   });
 
   /** Runs one collection and records when the next is due. */
   const runCollection = (databaseId: DatabaseId) =>
     collectionLock.withPermits(1)(
       Effect.gen(function* () {
+        const before = yield* cell.get;
+        const dueBefore = Option.flatMap(before, (state) => state.collectionDueAt);
         const report = yield* collector.collect(databaseId);
-        const state = yield* cell.get;
-        if (Option.isSome(state) && state.value.databaseId === databaseId) {
-          yield* cell.set({ ...state.value, collectionDueAt: report.nextCollectionAt });
-          if (Option.isSome(report.nextCollectionAt)) yield* pollBy(report.nextCollectionAt.value);
-        }
+        // A request or a finished compaction that moved the due time during this collection
+        // stands: the report predates it (D78).
+        const stored = yield* updateExisting(databaseId, (state) => ({
+          ...state,
+          collectionDueAt: sameTime(state.collectionDueAt, dueBefore)
+            ? report.nextCollectionAt
+            : earlier(state.collectionDueAt, report.nextCollectionAt),
+        }));
+        const due = Option.flatMap(stored, (state) => state.collectionDueAt);
+        if (Option.isSome(due)) yield* pollBy(due.value);
         return report;
       }),
     );
@@ -540,20 +661,41 @@ export const makeCompactor = Effect.gen(function* () {
     databaseId: DatabaseId,
   ) {
     yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
-    const state = yield* ensureState(databaseId);
+    yield* ensureState(databaseId);
     const now = yield* Clock.currentTimeMillis;
-    yield* cell.set({ ...state, collectionDueAt: Option.some(Timestamp.make(now)) });
+    yield* updateExisting(databaseId, (state) => ({
+      ...state,
+      collectionDueAt: Option.some(Timestamp.make(now)),
+    }));
     yield* pollBy(now);
   });
 
   const runAlarm = Effect.gen(function* () {
-    const before = yield* cell.get;
-    if (Option.isNone(before) || before.value.fenced) return;
-    if (before.value.formatVersion > COMPACTOR_STATE_FORMAT_VERSION) {
+    const stored = yield* cell.get;
+    if (Option.isNone(stored)) return;
+    if (stored.value.formatVersion > COMPACTOR_STATE_FORMAT_VERSION) {
       return yield* Effect.logError(
-        `The compactor of database ${before.value.databaseId} is idle: its state was written by a newer shaledb (format ${before.value.formatVersion}). Deploy that version or a later one.`,
+        `The compactor of database ${stored.value.databaseId} is idle: its state was written by a newer shaledb (format ${stored.value.formatVersion}). Deploy that version or a later one.`,
       );
     }
+    // An alarm is a start too: a fenced compactor fences in again before it collects or polls (D78).
+    const before = stored.value.fenced
+      ? yield* ensureState(stored.value.databaseId).pipe(
+          Effect.map(Option.some),
+          Effect.catchTags({
+            DatabaseNotFoundError: () => Effect.succeed(Option.none<CompactorState>()),
+            DatabaseIdMismatchError: () => Effect.succeed(Option.none<CompactorState>()),
+            CompactorUnavailableError: () =>
+              Effect.as(
+                Effect.flatMap(Clock.currentTimeMillis, (now) =>
+                  pollBy(now + settings.compactorPollInterval),
+                ),
+                Option.none<CompactorState>(),
+              ),
+          }),
+        )
+      : stored;
+    if (Option.isNone(before)) return;
     const now = yield* Clock.currentTimeMillis;
     const { databaseId, collectionDueAt } = before.value;
     if (Option.isSome(collectionDueAt) && collectionDueAt.value <= now) {
@@ -563,11 +705,12 @@ export const makeCompactor = Effect.gen(function* () {
           // Storage unavailable now: try again after the GC interval.
           GarbageCollectorUnavailableError: () =>
             Effect.gen(function* () {
-              const current = yield* cell.get;
-              if (Option.isNone(current)) return;
               const retryAt = Timestamp.make(now + settings.gcInterval);
-              yield* cell.set({ ...current.value, collectionDueAt: Option.some(retryAt) });
-              yield* pollBy(retryAt);
+              const retried = yield* updateExisting(databaseId, (current) => ({
+                ...current,
+                collectionDueAt: Option.some(retryAt),
+              }));
+              if (Option.isSome(retried)) yield* pollBy(retryAt);
             }),
         }),
       );
@@ -606,13 +749,8 @@ export const makeCompactor = Effect.gen(function* () {
       new SstDropRefusedError({ databaseId, sstId: request.sstId, reason, message });
     return yield* planLock.withPermits(1)(
       Effect.gen(function* () {
+        // Never fenced: a fenced compactor fences in again here (D78).
         const state = yield* ensureState(databaseId);
-        if (state.fenced) {
-          return yield* new CompactorUnavailableError({
-            databaseId,
-            message: `The compactor of database ${databaseId} was replaced by a newer one and cannot drop SSTs. Wake the database's compactor and retry.`,
-          });
-        }
         const latest = yield* reader
           .loadLatest(databaseId)
           .pipe(Effect.catchTags({ ManifestReadError: unavailable(databaseId) }));
@@ -674,15 +812,10 @@ export const makeCompactor = Effect.gen(function* () {
             message: `SST ${request.sstId} left database ${databaseId}'s manifest before it could be dropped, so there is nothing to drop.`,
           });
         }
-        const current = yield* cell.get;
-        if (Option.isSome(current)) {
-          yield* cell.set({
-            ...current.value,
-            corruptSsts: current.value.corruptSsts.filter(
-              (corrupt) => corrupt.sstId !== request.sstId,
-            ),
-          });
-        }
+        yield* updateExisting(databaseId, (current) => ({
+          ...current,
+          corruptSsts: current.corruptSsts.filter((corrupt) => corrupt.sstId !== request.sstId),
+        }));
         yield* pollBy(yield* Clock.currentTimeMillis);
         yield* Metric.update(sstsDropped, 1);
         yield* Effect.logWarning(

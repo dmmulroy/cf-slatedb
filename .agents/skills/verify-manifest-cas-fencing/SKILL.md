@@ -127,12 +127,30 @@ a flush commits from its own view with one create and no `ManifestReader.loadLat
   `LoadFromKnownFindsHead` (GC config). `hintOnlyProbe` is the reader as it was before D56: with a
   lagging hint and a checkpoint keeping manifest `h` while GC deleted `h + 1`, it stopped at `h`.
   `knownIgnoresBoundary` makes the same mistake from the writer's last flush.
+- A compactor that fences in again after being fenced (D78) is one more `Compactors` element:
+  each fence-in gets a fresh epoch, and an older epoch's jobs fail `commitCompaction`. That is the
+  case the two-compactor config already checks.
+- Not modeled: the compactor's own Durable Object state. The defect D78 fixed was an older epoch
+  written back over a newer one in that state, plus two fence-ins for one start. It made the
+  compactor stop for good, a liveness failure, and it never let a stale compaction commit, because
+  every commit carries its job's epoch. The model checks the manifest, where nothing was wrong,
+  so no broken variant here can express it. `compactor.test.ts` checks the state instead: one
+  fence-in for overlapping first wakes, no write over a newer epoch, and a fenced compactor that
+  fences in again, each shown failing under a mutation.
 - Not a broken variant: trusting a failure or no-op from the writer's own view. In this model the
   writer's view can never give a wrong non-write answer (its view holds its own epoch and lacks its
   new SST), so such a variant would pass; the code rechecks them for generic edits (a checkpoint
   removal against an old view), which `manifest-store.test.ts` covers.
 
 ## Maintenance notes
+
+- D78: `Compactor.ensureState` is single-flight (`startLock`), and a fenced compactor fences in
+  again on its next start (wake, requested collection, SST drop, or alarm). Every compactor state
+  write is a read-modify-write (`updateState`). The fence-in is still one `ManifestStore.update`
+  of `fenceCompactor`, now possibly repeated by one Durable Object, which the model already covers
+  as further compactors. No step changed. Reran
+  `node tools/formal-verification/src/verify.ts manifest-cas-fencing`: nine `✓`, and every broken
+  variant fails with its invariant.
 
 - D72: `loadLatestFrom` now also reads the `LATEST` hint in its first round and, when the known
   manifest was superseded, continues from the hint if that names a stored manifest further along
@@ -178,7 +196,7 @@ a flush commits from its own view with one create and no `ManifestReader.loadLat
 
 ## Keeping it in step with the code
 
-Sync commit: the D70–D74 commit (`fix(read)`, `fix(writer)`, and `perf`: the snapshot bound, the newest-version flush, the read and flush path changes, the writer's counters) (the model was last
+Sync commit: the D78 commit (`fix(compactor)`: one fence-in per start, state written by read-modify-write, a fenced compactor fences in again) (the model was last
 confirmed to describe the code at this commit). When a covered file changed after it, diff it, update the model so each step still maps
 to one awaited effect in the code, rerun, and show the affected invariant still fails on a broken
 variant. Move the sync commit forward only after confirming the model describes the code at the

@@ -286,6 +286,15 @@ hand-off is below.
     `database-lifecycle.test.ts`, `garbage-collector.test.ts`, and `manifest.test.ts` fail on the
     code before. `GcSafety` gains `GcSafetyFork.cfg` (`ForkReadsComplete`, broken variant
     `earlyForkRelease`). Not yet run in workerd or on a preview.
+- **D78: the compactor fenced itself (found live, 2026-11-26).** `measure manifest-cas` on
+  `preview-3` stalled database `ms-cas-mwy5ujbj` for good. Two cold wakes each fenced in, and a
+  poll wrote the older epoch back, so the compactor was `fenced` with no newer compactor to take
+  over. Now the fence-in is single-flight, every compactor state write is a read-modify-write,
+  and a fenced compactor fences in again on its next start.
+  - Five new `compactor.test.ts` tests; the first reproduced the stuck state on the code before
+    the fix. Six mutations are each caught.
+  - `manifest-cas-fencing` model check: 9/9 (no step changed).
+  - Still to do live: wake `ms-cas-mwy5ujbj` after the deploy and confirm it compacts.
 
 ## Remaining-work log
 
