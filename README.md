@@ -110,6 +110,8 @@ from `DbHttpApi`, with examples of every request and response. It covers:
 - **Transactions:** `Snapshot` or `SerializableSnapshot` isolation, with conflicts detected at
   commit.
 - **Change feed:** committed changes in sequence order, when the database's changelog is on.
+  It says `Expired` rather than skip changes retention dropped. A fork's or split successor's
+  feed starts at its fork point, where the sealed source's feed ends.
 - **Lifecycle:** checkpoints, forks of a key range from a checkpoint, and seal (for splits).
 - **Repair:** the compaction status, and dropping an SST that compaction reported corrupted.
 

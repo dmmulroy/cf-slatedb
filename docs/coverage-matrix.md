@@ -65,8 +65,11 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   changelog SSTs via `DbReader.changelogRows`, then the writer's unflushed ones; pages never split
   a batch), `GET /v1/databases/:id/changes?afterSeq=&limit=` (`nextAfterSeq`), errors
   `ChangelogUnavailable` (`Disabled`, `Expired`). Tests: `db-writer.test.ts`, `change-feed.test.ts`
-  (exactly-once, in-order delivery across random batches, flushes, and page sizes; shown failing
-  when a page can cut a batch), D42.
+  (exactly-once, in-order delivery across random batches, flushes, page sizes, and retention
+  prunes, or `Expired`; shown failing when a page can cut a batch; D80: every entry pruned, the
+  boundary at `afterSeq`, a fork before and after its first flush), `database-lifecycle.test.ts`
+  (following the feed through a split), `manifest.test.ts` (`changelogAfterSeq` and its default),
+  D42, D80.
 
 ## §4 Read path
 

@@ -443,7 +443,8 @@ memtable holds exactly the rows above `flushed_seq`). Changelog SSTs are read st
 `compacted/` SSTs. A page never ends inside a batch: it is cut between sequence numbers (and a batch
 larger than the page is returned whole; the writer's internal page allows a whole batch,
 `MAX_BATCH_OPERATIONS`), so a consumer resuming from `nextAfterSeq` cannot skip rows. A consumer
-behind retention gets `ChangelogUnavailable` (`Expired`) instead of a silent gap.
+behind retention gets `ChangelogUnavailable` (`Expired`) instead of a silent gap. (Until D80 that
+held only while some entry was kept; D80 states the rule exactly and enforces it in one place.)
 
 ## D43. Live stages keep Alchemy state in Cloudflare; local stages keep it on the machine
 
@@ -2244,3 +2245,78 @@ manifest, checked against two concurrent first calls:
 and a compactor that fences in again is one more of those. The overwritten epoch was in the
 compactor's own Durable Object state, not in the manifest, so it is a property of that state, and
 the tests check it. No step changed; reran, and every broken variant fails (the skill records it).
+
+## D80. The change feed answers only what its changelog provably holds; a fork's feed starts at its fork point
+
+**Found by the review agent's scratch test.** `DbReader.changelogRows` detected retention only by
+comparing the oldest kept entry's `firstSeq` with `afterSeq`. When no entry above `afterSeq` was
+kept, it returned no rows and no error, so `DbClient.changes` moved the consumer's cursor over
+`(afterSeq, flushed_seq]` as if nothing had changed. There were two ways in:
+
+- **Retention pruned every entry.** GC's `pruneChangelog` dropped them all and nothing was flushed
+  since. The consumer was handed the unflushed changes above them and lost the pruned ones without
+  being told.
+- **A fork or split successor before its first flush.** It starts with an empty changelog, and its
+  sequence numbers continue above its source's, so a consumer asking from before the fork point
+  got the fork's own changes and none of the source's.
+
+D42 promised `Expired` in both cases; for a feed, a silent gap is data loss.
+
+**The rule, enforced in one place.** The feed answers a request for changes after `afterSeq` only
+if the manifest's changelog holds every change in `(afterSeq, lastL0Seq]`
+(`changelogHoldsChangesAfter`). Otherwise it fails with `ChangelogUnavailable` (`Expired`).
+`DbReader.changelogRows` is the only caller. The unflushed part comes from the writer, which holds
+every row above `flushed_seq` (D42).
+
+**What the manifest records.** A new field, `changelogAfterSeq`: the changelog holds every change
+with a sequence number above it, up to `lastL0Seq`.
+
+- `initialManifest` sets it to 0.
+- A flush leaves it unchanged. Its entry covers `(previous lastL0Seq, cut]`, and a flush with no
+  rows adds no entry and loses nothing.
+- `pruneChangelog` raises it to the newest `lastSeq` it drops.
+- `forkManifest` sets it to the fork point (the checkpoint's `lastL0Seq`).
+
+**The format.** The field is optional and needs no `formatVersion` change (D64). A manifest
+without it reads as follows (`changelogAfterSeqOf`):
+
+- the oldest kept entry's `firstSeq - 1`, or `lastL0Seq` when no entry is kept;
+- that is never below the true value, because an entry's rows all lie above the previous flush's
+  cut;
+- so the default only answers `Expired` more often, never with a gap.
+
+Older code ignores the field when it decodes a manifest (as D49's dropped option showed), so a
+manifest it rewrites after a rollback loses the field and falls back to that safe default.
+`manifest.test.ts` checks the default against the field over random flushes, rows without
+sequence numbers, and prunes.
+
+**A fork's and a split successor's feed** start at the fork point; changes up to it are in the
+source's feed. A consumer following a database through a split:
+
+1. Reads the sealed source's feed until a page returns no rows. A sealed database accepts no
+   writes, so the feed has ended. Its `status` shows `sealed: true`, and its `lastSeq` is the
+   sequence number the seal made durable.
+2. Reads each successor's feed with `afterSeq` set to the source's `lastSeq`. Each successor was
+   forked from a checkpoint of the sealed manifest, whose `lastL0Seq` is that number, so the
+   successor's feed starts exactly there.
+
+The consumer must use the source's `lastSeq`, not its own cursor, which may be lower when the
+last sequence numbers carried no rows. `database-lifecycle.test.ts` runs that procedure through a
+split, and the OpenAPI description of the feed says it. The shard router exposes no feed.
+
+**Tests:**
+
+- `change-feed.test.ts`:
+  - every entry pruned, with nothing flushed since and with unflushed changes above the pruned
+    range;
+  - the boundary at exactly `afterSeq`, and one below it;
+  - a fork before and after its first flush;
+  - the property test now also prunes, and checks each page against the oracle: exactly the
+    committed changes in `(cursor, nextAfterSeq]`, or `Expired` only when the manifest says
+    changes after the cursor were dropped.
+- `database-lifecycle.test.ts`: the split procedure.
+- `manifest.test.ts`: the edits and the default.
+
+The three gap tests and the split test fail on the code before. Seven mutations are each caught:
+the rule removed, the prune not raising the field (two tests), the fork starting at 0, the
+boundary off by one, and two unsafe defaults.

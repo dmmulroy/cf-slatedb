@@ -296,6 +296,13 @@ hand-off is below.
   - `manifest-cas-fencing` model check: 9/9 (no step changed).
   - Still to do live: wake `ms-cas-mwy5ujbj` after the deploy and confirm it compacts.
 
+- **D80: the change feed's silent gap (found by review, 2026-11-26).** With every changelog entry
+  pruned, or on a fork before its first flush, the feed skipped changes without `Expired`. Now the
+  manifest records `changelogAfterSeq`, and the feed answers only when its changelog provably holds
+  every change after `afterSeq`.
+  - The four new tests failed before the fix; seven mutations are each caught.
+  - A fork's feed starts at its fork point. The split procedure is in D80 and the OpenAPI text.
+
 ## Remaining-work log
 
 - **Set up (new session).** Node 24.22, `vp` 1.8, pnpm 12.14; `repos/slatedb` and `.tlc/` present;
