@@ -2,6 +2,7 @@ import {
   DatabaseId,
   DEFAULT_DATABASE_OPTIONS,
   type KeyRange,
+  ManifestId,
   manifestSstHandles,
 } from "@shaledb/lsm-core";
 import { Clock, Context, Effect, Layer, Option, Ref } from "effect";
@@ -29,8 +30,8 @@ import { DurableObjectAlarm, durableObjectAlarmTestLayer } from "./durable-objec
 import { GarbageCollector, makeGarbageCollector } from "./garbage-collector.ts";
 import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
 import { ManifestReader } from "./manifest-reader.ts";
-import { databasePrefix } from "./object-keys.ts";
-import { ObjectStore } from "./object-store.ts";
+import { databasePrefix, manifestKey, manifestPrefix } from "./object-keys.ts";
+import { ObjectStore, ObjectStoreUnavailableError, objectStoreTestLayer } from "./object-store.ts";
 import { sstStoreLayerWithoutDependencies } from "./sst-store.ts";
 
 const SOURCE = DatabaseId.make("orders");
@@ -41,6 +42,59 @@ const text = (value: Uint8Array) => new TextDecoder().decode(value);
 const SPLIT = bytes("d");
 const LEFT_RANGE: KeyRange = { start: new Uint8Array(0), end: Option.some(SPLIT) };
 const RIGHT_RANGE: KeyRange = { start: SPLIT, end: Option.none() };
+const FULL_RANGE: KeyRange = { start: new Uint8Array(0), end: Option.none() };
+
+/**
+ * Faults injected into the bucket, none by default: a `get` that finds nothing (an object deleted
+ * meanwhile), a `get` that fails, and a create-if-absent that fails (R2 unavailable after retries).
+ */
+interface StoreFaultRules {
+  readonly hideGet: (key: string) => boolean;
+  readonly failGet: (key: string) => boolean;
+  readonly failCreate: (key: string, body: string) => boolean;
+}
+
+const NO_STORE_FAULTS: StoreFaultRules = {
+  hideGet: () => false,
+  failGet: () => false,
+  failCreate: () => false,
+};
+
+/** The current fault rules. */
+class StoreFaults extends Context.Service<StoreFaults, Ref.Ref<StoreFaultRules>>()(
+  "test/StoreFaults",
+) {}
+
+const storeFaultsLayer = Layer.effect(StoreFaults, Ref.make(NO_STORE_FAULTS));
+
+/** An in-memory bucket that applies `StoreFaults` to manifest reads and creates. */
+const faultyObjectStoreLayer = Layer.effect(
+  ObjectStore,
+  Effect.gen(function* () {
+    const faults = yield* StoreFaults;
+    const inner = Context.get(yield* Layer.build(objectStoreTestLayer), ObjectStore);
+    const rules = Ref.get(faults);
+    const injected = (operation: "get" | "putIfAbsent", key: string) =>
+      new ObjectStoreUnavailableError({ operation, key, message: "injected R2 failure" });
+    return ObjectStore.of({
+      ...inner,
+      get: (key) =>
+        Effect.gen(function* () {
+          const rule = yield* rules;
+          if (rule.failGet(key)) return yield* injected("get", key);
+          if (rule.hideGet(key)) return Option.none();
+          return yield* inner.get(key);
+        }),
+      putIfAbsent: (key, body) =>
+        Effect.gen(function* () {
+          const rule = yield* rules;
+          if (rule.failCreate(key, new TextDecoder().decode(body)))
+            return yield* injected("putIfAbsent", key);
+          return yield* inner.putIfAbsent(key, body);
+        }),
+    });
+  }),
+);
 
 /** Lifecycle, client, executor, in-process launcher, budget, and stores over one bucket. */
 const testLayer = Layer.mergeAll(
@@ -58,7 +112,13 @@ const testLayer = Layer.mergeAll(
       Layer.provide(sstStoreLayerWithoutDependencies),
     ),
   ),
-  Layer.provideMerge(dbClientTestLayer({ blockSize: 64 })),
+  Layer.provideMerge(
+    dbClientTestLayer(
+      { blockSize: 64 },
+      faultyObjectStoreLayer.pipe(Layer.provide(storeFaultsLayer)),
+    ),
+  ),
+  Layer.provideMerge(storeFaultsLayer),
 );
 
 type TestServices = Layer.Success<typeof testLayer> | DbReaderServices;
@@ -146,6 +206,42 @@ const readAtSnapshot = (databaseId: DatabaseId, key: string, snapshot: DbSnapsho
   });
 
 const HOUR = 3_600_000;
+
+/** The source's checkpoints and the fork's external references, as one value to compare. */
+const holdsAndRefs = Effect.gen(function* () {
+  const reader = yield* ManifestReader;
+  return {
+    holds: (yield* reader.loadLatest(SOURCE)).manifest.checkpoints.length,
+    refs: (yield* reader.loadLatest(LEFT)).manifest.externalRefs.length,
+  };
+});
+
+/**
+ * The source with two flushed keys, forked into `LEFT` (the caller's checkpoint deleted), and the
+ * fork's rewrite done. Returns the fork's compactor, whose collection is due gcMinAge later.
+ */
+const forkAndRewrite = Effect.gen(function* () {
+  const lifecycle = yield* DatabaseLifecycle;
+  const client = yield* DbClient;
+  yield* lifecycle.create(SOURCE, {
+    keyRange: Option.none(),
+    databaseOptions: DEFAULT_DATABASE_OPTIONS,
+  });
+  for (const key of ["a", "b"]) yield* client.put(SOURCE, bytes(key), bytes(key.toUpperCase()));
+  yield* client.flush(SOURCE);
+  const checkpoint = yield* lifecycle.createCheckpoint(SOURCE, {
+    name: Option.none(),
+    lifetimeMs: Option.none(),
+  });
+  yield* lifecycle.forkRange({
+    source: SOURCE,
+    checkpointId: checkpoint.id,
+    range: LEFT_RANGE,
+    forkId: LEFT,
+  });
+  yield* lifecycle.deleteCheckpoint(SOURCE, checkpoint.id);
+  return yield* compactorOf(LEFT);
+});
 
 const valuesIn = (databaseId: DatabaseId) =>
   Effect.gen(function* () {
@@ -464,6 +560,184 @@ describe("DatabaseLifecycle", () => {
     expect(outcome.middleReleased).toEqual({ onOwner: 0, middleRefs: 0 });
     expect(outcome.middleValues).toEqual(["a=A", "b=B"]);
     expect(outcome.grandchildValues).toEqual(["a=A", "b=B"]);
+  });
+
+  it("releases nothing while a manifest the fork's collection keeps cannot be loaded (D77)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const reader = yield* ManifestReader;
+        const gc = yield* GarbageCollector;
+        const faults = yield* StoreFaults;
+        const left = yield* forkAndRewrite;
+        const rewriteId = (yield* reader.loadLatest(LEFT)).id;
+        // The manifests before the rewrite are young: GC keeps them, and they name the source's
+        // SSTs. Their objects vanish between GC's listing and its loads (as if deleted meanwhile).
+        const beforeRewrite = new Set(
+          Array.from({ length: rewriteId - 1 }, (_, index) =>
+            manifestKey(LEFT, ManifestId.make(index + 1)),
+          ),
+        );
+        yield* Ref.set(faults, { ...NO_STORE_FAULTS, hideGet: (key) => beforeRewrite.has(key) });
+        yield* gc.collect(LEFT);
+        const whileMissing = yield* holdsAndRefs;
+        // Their loads fail instead: the collection fails, and releases nothing either.
+        yield* Ref.set(faults, { ...NO_STORE_FAULTS, failGet: (key) => beforeRewrite.has(key) });
+        const failed = yield* Effect.flip(gc.collect(LEFT));
+        const whileFailing = yield* holdsAndRefs;
+        // Storage answers again; gcMinAge after the rewrite the fork's due collection releases.
+        yield* Ref.set(faults, NO_STORE_FAULTS);
+        yield* TestClock.adjust(HOUR);
+        yield* left.runDue;
+        return { whileMissing, failed: failed._tag, whileFailing, after: yield* holdsAndRefs };
+      }),
+    );
+    expect(outcome.whileMissing).toEqual({ holds: 1, refs: 1 });
+    expect(outcome.failed).toBe("GarbageCollectorUnavailableError");
+    expect(outcome.whileFailing).toEqual({ holds: 1, refs: 1 });
+    expect(outcome.after).toEqual({ holds: 0, refs: 0 });
+  });
+
+  it("finishes a release interrupted between its two steps at the next collection (D77)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const gc = yield* GarbageCollector;
+        const faults = yield* StoreFaults;
+        yield* forkAndRewrite;
+        yield* TestClock.adjust(HOUR);
+        // The fork's manifest without its reference cannot be written: the collection stops after
+        // removing the source's checkpoint, as a crash between the two steps would.
+        yield* Ref.set(faults, {
+          ...NO_STORE_FAULTS,
+          failCreate: (key, body) =>
+            key.startsWith(manifestPrefix(LEFT)) && body.includes(`"externalRefs":[]`),
+        });
+        const failed = yield* Effect.flip(gc.collect(LEFT));
+        const interrupted = yield* holdsAndRefs;
+        yield* Ref.set(faults, NO_STORE_FAULTS);
+        yield* gc.collect(LEFT);
+        const finished = yield* holdsAndRefs;
+        yield* lifecycle.remove(SOURCE);
+        return { failed: failed._tag, interrupted, finished };
+      }),
+    );
+    expect(outcome.failed).toBe("GarbageCollectorUnavailableError");
+    // The source's checkpoint went first; the fork's reference is still there to retry from.
+    expect(outcome.interrupted).toEqual({ holds: 0, refs: 1 });
+    expect(outcome.finished).toEqual({ holds: 0, refs: 0 });
+  });
+
+  it("keeps the holds of a split successor that is split again before its rewrite (D57, D77)", async () => {
+    // ShardSplit's own calls: one seal that takes each half a hold, then a fork from each hold.
+    const A1 = DatabaseId.make("orders-a1");
+    const A2 = DatabaseId.make("orders-a2");
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const client = yield* DbClient;
+        const reader = yield* ManifestReader;
+        const gc = yield* GarbageCollector;
+        const holdsOn = (databaseId: DatabaseId) =>
+          Effect.map(reader.loadLatest(databaseId), (latest) => latest.manifest.checkpoints.length);
+        const refsOf = (databaseId: DatabaseId) =>
+          Effect.map(
+            reader.loadLatest(databaseId),
+            (latest) => latest.manifest.externalRefs.length,
+          );
+        const splitLike = (
+          databaseId: DatabaseId,
+          halves: readonly [DatabaseId, DatabaseId],
+          ranges: readonly [KeyRange, KeyRange],
+        ) =>
+          Effect.gen(function* () {
+            const sealed = yield* lifecycle.seal(databaseId, halves, true);
+            for (const [index, forkId] of halves.entries()) {
+              const hold = sealed.successorHolds.find((held) => held.successor === forkId);
+              if (hold === undefined) return yield* Effect.die(`no hold for ${forkId}`);
+              yield* lifecycle.forkRange({
+                source: databaseId,
+                checkpointId: hold.checkpointId,
+                range: ranges[index] ?? FULL_RANGE,
+                forkId,
+              });
+            }
+          });
+        yield* lifecycle.create(SOURCE, {
+          keyRange: Option.none(),
+          databaseOptions: DEFAULT_DATABASE_OPTIONS,
+        });
+        for (const key of ["a", "b", "c", "e"]) {
+          yield* client.put(SOURCE, bytes(key), bytes(key.toUpperCase()));
+        }
+        yield* splitLike(SOURCE, [LEFT, RIGHT], [LEFT_RANGE, RIGHT_RANGE]);
+        // The left half is split again before its compactor rewrote anything: its halves read the
+        // original shard's SSTs through their holds on the left half.
+        const atB: KeyRange = { start: new Uint8Array(0), end: Option.some(bytes("b")) };
+        const fromB: KeyRange = { start: bytes("b"), end: Option.some(SPLIT) };
+        yield* splitLike(LEFT, [A1, A2], [atB, fromB]);
+        const a1Owners = manifestSstHandles((yield* reader.loadLatest(A1)).manifest).map((sst) =>
+          Option.getOrUndefined(sst.owner),
+        );
+        // The sealed left half and the right half rewrite; gcMinAge later the right half has
+        // released the shard, but the left half keeps its hold: its halves' holds pin its sealed
+        // manifest, which names the shard's SSTs.
+        const left = yield* compactorOf(LEFT);
+        const right = yield* compactorOf(RIGHT);
+        yield* TestClock.adjust(HOUR);
+        yield* left.runDue;
+        yield* right.runDue;
+        // The second split's halves collect before their own rewrite (an operator's collect-now, or
+        // a due collection); they still read the shard's SSTs through the left half, so keep it.
+        yield* gc.collect(A1);
+        yield* gc.collect(A2);
+        const middleRewritten = {
+          onShard: yield* holdsOn(SOURCE),
+          onLeft: yield* holdsOn(LEFT),
+          leftRefs: yield* refsOf(LEFT),
+        };
+        // The second split's halves rewrite; they keep their holds for gcMinAge.
+        const a1 = yield* compactorOf(A1);
+        const a2 = yield* compactorOf(A2);
+        const halvesRewritten = {
+          onShard: yield* holdsOn(SOURCE),
+          onLeft: yield* holdsOn(LEFT),
+          removeShard: (yield* Effect.flip(lifecycle.remove(SOURCE)))._tag,
+          removeLeft: (yield* Effect.flip(lifecycle.remove(LEFT)))._tag,
+        };
+        yield* TestClock.adjust(HOUR);
+        yield* a1.runDue;
+        yield* a2.runDue;
+        const halvesReleased = { onShard: yield* holdsOn(SOURCE), onLeft: yield* holdsOn(LEFT) };
+        // The left half's next collection (the maintenance sweep asks for it) releases the shard.
+        yield* gc.collect(LEFT);
+        const leftReleased = { onShard: yield* holdsOn(SOURCE), leftRefs: yield* refsOf(LEFT) };
+        yield* lifecycle.remove(LEFT);
+        yield* lifecycle.remove(SOURCE);
+        return {
+          a1Owners,
+          middleRewritten,
+          halvesRewritten,
+          halvesReleased,
+          leftReleased,
+          values: {
+            a1: yield* valuesIn(A1),
+            a2: yield* valuesIn(A2),
+            right: yield* valuesIn(RIGHT),
+          },
+        };
+      }),
+    );
+    expect(outcome.a1Owners).toEqual([SOURCE]);
+    expect(outcome.middleRewritten).toEqual({ onShard: 1, onLeft: 2, leftRefs: 1 });
+    expect(outcome.halvesRewritten).toEqual({
+      onShard: 1,
+      onLeft: 2,
+      removeShard: "DatabaseHasDependentsError",
+      removeLeft: "DatabaseHasDependentsError",
+    });
+    expect(outcome.halvesReleased).toEqual({ onShard: 1, onLeft: 0 });
+    expect(outcome.leftReleased).toEqual({ onShard: 0, leftRefs: 0 });
+    expect(outcome.values).toEqual({ a1: ["a=A"], a2: ["b=B", "c=C"], right: ["e=E"] });
   });
 
   it("removing a fork releases its hold on the source", async () => {

@@ -2120,8 +2120,28 @@ fork's rewrite: an hour in production, 10 s with dev timings. For a split, the s
 cannot be removed (`DatabaseHasDependentsError`) until that time has passed for both halves.
 Nothing in a split waits on it: `ShardSplit` never removes the sealed database, and whoever does
 retries the removal later (`writer.workerd.ts` retries it). A middle database of a fork chain
-releases its own hold only at its next collection after its fork's release, which the sweep asks
-for within a sweep cycle.
+releases its own hold only at its next collection after its fork's release (below).
+
+**How long a middle database holds the original owner.** After a fork of a fork releases its hold
+on the middle database, nothing but the maintenance sweep asks the middle database to collect.
+The fork's collection does not call the middle database's compactor; `GarbageCollector` keeps its
+dependencies. The bound follows from the sweep:
+
+- **One sweep cycle.** Each cron run visits 50 databases (`MAINTENANCE_SWEEP_PAGE_DATABASES`),
+  every 5 minutes (`*/5 * * * *` in `gc-worker-entry.ts`). With `P` prefixes under `db/`
+  (databases and removed databases' leftovers), one cycle takes `ceil(P / 50)` runs, that is
+  `ceil(P / 50) × 5` minutes. For 1,000 prefixes that is 20 runs, 100 minutes; for 10,000, 200
+  runs, 16 h 40 min.
+- **The middle database has rewritten already.** The sweep's visit asks it to collect within one
+  cycle of the fork's release. If the manifest the released hold pinned was superseded less than
+  `gcMinAge` before that collection, it is still kept. The collection then schedules the next one
+  `gcMinAge` later (`nextCollectionTime`: a young manifest), and that one releases. So the hold
+  ends at most one sweep cycle plus `gcMinAge` after the fork's release.
+- **It has not.** It holds the owner until its own rewrite, and releases at the collection due
+  `gcMinAge` after that, as any fork does.
+
+A visit that fails is logged and retried a cycle later. Every chain adds its own wait: a chain of
+`k` forks below the original owner can hold it for up to `k` such bounds.
 
 **Tests and model.**
 
@@ -2135,8 +2155,18 @@ for within a sweep cycle.
     original owner.
 - `garbage-collector.test.ts`: the sweep asks a rewritten fork to collect and wakes one still
   reading its source.
+- `database-lifecycle.test.ts` also covers two more cases:
+  - **A failed load.** A kept manifest that cannot be loaded releases nothing, whether its object
+    is missing or its read fails.
+  - **A crash between the two steps.** The source's checkpoint is gone and the fork's reference
+    remains, and the next collection finishes the release.
+- `database-lifecycle.test.ts` also covers a split successor split again before its rewrite,
+  through `ShardSplit`'s own calls (`seal` with holds, then `forkRange` from each hold). The
+  second split's halves keep their holds on the sealed left half. The left half keeps its hold
+  on the original shard until its halves have released and it collects again.
 - `manifest.test.ts`: a fork of a fork's hold is kept before its rewrite.
-- All four `lsm-cloudflare` tests fail on the code before. Seven mutations are each caught.
+- Every `lsm-cloudflare` test above fails on the code before. Each mutation in the reports is
+  caught, including a release despite an unloaded manifest and the two steps swapped.
 - `GcSafety.tla` gains an abstract fork (`GcSafetyFork.cfg`: `ForkStart`, `ForkRewrite`,
   `ForkRelease`) and the invariant `ForkReadsComplete`. The broken variant `earlyForkRelease`
   (D38's rule) fails it.

@@ -295,6 +295,14 @@ hand-off is below.
     the fix. Six mutations are each caught.
   - `manifest-cas-fencing` model check: 9/9 (no step changed).
   - Still to do live: wake `ms-cas-mwy5ujbj` after the deploy and confirm it compacts.
+    `earlyForkRelease`). Not yet run in workerd or on a preview. More tests followed:
+    - a kept manifest that cannot be loaded releases nothing;
+    - a release interrupted between its two steps is finished by the next collection;
+    - a split half split again before its rewrite keeps its holds down the chain.
+
+    D77 and `operations.md` state how long a middle database of a fork chain holds the original
+    owner: at most one sweep cycle (`ceil(P / 50)` runs, 5 minutes apart) plus `gcMinAge` after its
+    fork's release.
 
 ## Remaining-work log
 

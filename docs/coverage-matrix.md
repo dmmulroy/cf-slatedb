@@ -354,7 +354,9 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   (`releasableExternalRefs` in `GarbageCollector.collect`, D77; D13 for forks of forks; the
   sweep asks a rewritten fork to collect). Tests: `database-lifecycle.test.ts` (split, rewrite,
   release `gcMinAge` later; a fork snapshot from before the rewrite readable until then; a fork of
-  a fork's holds kept down the chain; shown failing without release or with duplicate holds, and
+  a fork's holds kept down the chain; a split half split again before its rewrite; nothing released
+  while a kept manifest cannot be loaded; a release interrupted between its two steps finished by
+  the next collection; shown failing without release or with duplicate holds, and
   with the release rule before D77), `garbage-collector.test.ts` (the sweep), `size-tiered-compaction-scheduler.test.ts`,
   `manifest.test.ts`, `writer.workerd.ts`. Formal: `SealSplit` (`EveryAckedWriteInExactlyOneSuccessor`),
   `GcSafety` (`PinnedManifestsComplete`; `ForkReadsComplete` in `GcSafetyFork.cfg`, broken
