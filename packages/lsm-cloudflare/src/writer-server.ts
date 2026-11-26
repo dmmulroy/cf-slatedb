@@ -57,18 +57,20 @@ export const writerServerLayerWithoutDependencies = WriterServer.make(
 
     return Effect.gen(function* () {
       const storage = state.raw.storage;
+      // The object's `waitUntil`: the manifest store's LATEST hint and the writer's compactor
+      // wakes outlive the request that started them.
+      const backgroundWork = durableObjectBackgroundWorkLayer.pipe(
+        Layer.provide(Layer.succeed(Cloudflare.DurableObjectState, state)),
+      );
       const writerLayer = dbWriterLayerWithoutDependencies.pipe(
         Layer.provide(sstStoreLayerWithoutDependencies),
         Layer.provide(
           manifestStoreLayerWithoutDependencies.pipe(
             Layer.provide(manifestReaderLayerWithoutDependencies),
-            Layer.provide(
-              durableObjectBackgroundWorkLayer.pipe(
-                Layer.provide(Layer.succeed(Cloudflare.DurableObjectState, state)),
-              ),
-            ),
+            Layer.provide(backgroundWork),
           ),
         ),
+        Layer.provide(backgroundWork),
         Layer.provide(
           memTableLayerWithoutDependencies.pipe(Layer.provide(writerSqlStorageLayer(storage))),
         ),

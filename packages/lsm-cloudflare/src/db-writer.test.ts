@@ -12,7 +12,8 @@ import { Context, Effect, Layer, Option, Ref } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
-import { compactionTriggerTestLayer } from "./compaction-trigger.ts";
+import { backgroundWorkTestLayer } from "./background-work.ts";
+import { CompactionTrigger, compactionTriggerTestLayer } from "./compaction-trigger.ts";
 import { DbWriter, dbWriterLayerWithoutDependencies, dbWriterTestLayer } from "./db-writer.ts";
 import { lsmConfigurationTestLayer } from "./lsm-configuration.ts";
 import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
@@ -261,6 +262,7 @@ describe("DbWriter fencing and crash recovery", () => {
             Layer.provide([
               durableObjectAlarmTestLayer,
               compactionTriggerTestLayer,
+              backgroundWorkTestLayer,
               lsmConfigurationTestLayer(),
             ]),
             Layer.provide(Layer.succeedContext(shared)),
@@ -291,6 +293,56 @@ describe("DbWriter fencing and crash recovery", () => {
     // The stale writer's upload is an orphan: stored, but not in the manifest.
     expect(outcome.storedSsts).toBe(2);
     expect(outcome.durable.manifest.l0.length).toBe(1);
+  });
+
+  it("a flush wakes the compactor without waiting for it, and the next flush is not held up", async () => {
+    const outcome = await Effect.gen(function* () {
+      yield* createDatabase();
+      const shared = yield* Effect.context<ManifestStore | ManifestReader | ObjectStore>();
+      // A compactor that never answers: an idle one takes seconds to answer its first call.
+      const woken: Array<DatabaseId> = [];
+      const unansweredCompactor = Layer.succeed(
+        CompactionTrigger,
+        CompactionTrigger.of({
+          wake: (databaseId) =>
+            Effect.sync(() => woken.push(databaseId)).pipe(Effect.andThen(Effect.never)),
+        }),
+      );
+      const writer = yield* Layer.build(
+        dbWriterLayerWithoutDependencies.pipe(
+          Layer.provide(sstStoreLayerWithoutDependencies),
+          Layer.provide(
+            memTableLayerWithoutDependencies.pipe(Layer.provide(writerSqlStorageTestLayer)),
+          ),
+          Layer.provide([
+            durableObjectAlarmTestLayer,
+            unansweredCompactor,
+            backgroundWorkTestLayer,
+            lsmConfigurationTestLayer({ minCompactionSources: 2 }),
+          ]),
+          Layer.provide(Layer.succeedContext(shared)),
+        ),
+      ).pipe(Effect.map((context) => Context.get(context, DbWriter)));
+      // The second flush leaves two L0 SSTs, enough to compact: it wakes the compactor. The
+      // third starts while that wake is still unanswered.
+      const flushed: Array<number> = [];
+      for (const key of ["a", "b", "c"]) {
+        yield* writer.write(DB, put(key, "1"));
+        flushed.push(yield* writer.flush(DB).pipe(Effect.timeout("2 seconds")));
+      }
+      // The wakes run in the background: let them start.
+      yield* Effect.yieldNow;
+      const { manifest } = yield* (yield* ManifestReader).loadLatest(DB);
+      return { flushed, woken, l0: manifest.l0.length };
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(manifestStoreTestLayer),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.runPromise,
+    );
+    expect(outcome.flushed).toEqual([1, 2, 3]);
+    expect(outcome.l0).toBe(3);
+    expect(outcome.woken).toEqual([DB, DB]);
   });
 
   it("a crash between the manifest commit and the memtable truncate loses and duplicates nothing", async () => {
@@ -327,6 +379,7 @@ describe("DbWriter fencing and crash recovery", () => {
             Layer.provide([
               durableObjectAlarmTestLayer,
               compactionTriggerTestLayer,
+              backgroundWorkTestLayer,
               lsmConfigurationTestLayer(),
             ]),
             Layer.provide(Layer.succeedContext(shared)),
