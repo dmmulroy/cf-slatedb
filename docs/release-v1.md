@@ -388,8 +388,8 @@ different method, and none by the release gate as it then was.
 
 **What they demonstrably did not catch.**
 
-- **Races with windows of milliseconds** (D70, D78, the counters). A soak runs each interleaving at
-  random, a few thousand times. Two of these three were found by a model or by review, and one by
+- **Races with windows of milliseconds** (D70, D78, the counters). A soak reaches them only when its
+  workload happens to produce the timing. Two of these three were found by a model or by review, and one by
   luck in a measurement.
 - **Liveness after an idle hour** (D76, D77). The soaks write constantly and run at most 130
   minutes against a `gcMinAge` of 1 hour. Scenarios run with dev timings. No gate idles a database
@@ -437,7 +437,8 @@ What v1 does not do, or has not measured.
   when it gets one of an invocation's six connections. On a scan wide enough to queue, a hedge can
   start only because its read waited, and the hedge then waits too. A cap on hedges in flight is
   not adopted (D72).
-- **CPU per invocation varies up to 2×** with the machine a Durable Object lands on (D73).
+- **CPU varies between runs with the machine a Durable Object lands on.** The write CPU of the
+  same 128 batches ranged from 9.6 to 28 s between runs (`docs/measurements.md`, D73's section).
 - **One client.** Every measurement came from one client on a US residential connection, against
   preview stages.
 
