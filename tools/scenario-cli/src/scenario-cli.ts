@@ -464,6 +464,30 @@ const measure = Command.make("measure").pipe(
   ]),
 );
 
+/**
+ * Lets this process notice the connections the Stack's Workers closed, then sends each Worker one
+ * request whose outcome is ignored.
+ *
+ * **Details**
+ *
+ * A scenario ends with trace assertions that run the trace CLI synchronously, which blocks this
+ * process for seconds. The Workers close its idle connections meanwhile, and the next scenario's
+ * first request, sent before the process has seen that, fails with "other side closed". The pause
+ * gives the process a turn to see the closed connections; a request that still meets one fails
+ * here instead of in the scenario.
+ */
+const reopenConnections = Effect.gen(function* () {
+  const stack = yield* ScenarioStack;
+  const client = yield* HttpClient.HttpClient;
+  yield* Effect.sleep("100 millis");
+  yield* Effect.forEach(
+    [stack.api, stack.gc, stack.shards, stack.probe],
+    (url) =>
+      client.execute(HttpClientRequest.get(url)).pipe(Effect.timeout("10 seconds"), Effect.ignore),
+    { concurrency: "unbounded", discard: true },
+  );
+});
+
 const runScenarios = (names: ReadonlyArray<string>) =>
   Effect.gen(function* () {
     const wanted =
@@ -477,6 +501,7 @@ const runScenarios = (names: ReadonlyArray<string>) =>
     }
     const failures: Array<string> = [];
     for (const scenario of SCENARIOS.filter((candidate) => wanted.includes(candidate.name))) {
+      yield* reopenConnections;
       const started = yield* Clock.currentTimeMillis;
       const outcome = yield* Effect.result(scenario.run);
       const seconds = (((yield* Clock.currentTimeMillis) - started) / 1000).toFixed(1);

@@ -19,7 +19,7 @@ import {
   type WriteBatch,
   type WriteReceipt,
 } from "@shaledb/lsm-core";
-import { Bytes, Context, Effect, Layer, Option, Schema, Stream } from "effect";
+import { Bytes, Context, Effect, Layer, Option, Result, Schema, Stream } from "effect";
 
 import { backgroundWorkTestLayer } from "./background-work.ts";
 import { blockCacheLayerWithoutDependencies } from "./block-cache.ts";
@@ -31,7 +31,7 @@ import {
   type DbReaderServices,
   type DbReadError,
   type ChangelogUnavailableError,
-  type ReaderUnavailableError,
+  ReaderUnavailableError,
   type ReadView,
 } from "./db-reader.ts";
 import { compactionTriggerTestLayer } from "./compaction-trigger.ts";
@@ -282,6 +282,12 @@ export type DbTransactionError = DbClientReadError | TransactionConflictError;
 /** The contextual database client. */
 export class DbClient extends Context.Service<DbClient, IDbClient>()("@shaledb/DbClient") {}
 
+/**
+ * How many times a read that asks the writer does so before it gives up: each further time
+ * needs a flush to commit between the writer's answer and the manifest load.
+ */
+const LATEST_READ_ATTEMPTS = 3;
+
 const FLUSHED_VIEW: ReadView = {
   minLastL0Seq: SeqNum.make(0),
   snapshotSeq: Option.none(),
@@ -355,7 +361,8 @@ export const makeDbClient = Effect.gen(function* () {
         snapshotSeq: Option.some(probe.snapshotSeq),
         memtable: probe.versions,
         manifestId: Option.none(),
-        maxLastL0Seq: Option.none(),
+        // A manifest flushed past the snapshot may have compacted away the version it needs.
+        maxLastL0Seq: Option.some(probe.snapshotSeq),
         // The writer said which rows are flushed: any cached manifest holding them will do (D67).
         freshness: "Covering",
         manifestHint: probe.flushedManifestId,
@@ -399,11 +406,31 @@ export const makeDbClient = Effect.gen(function* () {
         snapshotSeq,
         memtable: rows,
         manifestId: Option.none(),
-        maxLastL0Seq: Option.none(),
+        // As for a point read. A flush between two pages also ends here: the later pages then
+        // miss rows that only a manifest flushed past the snapshot holds.
+        maxLastL0Seq: snapshotSeq,
         // The writer said which rows are flushed: any cached manifest holding them will do (D67).
         freshness: "Covering",
         manifestHint,
       } satisfies ReadView;
+    });
+
+  /**
+   * Whether a read that asked the writer found only a manifest flushed past the snapshot the
+   * writer gave it (see {@link ReadView.maxLastL0Seq}): the read asks the writer again. A read at
+   * a caller's own snapshot is not asked again; its snapshot has expired.
+   */
+  const flushedPastSnapshot = (options: ReadOptions, error: DbReadError) =>
+    Option.isNone(options.snapshot) &&
+    error._tag === "ReaderUnavailableError" &&
+    error.reason === "SnapshotExpired";
+
+  /** The retryable failure of a read that was overtaken by a flush on every attempt. */
+  const overtakenByFlushes = (databaseId: DatabaseId) =>
+    new ReaderUnavailableError({
+      databaseId,
+      reason: "StorageUnavailable",
+      message: `Database ${databaseId} was flushed during the read on each of ${LATEST_READ_ATTEMPTS} attempts, so the read could not settle on a snapshot. Retry the read.`,
     });
 
   const getRow = Effect.fn("DbClient.getRow")(function* (
@@ -415,20 +442,39 @@ export const makeDbClient = Effect.gen(function* () {
       "database.id": databaseId,
       "read.consistency": options.consistency._tag,
     });
-    const view = yield* pointView(databaseId, key, options);
-    return yield* reader.getRow(databaseId, key, view);
+    for (let attempt = 1; ; attempt++) {
+      const view = yield* pointView(databaseId, key, options);
+      const read = yield* Effect.result(reader.getRow(databaseId, key, view));
+      if (Result.isSuccess(read)) return read.success;
+      if (!flushedPastSnapshot(options, read.failure)) return yield* Effect.fail(read.failure);
+      if (attempt >= LATEST_READ_ATTEMPTS) return yield* overtakenByFlushes(databaseId);
+      yield* Effect.annotateCurrentSpan({ "read.asked_writer_again": attempt });
+    }
   });
 
-  const scan = (databaseId: DatabaseId, range: KeyRange, options: ScanReadOptions) =>
-    Stream.unwrap(
-      Effect.map(scanView(databaseId, range, options), (view) =>
-        reader.scan(databaseId, range, view, { limit: options.limit }),
-      ),
-    ).pipe(
+  const scan = (databaseId: DatabaseId, range: KeyRange, options: ScanReadOptions) => {
+    // The reader checks the manifest before it emits a row, so asking again repeats no row.
+    const attempt = (number: number): Stream.Stream<Row, DbClientReadError, DbReaderServices> =>
+      Stream.unwrap(
+        Effect.map(scanView(databaseId, range, options), (view) =>
+          reader.scan(databaseId, range, view, { limit: options.limit }),
+        ),
+      ).pipe(
+        Stream.catchTags({
+          ReaderUnavailableError: (error) =>
+            !flushedPastSnapshot(options, error)
+              ? Stream.fail(error)
+              : number >= LATEST_READ_ATTEMPTS
+                ? Stream.fail(overtakenByFlushes(databaseId))
+                : attempt(number + 1),
+        }),
+      );
+    return attempt(1).pipe(
       Stream.withSpan("DbClient.scan", {
         attributes: { "database.id": databaseId, "read.consistency": options.consistency._tag },
       }),
     );
+  };
 
   /** A read at a transaction's `readSeq` that found newer data flushed is a conflict. */
   const tooOld = (databaseId: DatabaseId, readSeq: SeqNum) =>
@@ -516,6 +562,7 @@ export const makeDbClient = Effect.gen(function* () {
     const rows: Array<Row> = [];
     let cursor = Option.none<MemTableCursor>();
     let retainedFromSeq = SeqNum.make(0);
+    let flushedSeq = SeqNum.make(0);
     for (;;) {
       const page = yield* writer.scan(databaseId, {
         range,
@@ -527,12 +574,15 @@ export const makeDbClient = Effect.gen(function* () {
       if (!pinned && page.flushedSeq > readSeq) return yield* tooOld(databaseId, readSeq);
       // Across pages a trim may raise the horizon: the read needs a manifest past the highest.
       retainedFromSeq = SeqNum.make(Math.max(retainedFromSeq, page.retainedFromSeq));
+      flushedSeq = SeqNum.make(Math.max(flushedSeq, page.flushedSeq));
       rows.push(...page.rows);
       if (Option.isNone(page.nextCursor)) break;
       cursor = page.nextCursor;
     }
     const view: ReadView = {
-      minLastL0Seq: pinned ? retainedFromSeq : SeqNum.make(0),
+      // Without a begin manifest the pages hold only unflushed rows, so the manifest must hold
+      // every flushed one: a cached manifest from before the last flush would miss its rows.
+      minLastL0Seq: pinned ? retainedFromSeq : flushedSeq,
       snapshotSeq: Option.some(readSeq),
       memtable: rows,
       manifestId,

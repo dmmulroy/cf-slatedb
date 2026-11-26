@@ -135,6 +135,8 @@ describe("DbWriter", () => {
     expect(result.flushed).toBe(4);
     expect(Object.fromEntries(result.durable.values)).toEqual({ a: "v3", b: "v2", c: "v0" });
     expect([result.durable.manifest.lastL0Seq, result.durable.manifest.l0.length]).toEqual([4, 1]);
+    // "a" was written twice since the last flush: the SST holds its newest version only (D70).
+    expect(result.durable.manifest.l0.map((sst) => sst.rowCount)).toEqual([3]);
     expect([result.status.unflushedRows, result.status.flushedSeq]).toEqual([0, 4]);
     expect([result.probe.versions.length, result.probe.flushedSeq]).toEqual([0, 4]);
   });
