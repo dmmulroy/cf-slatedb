@@ -17,6 +17,7 @@ import { Option, Schema } from "effect";
 import { OpenApi } from "effect/http-api";
 
 import { SstDropReport } from "./compactor.ts";
+import { LSM_ACCESS_TOKEN_CREDENTIAL, unauthenticatedMessage } from "./lsm-access-gate.ts";
 import { PinnedSnapshot } from "./database-lifecycle.ts";
 import { DbSnapshot } from "./db-client.ts";
 import {
@@ -409,8 +410,7 @@ const sharedErrorExamples = (operation: DbApiOperation): Readonly<Record<string,
     UnauthenticatedPublicError,
     new UnauthenticatedPublicError({
       code: "Unauthenticated",
-      message:
-        "The request was not authenticated. Send the stage's token as `Authorization: Bearer <token>`; `preview-cli token <stage>` prints it.",
+      message: unauthenticatedMessage(LSM_ACCESS_TOKEN_CREDENTIAL),
       details: {},
       retryable: false,
       ...envelope("routeRequest"),

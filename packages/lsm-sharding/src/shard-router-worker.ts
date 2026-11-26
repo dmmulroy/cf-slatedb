@@ -3,6 +3,8 @@ import { DatabaseId, DEFAULT_DATABASE_OPTIONS, KeyRange, SeqNum } from "@shaledb
 import {
   bindLsmWorkerSettings,
   DatabaseLifecycle,
+  type DbInternalError,
+  DbHttpRequest,
   dbServicesLayer,
   eventTelemetryFlushForStage,
   lsmAccessGateFrom,
@@ -11,6 +13,8 @@ import {
   lsmHttpServerLayer,
   lsmWorkerCompatibility,
   type LsmWorkerSettingsSource,
+  publicHttpRequestMiddlewareLayer,
+  toPublicError,
   type LsmWorkerTelemetry,
   withLsmTracePolicy,
 } from "@shaledb/lsm-cloudflare";
@@ -29,6 +33,7 @@ import {
 
 import {
   ShardDirectory,
+  type ShardDirectoryError,
   ShardDirectoryUnavailableError,
   ShardGroupExistsError,
   ShardGroupNotFoundError,
@@ -163,11 +168,17 @@ const RETRYABLE = new Set([
   "KeyOutOfRangeError",
 ]);
 
-/** Classifies a database failure the router could not route around. */
-const classify = (error: { readonly _tag: string; readonly message: string }) =>
-  RETRYABLE.has(error._tag)
-    ? new ShardedRequestUnavailableError({ reason: error._tag, message: error.message })
-    : new ShardedRequestRefusedError({ reason: error._tag, message: error.message });
+/**
+ * Classifies a database failure the router could not route around. The message is the database
+ * API's public one for the same failure (`toPublicError`), never the internal error's, which may
+ * name storage paths or carry a storage error's text (D79).
+ */
+const classify = (error: DbInternalError, requestId: string) => {
+  const { message } = toPublicError("routeRequest", requestId)(error);
+  return RETRYABLE.has(error._tag)
+    ? new ShardedRequestUnavailableError({ reason: error._tag, message })
+    : new ShardedRequestRefusedError({ reason: error._tag, message });
+};
 
 /** The sharding errors the API declares as themselves. */
 const isDeclaredShardingError = Schema.is(
@@ -181,13 +192,19 @@ const isDeclaredShardingError = Schema.is(
   ]),
 );
 
+/** Every failure a sharded handler can report before classification. */
+type ShardedHandlerError = ShardDirectoryError | CrossShardBatchError | DbInternalError;
+
 /** Keeps the sharding errors the API declares; classifies every other (database) failure. */
-const shardedFailures = <A, R>(
-  effect: Effect.Effect<A, { readonly _tag: string; readonly message: string }, R>,
-) =>
-  effect.pipe(
-    Effect.mapError((error) => (isDeclaredShardingError(error) ? error : classify(error))),
-  );
+const shardedFailures = <A, R>(effect: Effect.Effect<A, ShardedHandlerError, R>) =>
+  Effect.gen(function* () {
+    const { requestId } = yield* DbHttpRequest;
+    return yield* effect.pipe(
+      Effect.mapError((error) =>
+        isDeclaredShardingError(error) ? error : classify(error, requestId),
+      ),
+    );
+  });
 
 /** Handlers of the sharded API over the contextual router, split, directory, and lifecycle. */
 const shardedHttpHandlersLayer = HttpApiBuilder.group(ShardedHttpApi, "groups", (handlers) =>
@@ -252,9 +269,19 @@ const shardedHttpHandlersLayer = HttpApiBuilder.group(ShardedHttpApi, "groups", 
   }),
 );
 
-/** Every sharded API route. */
-const shardedHttpRouterLayer = HttpApiBuilder.layer(ShardedHttpApi).pipe(
+/**
+ * The database API's request middleware, naming the sharded API's own definition: an unmatched
+ * route, a malformed request, and a defect get the public error envelope with a request id, as on
+ * the database API (D69, D79).
+ */
+const shardedHttpRequestMiddlewareLayer = publicHttpRequestMiddlewareLayer({
+  contract: "the sharded API's endpoints (`ShardedHttpApi` in @shaledb/sharding)",
+});
+
+/** Every sharded API route, needing the router, split, directory, and lifecycle. */
+export const shardedHttpRouterLayer = HttpApiBuilder.layer(ShardedHttpApi).pipe(
   Layer.provide(shardedHttpHandlersLayer),
+  Layer.provide(shardedHttpRequestMiddlewareLayer),
   Layer.provide(lsmHttpServerLayer),
 );
 

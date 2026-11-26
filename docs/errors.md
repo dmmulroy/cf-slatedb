@@ -89,14 +89,19 @@ Translate each known tagged error explicitly with `Effect.catchTag` or `Effect.c
 
 Choose status from the caller-visible meaning, not the implementation that failed:
 
-- `400` — the caller can correct malformed or invalid request data;
+- `400` — the caller can correct malformed or invalid request data, including a body sent with a
+  content type the endpoint does not accept (`InvalidRequest`, which tells the caller to send JSON);
 - `401` — the request could not be authenticated;
-- `404` — a syntactically valid resource identity is unknown;
-- `405` — the route does not support the request method;
+- `404` — a syntactically valid resource identity is unknown, or no route matches the method and
+  path (`RouteNotFound`; a known path with a wrong method is answered the same way);
 - `409` — current resource state conflicts with the requested operation;
-- `415` — the request uses an unsupported media type;
 - `500` — shaledb cannot complete the operation because of an internal invariant or non-transient internal failure; and
 - `503` — a required capability is temporarily unavailable.
+
+shaledb's APIs answer neither `405` nor `415`. A request refused before any handler runs (an
+unmatched route, a malformed request, an unaccepted content type, a defect) gets the public error
+envelope from the shared request middleware: D69 for the database API, D79 for the shard router
+and the GC operator API.
 
 The concrete public `HttpApi` owns each endpoint's exact status and error schemas. Infrastructure such as Cloudflare Access may reject a request before it reaches that application contract.
 

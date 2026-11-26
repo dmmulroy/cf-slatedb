@@ -74,105 +74,122 @@ const malformedRequestPart = (cause: Cause.Cause<unknown>) => {
 };
 
 /**
- * Global middleware: provides `DbHttpRequest`, returns the request id as `x-request-id`, answers an
- * unmatched route with `RouteNotFound` (404) and a request that cannot be read or does not match
- * its endpoint's schemas with `InvalidRequest` (400), and answers any other router failure or
- * defect with `InternalFailure` (500) after logging it, so no internal detail reaches the caller.
+ * Where a public API's caller checks a request it got wrong, named at the end of the middleware's
+ * `RouteNotFound` and `InvalidRequest` messages: the database API's OpenAPI document, or the sharded
+ * API's endpoint definitions.
  */
-export const dbHttpRequestMiddlewareLayer = HttpRouter.middleware<{
-  provides: DbHttpRequest;
-  handles: HttpServerError.HttpServerError;
-}>()(
-  (httpEffect) =>
-    Effect.gen(function* () {
-      const request = yield* HttpServerRequest.HttpServerRequest;
-      const { requestId } = yield* DbHttpRequest;
-      const { pathname } = new URL(request.originalUrl, "http://api.internal");
-      yield* HttpEffect.appendPreResponseHandler((_request, response) =>
-        Effect.succeed(HttpServerResponse.setHeader(response, "x-request-id", requestId)),
-      );
-      const internalFailure = (description: string, cause: unknown) =>
-        Effect.logError(description, { cause }).pipe(
-          Effect.as(
-            HttpServerResponse.jsonUnsafe(
-              encodeInternalFailure(
-                new InternalFailurePublicError({
-                  code: "InternalFailure",
-                  operation: "routeRequest",
-                  message: `The request could not be completed because of an internal error. Contact the operator with request id ${requestId}.`,
-                  details: {},
-                  requestId,
-                  retryable: false,
-                }),
+export interface PublicHttpApiReference {
+  /** Completes "Check the method and path against …" and "Check the request against …". */
+  readonly contract: string;
+}
+
+/**
+ * Global middleware every public API shares (D69, D79): provides `DbHttpRequest`, returns the
+ * request id as `x-request-id`, answers an unmatched route with `RouteNotFound` (404) and a request
+ * that cannot be read or does not match its endpoint's schemas with `InvalidRequest` (400), and
+ * answers any other router failure or defect with `InternalFailure` (500) after logging it, so no
+ * internal detail reaches the caller. Every body is the public error envelope.
+ */
+export const publicHttpRequestMiddlewareLayer = (reference: PublicHttpApiReference) =>
+  HttpRouter.middleware<{
+    provides: DbHttpRequest;
+    handles: HttpServerError.HttpServerError;
+  }>()(
+    (httpEffect) =>
+      Effect.gen(function* () {
+        const request = yield* HttpServerRequest.HttpServerRequest;
+        const { requestId } = yield* DbHttpRequest;
+        const { pathname } = new URL(request.originalUrl, "http://api.internal");
+        yield* HttpEffect.appendPreResponseHandler((_request, response) =>
+          Effect.succeed(HttpServerResponse.setHeader(response, "x-request-id", requestId)),
+        );
+        const internalFailure = (description: string, cause: unknown) =>
+          Effect.logError(description, { cause }).pipe(
+            Effect.as(
+              HttpServerResponse.jsonUnsafe(
+                encodeInternalFailure(
+                  new InternalFailurePublicError({
+                    code: "InternalFailure",
+                    operation: "routeRequest",
+                    message: `The request could not be completed because of an internal error. Contact the operator with request id ${requestId}.`,
+                    details: {},
+                    requestId,
+                    retryable: false,
+                  }),
+                ),
+                { status: 500, headers: noStore },
               ),
-              { status: 500, headers: noStore },
             ),
+          );
+        const invalidRequest = (message: string) =>
+          HttpServerResponse.jsonUnsafe(
+            encodeInvalidRequest(
+              new InvalidRequestPublicError({
+                code: "InvalidRequest",
+                operation: "routeRequest",
+                message,
+                details: { method: request.method, path: pathname },
+                requestId,
+                retryable: false,
+              }),
+            ),
+            { status: 400, headers: noStore },
+          );
+        return yield* httpEffect.pipe(
+          // The API builder answers a content type no endpoint accepts itself, in plain text.
+          Effect.map((response) =>
+            response.status === 415
+              ? invalidRequest(
+                  `The request to ${request.method} ${pathname} has a content type the API does not accept. Send the body as application/json.`,
+                )
+              : response,
           ),
-        );
-      const invalidRequest = (message: string) =>
-        HttpServerResponse.jsonUnsafe(
-          encodeInvalidRequest(
-            new InvalidRequestPublicError({
-              code: "InvalidRequest",
-              operation: "routeRequest",
-              message,
-              details: { method: request.method, path: pathname },
-              requestId,
-              retryable: false,
-            }),
-          ),
-          { status: 400, headers: noStore },
-        );
-      return yield* httpEffect.pipe(
-        // The API builder answers a content type no endpoint accepts itself, in plain text.
-        Effect.map((response) =>
-          response.status === 415
-            ? invalidRequest(
-                `The request to ${request.method} ${pathname} has a content type the API does not accept. Send the body as application/json.`,
-              )
-            : response,
-        ),
-        Effect.catchTag("HttpServerError", (error) => {
-          switch (error.reason._tag) {
-            case "RouteNotFound":
-              return Effect.succeed(
-                HttpServerResponse.jsonUnsafe(
-                  encodeRouteNotFound(
-                    new RouteNotFoundPublicError({
-                      code: "RouteNotFound",
-                      operation: "routeRequest",
-                      message: `No route matches ${request.method} ${pathname}. Check the method and path against the API's OpenAPI document.`,
-                      details: { method: request.method, path: pathname },
-                      requestId,
-                      retryable: false,
-                    }),
+          Effect.catchTag("HttpServerError", (error) => {
+            switch (error.reason._tag) {
+              case "RouteNotFound":
+                return Effect.succeed(
+                  HttpServerResponse.jsonUnsafe(
+                    encodeRouteNotFound(
+                      new RouteNotFoundPublicError({
+                        code: "RouteNotFound",
+                        operation: "routeRequest",
+                        message: `No route matches ${request.method} ${pathname}. Check the method and path against ${reference.contract}.`,
+                        details: { method: request.method, path: pathname },
+                        requestId,
+                        retryable: false,
+                      }),
+                    ),
+                    { status: 404, headers: noStore },
                   ),
-                  { status: 404, headers: noStore },
-                ),
-              );
-            case "RequestParseError":
-              return Effect.succeed(
-                invalidRequest(
-                  `The request to ${request.method} ${pathname} could not be read because its path, query, or body is malformed. Fix the request and send it again.`,
-                ),
-              );
-            case "InternalError":
-            case "ResponseError":
-              return internalFailure("shaledb API router failed", error);
-          }
-        }),
-        Effect.catchCauseIf(Cause.hasDies, (cause) => {
-          const malformed = malformedRequestPart(cause);
-          return malformed === undefined
-            ? internalFailure("shaledb API request failed on a defect", Cause.pretty(cause))
-            : Effect.succeed(
-                invalidRequest(
-                  `The request to ${request.method} ${pathname} was refused because its ${malformed.part} did not match what the endpoint accepts: ${malformed.issue}. Check the request against the API's OpenAPI document and send it again.`,
-                ),
-              );
-        }),
-        Effect.annotateLogs({ requestId, path: pathname, method: request.method }),
-      );
-    }).pipe(Effect.provide(dbHttpRequestLayer)),
-  { global: true },
-);
+                );
+              case "RequestParseError":
+                return Effect.succeed(
+                  invalidRequest(
+                    `The request to ${request.method} ${pathname} could not be read because its path, query, or body is malformed. Fix the request and send it again.`,
+                  ),
+                );
+              case "InternalError":
+              case "ResponseError":
+                return internalFailure("shaledb API router failed", error);
+            }
+          }),
+          Effect.catchCauseIf(Cause.hasDies, (cause) => {
+            const malformed = malformedRequestPart(cause);
+            return malformed === undefined
+              ? internalFailure("shaledb API request failed on a defect", Cause.pretty(cause))
+              : Effect.succeed(
+                  invalidRequest(
+                    `The request to ${request.method} ${pathname} was refused because its ${malformed.part} did not match what the endpoint accepts: ${malformed.issue}. Check the request against ${reference.contract} and send it again.`,
+                  ),
+                );
+          }),
+          Effect.annotateLogs({ requestId, path: pathname, method: request.method }),
+        );
+      }).pipe(Effect.provide(dbHttpRequestLayer)),
+    { global: true },
+  );
+
+/** The database API's request middleware (`DbHttpApi`, whose contract is its OpenAPI document). */
+export const dbHttpRequestMiddlewareLayer = publicHttpRequestMiddlewareLayer({
+  contract: "the API's OpenAPI document",
+});

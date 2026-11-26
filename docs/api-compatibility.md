@@ -29,6 +29,23 @@ It never:
 Anything else is a new major version (`/v2`). During a published deprecation window, `/v1` and
 `/v2` are served side by side.
 
+## What the contract does not cover
+
+The database API Worker's `/v1` is the contract. Two other Workers also serve paths under `/v1`
+and are not part of it:
+
+- **The shard router** (`ShardedHttpApi` in `packages/lsm-sharding`, the `shardsUrl` output). It
+  is the sharding package's example consumer of the public API (D40). It may change in any
+  release.
+  - It answers a request it refuses before any handler runs (an unknown route, a malformed
+    request) with the same envelope as the database API (D79).
+  - Its declared errors are `{ _tag, message, … }`, not the envelope. Their `reason` field holds an
+    internal error tag (such as `WriterUnavailableError`) and may change in any release: decide
+    from the status and `_tag`, never from `reason`.
+- **The GC operator API** (`gcUrl`), for operators. It shares the same envelope for refusals and
+  defects (D79). Its declared errors (`DatabaseNotFoundError`, `GarbageCollectorUnavailableError`)
+  are `{ _tag, databaseId, message }`, with messages of its own and never storage detail.
+
 ## Examples from v1's history
 
 These shipped inside `/v1` because they are additive:

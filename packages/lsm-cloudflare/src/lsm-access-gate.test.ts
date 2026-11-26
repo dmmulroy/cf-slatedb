@@ -116,3 +116,35 @@ describe("lsmAccessGateOver (D64)", () => {
     expect(result).toEqual([401, 200, 200]);
   });
 });
+
+describe("the 401 answer", () => {
+  /** The body a gate answers a request without a token with. */
+  const refusedBody = (gate: LsmAccessGate) =>
+    gate(handler).pipe(
+      Effect.provideService(
+        HttpServerRequest.HttpServerRequest,
+        HttpServerRequest.fromWeb(new Request("http://api.internal/v1/databases")),
+      ),
+      Effect.scoped,
+      Effect.flatMap((response) => Effect.promise(() => HttpServerResponse.toWeb(response).json())),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.runPromise,
+    );
+
+  it("names the token to send without a command that works only on previews", async () => {
+    const accessTokens = await refusedBody(
+      lsmAccessGateOver(Option.some(Redacted.make("a".repeat(64))), [], 30_000),
+    );
+    expect(accessTokens).toMatchObject({ code: "Unauthenticated", retryable: false });
+    expect(JSON.stringify(accessTokens)).toContain("access tokens");
+    expect(JSON.stringify(accessTokens)).not.toContain("preview-cli");
+    expect(JSON.stringify(accessTokens)).not.toContain("a".repeat(64));
+    const collector = await refusedBody(
+      lsmAccessGate(
+        Option.some(Redacted.make("c".repeat(64))),
+        "the stage's trace collector token",
+      ),
+    );
+    expect(JSON.stringify(collector)).toContain("the stage's trace collector token");
+  });
+});

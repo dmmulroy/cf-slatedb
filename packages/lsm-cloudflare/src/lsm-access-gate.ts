@@ -46,12 +46,14 @@ export type LsmAccessGate = <R>(handler: HttpEffect<R>) => HttpEffect<R | Runtim
  *
  * @param binding - Name of the secret binding that carries the token.
  * @param token - Yields the token's Output at plan time, or `None` when the stage is not gated.
+ * @param credential - Names the token in the `401` message (see {@link LSM_ACCESS_TOKEN_CREDENTIAL}).
  * @returns The wrapper. A bound value that is not a valid secret stops the Worker (a defect): a
  *   misconfigured gate must not start open.
  */
 export const lsmAccessGateFor = <R>(
   binding: string,
   token: Effect.Effect<Option.Option<Output.Output<Redacted.Redacted<string>>>, never, R>,
+  credential: string,
 ) =>
   Effect.gen(function* () {
     const phase = yield* Alchemy.ALCHEMY_PHASE;
@@ -63,7 +65,7 @@ export const lsmAccessGateFor = <R>(
       }
     }
     const bound = yield* Config.option(Config.Redacted(binding)).pipe(Effect.orDie);
-    return lsmAccessGate(bound);
+    return lsmAccessGate(bound, credential);
   });
 
 /**
@@ -171,7 +173,10 @@ export const lsmAccessGateOver = (
       if (Option.isSome(presented) && matchesAny(presented.value, tokens)) {
         return yield* handler;
       }
-      return unauthenticatedResponse(request.headers["cf-ray"] ?? crypto.randomUUID());
+      return unauthenticatedResponse(
+        request.headers["cf-ray"] ?? crypto.randomUUID(),
+        LSM_ACCESS_TOKEN_CREDENTIAL,
+      );
     });
 };
 
@@ -184,10 +189,13 @@ const matchesAny = (presented: string, tokens: ReadonlyArray<Redacted.Redacted<s
 
 /**
  * The access check for a token: `None` passes every request through; `Some(token)` requires
- * `Authorization: Bearer <token>`.
+ * `Authorization: Bearer <token>`. `credential` names the token in the `401` message.
  */
 export const lsmAccessGate =
-  (token: Option.Option<Redacted.Redacted<string>>): LsmAccessGate =>
+  (
+    token: Option.Option<Redacted.Redacted<string>>,
+    credential: string = LSM_ACCESS_TOKEN_CREDENTIAL,
+  ): LsmAccessGate =>
   (handler) =>
     Option.isNone(token)
       ? handler
@@ -197,7 +205,10 @@ export const lsmAccessGate =
           if (Option.isSome(presented) && sameSecret(presented.value, token.value)) {
             return yield* handler;
           }
-          return unauthenticatedResponse(request.headers["cf-ray"] ?? crypto.randomUUID());
+          return unauthenticatedResponse(
+            request.headers["cf-ray"] ?? crypto.randomUUID(),
+            credential,
+          );
         });
 
 const bearerToken = (header: string | undefined): Option.Option<string> => {
@@ -219,15 +230,29 @@ const sameSecret = (presented: string, expected: Redacted.Redacted<string>): boo
 
 const encodeUnauthenticated = Schema.encodeSync(UnauthenticatedPublicError);
 
+/**
+ * How the `401` message names the token the database, GC, and shard-router APIs accept. It points to
+ * the runbook, not to a command: production's tokens are printed only when created or rotated (D64),
+ * and `preview-cli token` reads previews alone.
+ */
+export const LSM_ACCESS_TOKEN_CREDENTIAL =
+  'one of the stage\'s access tokens (docs/operations.md, "Access tokens")';
+
+/**
+ * The `401` message for a request without `credential`, the same on every gated Worker: it names
+ * the token to send and never the one expected.
+ */
+export const unauthenticatedMessage = (credential: string) =>
+  `The request was not authenticated. Send ${credential} as \`Authorization: Bearer <token>\`.`;
+
 /** The public error envelope (`Unauthenticated`, 401) for a request without the token. */
-const unauthenticatedResponse = (requestId: string) =>
+const unauthenticatedResponse = (requestId: string, credential: string) =>
   HttpServerResponse.jsonUnsafe(
     encodeUnauthenticated(
       new UnauthenticatedPublicError({
         code: "Unauthenticated",
         operation: "routeRequest",
-        message:
-          "The request was not authenticated. Send the stage's token as `Authorization: Bearer <token>`; `preview-cli token <stage>` prints it.",
+        message: unauthenticatedMessage(credential),
         details: {},
         requestId,
         retryable: false,

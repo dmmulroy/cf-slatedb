@@ -211,8 +211,7 @@ const readBatchesUnder = (prefix: string) =>
         failure(400, {
           code: "InvalidRequest",
           operation: "readTraces",
-          message:
-            "The trace collector could not read the query: `after` must be a stored key and `limit` a number from 1 to 100. Correct it and request again.",
+          message: `The trace collector could not read the query: \`after\` must be a stored key and \`limit\` a number (pages hold at most ${MAX_BATCHES_PER_PAGE} exports). Correct it and request again.`,
         }),
       R2Error: (error) =>
         Effect.logError("The trace collector could not read stored exports", { cause: error }).pipe(
@@ -261,6 +260,7 @@ export const traceCollectorWorkerLayer = TraceCollectorWorker.make(
     const withToken = yield* lsmAccessGateFor(
       TRACE_COLLECTOR_TOKEN_BINDING,
       Effect.map(TraceCollectorToken, Option.some),
+      "the stage's trace collector token (docs/operations.md, \"Reading a stage's telemetry\")",
     );
     const router = yield* makeExecutionMemo(HttpRouter.toHttpEffect(traceCollectorRoutesLayer));
     // Its bucket is in the Stack's jurisdiction, read through the same binding as the engine's.

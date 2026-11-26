@@ -1,4 +1,5 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
+import type { DatabaseId } from "@shaledb/lsm-core";
 import { withLsmTracePolicy } from "./lsm-trace-policy.ts";
 import * as Alchemy from "alchemy";
 import type { HttpEffect } from "alchemy/Http";
@@ -10,6 +11,8 @@ import { HttpApiBuilder } from "effect/http-api";
 
 import { workerBackgroundWorkLayer } from "./background-work.ts";
 import { CompactorClient, compactorClientLayer } from "./compactor-client.ts";
+import type { CompactorError } from "./compactor.ts";
+import { DbHttpRequest, publicHttpRequestMiddlewareLayer } from "./db-http-request.ts";
 import {
   GarbageCollectorUnavailableError,
   garbageCollectorLayerWithoutDependencies,
@@ -17,6 +20,7 @@ import {
 import { GcHttpApi } from "./gc-http-api.ts";
 import { lsmAccessGateFrom, type LsmAccessTokenSource } from "./lsm-access-gate.ts";
 import { lsmConfigurationLayer } from "./lsm-configuration.ts";
+import { DatabaseNotFoundError } from "./lsm-errors.ts";
 import { bindLsmWorkerSettings, type LsmWorkerSettingsSource } from "./lsm-worker-settings.ts";
 import { lsmHttpServerLayer } from "./lsm-http-server.ts";
 import { isLocalLsmStage, lsmWorkerCompatibility } from "./lsm-stage.ts";
@@ -33,8 +37,52 @@ import { objectStoreLayer } from "./object-store.ts";
 export const MAINTENANCE_SWEEP_PAGE_DATABASES = 50;
 
 /**
+ * The public answer to a failed collection of `databaseId` (D79): the declared error with a message
+ * of our own, never the internal one, which may name storage paths or repeat a storage error's text.
+ * The internal error is logged with the request id instead.
+ */
+const publicCollectFailure = (
+  databaseId: DatabaseId,
+  requestId: string,
+  error: CompactorError | GarbageCollectorUnavailableError,
+) =>
+  Effect.logError("GC collect-now failed", { cause: error, databaseId, requestId }).pipe(
+    Effect.andThen(
+      Effect.fail(
+        error._tag === "DatabaseNotFoundError"
+          ? new DatabaseNotFoundError({
+              databaseId,
+              message: `Database ${databaseId} does not exist. Check the id.`,
+            })
+          : new GarbageCollectorUnavailableError({
+              databaseId,
+              message:
+                error._tag === "DatabaseIdMismatchError"
+                  ? `Garbage collection of database ${databaseId} could not run because of an internal error. Contact the operator with request id ${requestId}.`
+                  : `Garbage collection of database ${databaseId} could not run just now: its compactor or storage was unavailable. Retry the same request; a collection is safe to repeat.`,
+            }),
+      ),
+    ),
+  );
+
+/** The public answer to a failed sweep page (D79); the internal error is logged instead. */
+const publicSweepFailure = (requestId: string, error: GarbageCollectorUnavailableError) =>
+  Effect.logError("GC maintenance sweep failed", { cause: error, requestId }).pipe(
+    Effect.andThen(
+      Effect.fail(
+        new GarbageCollectorUnavailableError({
+          databaseId: error.databaseId,
+          message:
+            "The maintenance sweep could not run just now: storage was unavailable. Retry the same request; the next scheduled run also retries.",
+        }),
+      ),
+    ),
+  );
+
+/**
  * Handlers of the GC API: "collect now" runs on the database's compactor, which owns its collection
- * (one at a time per database, D60); `POST /v1/gc` runs one page of the maintenance sweep.
+ * (one at a time per database, D60); `POST /v1/gc` runs one page of the maintenance sweep. Every
+ * failure is answered with a message of our own (D79).
  */
 export const gcHttpHandlersLayer = HttpApiBuilder.group(GcHttpApi, "gc", (handlers) =>
   Effect.gen(function* () {
@@ -42,43 +90,44 @@ export const gcHttpHandlersLayer = HttpApiBuilder.group(GcHttpApi, "gc", (handle
     const sweep = yield* MaintenanceSweep;
     return handlers
       .handle("collect", ({ params }) =>
-        compactors.collect(params.databaseId).pipe(
-          Effect.scoped,
-          Effect.catchTags({
-            CompactorUnavailableError: (error) =>
-              Effect.fail(
-                new GarbageCollectorUnavailableError({
-                  databaseId: params.databaseId,
-                  message: error.message,
-                }),
-              ),
-            DatabaseIdMismatchError: (error) =>
-              Effect.fail(
-                new GarbageCollectorUnavailableError({
-                  databaseId: params.databaseId,
-                  message: error.message,
-                }),
-              ),
-          }),
-        ),
+        Effect.gen(function* () {
+          const { requestId } = yield* DbHttpRequest;
+          return yield* compactors.collect(params.databaseId).pipe(
+            Effect.scoped,
+            Effect.catch((error) => publicCollectFailure(params.databaseId, requestId, error)),
+          );
+        }),
       )
       .handle("sweep", () =>
-        sweep.sweepPage(MAINTENANCE_SWEEP_PAGE_DATABASES).pipe(
-          Effect.map((report) => ({
+        Effect.gen(function* () {
+          const { requestId } = yield* DbHttpRequest;
+          const report = yield* sweep
+            .sweepPage(MAINTENANCE_SWEEP_PAGE_DATABASES)
+            .pipe(Effect.catch((error) => publicSweepFailure(requestId, error)));
+          return {
             visited: report.visited,
             reports: report.sweptLeftovers,
             woken: report.woken,
             collectionsRequested: report.collectionsRequested,
             cursor: report.cursor,
-          })),
-        ),
+          };
+        }),
       );
   }),
 );
 
+/**
+ * The public APIs' request middleware, naming the GC operator API's definition: an unmatched route,
+ * a malformed request, and a defect get the public error envelope with a request id (D69, D79).
+ */
+const gcHttpRequestMiddlewareLayer = publicHttpRequestMiddlewareLayer({
+  contract: "the GC operator API's endpoints (`GcHttpApi` in @shaledb/lsm-cloudflare)",
+});
+
 /** Every GC HTTP route, needing a `CompactorClient` and a `MaintenanceSweep`. */
 export const gcHttpRouterLayer = HttpApiBuilder.layer(GcHttpApi).pipe(
   Layer.provide(gcHttpHandlersLayer),
+  Layer.provide(gcHttpRequestMiddlewareLayer),
   Layer.provide(lsmHttpServerLayer),
 );
 

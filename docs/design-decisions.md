@@ -2279,121 +2279,109 @@ and a compactor that fences in again is one more of those. The overwritten epoch
 compactor's own Durable Object state, not in the manifest, so it is a property of that state, and
 the tests check it. No step changed; reran, and every broken variant fails (the skill records it).
 
-## D82. Every signal the operations guide names is read from a span or a tail record; metrics are not collected
+## D79. The sharded API answers refused requests with the public envelope; it is not part of `/v1`'s contract
 
-**The finding.** `docs/operations.md` ("What to watch") told an operator to watch three metrics:
-`lsm_compaction_corrupt_ssts`, `lsm_object_part_integrity_retries`, and
-`lsm_object_parts_unverified`. No live stage keeps any metric. The stage's trace collector accepts
-OTLP metrics and discards them (`acceptAndDiscard` on `/v1/metrics`,
-`infra/shaledb/src/trace-collector-worker.ts`), and so does the local receiver
-(`tools/trace-cli/src/otlp-receiver.ts`). Nothing in the repository reads a metric. The health
-report, which is the release soak's health criterion, also missed four signals the guide names:
+D69 put the database API's refusals in the public error envelope. The sharded API (the shard
+router Worker, `ShardedHttpApi`) had no request middleware. Measured in-process through the
+router and Alchemy's failure boundary (`safeHttpEffect`), before this change:
 
-- **Unverified parts.** Visible as `object.parts_unverified` on `ObjectStore.putMultipart`, but
-  never checked.
-- **A fenced compactor.** Its poll carried `compactor.fenced` but no `database.id`.
-- **L0 at its limit.** Reported as a number, never as an issue.
-- **Slow flushes.** Reported as percentiles, never as an issue.
+| Request                                       | Status | Body                                          |
+| --------------------------------------------- | ------ | --------------------------------------------- |
+| Malformed JSON, a refused body, an empty body | 400    | empty                                         |
+| A group id the path schema refuses            | 400    | empty                                         |
+| A content type no endpoint accepts            | 415    | `Unsupported content-type: text/plain` (text) |
+| An unknown route, or a wrong method           | 404    | empty                                         |
+| A defect in a handler                         | 500    | empty                                         |
+| Any answer                                    |        | no `x-request-id`                             |
 
-A write stalled with `WriteStalled` was an issue, but without the database or the reason.
+**The mechanism is shared, not copied.**
 
-**D78's stuck database, read against the old report.** The report said "N writes stalled" only
-while writes kept arriving and their spans were sampled. It named no database and gave no reason.
-The stuck compactor no longer polled, so its L0 backlog was missing. Its one fenced poll was not
-read. A database with no further writes would have looked healthy.
+- **The middleware.** `publicHttpRequestMiddlewareLayer` (`db-http-request.ts`) is now the
+  middleware both APIs use. The only parameter is the contract its messages point to: the
+  database API's OpenAPI document, or the sharded API's endpoints. `dbHttpRequestMiddlewareLayer`
+  is the database API's instance.
+- **The effect on the sharded API.** Each refusal above is now the envelope, with the request id
+  in the body and in `x-request-id`:
+  - `InvalidRequest` (400) names the malformed part.
+  - `RouteNotFound` (404) covers an unknown route or a wrong method.
+  - `InternalFailure` (500) answers a defect, which is logged.
+- **Why the change is allowed.** Every status stays the same, except an unaccepted content type:
+  415 becomes 400 `InvalidRequest`, as D69 did for the database API. The sharded API is not part
+  of `/v1`'s contract (below), and an empty body that becomes the documented envelope breaks no
+  caller that read only the status.
 
-**The inventory.** Every signal `docs/operations.md`, `docs/release-v1.md` §11, and the
-corruption runbook name, and where it can be read now:
+**A database failure's message.** The router passed a database failure's internal message to the
+caller verbatim. A storage failure's message names object paths (`db/<id>/…`) and repeats the
+storage error's text. `ShardedRequestUnavailable` and `ShardedRequestRefused` now carry the
+database API's public message for the same failure (`toPublicError`, now exported). Their
+`reason` still holds the internal error's tag (`WriterUnavailableError`). Changing what an
+existing field holds is not additive, so it is left for a decision.
 
-| Signal                | Produced by                                                                                                    | Readable on a live stage through                                                                 |
-| --------------------- | -------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| Limit hits            | the runtime, in tail records (`cpu-tail-worker.ts`; every non-`ok` invocation kept, D71)                       | `measure health` (issue)                                                                         |
-| Stalled writes        | `WriteStalledError` on `DbWriter.write`, now with `writer.stall_reason` (`db-writer.ts`)                       | `measure health` (issue per database and reason); `trace-cli grep --name DbWriter.write --error` |
-| Flush duration        | `DbWriter.flush` span                                                                                          | `measure health` (`flushMs`; issue above 30 s at p99); `trace-cli stats --name DbWriter.flush`   |
-| L0 backlog            | `manifest.l0_ssts` on `Compactor.poll`                                                                         | `measure health` (`l0Backlog`; issue at `l0MaxSsts`)                                             |
-| Fenced compactor      | `compactor.fenced` on `Compactor.poll`, now with `database.id`; `compactor.refenced` on the start's span (D78) | `measure health` (issue per database); `GET /v1/databases/:id/compaction` (`compactor.fenced`)   |
-| Corrupted SSTs        | `compaction.corrupt_ssts` on `Compactor.poll`; the compactor's error log, a span event there                   | `measure health` (issue, from each database's latest poll); `GET …/compaction` (`corruptSsts`)   |
-| Unverified parts      | `object.parts_unverified` on `ObjectStore.putMultipart`                                                        | `measure health` (issue)                                                                         |
-| Re-sent parts         | now `object.part_retried` on `ObjectStore.putMultipart`, and the warning log already a span event there        | `measure health` (`uploads.withRetriedPart`, a count, not an issue)                              |
-| GC and sweep failures | error status on `GarbageCollector.collect`, `MaintenanceSweep.sweepPage`                                       | `measure health` (issue)                                                                         |
-| Error spans           | any span with an error status                                                                                  | `measure health` (`errorSpans`); `trace-cli stats --error`                                       |
+**The `401` message.** It told every caller that `preview-cli token <stage>` prints the token.
+That is wrong for production, whose tokens are printed only when created or rotated (D64). It is
+also the wrong token for the trace collector. The message now names the token to send: one of the
+stage's access tokens, or, from the collector, its trace collector token, each pointing to
+`docs/operations.md`. The OpenAPI examples were regenerated. The collector's `InvalidRequest` said
+`limit` runs from 1 to 100; pages hold up to 500, and it now says so.
 
-The twelve metrics the engine defines (`rg "Metric\.counter"`) are listed below. No stage reads any
-of them:
+**An oversized body** never reaches either API's code: neither sets a body limit of its own.
+Cloudflare's Workers limits page says a request to a Worker on a zone is answered `413` by
+Cloudflare above the zone plan's limit (100 MB on Free and Pro, 200 MB on Business). It does not
+state the limit for `workers.dev`, where these Workers are served. No test covers it.
 
-- `lsm_block_cache_requests` (`block-cache.ts`);
-- `lsm_compaction_corrupt_ssts`, `lsm_compactions_started`, and `lsm_ssts_dropped` (`compactor.ts`);
-- `lsm_compactions_committed` (`compaction-executor.ts`);
-- `lsm_flush_bytes` and `lsm_write_stalls` (`db-writer.ts`);
-- `lsm_gc_deleted_objects` (`garbage-collector.ts`);
-- `lsm_manifest_cas_conflicts` (`manifest-store.ts`);
-- `lsm_object_part_integrity_retries` and `lsm_object_parts_unverified` (`object-store.ts`);
-- `lsm_sst_bytes_written` (`sst-store.ts`).
+**The GC operator API, the same way** (decided after review). The GC Worker's API (`GcHttpApi`) had
+the sharded API's gaps. Its refusals and defects were answered with empty bodies. Its declared
+errors carried internal messages: a collection or sweep that could not reach storage repeated the
+object store's message, which names object paths and the storage error's text.
 
-Each has a span attribute or span error that carries the same event, so none is the only record
-of anything an operator needs.
+- **The middleware.** `gcHttpRouterLayer` now provides `publicHttpRequestMiddlewareLayer`, naming
+  `GcHttpApi`.
+- **The handlers** answer every failure with the declared error and a message of their own:
+  - `DatabaseNotFoundError`: "does not exist".
+  - `GarbageCollectorUnavailableError`: retry the same request, a collection is safe to repeat.
+  - A served-id mismatch: an internal error, with the request id to give the operator.
+  - The internal error is logged with the request id.
+- **Why it is allowed:** statuses, `_tag`s, and fields are unchanged; only message texts change.
+  The GC API is an operator API outside `/v1`'s contract.
 
-**The decision: spans carry the signals, the health report judges them.**
+**After review.**
 
-- **Three span attributes, one line each.**
-  - `writer.stall_reason` (`L0Backlog` or `UnflushedBytes`), on the write a stall refused.
-  - `object.part_retried` on a multipart upload that re-sent a part. That was the one signal
-    visible nowhere as an attribute; the warning log was already a span event.
-  - `database.id` on the poll that finds its compactor fenced.
+- **Status guidance.** Both APIs keep `400` for an unaccepted content type. `docs/errors.md`'s
+  status guidance now says what they do: a wrong method is `404` `RouteNotFound`, an unaccepted
+  content type is `400` `InvalidRequest`, and neither `405` nor `415` is answered.
+- **The sharded errors' `reason`** stays the internal tag. `docs/api-compatibility.md` says it may
+  change.
 
-  All three keys are in namespaces the redaction policy already exports (`writer.`, `object.`,
-  `database.`; D63). `lsm-trace-policy.test.ts` now lists them with the other keys the report
-  reads.
+**The contract.** The OpenAPI drift test covers `DbHttpApi` alone.
+`docs/api-compatibility.md` now says the shard router's API is not part of `/v1`'s contract: it
+is the sharding package's example (D40), and its declared errors are not the envelope. The GC
+operator API is not part of the contract either.
 
-- **The report's judgement is a pure function**, `summarizeHealth`
-  (`tools/scenario-cli/src/health-report.ts`), so it is unit-tested without a stage.
-  `measureHealth` reads the tail records and spans and calls it. Its issues:
-  - limit hits;
-  - stalled writes per database and reason;
-  - corruption by each database's latest poll, judged by start time, because `trace-cli grep`
-    lists spans by trace;
-  - L0 at `l0MaxSsts` (the engine default, 16);
-  - a fenced compactor per database. Only its own Durable Object fences in for a database, so a
-    fenced poll means its state was overwritten, which is a defect even though D78 repairs it;
-  - any unverified part;
-  - a flush p99 above 30 s;
-  - failed collections and sweeps.
+**Tests.**
 
-  Re-sent parts are counted, not an issue: the guide calls them transient unless frequent.
-
-- **Metrics stay emitted and are not collected.** The engine keeps its `Metric` counters, for the
-  local receiver and a future collector. The guide no longer names them as signals. Collecting
-  them would need a store and a reader for metrics. Every signal an operator needs already
-  travels on a span, so that is not built.
-
-**What this does not cover.**
-
-- **Sampling.** In production 10% of traces are kept (P4), so a rare span-borne signal can be
-  missed in a short window. A stall or corruption repeats on every write or poll, so a sustained
-  one is seen. One unverified part or one fenced poll can go unseen at 10%. Tail records of
-  invocations that did not end `ok` are always kept (D71); spans are not.
-- **Silent databases.** A database that neither writes nor polls produces no spans, so the report
-  cannot see that it is stuck. D78's fix makes a fenced compactor fence in again on its next
-  start, so that state no longer persists.
-- **The threshold.** The L0 limit is the engine default. A stage deployed with another
-  `l0MaxSsts` is judged against 16.
-- **Not tried live.** The new attributes are on code not yet deployed.
-
-**Tests:**
-
-- `health-report.test.ts` (8 tests) covers: quiet signals; stalls per database and reason;
-  D78's stuck database (a fenced poll, L0 at 16, refused writes); the configurable L0 limit;
-  corruption by the latest poll, in either order; unverified parts against re-sent parts; the
-  30 s flush threshold; and limit hits with failed collections and sweeps.
-- `db-writer.test.ts`: a stalled write's span names `UnflushedBytes`.
-- `object-store.test.ts`: a re-sent part marks the span, and a first-time verified part does not.
-- `compactor.test.ts`: the fenced poll names its database.
-- **Mutations.** Ten mutations of the report, and the removal of each of the three attributes,
-  are each caught by a test (`/tmp/shale-work/agents/signals/mutations.log`). One of the ten
-  survived at first: two counts the test compared were equal, so the test was strengthened. One
-  more mutation is not counted, because `later` is symmetric and the mutation changed nothing.
-  `writer.stall_reason` for `L0Backlog` has no test of its own; the same line for
-  `UnflushedBytes` does.
+- **`db-http-request.test.ts`** sends the database API, in-process, a malformed body, a refused
+  body, an empty body, an unaccepted content type, a refused path id, an unknown route, and a
+  wrong method. It is the reference.
+- **`shard-router-worker.test.ts`** sends the same requests to the sharded API and expects the
+  envelope. It also covers:
+  - its declared errors and successes, unchanged but now with a request id;
+  - a defect, answered as `InternalFailure`;
+  - two database failures carrying internal detail, which never reaches the body.
+- **`lsm-access-gate.test.ts`**: the `401` names the token, not `preview-cli`.
+- **`serveLsmTestRequest`** (`lsm-test-runtime.ts`) serves a request as the Worker does:
+  `safeHttpEffect`, then `HttpEffect.toHandled`.
+- **`gc-worker.test.ts`** (GC operator API):
+  - a collection, and each failed collection (not found, compactor or storage unavailable, a
+    served-id mismatch) as its declared error with no storage detail;
+  - a failed sweep page;
+  - a refused id, a wrong method, an unknown route, and a defect, in the envelope.
+- **Mutations caught:**
+  - the middleware removed from the GC router (all three GC tests fail);
+  - each of the GC messages replaced by the internal one again: collect unavailable, sweep, and
+    not found (one test fails each);
+  - the middleware removed from the sharded router (all four sharded tests fail);
+  - the internal message passed through again (1 fails);
+  - the gate ignoring the token it names (1 fails).
 
 ## D80. The change feed answers only what its changelog provably holds; a fork's feed starts at its fork point
 
@@ -2555,3 +2543,119 @@ into a delete as usual. New compactions fold nothing new across expiries.
 - **Mutations, all five caught:** runs folding across expiries, the base folding whatever its
   expiry, a folded run that never expires, a delete not absorbing its run, and the base folding
   into every run.
+
+## D82. Every signal the operations guide names is read from a span or a tail record; metrics are not collected
+
+**The finding.** `docs/operations.md` ("What to watch") told an operator to watch three metrics:
+`lsm_compaction_corrupt_ssts`, `lsm_object_part_integrity_retries`, and
+`lsm_object_parts_unverified`. No live stage keeps any metric. The stage's trace collector accepts
+OTLP metrics and discards them (`acceptAndDiscard` on `/v1/metrics`,
+`infra/shaledb/src/trace-collector-worker.ts`), and so does the local receiver
+(`tools/trace-cli/src/otlp-receiver.ts`). Nothing in the repository reads a metric. The health
+report, which is the release soak's health criterion, also missed four signals the guide names:
+
+- **Unverified parts.** Visible as `object.parts_unverified` on `ObjectStore.putMultipart`, but
+  never checked.
+- **A fenced compactor.** Its poll carried `compactor.fenced` but no `database.id`.
+- **L0 at its limit.** Reported as a number, never as an issue.
+- **Slow flushes.** Reported as percentiles, never as an issue.
+
+A write stalled with `WriteStalled` was an issue, but without the database or the reason.
+
+**D78's stuck database, read against the old report.** The report said "N writes stalled" only
+while writes kept arriving and their spans were sampled. It named no database and gave no reason.
+The stuck compactor no longer polled, so its L0 backlog was missing. Its one fenced poll was not
+read. A database with no further writes would have looked healthy.
+
+**The inventory.** Every signal `docs/operations.md`, `docs/release-v1.md` §11, and the
+corruption runbook name, and where it can be read now:
+
+| Signal                | Produced by                                                                                                    | Readable on a live stage through                                                                 |
+| --------------------- | -------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| Limit hits            | the runtime, in tail records (`cpu-tail-worker.ts`; every non-`ok` invocation kept, D71)                       | `measure health` (issue)                                                                         |
+| Stalled writes        | `WriteStalledError` on `DbWriter.write`, now with `writer.stall_reason` (`db-writer.ts`)                       | `measure health` (issue per database and reason); `trace-cli grep --name DbWriter.write --error` |
+| Flush duration        | `DbWriter.flush` span                                                                                          | `measure health` (`flushMs`; issue above 30 s at p99); `trace-cli stats --name DbWriter.flush`   |
+| L0 backlog            | `manifest.l0_ssts` on `Compactor.poll`                                                                         | `measure health` (`l0Backlog`; issue at `l0MaxSsts`)                                             |
+| Fenced compactor      | `compactor.fenced` on `Compactor.poll`, now with `database.id`; `compactor.refenced` on the start's span (D78) | `measure health` (issue per database); `GET /v1/databases/:id/compaction` (`compactor.fenced`)   |
+| Corrupted SSTs        | `compaction.corrupt_ssts` on `Compactor.poll`; the compactor's error log, a span event there                   | `measure health` (issue, from each database's latest poll); `GET …/compaction` (`corruptSsts`)   |
+| Unverified parts      | `object.parts_unverified` on `ObjectStore.putMultipart`                                                        | `measure health` (issue)                                                                         |
+| Re-sent parts         | now `object.part_retried` on `ObjectStore.putMultipart`, and the warning log already a span event there        | `measure health` (`uploads.withRetriedPart`, a count, not an issue)                              |
+| GC and sweep failures | error status on `GarbageCollector.collect`, `MaintenanceSweep.sweepPage`                                       | `measure health` (issue)                                                                         |
+| Error spans           | any span with an error status                                                                                  | `measure health` (`errorSpans`); `trace-cli stats --error`                                       |
+
+The twelve metrics the engine defines (`rg "Metric\.counter"`) are listed below. No stage reads any
+of them:
+
+- `lsm_block_cache_requests` (`block-cache.ts`);
+- `lsm_compaction_corrupt_ssts`, `lsm_compactions_started`, and `lsm_ssts_dropped` (`compactor.ts`);
+- `lsm_compactions_committed` (`compaction-executor.ts`);
+- `lsm_flush_bytes` and `lsm_write_stalls` (`db-writer.ts`);
+- `lsm_gc_deleted_objects` (`garbage-collector.ts`);
+- `lsm_manifest_cas_conflicts` (`manifest-store.ts`);
+- `lsm_object_part_integrity_retries` and `lsm_object_parts_unverified` (`object-store.ts`);
+- `lsm_sst_bytes_written` (`sst-store.ts`).
+
+Each has a span attribute or span error that carries the same event, so none is the only record
+of anything an operator needs.
+
+**The decision: spans carry the signals, the health report judges them.**
+
+- **Three span attributes, one line each.**
+  - `writer.stall_reason` (`L0Backlog` or `UnflushedBytes`), on the write a stall refused.
+  - `object.part_retried` on a multipart upload that re-sent a part. That was the one signal
+    visible nowhere as an attribute; the warning log was already a span event.
+  - `database.id` on the poll that finds its compactor fenced.
+
+  All three keys are in namespaces the redaction policy already exports (`writer.`, `object.`,
+  `database.`; D63). `lsm-trace-policy.test.ts` now lists them with the other keys the report
+  reads.
+
+- **The report's judgement is a pure function**, `summarizeHealth`
+  (`tools/scenario-cli/src/health-report.ts`), so it is unit-tested without a stage.
+  `measureHealth` reads the tail records and spans and calls it. Its issues:
+  - limit hits;
+  - stalled writes per database and reason;
+  - corruption by each database's latest poll, judged by start time, because `trace-cli grep`
+    lists spans by trace;
+  - L0 at `l0MaxSsts` (the engine default, 16);
+  - a fenced compactor per database. Only its own Durable Object fences in for a database, so a
+    fenced poll means its state was overwritten, which is a defect even though D78 repairs it;
+  - any unverified part;
+  - a flush p99 above 30 s;
+  - failed collections and sweeps.
+
+  Re-sent parts are counted, not an issue: the guide calls them transient unless frequent.
+
+- **Metrics stay emitted and are not collected.** The engine keeps its `Metric` counters, for the
+  local receiver and a future collector. The guide no longer names them as signals. Collecting
+  them would need a store and a reader for metrics. Every signal an operator needs already
+  travels on a span, so that is not built.
+
+**What this does not cover.**
+
+- **Sampling.** In production 10% of traces are kept (P4), so a rare span-borne signal can be
+  missed in a short window. A stall or corruption repeats on every write or poll, so a sustained
+  one is seen. One unverified part or one fenced poll can go unseen at 10%. Tail records of
+  invocations that did not end `ok` are always kept (D71); spans are not.
+- **Silent databases.** A database that neither writes nor polls produces no spans, so the report
+  cannot see that it is stuck. D78's fix makes a fenced compactor fence in again on its next
+  start, so that state no longer persists.
+- **The threshold.** The L0 limit is the engine default. A stage deployed with another
+  `l0MaxSsts` is judged against 16.
+- **Not tried live.** The new attributes are on code not yet deployed.
+
+**Tests:**
+
+- `health-report.test.ts` (8 tests) covers: quiet signals; stalls per database and reason;
+  D78's stuck database (a fenced poll, L0 at 16, refused writes); the configurable L0 limit;
+  corruption by the latest poll, in either order; unverified parts against re-sent parts; the
+  30 s flush threshold; and limit hits with failed collections and sweeps.
+- `db-writer.test.ts`: a stalled write's span names `UnflushedBytes`.
+- `object-store.test.ts`: a re-sent part marks the span, and a first-time verified part does not.
+- `compactor.test.ts`: the fenced poll names its database.
+- **Mutations.** Ten mutations of the report, and the removal of each of the three attributes,
+  are each caught by a test (`/tmp/shale-work/agents/signals/mutations.log`). One of the ten
+  survived at first: two counts the test compared were equal, so the test was strengthened. One
+  more mutation is not counted, because `later` is symmetric and the mutation changed nothing.
+  `writer.stall_reason` for `L0Backlog` has no test of its own; the same line for
+  `UnflushedBytes` does.
