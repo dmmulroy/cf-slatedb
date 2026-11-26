@@ -16,8 +16,8 @@ import {
   BlockSource,
   type BlockSourceServices,
   type BlockSourceUnavailableError,
-  blockSourceLayer,
   blockSourceTestLayer,
+  hedgedBlockSourceLayer,
   type SstMissingError,
 } from "./block-source.ts";
 import {
@@ -183,7 +183,7 @@ export const blockCacheLayerWithoutDependencies = Layer.effect(BlockCache, makeB
 
 /** Provides the L1 cache over the `BlockServer` service binding and the configured budgets. */
 export const blockCacheLayer = blockCacheLayerWithoutDependencies.pipe(
-  Layer.provide(Layer.mergeAll(blockSourceLayer, lsmConfigurationLayer)),
+  Layer.provide(Layer.mergeAll(hedgedBlockSourceLayer, lsmConfigurationLayer)),
 );
 
 /** Provides the L1 cache over the in-memory object store (the test block source). */

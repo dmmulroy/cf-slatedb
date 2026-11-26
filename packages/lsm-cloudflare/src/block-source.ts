@@ -3,14 +3,20 @@ import type * as cf from "@cloudflare/workers-types";
 import type { DatabaseId, SstId } from "@shaledb/lsm-core";
 import { makeExecutionMemo } from "alchemy/Runtime/ExecutionMemo";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
-import { Context, Data, Effect, Layer, Option, type Scope } from "effect";
+import { Context, Data, Duration, Effect, Layer, Option, type Scope } from "effect";
 import { HttpClient } from "effect/http";
 import { HttpApiClient } from "effect/http-api";
 
 import { BlockServerHttpApi } from "./block-server-http-api.ts";
 import { BlockServerWorker } from "./block-server-worker.ts";
+import { LsmConfiguration, lsmConfigurationLayer } from "./lsm-configuration.ts";
 import { sstKey } from "./object-keys.ts";
-import { ObjectStore } from "./object-store.ts";
+import {
+  type IObjectReader,
+  ObjectReader,
+  objectReaderFromObjectStoreLayer,
+} from "./object-reader.ts";
+import { ObjectStore, objectStoreLayer } from "./object-store.ts";
 
 /** The requested SST is gone: the manifest that named it is stale. Reload the manifest and retry. */
 export class SstMissingError extends Data.TaggedError("SstMissingError")<{
@@ -196,8 +202,111 @@ export const makeBlockSource = Effect.gen(function* () {
   });
 });
 
-/** Provides the block source over the `BlockServer` service binding. */
+/** Reads a byte range of `owner`'s SST straight from the bucket, as the `BlockServer` does. */
+const readSstRangeFromBucket =
+  (getRange: IObjectReader["getRange"]) =>
+  (owner: DatabaseId, sstId: SstId, offset: number, length: number) =>
+    getRange(sstKey(owner, sstId), { offset, length }).pipe(
+      Effect.catchTags({
+        ObjectStoreUnavailableError: (error) =>
+          Effect.fail(
+            new BlockSourceUnavailableError({
+              owner,
+              sstId: Option.some(sstId),
+              message: error.message,
+            }),
+          ),
+      }),
+      Effect.flatMap((bytes) =>
+        Option.isSome(bytes) && bytes.value.length === length
+          ? Effect.succeed(bytes.value)
+          : Effect.fail(
+              new SstMissingError({
+                owner,
+                sstId,
+                message: `SST ${sstId} of database ${owner} does not exist.`,
+              }),
+            ),
+      ),
+    );
+
+/**
+ * `primary`, and once it has taken `hedgeAfterMs`, `direct` as well: whichever succeeds first.
+ *
+ * **Details**
+ *
+ * `primary` is a read through the `BlockServer`. Workers Cache answers most of them in a few
+ * milliseconds, but the slowest take hundreds of milliseconds to seconds (a miss pays the hop
+ * to the `BlockServer` on top of its bucket read; a rare hit is slow). `direct` reads the same
+ * immutable bytes from the bucket, which costs one more bucket read only when `primary` is slow.
+ *
+ * Only a success of `direct` counts. Its failures leave the outcome to `primary`, so a hedge never
+ * makes a read fail that `primary` would have answered, and every failure a caller sees is
+ * `primary`'s. The loser is interrupted. With `hedgeAfterMs` 0 this is `primary`.
+ */
+export const hedgedBlockRead = <A, E, R, E2, R2>(
+  primary: Effect.Effect<A, E, R>,
+  direct: Effect.Effect<A, E2, R2>,
+  hedgeAfterMs: number,
+): Effect.Effect<A, E, R | R2> =>
+  hedgeAfterMs <= 0
+    ? primary
+    : Effect.raceFirst(
+        primary,
+        Effect.sleep(Duration.millis(hedgeAfterMs)).pipe(
+          Effect.andThen(Effect.annotateCurrentSpan("block.hedged", true)),
+          Effect.andThen(direct),
+          Effect.tap(() => Effect.annotateCurrentSpan("block.hedge_won", true)),
+          Effect.catch(() => Effect.never),
+        ),
+      );
+
+/**
+ * Constructs the block source readers use: the `BlockServer` service binding, hedged with reads
+ * straight from the bucket after `blockReadHedgeAfterMs` (see {@link hedgedBlockRead}).
+ */
+export const makeHedgedBlockSource = Effect.gen(function* () {
+  const blockServer = yield* makeBlockSource;
+  const objects = yield* ObjectReader;
+  const settings = yield* LsmConfiguration;
+  const fromBucket = readSstRangeFromBucket(objects.getRange);
+  return BlockSource.of({
+    block: Effect.fn("BlockSource.block")(function* (
+      owner: DatabaseId,
+      sstId: SstId,
+      offset: number,
+      length: number,
+    ) {
+      return yield* hedgedBlockRead(
+        blockServer.block(owner, sstId, offset, length),
+        fromBucket(owner, sstId, offset, length),
+        settings.blockReadHedgeAfterMs,
+      );
+    }),
+    meta: Effect.fn("BlockSource.meta")(function* (
+      owner: DatabaseId,
+      sstId: SstId,
+      offset: number,
+      length: number,
+    ) {
+      return yield* hedgedBlockRead(
+        blockServer.meta(owner, sstId, offset, length),
+        fromBucket(owner, sstId, offset, length),
+        settings.blockReadHedgeAfterMs,
+      );
+    }),
+    purge: blockServer.purge,
+  });
+});
+
+/** Provides the block source over the `BlockServer` service binding alone (for purges). */
 export const blockSourceLayer = Layer.effect(BlockSource, makeBlockSource);
+
+/** Provides the hedged block source over the `BlockServer` service binding and the R2 bucket. */
+export const hedgedBlockSourceLayer = Layer.effect(BlockSource, makeHedgedBlockSource).pipe(
+  Layer.provide(objectReaderFromObjectStoreLayer),
+  Layer.provide(Layer.mergeAll(objectStoreLayer, lsmConfigurationLayer)),
+);
 
 /**
  * Provides a block source that reads ranges straight from the contextual (in-memory) object store,
@@ -207,30 +316,7 @@ export const blockSourceTestLayer = Layer.effect(
   BlockSource,
   Effect.gen(function* () {
     const objects = yield* ObjectStore;
-    const read = (owner: DatabaseId, sstId: SstId, offset: number, length: number) =>
-      objects.getRange(sstKey(owner, sstId), { offset, length }).pipe(
-        Effect.catchTags({
-          ObjectStoreUnavailableError: (error) =>
-            Effect.fail(
-              new BlockSourceUnavailableError({
-                owner,
-                sstId: Option.some(sstId),
-                message: error.message,
-              }),
-            ),
-        }),
-        Effect.flatMap((bytes) =>
-          Option.isSome(bytes) && bytes.value.length === length
-            ? Effect.succeed(bytes.value)
-            : Effect.fail(
-                new SstMissingError({
-                  owner,
-                  sstId,
-                  message: `SST ${sstId} of database ${owner} does not exist.`,
-                }),
-              ),
-        ),
-      );
+    const read = readSstRangeFromBucket(objects.getRange);
     return BlockSource.of({
       block: Effect.fn("BlockSource.block")(function* (
         owner: DatabaseId,
