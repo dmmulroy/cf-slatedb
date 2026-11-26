@@ -33,6 +33,8 @@ import {
   measureWriterMemory,
   measureWrites,
 } from "./measurements.ts";
+import { smoke } from "./smoke.ts";
+import { soak } from "./soak.ts";
 import { ScenarioStack, type ScenarioFailure } from "./scenario.ts";
 import { SCENARIOS } from "./scenarios.ts";
 
@@ -323,6 +325,98 @@ const measureSamplingCommand = Command.make(
   ),
 );
 
+const soakCommand = Command.make(
+  "soak",
+  {
+    stage: measureStage,
+    minutes: Flag.Int("minutes").pipe(Flag.withDefault(130)),
+    databases: Flag.Int("databases").pipe(Flag.withDefault(6)),
+    keysPerDatabase: Flag.Int("keys-per-database").pipe(Flag.withDefault(4000)),
+    redeployAt: Flag.Int("redeploy-at").pipe(
+      Flag.withDescription("Minute at which to redeploy the stage (production settings)"),
+      Flag.optional,
+    ),
+    splitAt: Flag.String("split-at").pipe(
+      Flag.withDescription("Comma-separated minutes at which to split the sharded group"),
+      Flag.withDefault("20,80"),
+    ),
+  },
+  ({ stage, minutes, databases, keysPerDatabase, redeployAt, splitAt }) =>
+    runMeasurement(
+      stage,
+      soak({
+        minutes,
+        databases,
+        keysPerDatabase,
+        redeployAtMinute: redeployAt,
+        splitAtMinutes: splitAt.split(",").map((minute) => Number(minute.trim())),
+      }),
+    ),
+).pipe(
+  Command.withDescription(
+    "Mixed workload with splits, snapshots, removals, and a redeploy; checks every acknowledged write at the end (D65)",
+  ),
+);
+
+const smokeCommand = Command.make(
+  "smoke",
+  {
+    stage: Flag.String("stage").pipe(
+      Flag.withDescription("A preview stage, whose URL and token preview-cli reads"),
+      Flag.optional,
+    ),
+    apiUrl: Flag.String("api-url").pipe(
+      Flag.withDescription(
+        "The API's URL (production: its apiUrl output); the token is read from CF_SLATEDB_TOKEN",
+      ),
+      Flag.optional,
+    ),
+  },
+  ({ stage, apiUrl }) =>
+    Effect.gen(function* () {
+      const target = yield* Option.match(stage, {
+        onSome: (name) =>
+          Effect.map(resolvePreview(name), ({ urls, token }) => ({ url: urls.apiUrl, token })),
+        onNone: () =>
+          Option.match(apiUrl, {
+            onNone: () =>
+              Effect.fail(
+                new ScenarioCliError({
+                  reason: "PreviewUnavailable",
+                  message: "Pass --stage <preview> or --api-url <url> (with CF_SLATEDB_TOKEN set).",
+                }),
+              ),
+            onSome: (url) => {
+              const token = process.env["CF_SLATEDB_TOKEN"];
+              return token === undefined || token === ""
+                ? Effect.fail(
+                    new ScenarioCliError({
+                      reason: "PreviewUnavailable",
+                      message: "Set CF_SLATEDB_TOKEN to one of the stage's access tokens.",
+                    }),
+                  )
+                : Effect.succeed({ url, token });
+            },
+          }),
+      });
+      const report = yield* smoke(target.url).pipe(
+        Effect.provide(
+          Layer.effect(
+            HttpClient.HttpClient,
+            Effect.map(HttpClient.HttpClient, (client) =>
+              client.pipe(HttpClient.mapRequest(HttpClientRequest.bearerToken(target.token))),
+            ),
+          ).pipe(Layer.provide(FetchHttpClient.layer)),
+        ),
+      );
+      yield* Console.log(JSON.stringify(report, null, 2));
+    }),
+).pipe(
+  Command.withDescription(
+    "Production-safe smoke test on its own databases, removed afterwards; no trace assertions (D65)",
+  ),
+);
+
 const measure = Command.make("measure").pipe(
   Command.withDescription("Measurements against a live preview stage; JSON results"),
   Command.withSubcommands([
@@ -378,7 +472,7 @@ const runScenarios = (names: ReadonlyArray<string>) =>
 
 const scenarioCli = Command.make("scenario").pipe(
   Command.withDescription("End-to-end scenarios for the local cf-slatedb Stack"),
-  Command.withSubcommands([list, run, measure]),
+  Command.withSubcommands([list, run, measure, soakCommand, smokeCommand]),
 );
 
 Command.run(scenarioCli, { version: "0.0.0" }).pipe(

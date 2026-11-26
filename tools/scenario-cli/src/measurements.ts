@@ -946,7 +946,7 @@ const measurementStore = (stage: string) =>
  * Pulls the stage's spans from the last `minutes` into its measurement store (resuming where the
  * last pull stopped).
  */
-const pullMeasurementSpans = (minutes: number) =>
+export const pullMeasurementSpans = (minutes: number) =>
   Effect.gen(function* () {
     const { previewStage } = yield* ScenarioStack;
     const stage = Option.getOrElse(previewStage, () => "local");
@@ -967,7 +967,7 @@ const pullMeasurementSpans = (minutes: number) =>
   });
 
 /** Spans `trace-cli grep` finds in `store` with `args` that started at or after `sinceMs`. */
-const spansSince = (store: string, sinceMs: number, args: ReadonlyArray<string>) =>
+export const spansSince = (store: string, sinceMs: number, args: ReadonlyArray<string>) =>
   Effect.gen(function* () {
     const result = yield* runTraceCli(["grep", "--json", "--store", store, ...args]);
     const step = `trace-cli grep ${args.join(" ")}`;
@@ -985,7 +985,7 @@ const spansSince = (store: string, sinceMs: number, args: ReadonlyArray<string>)
   });
 
 /** The type of the exception a failed span recorded, such as `WriteStalledError`. */
-const exceptionType = (span: typeof GreppedSpan.Type) => {
+export const exceptionType = (span: typeof GreppedSpan.Type) => {
   const type = span.events?.find((event) => event.name === "exception")?.attributes?.[
     "exception.type"
   ];

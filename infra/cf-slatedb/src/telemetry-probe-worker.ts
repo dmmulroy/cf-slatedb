@@ -8,6 +8,7 @@ import {
   lsmAccessGateFrom,
   lsmWorkerCompatibility,
   ObjectStore,
+  objectKindOfKey,
   objectStoreLayer,
   withLsmTracePolicy,
 } from "@cf-slatedb/lsm-cloudflare";
@@ -107,6 +108,51 @@ const damageObject = (objects: ObjectStore["Service"], url: URL) =>
     return HttpServerResponse.text("damaged");
   });
 
+/** Query of `GET /v1/probe/storage`: a database's prefix and the age that counts as old. */
+const StorageQuery = Schema.Struct({
+  prefix: Schema.String.check(Schema.isStartingWith("db/")),
+  olderThanMs: Schema.NumberFromString.pipe(
+    Schema.decodeTo(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  ),
+});
+const decodeStorageQuery = Schema.decodeUnknownOption(StorageQuery);
+
+/**
+ * What is stored under a prefix (`GET /storage`), by object kind: how many objects and bytes, and
+ * how many of them were uploaded more than `olderThanMs` ago. The soak uses it to check that GC
+ * keeps storage bounded (D65).
+ */
+const describeStorage = (objects: ObjectStore["Service"], url: URL) =>
+  Effect.gen(function* () {
+    const query = decodeStorageQuery(Object.fromEntries(url.searchParams));
+    if (Option.isNone(query)) {
+      return HttpServerResponse.text("prefix must start with db/ and olderThanMs be a duration", {
+        status: 400,
+      });
+    }
+    const now = yield* Clock.currentTimeMillis;
+    const kinds: Record<
+      string,
+      { objects: number; bytes: number; older: number; olderBytes: number }
+    > = {};
+    let cursor = Option.none<string>();
+    do {
+      const page = yield* objects.list(query.value.prefix, cursor);
+      for (const object of page.objects) {
+        const kind = objectKindOfKey(object.key);
+        const entry = (kinds[kind] ??= { objects: 0, bytes: 0, older: 0, olderBytes: 0 });
+        entry.objects += 1;
+        entry.bytes += object.sizeBytes;
+        if (now - object.uploadedAt > query.value.olderThanMs) {
+          entry.older += 1;
+          entry.olderBytes += object.sizeBytes;
+        }
+      }
+      cursor = page.cursor;
+    } while (Option.isSome(cursor));
+    return yield* HttpServerResponse.json({ prefix: query.value.prefix, kinds });
+  });
+
 const r2ProbeServerLayer = R2ProbeServer.make(
   Effect.gen(function* () {
     const objects = yield* ObjectStore;
@@ -116,6 +162,7 @@ const r2ProbeServerLayer = R2ProbeServer.make(
         const request = yield* HttpServerRequest.HttpServerRequest;
         const url = new URL(request.url, "http://probe");
         if (url.pathname.endsWith("/damage")) return yield* damageObject(objects, url);
+        if (url.pathname.endsWith("/storage")) return yield* describeStorage(objects, url);
         const query = yield* decodeR2ProbeQuery(
           Object.fromEntries(new URL(request.url, "http://probe").searchParams),
         ).pipe(Effect.option);
@@ -227,6 +274,18 @@ export const telemetryProbeWorkerLayer = TelemetryProbeWorker.make(
         Effect.gen(function* () {
           const request = yield* HttpServerRequest.HttpServerRequest;
           const url = new URL(request.url, "http://probe");
+          if (url.pathname.endsWith("/storage")) {
+            const storage = Cloudflare.toHttpClient(
+              inLsmJurisdiction(r2Probes, jurisdiction).getByName("damage"),
+            );
+            const described = yield* storage.execute(
+              HttpClientRequest.get(`http://probe/storage${url.search}`),
+            );
+            return HttpServerResponse.text(yield* described.text, {
+              status: described.status,
+              contentType: "application/json",
+            });
+          }
           if (url.pathname.endsWith("/damage") && request.method === "POST") {
             // The object store needs a Durable Object's runtime context; any R2 probe object will do.
             const damager = Cloudflare.toHttpClient(
