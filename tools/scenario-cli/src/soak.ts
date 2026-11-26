@@ -11,6 +11,7 @@ import { HttpApiClient } from "effect/http-api";
 import {
   exceptionType,
   forEachInvocationRecord,
+  invocationsRepresentedBy,
   measureHealth,
   pullMeasurementSpans,
   spansSince,
@@ -712,7 +713,11 @@ export const soak = (options: SoakOptions) =>
           const worker =
             Option.getOrElse(record.scriptName, () => "unknown").split("-")[1] ?? "unknown";
           const key = `${worker} ${record.outcome}`;
-          invocationOutcomes.set(key, (invocationOutcomes.get(key) ?? 0) + 1);
+          // A kept `ok` record stands for `1 / sampleRate` invocations (D71).
+          invocationOutcomes.set(
+            key,
+            (invocationOutcomes.get(key) ?? 0) + invocationsRepresentedBy(record),
+          );
           if (
             ["exceededCpu", "exceededMemory", "exception"].includes(record.outcome) &&
             limitHits.length < 50
@@ -1016,7 +1021,9 @@ export const soak = (options: SoakOptions) =>
       storage,
       spansChecked,
       invocationsChecked: invocationsSeen,
-      invocationOutcomes: Object.fromEntries(invocationOutcomes),
+      invocationOutcomes: Object.fromEntries(
+        [...invocationOutcomes].map(([outcome, count]) => [outcome, Math.round(count)]),
+      ),
       errorsByException: Object.fromEntries(errorsByException),
       unexpectedErrors: Object.fromEntries(unexpectedErrors),
       health: Option.getOrNull(health),

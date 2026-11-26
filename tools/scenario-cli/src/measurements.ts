@@ -212,8 +212,19 @@ const InvocationRecord = Schema.Struct({
   eventTimestamp: Schema.OptionFromNullOr(Schema.Number),
   cpuTimeMs: Schema.Number,
   wallTimeMs: Schema.Number,
+  // Absent in records from before D71, which were all kept.
+  sampleRate: Schema.optional(Schema.Number),
 });
 export type InvocationRecord = typeof InvocationRecord.Type;
+
+/**
+ * How many invocations a kept record stands for: the Tail Worker keeps every invocation that did
+ * not end `ok` and a sampled fraction of the rest (D71).
+ */
+export const invocationsRepresentedBy = (record: InvocationRecord): number => {
+  const rate = record.sampleRate ?? 1;
+  return rate > 0 ? 1 / rate : 1;
+};
 
 const TailPage = Schema.Struct({
   batches: Schema.Array(Schema.Struct({ key: Schema.String, body: Schema.String })),
@@ -1057,6 +1068,23 @@ const tally = (values: ReadonlyArray<string>) =>
     ].sort((left, right) => right[1] - left[1]),
   );
 
+/** Invocations by outcome, most frequent first, scaled up from the kept records (D71). */
+const estimatedOutcomes = (records: ReadonlyArray<InvocationRecord>) =>
+  Object.fromEntries(
+    [
+      ...records.reduce(
+        (counts, record) =>
+          counts.set(
+            record.outcome,
+            (counts.get(record.outcome) ?? 0) + invocationsRepresentedBy(record),
+          ),
+        new Map<string, number>(),
+      ),
+    ]
+      .map(([outcome, count]): readonly [string, number] => [outcome, Math.round(count)])
+      .sort((left, right) => right[1] - left[1]),
+  );
+
 /** The operations {@link measureLatency} reports, each a span the API Worker records per request. */
 const LATENCY_OPERATIONS: ReadonlyArray<{
   readonly operation: string;
@@ -1194,7 +1222,10 @@ export const measureHealth = (minutes: number) =>
       [...workers].map(([worker, list]) => [
         worker,
         {
-          outcomes: tally(list.map((record) => record.outcome)),
+          // Estimated from the kept records: every invocation that did not end `ok` is kept,
+          // and each kept `ok` record stands for `1 / sampleRate` invocations (D71).
+          outcomes: estimatedOutcomes(list),
+          recordsKept: list.length,
           cpuMs: summarize(list.map((record) => record.cpuTimeMs)),
         },
       ]),
