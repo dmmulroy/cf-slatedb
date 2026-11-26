@@ -11,6 +11,8 @@
  * - `url <stage>` prints one stage's URLs.
  * - `token <stage>` prints the stage's access token (its Workers answer `401` without it).
  * - `collector <stage>` prints the stage's trace collector URL and token (for `trace-cli pull`).
+ * - `trace-token <stage>` writes only the trace collector token of any live stage, `production`
+ *   included, into a pipe or command substitution (for `SHALEDB_TRACE_TOKEN`); never to a terminal.
  * - `bindings <stage>` prints the engine settings and jurisdiction each Worker is bound.
  * - `destroy-command <stage>` prints the command that tears a stage down. It never runs it.
  */
@@ -28,6 +30,8 @@ import {
   deployTask,
   describeBoundLsmSettings,
   destroyCommand,
+  LIVE_STAGES,
+  type LiveStage,
   parseStateRead,
   PREVIEW_DEV_TIMINGS,
   PREVIEW_STAGES,
@@ -36,6 +40,8 @@ import {
   previewSecret,
   previewWorkerBindings,
   encodePreviewOutputs,
+  traceCollectorToken,
+  traceTokenRefusal,
   type PreviewOutputs,
   type PreviewStage,
   type PreviewStatus,
@@ -44,12 +50,13 @@ import {
 
 /**
  * Failure the preview CLI reports to the person running it, exiting non-zero. `reason` is
- * `DeployFailed` when the deploy task exited non-zero, `NotDeployed` when the stage has no Stack, and
- * `TokenMissing` when a deployed stage has no access token.
+ * `DeployFailed` when the deploy task exited non-zero, `NotDeployed` when the stage has no Stack,
+ * `TokenMissing` when a deployed stage has no access token, and `OutputIsTerminal` when
+ * `trace-token` was asked to write a token to a terminal.
  */
 class PreviewCliError extends Data.TaggedError("PreviewCliError")<{
-  readonly reason: "DeployFailed" | "NotDeployed" | "TokenMissing";
-  readonly stage: PreviewStage;
+  readonly reason: "DeployFailed" | "NotDeployed" | "TokenMissing" | "OutputIsTerminal";
+  readonly stage: LiveStage;
   readonly message: string;
 }> {}
 
@@ -68,7 +75,7 @@ const stageArgument = Argument.Literals("stage", PREVIEW_STAGES).pipe(
 );
 
 /** Reads every state record under `Shaledb[/<stage>]` through the read-only `state:read` task. */
-const readStateRecords = (stage: Option.Option<PreviewStage>) =>
+const readStateRecords = (stage: Option.Option<LiveStage>) =>
   Effect.gen(function* () {
     const path = Option.match(stage, {
       onNone: () => SHALEDB_STACK_NAME,
@@ -304,6 +311,34 @@ const collector = Command.make(
   ),
 );
 
+// A read of state, like `collector`: it accepts production, which `deploy` never does.
+const traceToken = Command.make(
+  "trace-token",
+  {
+    stage: Argument.Literals("stage", LIVE_STAGES).pipe(
+      Argument.withDescription("Live stage: preview-1, preview-2, preview-3, or production"),
+    ),
+  },
+  ({ stage }) =>
+    Effect.gen(function* () {
+      // Refused before the state is read, so nothing is fetched for a terminal.
+      const refusal = traceTokenRefusal(stage, process.stdout.isTTY === true);
+      if (Option.isSome(refusal)) {
+        return yield* new PreviewCliError({
+          stage,
+          reason: "OutputIsTerminal",
+          message: refusal.value,
+        });
+      }
+      const value = yield* traceCollectorToken(yield* readStateRecords(Option.some(stage)), stage);
+      yield* Console.log(value);
+    }),
+).pipe(
+  Command.withDescription(
+    "Write a live stage's trace collector token (production included) into a pipe or command substitution, for SHALEDB_TRACE_TOKEN",
+  ),
+);
+
 const bindings = Command.make(
   "bindings",
   { stage: stageArgument, json: jsonFlag },
@@ -355,7 +390,7 @@ const destroy = Command.make(
 
 const previewCli = Command.make("preview").pipe(
   Command.withDescription("Deploy and inspect shaledb's live preview stages"),
-  Command.withSubcommands([deploy, status, url, token, collector, bindings, destroy]),
+  Command.withSubcommands([deploy, status, url, token, collector, traceToken, bindings, destroy]),
 );
 
 Command.run(previewCli, { version: "0.0.0" }).pipe(

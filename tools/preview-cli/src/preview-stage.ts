@@ -10,6 +10,18 @@ export type PreviewStage = typeof PreviewStage.Type;
 /** Every preview stage, in order. */
 export const PREVIEW_STAGES: ReadonlyArray<PreviewStage> = PreviewStage.literals;
 
+/**
+ * Schema for a live stage whose trace collector token `preview-cli trace-token` prints: a preview,
+ * or `production`. Only reads accept it; `deploy` accepts {@link PreviewStage} alone.
+ */
+export const LiveStage = Schema.Literals(["preview-1", "preview-2", "preview-3", "production"]);
+
+/** A live stage: a preview or production. */
+export type LiveStage = typeof LiveStage.Type;
+
+/** Every live stage `trace-token` reads, previews first. */
+export const LIVE_STAGES: ReadonlyArray<LiveStage> = LiveStage.literals;
+
 /** Name of the Alchemy Stack every preview deploys (`infra/shaledb/alchemy.run.ts`). */
 export const SHALEDB_STACK_NAME = "Shaledb";
 
@@ -81,11 +93,11 @@ export type StateRecords = ReadonlyMap<string, unknown>;
 
 /**
  * The Alchemy state store could not be read, or a record in it does not have the expected shape.
- * `reason` is `StateUnreadable` when `alchemy state read` failed and `StateRecordInvalid` when a
- * record did not parse.
+ * `reason` is `StateUnreadable` when `alchemy state read` failed, `StateRecordInvalid` when a
+ * record did not parse, and `StateRecordMissing` when a record a command needs is not there.
  */
 export class PreviewStateError extends Data.TaggedError("PreviewStateError")<{
-  readonly reason: "StateUnreadable" | "StateRecordInvalid";
+  readonly reason: "StateUnreadable" | "StateRecordInvalid" | "StateRecordMissing";
   /** The state path read (`Shaledb[/<stage>[/<record>]]`). */
   readonly path: string;
   readonly message: string;
@@ -167,7 +179,7 @@ export type PreviewSecret = "LsmAccessToken" | "TraceCollectorToken";
  */
 export const previewSecret = Effect.fn("PreviewStage.previewSecret")(function* (
   records: StateRecords,
-  stage: PreviewStage,
+  stage: LiveStage,
   secret: PreviewSecret,
 ) {
   const path = `${SHALEDB_STACK_NAME}/${stage}/${secret}`;
@@ -179,12 +191,58 @@ export const previewSecret = Effect.fn("PreviewStage.previewSecret")(function* (
         new PreviewStateError({
           reason: "StateRecordInvalid",
           path,
-          message: `${path} does not hold a generated token. Redeploy ${stage} with \`preview-cli deploy ${stage}\`.`,
+          message: `${path} does not hold a generated token. ${redeployAdvice(stage)}`,
         }),
     ),
   );
   return Option.some(decoded.attr.text.__redacted__);
 });
+
+/** How a stage's missing or broken state is put right: the preview CLI's deploy, or production's task. */
+const redeployAdvice = (stage: LiveStage) =>
+  stage === "production"
+    ? 'Deploy production (docs/operations.md, "Deploying") and run this again.'
+    : `Redeploy ${stage} with \`preview-cli deploy ${stage}\`.`;
+
+/**
+ * A live stage's trace collector token (`TraceCollectorToken`, held in its Alchemy state on every
+ * live stage, production included), for `trace-cli` and `scenario-cli measure` with
+ * `--collector-url`. Unlike the access tokens (D64), it grants reading the stage's spans and tail
+ * records, not its databases.
+ *
+ * @returns The token, or `PreviewStateError`: `StateRecordMissing` when the stage has no collector
+ *   token (nothing deployed there yet), `StateRecordInvalid` when its record holds no token.
+ */
+export const traceCollectorToken = Effect.fn("PreviewStage.traceCollectorToken")(function* (
+  records: StateRecords,
+  stage: LiveStage,
+) {
+  const token = yield* previewSecret(records, stage, "TraceCollectorToken");
+  if (Option.isNone(token)) {
+    const path = `${SHALEDB_STACK_NAME}/${stage}/TraceCollectorToken`;
+    return yield* new PreviewStateError({
+      reason: "StateRecordMissing",
+      path,
+      message: `${stage} has no trace collector token: ${path} is not in the Alchemy state store, so nothing has deployed its trace collector. ${redeployAdvice(stage)}`,
+    });
+  }
+  return token.value;
+});
+
+/**
+ * Why `trace-token` will not print to standard output, or `None` when it may: it writes a token only
+ * into a pipe or a command substitution, never to a terminal, where it would stay on the screen and
+ * in the scrollback.
+ */
+export const traceTokenRefusal = (
+  stage: LiveStage,
+  stdoutIsTerminal: boolean,
+): Option.Option<string> =>
+  stdoutIsTerminal
+    ? Option.some(
+        `trace-token writes ${stage}'s trace collector token only into a pipe or a command substitution, not to a terminal. Put it in the environment without showing it: export SHALEDB_TRACE_TOKEN="$(node tools/preview-cli/src/preview-cli.ts trace-token ${stage})"`,
+      )
+    : Option.none();
 
 /**
  * Deploy variables the preview CLI decides from its flags. The Stack resolves the rest of its
