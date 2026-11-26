@@ -19,7 +19,7 @@ import { HttpClientRequest, HttpServerRequest, HttpServerResponse } from "effect
 
 import { shaledbAccessTokens } from "./shaledb-access-tokens.ts";
 import { shaledbWorkerSettings } from "./shaledb-stack-config.ts";
-import { shaledbTelemetry } from "./shaledb-telemetry.ts";
+import { shaledbTailConsumers, shaledbTelemetry } from "./shaledb-telemetry.ts";
 
 interface TelemetryProbeServerContract {
   readonly fetch: HttpEffect<RuntimeContext>;
@@ -216,6 +216,78 @@ const r2ProbeServerLayer = R2ProbeServer.make(
   }),
 );
 
+interface PlainSqliteServerContract {
+  readonly fetch: HttpEffect<RuntimeContext>;
+}
+
+/**
+ * The comparison baseline for `scenario-cli measure baseline` (D75): a key-value store that is
+ * nothing but one Durable Object's SQLite table. `POST /batches` takes the public API's write
+ * batch body (puts only) and commits it in one transaction; `POST /get` returns one key's value.
+ * No flush, no R2, no manifest, no compaction, no snapshots: what an application gets by keeping
+ * its rows in a Durable Object and nothing else. Local and preview stages only.
+ */
+export class PlainSqliteServer extends Cloudflare.DurableObject<
+  PlainSqliteServer,
+  PlainSqliteServerContract
+>()("PlainSqliteServer") {}
+
+const PlainSqliteBatch = Schema.Struct({
+  operations: Schema.Array(
+    Schema.Struct({ key: Schema.Uint8ArrayFromBase64, value: Schema.Uint8ArrayFromBase64 }),
+  ),
+});
+const decodePlainSqliteBatch = Schema.decodeUnknownEffect(Schema.fromJsonString(PlainSqliteBatch));
+const PlainSqliteGet = Schema.Struct({ key: Schema.Uint8ArrayFromBase64 });
+const decodePlainSqliteGet = Schema.decodeUnknownEffect(Schema.fromJsonString(PlainSqliteGet));
+const encodeBase64 = Schema.encodeSync(Schema.Uint8ArrayFromBase64);
+
+const plainSqliteServerLayer = PlainSqliteServer.make(
+  Effect.gen(function* () {
+    const state = yield* Cloudflare.DurableObjectState;
+    const withEventTelemetryFlush = yield* eventTelemetryFlushForStage;
+    return Effect.sync(() => {
+      const storage = state.raw.storage;
+      storage.sql.exec(
+        "CREATE TABLE IF NOT EXISTS kv (key BLOB PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID",
+      );
+      return {
+        fetch: Effect.gen(function* () {
+          const request = yield* HttpServerRequest.HttpServerRequest;
+          const body = yield* request.text;
+          if (request.url.endsWith("/batches")) {
+            const batch = yield* decodePlainSqliteBatch(body);
+            storage.transactionSync(() => {
+              for (const { key, value } of batch.operations) {
+                storage.sql.exec(
+                  "INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                  key.slice().buffer,
+                  value.slice().buffer,
+                );
+              }
+            });
+            return yield* HttpServerResponse.json({ rows: batch.operations.length });
+          }
+          const { key } = yield* decodePlainSqliteGet(body);
+          const [row] = storage.sql
+            .exec("SELECT value FROM kv WHERE key = ?", key.slice().buffer)
+            .toArray();
+          const value = row?.["value"];
+          return yield* HttpServerResponse.json({
+            value: value instanceof ArrayBuffer ? encodeBase64(new Uint8Array(value)) : null,
+          });
+        }).pipe(
+          Effect.catchCause(() =>
+            Effect.succeed(HttpServerResponse.text("plain-sqlite-failed", { status: 500 })),
+          ),
+          Effect.withSpan("PlainSqliteServer.fetch"),
+          withEventTelemetryFlush,
+        ),
+      };
+    });
+  }),
+);
+
 /**
  * Whether a stage deploys the probe Worker, a test tool: local and preview stages only. Production
  * (and any other live stage) never has it, so its fault injection (`POST /v1/probe/damage`) cannot
@@ -249,8 +321,11 @@ const decodeR2ProbeRegion = Schema.decodeUnknownOption(R2ProbeRegion);
 export class TelemetryProbeWorker extends Cloudflare.Worker<
   TelemetryProbeWorker,
   { readonly fetch: HttpEffect<RuntimeContext> },
-  TelemetryProbeServer | R2ProbeServer
+  TelemetryProbeServer | R2ProbeServer | PlainSqliteServer
 >()("TelemetryProbeWorker") {}
+
+/** `/v1/probe/sqlite/<name>/batches` or `/get`: a {@link PlainSqliteServer} and what to ask it. */
+const PLAIN_SQLITE_PATH = /\/sqlite\/([A-Za-z0-9_-]{1,64})\/(batches|get)$/;
 
 /** Worker Layer for {@link TelemetryProbeWorker}. */
 export const telemetryProbeWorkerLayer = TelemetryProbeWorker.make(
@@ -258,12 +333,15 @@ export const telemetryProbeWorkerLayer = TelemetryProbeWorker.make(
     return {
       main: import.meta.url,
       compatibility: yield* lsmWorkerCompatibility,
+      // Tail records for the comparison baseline's invocations (D75).
+      tailConsumers: yield* shaledbTailConsumers,
       dev: { host: "127.0.0.1", port: 8790 },
     };
   }),
   Effect.gen(function* () {
     const namespace = yield* TelemetryProbeServer;
     const r2Probes = yield* R2ProbeServer;
+    const plainSqlite = yield* PlainSqliteServer;
     const jurisdiction = yield* lsmJurisdiction;
     const withEventTelemetryFlush = yield* eventTelemetryFlushForStage;
     const withAccessGate = yield* lsmAccessGateFrom(shaledbAccessTokens);
@@ -274,6 +352,22 @@ export const telemetryProbeWorkerLayer = TelemetryProbeWorker.make(
         Effect.gen(function* () {
           const request = yield* HttpServerRequest.HttpServerRequest;
           const url = new URL(request.url, "http://probe");
+          const plain = PLAIN_SQLITE_PATH.exec(url.pathname);
+          if (plain !== null && request.method === "POST") {
+            const [, name = "", operation = ""] = plain;
+            const store = Cloudflare.toHttpClient(
+              inLsmJurisdiction(plainSqlite, jurisdiction).getByName(name),
+            );
+            const answered = yield* store.execute(
+              HttpClientRequest.post(`http://probe/${operation}`).pipe(
+                HttpClientRequest.bodyText(yield* request.text, "application/json"),
+              ),
+            );
+            return HttpServerResponse.text(yield* answered.text, {
+              status: answered.status,
+              contentType: "application/json",
+            });
+          }
           if (url.pathname.endsWith("/storage")) {
             const storage = Cloudflare.toHttpClient(
               inLsmJurisdiction(r2Probes, jurisdiction).getByName("damage"),
@@ -334,6 +428,7 @@ export const telemetryProbeWorkerLayer = TelemetryProbeWorker.make(
   }).pipe(
     Effect.provide(telemetryProbeServerLayer),
     Effect.provide(r2ProbeServerLayer),
+    Effect.provide(plainSqliteServerLayer),
     Effect.provide(objectStoreLayer),
     Effect.provide(withLsmTracePolicy(shaledbTelemetry("shaledb-telemetry-probe"))),
   ),
