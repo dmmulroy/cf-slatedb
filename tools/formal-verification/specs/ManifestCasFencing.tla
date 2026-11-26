@@ -16,10 +16,11 @@
 (*    read the hint and GC's manifest boundary, probe forward from         *)
 (*    max(hint, boundary + 1) to the first missing id; a missing start     *)
 (*    falls back to listing (the newest id).                               *)
-(*    ManifestReader.loadLatestFrom(k), for a manifest k whose commit was  *)
-(*    reported (the writer's last flush, which a reader learns from the    *)
-(*    writer's probe, D67): probe forward from k when it is stored and     *)
-(*    above the boundary, otherwise loadLatest.                            *)
+(*    ManifestReader.loadLatestFrom(k), for a stored manifest k (the       *)
+(*    writer's last flush, which a reader learns from the writer's probe,  *)
+(*    or the manifest the reader loaded before, D67): when k is stored and *)
+(*    above the boundary, k itself if k + 1 is missing, else probe forward *)
+(*    from the later of k + 1 and the hint; otherwise loadLatest.          *)
 (*  - lsm-core/src/manifest.ts fenceWriter, fenceCompactor, commitL0Flush  *)
 (*    (writer epoch check, idempotent retry), commitCompaction (compactor  *)
 (*    epoch check, inputs-present check).                                  *)
@@ -105,9 +106,12 @@ LoadLatest == IF Exists(Start) THEN ProbeFrom(Start) ELSE Head
 \* boundary nothing is deleted and ids are contiguous up to the newest, so a stored k there is a
 \* sound place to probe from; at or below it a missing k + 1 may be a gap GC left beside a
 \* manifest a checkpoint keeps, so the reader starts over with loadLatest.
+\* A superseded k continues from the hint when that names a stored manifest further along.
+KnownStart(k) == IF hint > k + 1 /\ Exists(hint) THEN hint ELSE k + 1
 LoadLatestFrom(k) ==
   IF Exists(k) /\ (k > boundary \/ Broken = "knownIgnoresBoundary")
-  THEN ProbeFrom(k) ELSE LoadLatest
+  THEN IF Exists(k + 1) THEN ProbeFrom(KnownStart(k)) ELSE k
+  ELSE LoadLatest
 
 Init ==
   /\ store = [i \in Ids |-> IF i = 1 THEN Empty ELSE NoManifest]
@@ -403,9 +407,10 @@ AckedDataVisible == acked \subseteq Data(store[Head])
 \* loadLatest finds the newest manifest, however far the hint lags or which manifests GC deleted.
 LoadFindsHead == LoadLatest = Head
 
-\* loadLatestFrom finds the newest manifest from any manifest a committer was told it committed,
-\* however long ago, whatever was committed after it and whichever manifests GC deleted.
-LoadFromKnownFindsHead == \A k \in reported : LoadLatestFrom(k) = Head
+\* loadLatestFrom finds the newest manifest from any manifest that is stored (one a committer was
+\* told it committed, or one a reader loaded), however long ago, whatever was committed after it
+\* and whichever manifests GC deleted.
+LoadFromKnownFindsHead == \A k \in Ids : Exists(k) => LoadLatestFrom(k) = Head
 
 \* Compactions never duplicate data into both L0 and the sorted run (inputs are replaced exactly).
 NoDoubleReference == \A s \in store[Head].l0 : sstData[s] \cap UNION {sstData[r] : r \in store[Head].runs} = {}

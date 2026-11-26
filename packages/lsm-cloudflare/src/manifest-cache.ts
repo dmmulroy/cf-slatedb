@@ -138,7 +138,15 @@ export const makeManifestCache = Effect.gen(function* () {
     });
 
   const refresh = Effect.fn("ManifestCache.refresh")(function* (databaseId: DatabaseId) {
-    return yield* loadWith(databaseId, reader.loadLatest(databaseId));
+    // The search starts from the manifest this isolate loaded last, when it has one: on a
+    // database that committed nothing since, that is one round trip instead of two.
+    const cached = (yield* Ref.get(entries)).get(databaseId);
+    return yield* loadWith(
+      databaseId,
+      cached === undefined
+        ? reader.loadLatest(databaseId)
+        : reader.loadLatestFrom(databaseId, cached.versioned.id),
+    );
   });
 
   const recent = (databaseId: DatabaseId) =>

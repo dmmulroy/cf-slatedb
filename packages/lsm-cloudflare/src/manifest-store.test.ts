@@ -358,6 +358,83 @@ describe("ManifestStore", () => {
     expect(outcome).toEqual([2, 4, 4, 4, 4]);
   });
 
+  /** Runs `effect` and returns its value with the name of every span it started. */
+  const withSpanNames = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    Effect.gen(function* () {
+      const names: Array<string> = [];
+      const recording = Tracer.make({
+        span: (options) => {
+          names.push(options.name);
+          return new Tracer.NativeSpan(options);
+        },
+      });
+      const value = yield* Effect.withTracer(effect, recording);
+      return { value, names };
+    });
+  const manifestReads = (names: ReadonlyArray<string>) =>
+    names.filter((name) => name === "ManifestReader.load").length;
+
+  it("from a known manifest far behind, continues from the LATEST hint instead of one id at a time (D67)", async () => {
+    const outcome = await runWithCache(
+      Effect.gen(function* () {
+        yield* initialize;
+        const store = yield* ManifestStore;
+        const reader = yield* ManifestReader;
+        const objects = yield* ObjectStore;
+        for (let n = 1; n <= 8; n++) yield* store.update(DB, flushEdit(n, WriterEpoch.make(0)));
+        const hint = (id: number) =>
+          objects.put(latestManifestKey(DB), new TextEncoder().encode(String(id)));
+        // Manifest 2 was superseded seven times; the hint names 8: read 2 and 3, then 8, 9, 10.
+        yield* hint(8);
+        const jumped = yield* withSpanNames(reader.loadLatestFrom(DB, ManifestId.make(2)));
+        // A hint behind the known manifest is ignored: 8 and 9, then 10.
+        yield* hint(3);
+        const behind = yield* withSpanNames(reader.loadLatestFrom(DB, ManifestId.make(8)));
+        // A hint naming a manifest that is not stored is not trusted: every id after 2 is read.
+        yield* hint(50);
+        const bogus = yield* withSpanNames(reader.loadLatestFrom(DB, ManifestId.make(2)));
+        return {
+          ids: [jumped.value.id, behind.value.id, bogus.value.id],
+          reads: [jumped.names, behind.names, bogus.names].map(manifestReads),
+        };
+      }),
+    );
+    expect(outcome).toEqual({ ids: [9, 9, 9], reads: [5, 3, 11] });
+  });
+
+  it("the cache refreshes from the manifest it holds: one round of reads while nothing was committed since (D67)", async () => {
+    const outcome = await runWithCache(
+      Effect.gen(function* () {
+        yield* initialize;
+        const cache = yield* ManifestCache;
+        const store = yield* ManifestStore;
+        // Nothing cached: the hint and the boundary first, then the manifest and the id after it.
+        const cold = yield* withSpanNames(cache.current(DB));
+        yield* TestClock.adjust("2 seconds");
+        // Cached and unchanged: the held manifest and the id after it, read with the hint and
+        // the boundary.
+        const unchanged = yield* withSpanNames(cache.current(DB));
+        yield* store.update(DB, flushEdit(1, WriterEpoch.make(0)));
+        yield* TestClock.adjust("2 seconds");
+        const superseded = yield* withSpanNames(cache.current(DB));
+        return {
+          ids: [cold.value.id, unchanged.value.id, superseded.value.id],
+          cold: cold.names.filter((name) => name.startsWith("ManifestReader.loadLatest")),
+          unchanged: unchanged.names.filter((name) => name.startsWith("ManifestReader.loadLatest")),
+          unchangedReads: manifestReads(unchanged.names),
+          supersededReads: manifestReads(superseded.names),
+        };
+      }),
+    );
+    expect(outcome).toEqual({
+      ids: [1, 1, 2],
+      cold: ["ManifestReader.loadLatest"],
+      unchanged: ["ManifestReader.loadLatestFrom"],
+      unchangedReads: 2,
+      supersededReads: 3,
+    });
+  });
+
   it("a covering hit vouches for the cached manifest: Flushed reads use it for another refresh interval, not longer (D67)", async () => {
     const outcome = await runWithCache(
       Effect.gen(function* () {
