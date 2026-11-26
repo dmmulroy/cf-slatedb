@@ -243,6 +243,15 @@ hand-off is below.
   - **Verified.** `vp run ready` exit 0, `vp run verify` exit 0 (28/28), 13/13 scenarios locally
     and on `preview-3` (`--dev-timings`), 5-minute soaks passing on `preview-2` and `preview-3`
     for each arm. Thirty-five mutations of the new code are each caught by a test.
+  - **A fork keeps its hold while a reader may hold a manifest that reads the source (D77).** A
+    fork released its hold seconds after its rewrite. Its snapshot from before the rewrite, cached
+    manifests, and fence-in transactions then failed once the source collected or was removed.
+    A fork of a fork could also release its hold on the middle database before its own rewrite.
+    The fork's own collection now releases the hold, once no manifest GC keeps names another
+    database's SST. The source of a split lives about `gcMinAge` longer. Tests in
+    `database-lifecycle.test.ts`, `garbage-collector.test.ts`, and `manifest.test.ts` fail on the
+    code before. `GcSafety` gains `GcSafetyFork.cfg` (`ForkReadsComplete`, broken variant
+    `earlyForkRelease`). Not yet run in workerd or on a preview.
 
 ## Remaining-work log
 

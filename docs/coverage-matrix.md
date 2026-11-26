@@ -344,13 +344,17 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 - **Zero-copy `forkRange` (SST views + external references)** — done. `forkManifest` (lsm-core),
   `DatabaseLifecycle.forkRange` (hold taken in a CAS that re-checks the caller's checkpoint;
   idempotent retry; wakes the fork's compactor), fork rewrite (`planCompactions` full compaction
-  while external SSTs remain), release (`releasableExternalRefs`, `Compactor.releaseExternalRefs`,
-  D13 for forks of forks). Tests: `database-lifecycle.test.ts` (split, rewrite, release; shown
-  failing without release or with duplicate holds), `size-tiered-compaction-scheduler.test.ts`,
+  while external SSTs remain), release by the fork's own collection once no manifest GC keeps names another database's SST
+  (`releasableExternalRefs` in `GarbageCollector.collect`, D77; D13 for forks of forks; the
+  sweep asks a rewritten fork to collect). Tests: `database-lifecycle.test.ts` (split, rewrite,
+  release `gcMinAge` later; a fork snapshot from before the rewrite readable until then; a fork of
+  a fork's holds kept down the chain; shown failing without release or with duplicate holds, and
+  with the release rule before D77), `garbage-collector.test.ts` (the sweep), `size-tiered-compaction-scheduler.test.ts`,
   `manifest.test.ts`, `writer.workerd.ts`. Formal: `SealSplit` (`EveryAckedWriteInExactlyOneSuccessor`),
-  `GcSafety` (`PinnedManifestsComplete`). D37, D38.
+  `GcSafety` (`PinnedManifestsComplete`; `ForkReadsComplete` in `GcSafetyFork.cfg`, broken
+  variant `earlyForkRelease`). D37, D38, D77.
 - **GC per database respecting fork checkpoints** — done. `garbage-collector.ts` lists only
-  `db/<id>/`; pinned manifests and their SSTs are kept; forks release their holds once rewritten;
+  `db/<id>/`; pinned manifests and their SSTs are kept; forks release their holds once no kept manifest reads their source (D77);
   a prefix left without a manifest (an interrupted removal) is swept after `gcMinAge`
   (`garbage-collector.test.ts`). Formal: `GcSafety`.
 - **`DatabaseLifecycle.create`/`remove` (`DatabaseHasDependentsError`, purge `db:<id>`)** — done.
