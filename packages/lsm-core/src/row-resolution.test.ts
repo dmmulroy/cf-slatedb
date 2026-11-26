@@ -1,4 +1,4 @@
-import { Arbitrary, Option, Result, Schema } from "effect";
+import { Arbitrary, Effect, Option, Result, Schema, Stream } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 
 import { SeqNum, Timestamp } from "./ids.ts";
@@ -10,7 +10,12 @@ import {
   rowsFromWrites,
   sortRows,
 } from "./lsm-core-arbitraries.ts";
-import { MERGE_OPERATORS, resolveVisibleRow, retainKeyVersions } from "./row-resolution.ts";
+import {
+  keepReachableVersions,
+  MERGE_OPERATORS,
+  resolveVisibleRow,
+  retainKeyVersions,
+} from "./row-resolution.ts";
 import { type Row, RowValue } from "./row.ts";
 
 const smallInt = (minimum: number, maximum: number) =>
@@ -34,6 +39,92 @@ const sameValue = (visible: Option.Option<Row>, expected: Uint8Array | undefined
       row.value._tag === "Value" &&
       keyToHex(row.value.bytes) === keyToHex(expected),
   });
+
+describe("keepReachableVersions", () => {
+  /** A history in which the rows of one flush window are replaced by the versions it keeps. */
+  const withWindowKept = (rows: ReadonlyArray<Row>, after: number, upTo: number, chunk: number) => {
+    const inWindow = (row: Row) => row.seq > after && row.seq <= upTo;
+    const kept = Effect.runSync(
+      Stream.runCollect(
+        keepReachableVersions(
+          Stream.fromIterable(sortRows(rows.filter(inWindow))).pipe(Stream.rechunk(chunk)),
+        ),
+      ),
+    );
+    return { kept, history: [...rows.filter((row) => !inWindow(row)), ...kept] };
+  };
+
+  it("drops only versions no read at or after the window's newest row can reach", () => {
+    assertProperty(
+      Arbitrary.all({
+        writes: narrowHistoryArbitrary(60),
+        afterFraction: smallInt(0, 100),
+        upToFraction: smallInt(0, 100),
+        snapshotFraction: smallInt(0, 100),
+        nowOffset: smallInt(0, 120),
+        chunk: smallInt(1, 7),
+      }),
+      ({ writes, afterFraction, upToFraction, snapshotFraction, nowOffset, chunk }) => {
+        const rows = rowsFromWrites(writes);
+        const [after, upTo] = [afterFraction, upToFraction]
+          .map((fraction) => Math.round((rows.length * fraction) / 100))
+          .sort((left, right) => left - right);
+        if (after === undefined || upTo === undefined) return false;
+        const { kept, history } = withWindowKept(rows, after, upTo, chunk);
+        // Any snapshot from the window's newest row on, at any time.
+        const snapshotSeq = SeqNum.make(
+          upTo + Math.round(((rows.length - upTo) * snapshotFraction) / 100),
+        );
+        const now = Timestamp.make(100 + nowOffset);
+        const expected = oracleState(rows, snapshotSeq, now);
+        const reads = [...versionsByKey(history)].every(([key, versions]) =>
+          sameValue(
+            Result.getOrThrow(
+              resolveVisibleRow(versions, {
+                snapshotSeq,
+                now,
+                mergeOperator: Option.some(MERGE_OPERATORS.Concat),
+              }),
+            ),
+            expected.get(key),
+          ),
+        );
+        // Still in row order, and no key of the window lost every row.
+        const ordered = sortRows(kept).every((row, index) => row === kept[index]);
+        const windowKeys = new Set(
+          rows.filter((row) => row.seq > after && row.seq <= upTo).map((row) => keyToHex(row.key)),
+        );
+        const keptKeys = new Set(kept.map((row) => keyToHex(row.key)));
+        return reads && ordered && windowKeys.size === keptKeys.size;
+      },
+      { runs: 400 },
+    );
+  });
+
+  it("keeps one row for an overwritten key, and every operand down to the first value or delete", () => {
+    const key = Uint8Array.of(1);
+    const row = (seq: number, value: Row["value"]): Row => ({
+      key,
+      seq: SeqNum.make(seq),
+      value,
+      createTs: Option.none(),
+      expireTs: Option.none(),
+    });
+    const keptSeqs = (versions: ReadonlyArray<Row>) =>
+      Effect.runSync(Stream.runCollect(keepReachableVersions(Stream.fromIterable(versions)))).map(
+        (kept) => kept.seq,
+      );
+    const value = RowValue.Value({ bytes: Uint8Array.of(7) });
+    const operand = RowValue.Merge({ operand: Uint8Array.of(8) });
+    expect(keptSeqs([row(3, value), row(2, value), row(1, value)])).toEqual([3]);
+    expect(keptSeqs([row(3, RowValue.Tombstone()), row(2, value)])).toEqual([3]);
+    expect(
+      keptSeqs([row(5, operand), row(4, operand), row(3, value), row(2, operand), row(1, value)]),
+    ).toEqual([5, 4, 3]);
+    // Operands with no value or delete under them in the window all stay: their base is older.
+    expect(keptSeqs([row(3, operand), row(2, operand)])).toEqual([3, 2]);
+  });
+});
 
 describe("resolveVisibleRow", () => {
   it("matches a plain oracle for puts, deletes, merges, and TTL at any snapshot and time", () => {

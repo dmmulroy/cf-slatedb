@@ -1,4 +1,5 @@
 import {
+  keepReachableVersions,
   changelogRowOrder,
   collapseWriteBatch,
   commitL0Flush,
@@ -494,7 +495,11 @@ export const makeDbWriter = Effect.gen(function* () {
               owner: databaseId,
               kind: "Compacted",
               objectKey: (id) => sstKey(databaseId, id),
-              rows: memTable.rowsUpTo(meta.flushedSeq, cut),
+              // Only the versions a read of this SST can reach: every such read is at a snapshot
+              // at or after `cut`, since one at an older snapshot takes these rows from this
+              // writer (they stay in SQLite) or reads an older manifest. A key rewritten many
+              // times since the last flush is then one row, not one per write (D70).
+              rows: keepReachableVersions(memTable.rowsUpTo(meta.flushedSeq, cut)),
             })
             .pipe(
               Effect.catchTags({

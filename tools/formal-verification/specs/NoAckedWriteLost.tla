@@ -5,8 +5,10 @@
 (* Code this models (packages/lsm-cloudflare/src/):                        *)
 (*  - db-writer.ts write: commit rows + last_seq in one SQLite transaction *)
 (*    (MemTable.commit), then acknowledge.                                 *)
-(*  - db-writer.ts flushNow: cut = last_seq; upload rows in               *)
-(*    (flushed_seq, cut] as an L0 SST; ManifestStore.updateFrom            *)
+(*  - db-writer.ts flushNow: cut = last_seq; upload, of the rows in       *)
+(*    (flushed_seq, cut], the versions a read can reach                    *)
+(*    (keepReachableVersions; for one key: the newest) as an L0 SST;       *)
+(*    ManifestStore.updateFrom                                             *)
 (*    (commitL0Flush) sets lastL0Seq = cut; only then MemTable.markFlushed *)
 (*    sets flushed_seq = cut (rows stay), and a separate MemTable.trim     *)
 (*    deletes flushed rows up to a horizon at or below flushed_seq (D58).  *)
@@ -26,9 +28,9 @@
 (*    the snapshot needs, so the read asks the writer again instead.       *)
 (*                                                                         *)
 (* Rows are modeled by their sequence numbers, all versions of one key:    *)
-(* a later write supersedes an earlier one, so a compaction keeps the      *)
-(* newest version, and a read must return the newest version acknowledged  *)
-(* before it started.                                                      *)
+(* a later write supersedes an earlier one, so a flush and a compaction    *)
+(* keep the newest version, and a read must return the newest version      *)
+(* acknowledged before it started.                                         *)
 (*                                                                         *)
 (* Broken selects a deliberately broken variant (must fail):               *)
 (*   "none"                  the code as written                           *)
@@ -84,12 +86,13 @@ Write ==
   /\ acked' = acked \cup {lastSeq + 1}
   /\ UNCHANGED <<flushedSeq, manifests, wpc, cut, sst, crashes>> /\ UNCHANGED readerVars
 
-\* flushNow: cut and upload of the rows in (flushed_seq, cut] (an SST with a fresh ULID).
+\* flushNow: cut, and upload of the newest version among the rows in (flushed_seq, cut] (an SST
+\* with a fresh ULID): the older ones are superseded for every read of this SST.
 FlushUpload ==
   /\ wpc = "ready"
   /\ lastSeq > flushedSeq
   /\ cut' = lastSeq
-  /\ sst' = {s \in mem : flushedSeq < s /\ s <= lastSeq}
+  /\ sst' = NewestOf({s \in mem : flushedSeq < s /\ s <= lastSeq})
   /\ IF Broken = "truncateBeforeCommit"
      THEN /\ mem' = {s \in mem : s > lastSeq}
           /\ flushedSeq' = Max(flushedSeq, lastSeq)
@@ -196,8 +199,8 @@ Next ==
 Spec == Init /\ [][Next]_vars
 
 ---------------------------------------------------------------------------
-\* The newest acknowledged write (the key's current version; compactions drop the ones it
-\* superseded) is durable in the memtable or in the newest manifest's SSTs.
+\* The newest acknowledged write (the key's current version; flushes and compactions drop the
+\* ones it superseded) is durable in the memtable or in the newest manifest's SSTs.
 NoAckedWriteLost == NewestOf(acked) \subseteq mem \cup Newest.data
 
 \* A Latest read returns the newest write acknowledged before it started.

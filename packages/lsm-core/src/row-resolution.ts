@@ -248,6 +248,33 @@ export const retainKeyVersions = (
 };
 
 /**
+ * Keeps, of rows in {@link rowOrder}, the versions of each key that a read can reach when its
+ * snapshot is at or after the key's newest row: from that newest row down to and including the
+ * first row that is not a merge operand. The rows below it are dropped.
+ *
+ * **Details**
+ *
+ * {@link resolveVisibleRow} walks a key's versions newest first and stops at the first value or
+ * delete, so it never looks at the rows this drops, whatever the time (an expired value still
+ * ends the walk) and whatever the merge operator. A flush uses it: every read of the SST a flush
+ * writes is at a snapshot at or after the flush's newest row, because a read at an older snapshot
+ * takes those rows from the writer or from an older manifest (D70).
+ */
+export const keepReachableVersions = <E, R>(
+  rows: Stream.Stream<Row, E, R>,
+): Stream.Stream<Row, E, R> =>
+  rows.pipe(
+    Stream.mapAccum<{ readonly key: Uint8Array | undefined; readonly settled: boolean }, Row, Row>(
+      () => ({ key: undefined, settled: false }),
+      (state, row) => {
+        const sameKey = state.key !== undefined && Bytes.Equivalence(state.key, row.key);
+        if (sameKey && state.settled) return [state, []] as const;
+        return [{ key: row.key, settled: row.value._tag !== "Merge" }, [row]] as const;
+      },
+    ),
+  );
+
+/**
  * Groups a stream in {@link rowOrder} into each key's versions, newest first.
  */
 export const groupRowsByKey = <E, R>(
