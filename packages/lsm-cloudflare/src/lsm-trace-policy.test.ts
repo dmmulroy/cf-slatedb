@@ -38,6 +38,13 @@ describe("isExportedSpanAttribute (D63)", () => {
       "sst.id",
       "manifest.cas_attempts",
       "object.parts_unverified",
+      // The health report reads these (D82).
+      "object.part_retried",
+      "writer.stall_reason",
+      "compactor.fenced",
+      "compactor.refenced",
+      "compaction.corrupt_ssts",
+      "manifest.l0_ssts",
       "seq",
       "http.request.method",
       "http.response.status_code",
