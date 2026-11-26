@@ -52,7 +52,19 @@ export interface ReadView {
   readonly snapshotSeq: Option.Option<SeqNum>;
   /** Unflushed rows from the writer, in LSM order; empty for `Flushed` reads. */
   readonly memtable: ReadonlyArray<Row>;
-  /** Read exactly this manifest (a snapshot) instead of the newest one. */
+  /**
+   * The manifest to read instead of the newest one.
+   *
+   * **Details**
+   *
+   * - **A snapshot** (no `maxLastL0Seq`) is this manifest: when it is gone, the read fails with
+   *   `SnapshotExpired`.
+   * - **A transaction's read** (with `maxLastL0Seq`) uses it only when the newest manifest is
+   *   past the read's bounds, because a flush committed since the transaction began. Any manifest
+   *   between the two bounds gives the same answer, and the newest one's SSTs are always stored.
+   *   The manifest a transaction begins with is the writer's last flush, which a compaction
+   *   replaces and GC later deletes while the writer still names it (D76).
+   */
   readonly manifestId: Option.Option<ManifestId>;
   /**
    * The newest `lastL0Seq` the read accepts: the snapshot of a read that asked the writer, or a
@@ -153,7 +165,19 @@ export interface IDbReader {
   readonly recentManifest: (
     databaseId: DatabaseId,
   ) => Effect.Effect<Option.Option<VersionedManifest>>;
-  /** The manifest a `Flushed` read at this moment would use (for snapshots). */
+  /**
+   * The newest manifest, loaded now: what a new snapshot is taken at. GC keeps it for `gcMinAge`
+   * after something replaces it, so a snapshot of it is readable for at least that long from now
+   * (a cached manifest may already have been replaced, D76).
+   */
+  readonly newestManifest: (
+    databaseId: DatabaseId,
+  ) => Effect.Effect<
+    VersionedManifest,
+    DatabaseNotFoundError | ReaderUnavailableError,
+    DbReaderServices
+  >;
+  /** The manifest a `Flushed` read at this moment would use. */
   readonly currentManifest: (
     databaseId: DatabaseId,
   ) => Effect.Effect<
@@ -232,34 +256,41 @@ export const makeDbReader = Effect.gen(function* () {
       ),
   });
 
-  /** The manifest a view reads: the pinned one, or the cached newest one refreshed until it is new enough. */
+  /**
+   * The manifest a view reads.
+   *
+   * **Details**
+   *
+   * - **A snapshot** (a named manifest and no upper bound) reads exactly that manifest.
+   * - **Every other view** reads the newest manifest when it is between the view's bounds: the
+   *   cached one, refreshed when it is behind `minLastL0Seq`. The newest manifest's SSTs are
+   *   always stored, which no older manifest can promise (D76).
+   * - **A transaction's read** whose bounds the newest manifest is past (a flush committed since
+   *   the transaction began) reads the manifest it began with instead, when that is still stored
+   *   and between the bounds.
+   */
   const manifestFor = (databaseId: DatabaseId, view: ReadView) =>
     Effect.gen(function* () {
-      if (Option.isSome(view.manifestId)) {
-        const pinned = yield* reader
-          .load(databaseId, view.manifestId.value)
-          .pipe(Effect.catchTags(manifestUnavailable(databaseId)));
-        if (Option.isNone(pinned)) {
+      const named = view.manifestId;
+      const loadNamed = (manifestId: ManifestId) =>
+        reader.load(databaseId, manifestId).pipe(Effect.catchTags(manifestUnavailable(databaseId)));
+      if (Option.isSome(named) && Option.isNone(view.maxLastL0Seq)) {
+        const snapshot = yield* loadNamed(named.value);
+        if (Option.isNone(snapshot)) {
           return yield* new ReaderUnavailableError({
             databaseId,
             reason: "SnapshotExpired",
-            message: `Snapshot manifest ${view.manifestId.value} of database ${databaseId} no longer exists: an unpinned snapshot is kept only for GC's minimum age, and a pinned one until its checkpoint expires or is deleted. Take a new snapshot (pinned, to read for longer) and read again.`,
+            message: `Snapshot manifest ${named.value} of database ${databaseId} no longer exists: an unpinned snapshot is kept only for GC's minimum age, and a pinned one until its checkpoint expires or is deleted. Take a new snapshot (pinned, to read for longer) and read again.`,
           });
         }
-        // A transaction's pinned manifest must cover every row the writer no longer keeps, and hold
-        // nothing newer than its snapshot (D58); snapshots set neither bound.
-        if (
-          pinned.value.lastL0Seq < view.minLastL0Seq ||
-          (Option.isSome(view.maxLastL0Seq) && pinned.value.lastL0Seq > view.maxLastL0Seq.value)
-        ) {
-          return yield* new ReaderUnavailableError({
-            databaseId,
-            reason: "SnapshotExpired",
-            message: `Manifest ${view.manifestId.value} of database ${databaseId} no longer covers the read's snapshot together with the writer's kept rows. Read again at a new snapshot.`,
-          });
-        }
-        return { id: view.manifestId.value, manifest: pinned.value };
+        yield* Effect.annotateCurrentSpan({ "manifest.id": named.value });
+        return { id: named.value, manifest: snapshot.value };
       }
+      // Between the bounds: it holds every row the writer no longer returned, and no flush or
+      // compaction after the read's snapshot shaped it (D58, D70).
+      const fits = (manifest: Manifest) =>
+        manifest.lastL0Seq >= view.minLastL0Seq &&
+        (Option.isNone(view.maxLastL0Seq) || manifest.lastL0Seq <= view.maxLastL0Seq.value);
       let current = yield* (
         view.freshness === "Covering"
           ? manifests.covering(databaseId, view.minLastL0Seq, view.manifestHint)
@@ -272,6 +303,20 @@ export const makeDbReader = Effect.gen(function* () {
           .pipe(Effect.catchTags(manifestUnavailable(databaseId)));
         yield* Effect.annotateCurrentSpan({ "manifest.refreshed": true });
       }
+      if (fits(current.manifest)) {
+        yield* Effect.annotateCurrentSpan({ "manifest.id": current.id });
+        return current;
+      }
+      if (Option.isSome(named)) {
+        const begin = yield* loadNamed(named.value);
+        if (Option.isSome(begin) && fits(begin.value)) {
+          yield* Effect.annotateCurrentSpan({
+            "manifest.id": named.value,
+            "manifest.begin_manifest": true,
+          });
+          return { id: named.value, manifest: begin.value };
+        }
+      }
       if (
         Option.isSome(view.maxLastL0Seq) &&
         current.manifest.lastL0Seq > view.maxLastL0Seq.value
@@ -282,15 +327,11 @@ export const makeDbReader = Effect.gen(function* () {
           message: `Database ${databaseId} has flushed data newer than the read's snapshot (sequence number ${view.maxLastL0Seq.value}), so the snapshot can no longer be read. Read again at a new snapshot.`,
         });
       }
-      if (current.manifest.lastL0Seq < view.minLastL0Seq) {
-        return yield* new ReaderUnavailableError({
-          databaseId,
-          reason: "StorageUnavailable",
-          message: `Database ${databaseId}'s newest manifest does not yet include sequence number ${view.minLastL0Seq}. Retry the read.`,
-        });
-      }
-      yield* Effect.annotateCurrentSpan({ "manifest.id": current.id });
-      return current;
+      return yield* new ReaderUnavailableError({
+        databaseId,
+        reason: "StorageUnavailable",
+        message: `Database ${databaseId}'s newest manifest does not yet include sequence number ${view.minLastL0Seq}. Retry the read.`,
+      });
     });
 
   const blockFailures = (databaseId: DatabaseId) => ({
@@ -517,6 +558,12 @@ export const makeDbReader = Effect.gen(function* () {
 
   const recentManifest = (databaseId: DatabaseId) => manifests.recent(databaseId);
 
+  const newestManifest = Effect.fn("DbReader.newestManifest")(function* (databaseId: DatabaseId) {
+    return yield* manifests
+      .refresh(databaseId)
+      .pipe(Effect.catchTags(manifestUnavailable(databaseId)));
+  });
+
   const currentManifest = Effect.fn("DbReader.currentManifest")(function* (databaseId: DatabaseId) {
     return yield* manifests
       .current(databaseId)
@@ -604,7 +651,14 @@ export const makeDbReader = Effect.gen(function* () {
     return rows;
   });
 
-  return DbReader.of({ getRow, scan, changelogRows, currentManifest, recentManifest });
+  return DbReader.of({
+    getRow,
+    scan,
+    changelogRows,
+    currentManifest,
+    newestManifest,
+    recentManifest,
+  });
 });
 
 /** Provides the reader, leaving its caches and manifest reader visible. */

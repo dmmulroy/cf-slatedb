@@ -798,8 +798,10 @@ export const makeDbClient = Effect.gen(function* () {
       scan(databaseId, keyRangeOfPrefix(prefix), options),
     flush: (databaseId) => writer.flush(databaseId),
     snapshot: Effect.fn("DbClient.snapshot")(function* (databaseId: DatabaseId) {
-      const current = yield* reader.currentManifest(databaseId);
-      return { databaseId, manifestId: current.id, snapshotSeq: current.manifest.lastL0Seq };
+      // Loaded now, not taken from the cache: the snapshot must stay readable for `gcMinAge`
+      // from this moment, and a cached manifest may have been replaced half of that ago (D76).
+      const newest = yield* reader.newestManifest(databaseId);
+      return { databaseId, manifestId: newest.id, snapshotSeq: newest.manifest.lastL0Seq };
     }),
     transaction,
     changes,

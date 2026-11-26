@@ -20,9 +20,11 @@ node tools/formal-verification/src/verify.ts transactions   # about 30 seconds
 vp run verify                                               # every formal check
 ```
 
-Expected: three `✓` lines. The code as written passes; `snapshotOnly` (the commit checks written
-keys only, which is `Snapshot` isolation) and `noFlushCheck` (the commit skips the `flushed_seq`
-check, so writes already flushed out of the memtable go unseen) fail `Serializable`.
+Expected: five `✓` lines. The code as written passes. `snapshotOnly` (the commit checks written
+keys only, which is `Snapshot` isolation) and `trimWithoutAbort` (the commit skips the
+`retained_from_seq` check, so a trim past an open transaction hides its writes) fail
+`Serializable`. `noReadHorizonCheck` (a read accepts a manifest below `retained_from_seq`) and
+`noReadUpperBound` (a read accepts a manifest flushed past `readSeq`) fail `ReadsAtBegin`.
 
 ## Read a result
 
@@ -34,7 +36,7 @@ step:
 | Action | Code |
 | --- | --- |
 | `Begin(t)` | `DbClient.beginTransaction`: `readSeq` = the writer's `last_seq` (`WriterClient.status`) |
-| `Read(t, k)` | `DbClient.getAt`: the probe's `flushedSeq` (and the manifest's `lastL0Seq`) above `readSeq` aborts; else the value at `readSeq` |
+| `Read(t, k)` | `DbClient.getAt`/`scanAt`: the writer's rows in `(retained_from_seq, readSeq]` (`probeAt`), merged by `DbReader.manifestFor` with the newest manifest when `retained_from_seq <= lastL0Seq <= readSeq`, else the begin manifest when it is stored and between those bounds, else `SnapshotTooOld` (D76) |
 | `Write(t, k)` | `DbTransaction.put` (buffered in the client) |
 | `Commit(t)` | `DbWriter.commitTransaction` under `commitLock`: `flushed_seq > readSeq` aborts; `MemTable.writtenAfter(written keys, and for SerializableSnapshot read keys and ranges)` aborts; else `commitBatch` |
 | `DirectWrite(k)` | `DbWriter.write` (a plain put) |
@@ -82,6 +84,19 @@ deletes rows. `writer.workerd.ts` refuses write skew through the public API.
   the pinned manifest's horizon check); each fails `Serializable`.
 
 ## Maintenance notes
+
+- D76: a transaction's read no longer requires its begin manifest. `DbReader.manifestFor` uses
+  the newest manifest when it is between the read's bounds
+  (`retained_from_seq <= lastL0Seq <= readSeq`), otherwise the begin manifest when it is stored
+  and between them, otherwise `SnapshotTooOld`. The defect behind it: GC deletes the begin
+  manifest `gcMinAge` after a compaction replaced it while the writer still names it, so every
+  transaction on a warm database with no flush for that long failed, on every retry. The model's
+  `Read` now takes either manifest (`\E m \in {pinned[t], flushed}`) and aborts when the one it
+  finds does not fit (`Fits`). New invariant `ReadsAtBegin` (every read, committed or not,
+  returned the value at the transaction's begin), which `noReadHorizonCheck` and the new
+  `noReadUpperBound` fail; `snapshotOnly` and `trimWithoutAbort` still fail `Serializable`.
+  40.6M states, about 170 s: the run's time limit is raised to 420 s. `DbClient.snapshot` now
+  loads the newest manifest; snapshots are not in this model.
 
 - D74: `DbClient.beginTransaction` still reads `lastSeq` and the flushed manifest from
   `DbWriter.status`, in one read of the writer's bookkeeping (`memTable.meta`); `status` no longer

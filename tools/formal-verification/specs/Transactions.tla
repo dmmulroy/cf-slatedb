@@ -13,9 +13,13 @@
 (*  - db-client.ts beginTransaction: readSeq = last_seq, and the manifest  *)
 (*    that made flushed_seq durable (its lastL0Seq = flushed_seq), read    *)
 (*    together. getAt/scanAt: the writer's rows above retained_from_seq    *)
-(*    at or below readSeq (probeAt) merged with that pinned manifest; the  *)
-(*    reader refuses when the manifest's lastL0Seq < retained_from_seq     *)
-(*    (SnapshotTooOld).                                                    *)
+(*    at or below readSeq (probeAt) merged with a manifest M such that     *)
+(*    retained_from_seq <= M.lastL0Seq <= readSeq: the begin manifest when *)
+(*    it is stored and between those bounds, otherwise the newest manifest *)
+(*    when that is (db-reader.ts manifestFor, D76); with neither, the read *)
+(*    is refused (SnapshotTooOld). GC may delete the begin manifest at any *)
+(*    time: a compaction replaces a flush's manifest while the writer      *)
+(*    still names it.                                                      *)
 (*  - db-writer.ts commitTransaction: under the commit lock, abort if      *)
 (*    retained_from_seq > readSeq (SnapshotTooOld); abort if a written     *)
 (*    key, or for SerializableSnapshot a read key, has a row newer than    *)
@@ -36,14 +40,16 @@
 (*   "snapshotOnly"       commits check written keys only (Snapshot)       *)
 (*   "trimWithoutAbort"   commits skip the retained_from_seq check, so a   *)
 (*                        trim past an open transaction hides its writes   *)
-(*   "noReadHorizonCheck" reads skip the pinned manifest's horizon check,  *)
-(*                        so rows trimmed below it are silently missed     *)
+(*   "noReadHorizonCheck" reads skip the manifest's lower bound, so rows   *)
+(*                        trimmed below it are silently missed             *)
+(*   "noReadUpperBound"   reads accept a manifest flushed past readSeq     *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
 CONSTANTS Keys, Txns, MaxSeq, Broken
 
-ASSUME Broken \in {"none", "snapshotOnly", "trimWithoutAbort", "noReadHorizonCheck"}
+ASSUME Broken \in {"none", "snapshotOnly", "trimWithoutAbort", "noReadHorizonCheck",
+                   "noReadUpperBound"}
 
 Init0 == "init"
 Direct == "direct"
@@ -87,16 +93,25 @@ Begin(t) ==
   /\ pinned' = [pinned EXCEPT ![t] = flushed]
   /\ UNCHANGED <<seq, flushed, retained, versions, reads, writes, okAtCommit>>
 
-\* getAt: the writer's rows in (retained, readSeq] (probeAt), else the pinned manifest's newest at or
-\* below readSeq; refused when the manifest no longer covers what SQLite dropped.
+\* A manifest, by its lastL0Seq m, serves a read of t when it holds every row SQLite dropped and
+\* was not flushed past the read's snapshot.
+Fits(t, m) ==
+  /\ (m >= retained \/ Broken = "noReadHorizonCheck")
+  /\ (m <= readSeq[t] \/ Broken = "noReadUpperBound")
+
+\* getAt: the writer's rows in (retained, readSeq] (probeAt), else the newest version at or below
+\* the manifest's lastL0Seq. The manifest is the begin manifest or the newest one (the begin
+\* manifest may have been deleted by GC, so either may be the one the reader finds); a manifest
+\* that does not fit ends the read as too old.
 Read(t, k) ==
   /\ state[t] = "active" /\ k \notin writes[t]
-  /\ IF retained > pinned[t] /\ Broken # "noReadHorizonCheck"
-       THEN /\ state' = [state EXCEPT ![t] = "aborted"] /\ UNCHANGED reads
-       ELSE LET kept == {v \in versions[k] : v.seq > retained /\ v.seq <= readSeq[t]}
-                value == IF kept # {} THEN Newest(kept).value ELSE ValueAt(k, pinned[t])
-            IN /\ reads' = [reads EXCEPT ![t] = @ \cup {<<k, value>>}]
-               /\ UNCHANGED state
+  /\ \E m \in {pinned[t], flushed} :
+       IF ~Fits(t, m)
+         THEN /\ state' = [state EXCEPT ![t] = "aborted"] /\ UNCHANGED reads
+         ELSE LET kept == {v \in versions[k] : v.seq > retained /\ v.seq <= readSeq[t]}
+                  value == IF kept # {} THEN Newest(kept).value ELSE ValueAt(k, m)
+              IN /\ reads' = [reads EXCEPT ![t] = @ \cup {<<k, value>>}]
+                 /\ UNCHANGED state
   /\ UNCHANGED <<seq, flushed, retained, versions, readSeq, pinned, writes, okAtCommit>>
 
 Write(t, k) ==
@@ -164,4 +179,9 @@ TypeOK ==
 
 \* Serializable in commit order: every committed transaction read what the database held at its commit.
 Serializable == \A t \in Txns : state[t] = "committed" => okAtCommit[t]
+
+\* Every read of a transaction, committed or not (a read-only transaction never commits), returned
+\* the value the database held at the transaction's begin.
+ReadsAtBegin ==
+  \A t \in Txns : \A r \in reads[t] : r[2] = ValueAt(r[1], readSeq[t])
 =============================================================================

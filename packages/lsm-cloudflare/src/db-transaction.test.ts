@@ -6,6 +6,7 @@ import {
   DEFAULT_DATABASE_OPTIONS,
   initialManifest,
   planCompactions,
+  type Row,
   type SstHandle,
   type TransactionIsolation,
 } from "@shaledb/lsm-core";
@@ -13,16 +14,23 @@ import { Arbitrary, Effect, Layer, Option, Schema } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
+import { backgroundWorkTestLayer } from "./background-work.ts";
 import { CompactionExecutor, makeCompactionExecutor } from "./compaction-executor.ts";
 import { DbClient, dbClientTestLayer, type TransactionBegin } from "./db-client.ts";
 import type { DbReaderServices } from "./db-reader.ts";
+import { GarbageCollector, garbageCollectorLayerWithoutDependencies } from "./garbage-collector.ts";
 import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
 import { ManifestReader } from "./manifest-reader.ts";
 import { ManifestStore } from "./manifest-store.ts";
+import { sstKey } from "./object-keys.ts";
+import { ObjectStore } from "./object-store.ts";
 import { sstStoreLayerWithoutDependencies } from "./sst-store.ts";
 
 const DB = DatabaseId.make("orders");
 const key = (n: number) => Uint8Array.of(0x6b, n);
+/** A row's value bytes, or none for a delete or an unresolved merge operand. */
+const valueBytes = (row: Row): Option.Option<Uint8Array> =>
+  row.value._tag === "Value" ? Option.some(row.value.bytes) : Option.none();
 const byte = (value: Option.Option<Uint8Array>) =>
   Option.getOrUndefined(Option.map(value, (bytes) => bytes[0]));
 const smallInt = (minimum: number, maximum: number) =>
@@ -43,6 +51,7 @@ type TestServices =
   | DbClient
   | ManifestStore
   | ManifestReader
+  | ObjectStore
   | DbReaderServices;
 
 const provideWith =
@@ -420,6 +429,136 @@ describe("transactions", () => {
       ),
     );
     expect(outcome).toEqual([key(1)]);
+  });
+
+  it("a transaction begun after GC deleted the last flush's manifest still reads and commits (D76)", async () => {
+    const settings = { transactionRetentionMs: 1_000, gcMinAge: 10_000 };
+    const outcome = await Effect.gen(function* () {
+      yield* createDatabase;
+      const client = yield* DbClient;
+      yield* client.put(DB, key(1), Uint8Array.of(1));
+      yield* client.flush(DB);
+      yield* client.put(DB, key(2), Uint8Array.of(2));
+      yield* client.flush(DB);
+      // The writer names the second flush's manifest. A compaction replaces it, and once that
+      // is older than gcMinAge, GC deletes it. The writer flushes nothing meanwhile.
+      const flushManifest = (yield* client.beginTransaction(DB)).manifestId;
+      yield* compact;
+      yield* TestClock.adjust("60 seconds");
+      const collected = yield* (yield* GarbageCollector).collect(DB);
+      const stillStored = yield* (yield* ManifestReader).load(DB, Option.getOrThrow(flushManifest));
+      // The writer still hands out that manifest. Reads use the newest one instead: nothing was
+      // flushed since, so it holds exactly the rows the begin manifest held.
+      const begin = yield* client.beginTransaction(DB);
+      const read = yield* client.getAt(DB, key(1), begin.readSeq, begin.manifestId);
+      const scanned = yield* client.scanAt(DB, FULL_KEY_RANGE, begin.readSeq, 10, begin.manifestId);
+      const committed = yield* client.commitTransaction(DB, {
+        readSeq: begin.readSeq,
+        isolation: "SerializableSnapshot",
+        batch: {
+          operations: [
+            { _tag: "Put", key: key(1), value: Uint8Array.of(11), ttlMillis: Option.none() },
+          ],
+        },
+        readKeys: [key(1)],
+        readRanges: [],
+      });
+      // A transaction that began before a flush, whose begin manifest is gone. While this reader
+      // still holds the manifest from before the flush, that one is between the read's bounds
+      // and serves it. Once the reader has moved on to the newest manifest, which holds rows
+      // past the snapshot, the read is too old, once: the next transaction begins with the new
+      // flush's manifest and reads.
+      const before = yield* client.beginTransaction(DB);
+      yield* client.put(DB, key(3), Uint8Array.of(3));
+      yield* client.flush(DB);
+      const fromHeldManifest = yield* client.getAt(
+        DB,
+        key(1),
+        before.readSeq,
+        Option.some(Option.getOrThrow(flushManifest)),
+      );
+      yield* TestClock.adjust("2 seconds");
+      const tooOld = yield* Effect.flip(
+        client.getAt(DB, key(1), before.readSeq, Option.some(Option.getOrThrow(flushManifest))),
+      );
+      const next = yield* client.beginTransaction(DB);
+      const afterFlush = yield* client.getAt(DB, key(1), next.readSeq, next.manifestId);
+      return {
+        deletedManifests: collected.deletedManifests > 0,
+        beginManifestStored: Option.isSome(stillStored),
+        sameManifestHandedOut:
+          Option.getOrNull(begin.manifestId) === Option.getOrNull(flushManifest),
+        read: byte(Option.flatMap(read, (row) => valueBytes(row))),
+        scanned: scanned.map((row) => row.key[1]),
+        committedSeq: committed.seq > begin.readSeq,
+        fromHeldManifest: byte(Option.flatMap(fromHeldManifest, (row) => valueBytes(row))),
+        tooOld: tooOld._tag === "TransactionConflictError" ? tooOld.reason : tooOld._tag,
+        afterFlush: byte(Option.flatMap(afterFlush, (row) => valueBytes(row))),
+      };
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.provideMerge(
+          garbageCollectorLayerWithoutDependencies.pipe(Layer.provide(backgroundWorkTestLayer)),
+          testLayer(settings),
+        ),
+      ),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.provide(TestClock.layer()),
+      Effect.runPromise,
+    );
+    expect(outcome).toEqual({
+      deletedManifests: true,
+      beginManifestStored: false,
+      sameManifestHandedOut: true,
+      read: 1,
+      scanned: [1, 2],
+      committedSeq: true,
+      fromHeldManifest: 11,
+      tooOld: "SnapshotTooOld",
+      afterFlush: 11,
+    });
+  });
+
+  it("a transaction reads the newest manifest when it fits, not a begin manifest whose SSTs are gone (D76)", async () => {
+    const outcome = await Effect.runPromise(
+      provideWith({ transactionRetentionMs: 1_000 })(
+        Effect.gen(function* () {
+          yield* createDatabase;
+          const client = yield* DbClient;
+          yield* client.put(DB, key(1), Uint8Array.of(1));
+          yield* client.flush(DB);
+          yield* client.put(DB, key(2), Uint8Array.of(2));
+          yield* client.flush(DB);
+          const begin = yield* client.beginTransaction(DB);
+          const beginManifest = yield* (yield* ManifestReader).load(
+            DB,
+            Option.getOrThrow(begin.manifestId),
+          );
+          // A compaction replaces the two L0 SSTs, and they are deleted, as GC deletes them once
+          // the manifests naming them are old. The begin manifest itself is still stored (GC
+          // deletes SSTs before manifests; a fork's begin manifest names its source's SSTs).
+          yield* compact;
+          const replaced = Option.getOrThrow(beginManifest).l0.map((sst) => sstKey(DB, sst.id));
+          yield* (yield* ObjectStore).delete(replaced);
+          yield* TestClock.adjust("2 seconds");
+          const read = yield* client.getAt(DB, key(1), begin.readSeq, begin.manifestId);
+          const scanned = yield* client.scanAt(
+            DB,
+            FULL_KEY_RANGE,
+            begin.readSeq,
+            10,
+            begin.manifestId,
+          );
+          return {
+            replaced: replaced.length,
+            read: byte(Option.flatMap(read, (row) => valueBytes(row))),
+            scanned: scanned.map((row) => row.key[1]),
+          };
+        }),
+      ),
+    );
+    expect(outcome).toEqual({ replaced: 2, read: 1, scanned: [1, 2] });
   });
 
   it("ends a transaction only once its rows are trimmed, and old callers at the first flush", async () => {

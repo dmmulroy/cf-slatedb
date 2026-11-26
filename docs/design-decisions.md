@@ -1883,3 +1883,73 @@ flush). Both are once per flush.
 
 **Model.** `NoAckedWriteLost` and `SealSplit` are indifferent to when a flush is scheduled; no
 step changed (the skills record it).
+
+## D76. A transaction reads the newest manifest when it fits; a snapshot is taken at the newest manifest
+
+Corrects D58's "reads pin the begin manifest". Found by checking `docs/invariants.md` against the
+code, and reproduced with a unit test before the fix.
+
+**The defect.** A transaction begins with the manifest of the writer's last flush
+(`flushed_manifest_id`), and its reads loaded exactly that manifest. A compaction replaces a
+flush's manifest within seconds. GC deletes it `gcMinAge` after that. The writer goes on naming
+it until its next flush.
+
+- On a database that stays warm with reads but flushes nothing for more than `gcMinAge` after a
+  compaction, every transaction that reads failed with `SnapshotTooOld`, and so did every retry,
+  because each new transaction was handed the same deleted manifest.
+- A transaction's own commit could not end the state: it has to read first. A plain write
+  followed by a flush did, and so did a writer restart.
+- No answer was ever wrong. D58's argument, "GC keeps a superseded manifest for `gcMinAge`, which
+  is longer than the retention", counted from the transaction's begin; GC counts from when the
+  manifest was replaced, which can be long before.
+- No soak showed it: they write continuously.
+
+**The rule.** A transaction's read at `readSeq`, holding the writer's rows above
+`retained_from_seq`, is exact from any manifest `M` with
+
+> `retained_from_seq <= M.lastL0Seq <= readSeq`
+
+by D70's argument: such a manifest holds every row the writer dropped, and no flush or compaction
+after `readSeq` shaped it. The begin manifest is one such manifest. So is the newest manifest,
+whenever nothing was flushed since the transaction began.
+
+`DbReader.manifestFor` now reads, for a transaction's view:
+
+1. **the newest manifest, when it is between the bounds** (the cached one, as a `Flushed` read
+   uses it). Its SSTs are always stored, which no older manifest can promise, and it needs no
+   R2 read when cached. Before, every transactional read loaded its begin manifest from R2.
+2. **otherwise the begin manifest**, when it is still stored and between the bounds. This is the
+   case D58 was built for: a flush committed after the transaction began.
+3. **otherwise `SnapshotTooOld`.** The retry begins with the newer flush's manifest.
+
+A snapshot is unchanged: it names one manifest and reads exactly that one.
+
+**A snapshot is taken at the newest manifest, loaded now.** `DbClient.snapshot` took the manifest
+a `Flushed` read would use. Since D67 that can be a cached manifest a compaction replaced up to
+half of `gcMinAge` ago, so an unpinned snapshot was guaranteed readable for 30 minutes from when
+it was taken, not the documented hour. It now loads the newest manifest
+(`DbReader.newestManifest`): one manifest load per snapshot, and the documented lifetime holds
+again.
+
+**Model.** `Transactions.tla`: a read uses the begin manifest or the newest one, whichever the
+reader finds, and aborts when the one it finds is outside the bounds. New invariant
+`ReadsAtBegin`: every read of a transaction, committed or not, returned the value the database
+held at its begin (the old `Serializable` says nothing about read-only transactions). New broken
+variant `noReadUpperBound` fails it, and `noReadHorizonCheck` now fails it too. 40.6M states.
+`vp run verify` is 29 runs.
+
+**Tests** (`db-transaction.test.ts`, `db-client.test.ts`):
+
+- Flush, flush, compact, wait, collect: the writer still names the deleted manifest; a get, a
+  scan, and a serializable commit succeed. A transaction that began before a later flush is
+  served by the manifest the reader still holds, then is too old once the reader has moved on,
+  and the next transaction reads. Fails on the code before.
+- A begin manifest that is stored and between the bounds but whose SSTs are gone: the read uses
+  the newest manifest.
+- A snapshot taken while the reader holds a replaced manifest is taken at the newest.
+- Six mutations caught: the begin manifest tried first, no fallback to it, a begin manifest
+  outside the bounds used anyway, the newest manifest used past the snapshot, a snapshot reading
+  the newest manifest when its own is gone, a snapshot taken from the cache.
+
+**Not fixed here.** A fork's manifests name its source's SSTs, and the fork released its hold on
+the source too early for readers of its older manifests (D77).
