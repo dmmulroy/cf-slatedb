@@ -74,17 +74,19 @@ export interface IManifestReader {
     databaseId: DatabaseId,
   ) => Effect.Effect<VersionedManifest, DatabaseNotFoundError | ManifestReadError, RuntimeContext>;
   /**
-   * Finds and reads the newest manifest starting from `knownId`, a manifest the caller knows was
-   * committed (the writer's last flush, from its probe): GC's manifest boundary, that manifest, and
-   * the id after it are read together, so when it is still the newest this is one round trip
-   * instead of `loadLatest`'s two or more (D67).
+   * Finds and reads the newest manifest starting from `knownId`, a manifest the caller knows is
+   * stored (the writer's last flush, from its probe, or the manifest the caller loaded before):
+   * GC's manifest boundary, the `LATEST` hint, that manifest, and the id after it are read
+   * together, so when it is still the newest this is one round trip instead of `loadLatest`'s two
+   * or more (D67).
    *
    * **Details**
    *
    * Always returns the newest manifest, never just `knownId`: a compaction usually supersedes a
    * flush's manifest within seconds, and a reader may only keep a manifest that was the newest
-   * when it loaded it (D29). When `knownId` is at or below the boundary, or no longer stored, this
-   * is `loadLatest`.
+   * when it loaded it (D29). When `knownId` was superseded, the search continues from the hint
+   * if that is further along, so a known manifest far behind costs no more than `loadLatest`.
+   * When `knownId` is at or below the boundary, or no longer stored, this is `loadLatest`.
    */
   readonly loadLatestFrom: (
     databaseId: DatabaseId,
@@ -267,20 +269,31 @@ export const makeManifestReader = Effect.gen(function* () {
     return newest;
   });
 
-  const loadLatest = Effect.fn("ManifestReader.loadLatest")(function* (databaseId: DatabaseId) {
-    yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
-    const { hintBody, boundary } = yield* Effect.all(
-      {
-        hintBody: objects
-          .get(latestManifestKey(databaseId))
-          .pipe(storageUnavailable(databaseId, Option.none())),
-        boundary: loadManifestBoundary(databaseId),
-      },
-      { concurrency: 2 },
-    );
-    const hint = Option.isSome(hintBody)
+  /** Reads the `LATEST` hint: the id it names, or none when it is absent or not a manifest id. */
+  const loadLatestHint = Effect.fnUntraced(function* (databaseId: DatabaseId) {
+    const hintBody = yield* objects
+      .get(latestManifestKey(databaseId))
+      .pipe(storageUnavailable(databaseId, Option.none()));
+    return Option.isSome(hintBody)
       ? yield* decodeManifestIdText(textDecoder.decode(hintBody.value)).pipe(Effect.option)
       : Option.none<ManifestId>();
+  });
+
+  const loadLatest = Effect.fn("ManifestReader.loadLatest")(function* (databaseId: DatabaseId) {
+    yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
+    const { hint, boundary } = yield* Effect.all(
+      { hint: loadLatestHint(databaseId), boundary: loadManifestBoundary(databaseId) },
+      { concurrency: 2 },
+    );
+    return yield* newestFromHint(databaseId, hint, boundary);
+  });
+
+  /** The newest manifest, searched from an already-read `LATEST` hint and GC boundary. */
+  const newestFromHint = Effect.fnUntraced(function* (
+    databaseId: DatabaseId,
+    hint: Option.Option<ManifestId>,
+    boundary: ManifestBoundary,
+  ) {
     // Ids above the boundary are never deleted: start there when the hint lags below it.
     let id = ManifestId.make(
       Math.max(
@@ -324,21 +337,48 @@ export const makeManifestReader = Effect.gen(function* () {
     knownId: ManifestId,
   ) {
     yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
-    const { boundary, known, after } = yield* Effect.all(
+    const { boundary, hint, known, after } = yield* Effect.all(
       {
         boundary: loadManifestBoundary(databaseId),
+        hint: loadLatestHint(databaseId),
         known: load(databaseId, knownId),
         after: load(databaseId, ManifestId.make(knownId + 1)),
       },
-      { concurrency: 3 },
+      { concurrency: 4 },
     );
     // Only ids above the boundary are contiguous up to the newest (D56): below it a missing
-    // successor may be a gap GC left, so start over from the hint and the boundary.
+    // successor may be a gap GC left, so search from the hint and the boundary instead.
     if (knownId <= boundary.id || Option.isNone(known)) {
       yield* Effect.annotateCurrentSpan({ "manifest.known_usable": false });
-      return yield* loadLatest(databaseId);
+      return yield* newestFromHint(databaseId, hint, boundary);
     }
-    return yield* probeForward(databaseId, { id: knownId, manifest: known.value }, after, 1);
+    if (Option.isNone(after)) {
+      yield* Effect.annotateCurrentSpan({ "manifest.id": knownId, "manifest.probes": 1 });
+      return { id: knownId, manifest: known.value };
+    }
+    // Superseded. The hint, when it is further along, names a stored manifest above the boundary
+    // (it is above `knownId`): continue from there rather than one id at a time.
+    if (Option.isSome(hint) && hint.value > knownId + 1) {
+      const [hinted, afterHinted] = yield* Effect.all(
+        [load(databaseId, hint.value), load(databaseId, ManifestId.make(hint.value + 1))],
+        { concurrency: 2 },
+      );
+      if (Option.isSome(hinted)) {
+        return yield* probeForward(
+          databaseId,
+          { id: hint.value, manifest: hinted.value },
+          afterHinted,
+          2,
+        );
+      }
+    }
+    const next = ManifestId.make(knownId + 1);
+    return yield* probeForward(
+      databaseId,
+      { id: next, manifest: after.value },
+      yield* load(databaseId, ManifestId.make(next + 1)),
+      2,
+    );
   });
 
   return ManifestReader.of({ load, loadLatest, loadLatestFrom, loadManifestBoundary });
