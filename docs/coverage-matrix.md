@@ -502,7 +502,13 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   (`infra/shaledb/src/cpu-tail-worker.ts`), `TAIL_SAMPLE_RATE` bound by the Stack;
   `invocationsRepresentedBy` in the measurement tools. Test: `cpu-tail-worker.test.ts`.
 - **A request the endpoint's schemas refuse is `InvalidRequest`** — done (D69).
-  `db-http-request.ts`; `writer.workerd.ts` (five malformed requests).
+  `db-http-request.ts`; `writer.workerd.ts` (five malformed requests); `db-http-request.test.ts`
+  (in-process: malformed, refused, and empty bodies, an unaccepted content type, a refused path
+  id, an unknown route, a wrong method).
+- **The sharded API's refusals in the public envelope** — done (D79). The shared
+  `publicHttpRequestMiddlewareLayer` applies to `shardedHttpRouterLayer`. A database failure's
+  message is the public one (`toPublicError`). Test: `shard-router-worker.test.ts`. The `401`
+  names the token to send: `lsm-access-gate.test.ts`.
 - **Soak and production smoke test (v1 workstream 10)** — done (D65). `scenario-cli soak`
   (`tools/scenario-cli/src/soak.ts`: writers, readers at every consistency, scanners, transactors,
   snapshotters, a remover, a sharded group split twice, a midway redeploy; a model of every

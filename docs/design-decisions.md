@@ -2033,3 +2033,76 @@ variant `noReadUpperBound` fails it, and `noReadHorizonCheck` now fails it too. 
 
 **Not fixed here.** A fork's manifests name its source's SSTs, and the fork released its hold on
 the source too early for readers of its older manifests (D77).
+
+## D79. The sharded API answers refused requests with the public envelope; it is not part of `/v1`'s contract
+
+D69 put the database API's refusals in the public error envelope. The sharded API (the shard
+router Worker, `ShardedHttpApi`) had no request middleware. Measured in-process through the
+router and Alchemy's failure boundary (`safeHttpEffect`), before this change:
+
+| Request                                       | Status | Body                                          |
+| --------------------------------------------- | ------ | --------------------------------------------- |
+| Malformed JSON, a refused body, an empty body | 400    | empty                                         |
+| A group id the path schema refuses            | 400    | empty                                         |
+| A content type no endpoint accepts            | 415    | `Unsupported content-type: text/plain` (text) |
+| An unknown route, or a wrong method           | 404    | empty                                         |
+| A defect in a handler                         | 500    | empty                                         |
+| Any answer                                    |        | no `x-request-id`                             |
+
+**The mechanism is shared, not copied.**
+
+- **The middleware.** `publicHttpRequestMiddlewareLayer` (`db-http-request.ts`) is now the
+  middleware both APIs use. The only parameter is the contract its messages point to: the
+  database API's OpenAPI document, or the sharded API's endpoints. `dbHttpRequestMiddlewareLayer`
+  is the database API's instance.
+- **The effect on the sharded API.** Each refusal above is now the envelope, with the request id
+  in the body and in `x-request-id`:
+  - `InvalidRequest` (400) names the malformed part.
+  - `RouteNotFound` (404) covers an unknown route or a wrong method.
+  - `InternalFailure` (500) answers a defect, which is logged.
+- **Why the change is allowed.** Every status stays the same, except an unaccepted content type:
+  415 becomes 400 `InvalidRequest`, as D69 did for the database API. The sharded API is not part
+  of `/v1`'s contract (below), and an empty body that becomes the documented envelope breaks no
+  caller that read only the status.
+
+**A database failure's message.** The router passed a database failure's internal message to the
+caller verbatim. A storage failure's message names object paths (`db/<id>/…`) and repeats the
+storage error's text. `ShardedRequestUnavailable` and `ShardedRequestRefused` now carry the
+database API's public message for the same failure (`toPublicError`, now exported). Their
+`reason` still holds the internal error's tag (`WriterUnavailableError`). Changing what an
+existing field holds is not additive, so it is left for a decision.
+
+**The `401` message.** It told every caller that `preview-cli token <stage>` prints the token.
+That is wrong for production, whose tokens are printed only when created or rotated (D64). It is
+also the wrong token for the trace collector. The message now names the token to send: one of the
+stage's access tokens, or, from the collector, its trace collector token, each pointing to
+`docs/operations.md`. The OpenAPI examples were regenerated. The collector's `InvalidRequest` said
+`limit` runs from 1 to 100; pages hold up to 500, and it now says so.
+
+**An oversized body** never reaches either API's code: neither sets a body limit of its own.
+Cloudflare's Workers limits page says a request to a Worker on a zone is answered `413` by
+Cloudflare above the zone plan's limit (100 MB on Free and Pro, 200 MB on Business). It does not
+state the limit for `workers.dev`, where these Workers are served. No test covers it.
+
+**The contract.** The OpenAPI drift test covers `DbHttpApi` alone.
+`docs/api-compatibility.md` now says the shard router's API is not part of `/v1`'s contract: it
+is the sharding package's example (D40), and its declared errors are not the envelope. The GC
+operator API is not part of the contract either.
+
+**Tests.**
+
+- **`db-http-request.test.ts`** sends the database API, in-process, a malformed body, a refused
+  body, an empty body, an unaccepted content type, a refused path id, an unknown route, and a
+  wrong method. It is the reference.
+- **`shard-router-worker.test.ts`** sends the same requests to the sharded API and expects the
+  envelope. It also covers:
+  - its declared errors and successes, unchanged but now with a request id;
+  - a defect, answered as `InternalFailure`;
+  - two database failures carrying internal detail, which never reaches the body.
+- **`lsm-access-gate.test.ts`**: the `401` names the token, not `preview-cli`.
+- **`serveLsmTestRequest`** (`lsm-test-runtime.ts`) serves a request as the Worker does:
+  `safeHttpEffect`, then `HttpEffect.toHandled`.
+- **Mutations caught:**
+  - the middleware removed from the sharded router (all four sharded tests fail);
+  - the internal message passed through again (1 fails);
+  - the gate ignoring the token it names (1 fails).
