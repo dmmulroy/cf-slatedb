@@ -39,8 +39,12 @@ and are not part of it:
   release.
   - It answers a request it refuses before any handler runs (an unknown route, a malformed
     request) with the same envelope as the database API (D79).
-  - Its declared errors are `{ _tag, message, … }`, not the envelope.
-- **The GC operator API** (`gcUrl`), for operators.
+  - Its declared errors are `{ _tag, message, … }`, not the envelope. Their `reason` field holds an
+    internal error tag (such as `WriterUnavailableError`) and may change in any release: decide
+    from the status and `_tag`, never from `reason`.
+- **The GC operator API** (`gcUrl`), for operators. It shares the same envelope for refusals and
+  defects (D79). Its declared errors (`DatabaseNotFoundError`, `GarbageCollectorUnavailableError`)
+  are `{ _tag, databaseId, message }`, with messages of its own and never storage detail.
 
 ## Examples from v1's history
 

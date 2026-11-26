@@ -514,7 +514,8 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 - **The sharded API's refusals in the public envelope** — done (D79). The shared
   `publicHttpRequestMiddlewareLayer` applies to `shardedHttpRouterLayer`. A database failure's
   message is the public one (`toPublicError`). Test: `shard-router-worker.test.ts`. The `401`
-  names the token to send: `lsm-access-gate.test.ts`.
+  names the token to send: `lsm-access-gate.test.ts`. The GC operator API shares the middleware and
+  answers failures with its own messages (`gc-worker.ts`); test: `gc-worker.test.ts`.
 - **Soak and production smoke test (v1 workstream 10)** — done (D65). `scenario-cli soak`
   (`tools/scenario-cli/src/soak.ts`: writers, readers at every consistency, scanners, transactors,
   snapshotters, a remover, a sharded group split twice, a midway redeploy; a model of every

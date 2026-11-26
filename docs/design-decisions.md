@@ -2295,6 +2295,29 @@ Cloudflare's Workers limits page says a request to a Worker on a zone is answere
 Cloudflare above the zone plan's limit (100 MB on Free and Pro, 200 MB on Business). It does not
 state the limit for `workers.dev`, where these Workers are served. No test covers it.
 
+**The GC operator API, the same way** (decided after review). The GC Worker's API (`GcHttpApi`) had
+the sharded API's gaps. Its refusals and defects were answered with empty bodies. Its declared
+errors carried internal messages: a collection or sweep that could not reach storage repeated the
+object store's message, which names object paths and the storage error's text.
+
+- **The middleware.** `gcHttpRouterLayer` now provides `publicHttpRequestMiddlewareLayer`, naming
+  `GcHttpApi`.
+- **The handlers** answer every failure with the declared error and a message of their own:
+  - `DatabaseNotFoundError`: "does not exist".
+  - `GarbageCollectorUnavailableError`: retry the same request, a collection is safe to repeat.
+  - A served-id mismatch: an internal error, with the request id to give the operator.
+  - The internal error is logged with the request id.
+- **Why it is allowed:** statuses, `_tag`s, and fields are unchanged; only message texts change.
+  The GC API is an operator API outside `/v1`'s contract.
+
+**After review.**
+
+- **Status guidance.** Both APIs keep `400` for an unaccepted content type. `docs/errors.md`'s
+  status guidance now says what they do: a wrong method is `404` `RouteNotFound`, an unaccepted
+  content type is `400` `InvalidRequest`, and neither `405` nor `415` is answered.
+- **The sharded errors' `reason`** stays the internal tag. `docs/api-compatibility.md` says it may
+  change.
+
 **The contract.** The OpenAPI drift test covers `DbHttpApi` alone.
 `docs/api-compatibility.md` now says the shard router's API is not part of `/v1`'s contract: it
 is the sharding package's example (D40), and its declared errors are not the envelope. The GC
@@ -2313,7 +2336,15 @@ operator API is not part of the contract either.
 - **`lsm-access-gate.test.ts`**: the `401` names the token, not `preview-cli`.
 - **`serveLsmTestRequest`** (`lsm-test-runtime.ts`) serves a request as the Worker does:
   `safeHttpEffect`, then `HttpEffect.toHandled`.
+- **`gc-worker.test.ts`** (GC operator API):
+  - a collection, and each failed collection (not found, compactor or storage unavailable, a
+    served-id mismatch) as its declared error with no storage detail;
+  - a failed sweep page;
+  - a refused id, a wrong method, an unknown route, and a defect, in the envelope.
 - **Mutations caught:**
+  - the middleware removed from the GC router (all three GC tests fail);
+  - each of the GC messages replaced by the internal one again: collect unavailable, sweep, and
+    not found (one test fails each);
   - the middleware removed from the sharded router (all four sharded tests fail);
   - the internal message passed through again (1 fails);
   - the gate ignoring the token it names (1 fails).
