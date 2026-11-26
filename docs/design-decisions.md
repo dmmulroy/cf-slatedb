@@ -2028,6 +2028,8 @@ reader finds, and aborts when the one it finds is outside the bounds. New invari
 `ReadsAtBegin`: every read of a transaction, committed or not, returned the value the database
 held at its begin (the old `Serializable` says nothing about read-only transactions). New broken
 variant `noReadUpperBound` fails it, and `noReadHorizonCheck` now fails it too. 40.6M states.
+(Widened in review, D83: a read may use any manifest the reader's cache can hold, not only these
+two.)
 `vp run verify` is 29 runs.
 
 **Tests** (`db-transaction.test.ts`, `db-client.test.ts`):
