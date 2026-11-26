@@ -15,6 +15,7 @@ import { Base64 } from "effect/encoding";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import { CF_SLATEDB_PRODUCTION_STAGE } from "./cf-slatedb-stage.ts";
+import { cfSlatedbTraceRetentionDays } from "./cf-slatedb-stack-config.ts";
 import { cfSlatedbWorkerSettings } from "./cf-slatedb-stack-config.ts";
 
 /** Name of the secret binding that carries a stage's trace collector token. */
@@ -46,8 +47,15 @@ export const TraceBucket = Cloudflare.R2.Bucket(
   Effect.gen(function* () {
     const stage = yield* Alchemy.Stage;
     const jurisdiction = yield* lsmJurisdiction;
+    const retentionSeconds = (yield* cfSlatedbTraceRetentionDays) * 24 * 60 * 60;
     return {
       ...(Option.isSome(jurisdiction) ? { jurisdiction: jurisdiction.value } : {}),
+      // Traces and tail records expire after the configured days (P4, D63).
+      lifecycleRules: [TRACE_COLLECTOR_PREFIX, TAIL_RECORDS_PREFIX].map((prefix) => ({
+        id: `expire-${prefix.replace("/", "")}`,
+        prefix,
+        deleteObjectsTransition: { condition: { type: "Age" as const, maxAge: retentionSeconds } },
+      })),
       // Traces are disposable. Outside production, replacing the bucket (a jurisdiction change) or
       // destroying the stage empties it first instead of failing on its contents.
       forceDestroy: stage !== CF_SLATEDB_PRODUCTION_STAGE,

@@ -10,6 +10,7 @@ import {
   lsmWorkerCompatibility,
   type LsmWorkerSettingsSource,
   type LsmWorkerTelemetry,
+  withLsmTracePolicy,
 } from "@cf-slatedb/lsm-cloudflare";
 import type { HttpEffect } from "alchemy/Http";
 import { makeExecutionMemo } from "alchemy/Runtime/ExecutionMemo";
@@ -315,6 +316,6 @@ export const shardRouterWorkerLayer = <R = never>(options: ShardRouterWorkerOpti
         ).pipe(Layer.provideMerge(shardDirectoryLayer), Layer.provideMerge(dbServicesLayer)),
       ),
       Effect.provide(shardDirectoryServerLayer),
-      Effect.provide(options.telemetry("cf-slatedb-shards")),
+      Effect.provide(withLsmTracePolicy(options.telemetry("cf-slatedb-shards"))),
     ),
   );

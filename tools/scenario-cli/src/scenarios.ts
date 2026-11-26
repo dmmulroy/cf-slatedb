@@ -753,6 +753,44 @@ const repair: Scenario = {
   }),
 };
 
+/** Span attributes that identify a caller or carry a query string: never exported (D63). */
+const CALLER_ATTRIBUTES = ["client.address", "user_agent.original", "url.full", "url.query"];
+
+const redaction: Scenario = {
+  name: "redaction",
+  description:
+    "A request with a User-Agent and a query string: its server and client spans export the method, route, and status, and never the caller's address, user agent, full URL, or query (D63).",
+  run: Effect.gen(function* () {
+    const databaseId = DatabaseId.make(uniqueId("sc-redact"));
+    yield* createDatabase(databaseId);
+    yield* put(databaseId, "k", "v");
+    const { api: apiUrl } = yield* ScenarioStack;
+    const http = yield* HttpClient.HttpClient;
+    const response = yield* step(
+      "status with a query string and a user agent",
+      http.execute(
+        HttpClientRequest.get(`${apiUrl}/v1/databases/${databaseId}/status`).pipe(
+          HttpClientRequest.setUrlParams({ probe: "redaction-secret" }),
+          HttpClientRequest.setHeader("user-agent", "cf-slatedb-scenario/redaction"),
+        ),
+      ),
+    );
+    yield* expectEqual("status answered", response.status, 200);
+    yield* assertTraces("server and client spans carry no caller attributes", {
+      select: { databaseId, containing: { name: "WriterClient.status" } },
+      checks: [
+        {
+          _tag: "Attribute",
+          span: { name: "GET" },
+          requiredKeys: ["http.request.method", "http.response.status_code"],
+          forbiddenKeys: CALLER_ATTRIBUTES,
+        },
+        { _tag: "SpanExists", span: { name: "WriterClient.status" } },
+      ],
+    });
+  }),
+};
+
 /** Every scenario, in the order `run all` runs them. */
 export const SCENARIOS: ReadonlyArray<Scenario> = [
   writeRead,
@@ -767,4 +805,5 @@ export const SCENARIOS: ReadonlyArray<Scenario> = [
   blockCache,
   createRace,
   repair,
+  redaction,
 ];

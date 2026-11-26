@@ -13,9 +13,9 @@ checklist and Dillon's go-ahead (P6). The decisions asked of Dillon are under "O
 | 4. Transactions exact across flushes      | done        | `5f2850b`, `5df4099` |
 | 5. GC and maintenance that scale          | done        | `e06f3eb`            |
 | 6. Writer throughput and limits           | done        | `308defd`            |
-| 7. Corruption: prevent, detect, repair    | done        | this commit          |
-| 8. Production telemetry                   | next        |                      |
-| 9. Production readiness                   | not started |                      |
+| 7. Corruption: prevent, detect, repair    | done        | `2cb5116`            |
+| 8. Production telemetry                   | done        | this commit          |
+| 9. Production readiness                   | next        |                      |
 | 10. Soak, release checklist, the go-ahead | not started |                      |
 
 The previous round (all ten build phases and `docs/handoff.md`'s seven items) is complete; its
@@ -132,6 +132,21 @@ hand-off is below.
     (p50 1.0 s, max 3.9 s), and all 134 parts were verified on R2.
   - **Results.** 12/12 scenarios locally and on `preview-1` (`--dev-timings`), which was then
     redeployed with production settings.
+- **8. Production telemetry (D63).**
+  - **Redaction.** Every Worker's tracer is wrapped with a policy that exports only project
+    attributes plus HTTP method, route, path, and status. The new `redaction` scenario proves it
+    locally and on `preview-1`.
+  - **Sampling.** Head sampling is decided from the trace id, at 10% in production and 100%
+    elsewhere. The finding behind it: honouring incoming sampled flags kept every trace, because
+    instrumented clients send the flag. Measured on `preview-3` at 25%: 45 of 200 kept, all whole
+    across the API Worker and the writer Durable Object.
+  - **Retention.** The trace bucket expires `traces/` and `tails/` after 14 days, and the LSM
+    bucket aborts stale multipart uploads. Both are confirmed on `preview-3`.
+  - **Health report.** "What to watch" is in `docs/operations.md`, and `measure health` reports a
+    stage's health. Its first run found the D61 deploy incident's seven exceptions.
+  - **First attempt, fixed.** It overrode `Telemetry` inside the init context, which never reaches
+    Alchemy's bridge. The local scenario caught it.
+  - **Results.** 13/13 scenarios pass locally and on `preview-1`.
 
 ## Remaining-work log
 

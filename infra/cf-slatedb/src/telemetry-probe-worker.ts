@@ -9,6 +9,7 @@ import {
   lsmWorkerCompatibility,
   ObjectStore,
   objectStoreLayer,
+  withLsmTracePolicy,
 } from "@cf-slatedb/lsm-cloudflare";
 import type { HttpEffect } from "alchemy/Http";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
@@ -274,7 +275,7 @@ export const telemetryProbeWorkerLayer = TelemetryProbeWorker.make(
     Effect.provide(telemetryProbeServerLayer),
     Effect.provide(r2ProbeServerLayer),
     Effect.provide(objectStoreLayer),
-    Effect.provide(cfSlatedbTelemetry("cf-slatedb-telemetry-probe")),
+    Effect.provide(withLsmTracePolicy(cfSlatedbTelemetry("cf-slatedb-telemetry-probe"))),
   ),
 );
 

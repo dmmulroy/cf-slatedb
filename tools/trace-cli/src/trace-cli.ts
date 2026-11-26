@@ -9,7 +9,7 @@
  * command then works on them unchanged.
  */
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
-import { Console, Data, Effect, FileSystem, Layer, Option, Schema } from "effect";
+import { Clock, Console, Data, Effect, FileSystem, Layer, Option, Schema } from "effect";
 import { Argument, Command, Flag } from "effect/cli";
 import { FetchHttpClient } from "effect/http";
 
@@ -426,12 +426,22 @@ const pull = Command.make(
         "Live preview stage (preview-1, preview-2, preview-3) to pull spans from",
       ),
     ),
+    sinceMinutes: Flag.Int("since-minutes").pipe(
+      Flag.withDescription(
+        "Only exports from the last N minutes (a fresh store otherwise pulls all)",
+      ),
+      Flag.optional,
+    ),
   },
-  ({ store, json, stage }) =>
+  ({ store, json, stage, sinceMinutes }) =>
     withStore(
       store,
       Effect.gen(function* () {
-        const pulled = yield* pullPreviewTraces(yield* resolvePreviewCollector(stage));
+        const now = yield* Clock.currentTimeMillis;
+        const pulled = yield* pullPreviewTraces(
+          yield* resolvePreviewCollector(stage),
+          Option.map(sinceMinutes, (minutes) => now - minutes * 60_000),
+        );
         yield* json
           ? Console.log(JSON.stringify(pulled))
           : Console.log(

@@ -33,4 +33,5 @@ export const INTEGRATION_WORKER_SETTINGS: LsmWorkerSettingsSource = Effect.succe
   },
   jurisdiction: Option.none(),
   bucketLocation: Option.none(),
+  traceSampleRate: 1,
 });

@@ -119,6 +119,7 @@ describe("deployEnvironment", () => {
         devTimings: false,
         jurisdiction: "none",
         settings: Option.none(),
+        traceSampleRate: Option.none(),
       }),
     ).toEqual({
       PATH: "/bin",
@@ -129,6 +130,7 @@ describe("deployEnvironment", () => {
         devTimings: true,
         jurisdiction: "fedramp",
         settings: Option.none(),
+        traceSampleRate: Option.none(),
       }),
     ).toEqual({
       PATH: "/bin",
@@ -147,6 +149,7 @@ describe("deployEnvironment settings", () => {
         devTimings: true,
         jurisdiction: "none",
         settings: Option.some({ l0SstSize: 268_435_456, gcMinAge: 20_000 }),
+        traceSampleRate: Option.some(0.25),
       },
     );
     expect(JSON.parse(environment["CF_SLATEDB_LSM_SETTINGS"] ?? "{}")).toEqual({
@@ -154,6 +157,7 @@ describe("deployEnvironment settings", () => {
       l0SstSize: 268_435_456,
       gcMinAge: 20_000,
     });
+    expect(environment["CF_SLATEDB_TRACE_SAMPLE_RATE"]).toBe("0.25");
   });
 });
 

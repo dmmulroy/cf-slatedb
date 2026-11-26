@@ -5,6 +5,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { makeLsmConfiguration } from "./lsm-configuration.ts";
 import { lsmBucketLocation } from "./lsm-bucket.ts";
 import { lsmJurisdiction } from "./lsm-jurisdiction.ts";
+import { lsmTraceSampleRate } from "./lsm-trace-policy.ts";
 import { lsmWorkerSettingsBindings } from "./lsm-worker-settings.ts";
 
 /** What a Worker reads back from `bindings` through `Config` at runtime. */
@@ -13,6 +14,7 @@ const readBack = (bindings: Readonly<Record<string, string>>) =>
     settings: makeLsmConfiguration,
     jurisdiction: lsmJurisdiction,
     bucketLocation: lsmBucketLocation,
+    traceSampleRate: lsmTraceSampleRate,
   }).pipe(
     Effect.provideService(ConfigProvider.ConfigProvider, ConfigProvider.fromUnknown(bindings)),
     Effect.runPromise,
@@ -31,18 +33,21 @@ describe("LsmWorkerSettings bindings", () => {
         lsmSettings,
         jurisdiction: Option.some("eu"),
         bucketLocation: Option.none(),
+        traceSampleRate: 0.1,
       }),
     );
     expect(read).toEqual({
       settings: lsmSettings,
       jurisdiction: Option.some("eu"),
       bucketLocation: Option.none(),
+      traceSampleRate: 0.1,
     });
     const unrestricted = await readBack(
       lsmWorkerSettingsBindings({
         lsmSettings,
         jurisdiction: Option.none(),
         bucketLocation: Option.some("weur"),
+        traceSampleRate: 1,
       }),
     );
     expect(unrestricted.jurisdiction).toEqual(Option.none());
@@ -52,6 +57,8 @@ describe("LsmWorkerSettings bindings", () => {
   it("still reads the partial overrides that deploys before D55 bound", async () => {
     const read = await readBack({ CF_SLATEDB_LSM_SETTINGS: '{"compactorPollInterval":2000}' });
     expect(read.settings).toEqual({ ...DEFAULT_LSM_SETTINGS, compactorPollInterval: 2000 });
+    // Deploys before D63 bound no sample rate: every trace is kept.
+    expect(read.traceSampleRate).toBe(1);
     expect((await readBack({ CF_SLATEDB_LSM_SETTINGS: "{}" })).settings).toEqual(
       DEFAULT_LSM_SETTINGS,
     );

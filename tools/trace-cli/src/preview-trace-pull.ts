@@ -107,7 +107,14 @@ export interface PreviewTracePull {
  *   refused), `CollectorUnavailable` (unreachable or an error status; pull again), or `ExportInvalid`
  *   (a stored export is not OTLP traces); or `TraceStoreError` when the local store cannot be written.
  */
-export const pullPreviewTraces = (collector: PreviewCollector) =>
+/** Prefix of a collector's export keys, which then start with the arrival time in ms. */
+const TRACE_EXPORTS_PREFIX = "traces/";
+
+export const pullPreviewTraces = (
+  collector: PreviewCollector,
+  /** Skip exports that arrived before this Unix millisecond time (keys start with it). */
+  sinceMs: Option.Option<number> = Option.none(),
+) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
@@ -120,9 +127,18 @@ export const pullPreviewTraces = (collector: PreviewCollector) =>
       Effect.map(Option.some),
       Effect.orElseSucceed(() => Option.none<typeof PullCursor.Type>()),
     );
-    let after = Option.filter(saved, (cursor) => cursor.url === collector.url).pipe(
+    const resumed = Option.filter(saved, (cursor) => cursor.url === collector.url).pipe(
       Option.map((cursor) => cursor.after),
     );
+    const start = Option.map(
+      sinceMs,
+      (ms) => `${TRACE_EXPORTS_PREFIX}${(ms - 1).toString().padStart(15, "0")}`,
+    );
+    // Whichever is later: the saved position, or the requested start.
+    let after =
+      Option.isSome(resumed) && Option.isSome(start)
+        ? Option.some(resumed.value > start.value ? resumed.value : start.value)
+        : Option.orElse(resumed, () => start);
     let exports = 0;
     let spans = 0;
     const saveCursor = (key: string) =>

@@ -1,4 +1,5 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
+import { withLsmTracePolicy } from "./lsm-trace-policy.ts";
 import type { HttpEffect } from "alchemy/Http";
 import { makeExecutionMemo } from "alchemy/Runtime/ExecutionMemo";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
@@ -136,6 +137,6 @@ export const dbApiWorkerLayer = <R = never>(options: DbApiWorkerOptions<R>) =>
       // lifecycle and the compaction endpoint call it too.
       Effect.provide(compactionTriggerLayer.pipe(Layer.provideMerge(compactorClientLayer))),
       Effect.provide(Layer.mergeAll(objectStoreLayer, lsmConfigurationLayer)),
-      Effect.provide(options.telemetry("cf-slatedb-api")),
+      Effect.provide(withLsmTracePolicy(options.telemetry("cf-slatedb-api"))),
     ),
   );

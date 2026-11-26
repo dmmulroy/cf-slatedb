@@ -1,11 +1,51 @@
 # Operations
 
 How to run cf-slatedb in production. Workstream 9 of [`handoff-v1.md`](handoff-v1.md) completes
-this document (deploy, rollback, token rotation, jurisdiction, GC and removal, capacity, alerts);
-the corruption runbook below is from workstream 7 (D62).
+this document (deploy, rollback, token rotation, jurisdiction, GC and removal, capacity). The
+corruption runbook is from workstream 7 (D62); telemetry and what to watch are from workstream 8
+(D63).
 
 Every endpoint below is on the API Worker under `/v1` and needs the stage's token
 (`Authorization: Bearer <token>`).
+
+## Telemetry
+
+Every Worker and Durable Object exports spans over OTLP to the stage's own trace collector, which
+stores them in the stage's trace bucket (D63):
+
+- **Sampling.** Production keeps 10% of traces (`CF_SLATEDB_TRACE_SAMPLE_RATE`, P4). Local and
+  preview stages keep every trace. The decision comes from each trace's id, so a kept trace is
+  whole across the API Worker, its Durable Objects, and the BlockServer. A caller's `traceparent`
+  joins our spans to its trace, but its sampled flag does not force them to be kept.
+- **Redaction.** Spans carry only cf-slatedb's own attributes (`database.id`, `sst.id`,
+  `manifest.id`, sizes, counts, outcomes) and the HTTP method, route, path, and status. A caller's
+  address, user agent, full URL, query string, and headers are dropped where they are set.
+- **Retention.** The trace bucket deletes `traces/` and `tails/` objects after 14 days
+  (`CF_SLATEDB_TRACE_RETENTION_DAYS`).
+- **Tail records.** The API, compactor, and GC Workers' invocations (their outcome, CPU time, and
+  wall time) are stored unsampled under `tails/`.
+
+The telemetry probe Worker, a test tool, is not deployed to production.
+
+## What to watch
+
+`node tools/scenario-cli/src/scenario-cli.ts measure health --stage <stage> --minutes 60` summarizes
+a stage from its tail records and spans. It prints `healthy: false` and an `issues` list when any of
+the conditions below holds.
+
+| Signal                       | Where                                                                                            | Act when                                                                                    |
+| ---------------------------- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
+| Invocations that hit a limit | Tail records: outcome `exceededCpu`, `exceededMemory`, `exception`                               | Any. CPU limits are 30 s (API, writers) and 60 s (compactor); see `docs/measurements.md`    |
+| Writes stalled               | `DbWriter.write` errors with `WriteStalledError`; public `WriteStalled` (503)                    | Sustained: L0 is not draining (compaction backlog or corruption) or a writer is overloaded  |
+| Flush duration               | `DbWriter.flush` span duration                                                                   | p99 above about 30 s, or rising                                                             |
+| Compaction backlog           | `manifest.l0_ssts` on `Compactor.poll`                                                           | Near `l0MaxSsts` (16), where writes stall                                                   |
+| Corrupted SSTs               | `lsm_compaction_corrupt_ssts`; `compaction.corrupt_ssts` on `Compactor.poll`; `GET …/compaction` | Any: follow the corruption runbook                                                          |
+| Upload integrity             | `lsm_object_part_integrity_retries`, `lsm_object_parts_unverified`                               | Retries: transient, unless frequent. Any unverified part on R2: parts are no longer checked |
+| Garbage collection           | `GarbageCollector.collect` and `MaintenanceSweep.sweepPage` errors                               | Repeated failures: storage unreachable or a manifest unreadable                             |
+| Error spans                  | `trace-cli grep --error`                                                                         | A new name in the top errors                                                                |
+
+Expected errors that are not trouble: `DatabaseSealedError` (a stale router's write to a sealed
+shard; the router retries), `TransactionConflictError`, and `DatabaseAlreadyExists` on create.
 
 ## Corruption runbook
 

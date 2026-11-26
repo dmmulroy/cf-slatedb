@@ -1161,3 +1161,97 @@ variant fails `ReadableManifestsComplete`. No other model changed (see the skill
   dropped SST's key is gone. Removing each refusal or the report's removal fails the test.
 - `writer.workerd.ts`: a 12 MB flush uploads in parts against local R2.
 - The `repair` scenario passes locally and on `preview-1`.
+
+## D63. Production telemetry: redacted at the source, sampled by trace id, expired, and summarized
+
+Traces were built for debugging previews. The HTTP middleware put the caller's address, user agent,
+full URL, and query string on server spans. Every request was traced, traces were kept forever, and
+the probe Worker would have shipped to production (removed by D62).
+
+**One trace policy for every Worker** (`withLsmTracePolicy`, `lsm-trace-policy.ts`).
+
+- **The hook.** Alchemy builds each event's OTLP exporters from the bound destinations. A Layer
+  registered with `Telemetry.layer` is merged over them, and its `Tracer` wins. At runtime the
+  policy registers a Layer that builds those same exporters and wraps their tracer, so every span an
+  event creates goes through the policy, including the middleware's server span. The bound
+  exporters are also built and stay idle.
+- **What did not work.** Providing a new `Telemetry` reference inside a Worker's init does not
+  reach the bridge: it reads the shared build's context. A local scenario run showed the
+  attributes still exported, which is how this was found.
+- **At plan time** the policy only binds.
+
+**Redaction at the source.** `isExportedSpanAttribute` allows two kinds of attribute:
+
+- the project's namespaces (`database.`, `sst.`, `manifest.`, `object.`, `compaction.`, ... and
+  `seq`), which carry only identifiers, sizes, counts, and outcomes;
+- `http.request.method`, `http.response.status_code`, `http.route`, `url.path`, `url.scheme`,
+  `server.address`, `server.port`, and `error.type`.
+
+The wrapped span records nothing else. That drops `client.address`, `user_agent.original`,
+`url.full`, `url.query`, and request and response headers. A new project namespace must be added
+to the list, or its attributes are dropped. The test enumerates both kinds.
+
+**Head sampling by trace id.** A span that starts a trace in this process is kept when its trace
+id's low 32 bits, as a fraction of 2^32, fall below the sample rate (OpenTelemetry's
+trace-id-ratio sampler). Such a span has no parent, is an explicit root, or has a `traceparent`
+parent from another process. Spans under a local parent inherit, as Effect does. Every Worker and
+Durable Object decides the same for the same trace, so traces stay whole across hops without
+trusting the incoming sampled flag.
+
+The first version drew a random number at each root and honoured an incoming sampled flag, as W3C
+parent-based sampling does. On `preview-3` at 25%, it kept all 200 traces: the client's Effect
+`HttpClient`, like any instrumented client, sends `traceparent` with the sampled flag on every
+request. Decided by trace id, it kept 45 of 200 (22.5%), and all 45 were whole: the API Worker's
+`WriterClient.write` and the writer Durable Object's `DbWriter.write` were in the same trace, and
+neither side appeared without the other. A caller's `traceparent` still joins our spans to its
+trace.
+
+The rate is `CfSlatedbStackConfig.telemetry.traceSampleRate`: 0.1 in production, 1 elsewhere (P4).
+It reaches every Worker as one more always-bound worker setting, `CF_SLATEDB_TRACE_SAMPLE_RATE`;
+an unbound Worker keeps every trace. `preview-cli deploy --trace-sample-rate` sets it for a
+measurement deploy.
+
+**Retention.** The trace bucket has lifecycle rules that delete `traces/` and `tails/` after the
+configured days (14). The value is read at plan time only (`cfSlatedbTraceRetentionDays`), like the
+CPU limits (D61). The LSM bucket aborts multipart uploads still open after a day; a Worker that
+dies mid-upload otherwise leaves its parts stored. Both are confirmed on `preview-3` through the
+Cloudflare API.
+
+**What to watch.** `docs/operations.md` ("What to watch") lists the signals and when to act.
+`scenario-cli measure health --stage <s> --minutes N` summarizes a stage from its unsampled tail
+records and from its spans, pulled into a per-stage store (`trace-cli pull --since-minutes`). It
+reports:
+
+- invocation outcomes and CPU per Worker,
+- refused writes by error type (only `WriteStalledError` is an issue),
+- flush durations,
+- the L0 backlog (the new `manifest.l0_ssts` on `Compactor.poll`),
+- currently corrupted SSTs (each database's latest poll),
+- GC and sweep failures, and
+- the top error spans.
+
+Its first run over two hours of `preview-1` found the seven `exception` invocations of the D61
+deploy incident, and found the `repair` scenario's corruption, which it stopped reporting once the
+drop had repaired it. It now reports healthy for the last hour.
+
+**Also.** The SST corruption messages now point to the runbook (restore from a checkpoint created
+before the SST, or drop it) instead of "recompact its inputs", which no tool does.
+
+**Tests:**
+
+- `lsm-trace-policy.test.ts` covers:
+  - the allowlist;
+  - all traces kept at rate 1, with only allowed attributes recorded;
+  - about 25% kept at 0.25 over 2,000 roots, each child sharing its root's decision;
+  - a caller's trace decided by its id whatever flag the caller sent;
+  - a real `OtlpTracer` export that contains no dropped attribute.
+
+  Removing the filter or the decision fails it.
+
+- `lsm-worker-settings.test.ts`: the sample rate round-trips through the bindings and defaults
+  to 1.
+- `preview-stage.test.ts`: the flag passes through.
+- The new `redaction` scenario sends a query string and a User-Agent, and asserts that every `GET`
+  span carries the method and status and none of the four caller attributes. Before the fix it
+  failed (three spans carried them). Across a whole local run (6,193 spans), only allowed keys
+  appear and no span is exported twice.

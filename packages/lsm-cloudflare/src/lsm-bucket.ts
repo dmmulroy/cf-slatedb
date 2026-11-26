@@ -63,6 +63,14 @@ export const LsmBucket = Effect.gen(function* () {
     // Every other stage's data is disposable: destroying or replacing its bucket empties it first,
     // so a preview stays destroyable once it holds databases. Production keeps R2's refusal.
     forceDestroy: !production,
+    // A Worker that dies mid-upload leaves its multipart upload open (its parts cost storage);
+    // every upload finishes in minutes, so R2 aborts any still open after a day (D63).
+    lifecycleRules: [
+      {
+        id: "abort-stale-multipart-uploads",
+        abortMultipartUploadsTransition: { condition: { type: "Age", maxAge: 24 * 60 * 60 } },
+      },
+    ],
   }).pipe(RemovalPolicy.retain(production));
 });
 

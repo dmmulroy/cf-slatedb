@@ -313,6 +313,27 @@ Node, was several times slower inside workerd. It stays only as the fallback whe
 MD5 (Node, in tests). Every part R2 stored matched the MD5 sent (`object.parts_unverified` 0, no
 re-uploads).
 
+## Trace sampling and redaction (v1 workstream 8, D63)
+
+`measure sampling --requests 200` on `preview-3`, deployed with `--trace-sample-rate 0.25`. Each
+write is its own request:
+
+| Sampler                                            | Traces kept | Kept fraction | Whole (API and writer sides) | One side only |
+| -------------------------------------------------- | ----------: | ------------: | ---------------------------: | ------------: |
+| random at the root, incoming sampled flag honoured |         200 |          1.00 |                          200 |             0 |
+| trace-id ratio (D63)                               |          45 |         0.225 |                           45 |             0 |
+
+**Reading.** The client's `HttpClient` sends a sampled `traceparent` on every request, so honouring
+the flag kept every trace. Deciding from the trace id keeps the configured fraction (binomial
+expectation 50 ± 6), and every kept trace is whole across the API Worker and the writer Durable
+Object.
+
+**Redaction**, measured on a local run of all 13 scenarios (6,193 spans): the only attribute keys
+outside the project's namespaces were `http.request.method`, `http.response.status_code`,
+`http.route`, `url.path`, `url.scheme`, `server.address`, `server.port`, `seq`, and `error.type`.
+Before D63, the same run exported `client.address` (2,006 spans), `user_agent.original` (1,983),
+`url.full` (7,063), and `url.query` (7).
+
 ## Live checks
 
 | Check                                       | Result                         | How                                                                                                                                                                                                                                                                                                                                                                                             |

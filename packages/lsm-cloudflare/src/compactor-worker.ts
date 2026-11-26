@@ -1,4 +1,5 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
+import { withLsmTracePolicy } from "./lsm-trace-policy.ts";
 import type { HttpEffect } from "alchemy/Http";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Effect, Layer } from "effect";
@@ -92,6 +93,6 @@ export const compactorWorkerLayer = <R = never>(options: CompactorWorkerOptions<
       ),
       Effect.provide(compactionExecutorLayerWithoutDependencies),
       Effect.provide(Layer.mergeAll(objectStoreLayer, lsmConfigurationLayer)),
-      Effect.provide(options.telemetry("cf-slatedb-compactor")),
+      Effect.provide(withLsmTracePolicy(options.telemetry("cf-slatedb-compactor"))),
     ),
   );

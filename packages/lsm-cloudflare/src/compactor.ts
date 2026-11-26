@@ -498,6 +498,8 @@ export const makeCompactor = Effect.gen(function* () {
       yield* Effect.annotateCurrentSpan({
         "database.id": databaseId,
         "manifest.id": latest.id,
+        // The compaction backlog an operator watches (D63).
+        "manifest.l0_ssts": latest.manifest.l0.length,
         "compaction.running": running.length,
         "compaction.started": running.length - state.running.length,
         "compaction.waiting_for_budget": waitingForBudget,

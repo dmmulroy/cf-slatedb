@@ -212,6 +212,8 @@ export const deployEnvironment = (
     readonly jurisdiction: PreviewJurisdiction;
     /** Extra setting overrides for a measurement deploy (`--settings`), applied over dev timings. */
     readonly settings: Option.Option<Readonly<Record<string, number>>>;
+    /** A trace sample rate for a measurement deploy (`--trace-sample-rate`); previews keep 1. */
+    readonly traceSampleRate: Option.Option<number>;
   },
 ): Record<string, string> => {
   const environment: Record<string, string> = {};
@@ -228,6 +230,9 @@ export const deployEnvironment = (
     environment["CF_SLATEDB_LSM_SETTINGS"] = JSON.stringify(overrides);
   }
   environment["CF_SLATEDB_JURISDICTION"] = options.jurisdiction;
+  if (Option.isSome(options.traceSampleRate)) {
+    environment["CF_SLATEDB_TRACE_SAMPLE_RATE"] = String(options.traceSampleRate.value);
+  }
   return environment;
 };
 

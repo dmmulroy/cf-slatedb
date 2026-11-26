@@ -121,11 +121,14 @@ const PREVIEW_SPAN_SETTLE = "5 seconds";
 /** Pulls and asserts again this many times, a few seconds apart, before a preview check fails. */
 const PREVIEW_ASSERT_ATTEMPTS = 6;
 
-const runTraceCli = (args: ReadonlyArray<string>, input?: string) =>
+/** Runs the trace CLI in its own process; returns its exit status and output. */
+export const runTraceCli = (args: ReadonlyArray<string>, input?: string) =>
   Effect.sync(() =>
     spawnSync(process.execPath, [TRACE_CLI, ...args], {
       ...(input === undefined ? {} : { input }),
       encoding: "utf8",
+      // A grep over a busy stage prints far more than the default 1 MiB.
+      maxBuffer: 1024 * 1024 * 1024,
     }),
   );
 

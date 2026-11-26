@@ -7,6 +7,7 @@ import { Effect, Option, Redacted, Schema } from "effect";
 import { LSM_BUCKET_LOCATION_SETTING, type LsmBucketLocation } from "./lsm-bucket.ts";
 import { LSM_SETTINGS_BINDING } from "./lsm-configuration.ts";
 import { LSM_JURISDICTION_SETTING, type LsmJurisdiction } from "./lsm-jurisdiction.ts";
+import { LSM_TRACE_SAMPLE_RATE_SETTING } from "./lsm-trace-policy.ts";
 
 /**
  * Everything a deployment decides for the engine that every cf-slatedb Worker must agree on: the
@@ -19,6 +20,8 @@ export interface LsmWorkerSettings {
   readonly jurisdiction: Option.Option<LsmJurisdiction>;
   /** The LSM bucket's location hint, or `None` to let R2 place it. */
   readonly bucketLocation: Option.Option<LsmBucketLocation>;
+  /** Fraction of traces kept, decided at each trace's root (D63). */
+  readonly traceSampleRate: number;
 }
 
 /**
@@ -33,8 +36,8 @@ const encodeLsmSettingsJson = Schema.encodeSync(Schema.fromJsonString(LsmSetting
 /**
  * The bindings that carry `settings` to a Worker, by binding name: the complete settings as JSON
  * under `CF_SLATEDB_LSM_SETTINGS`, the jurisdiction (`eu`, `fedramp`, or `none`) under
- * `CF_SLATEDB_JURISDICTION`, and the bucket's location hint (or `auto`) under
- * `CF_SLATEDB_BUCKET_LOCATION`. None is ever absent, so a deploy can never leave an earlier value
+ * `CF_SLATEDB_JURISDICTION`, the bucket's location hint (or `auto`) under
+ * `CF_SLATEDB_BUCKET_LOCATION`, and the trace sample rate under `CF_SLATEDB_TRACE_SAMPLE_RATE`. None is ever absent, so a deploy can never leave an earlier value
  * bound (D55).
  */
 export const lsmWorkerSettingsBindings = (
@@ -43,6 +46,7 @@ export const lsmWorkerSettingsBindings = (
   [LSM_SETTINGS_BINDING]: encodeLsmSettingsJson(settings.lsmSettings),
   [LSM_JURISDICTION_SETTING]: Option.getOrElse(settings.jurisdiction, () => "none"),
   [LSM_BUCKET_LOCATION_SETTING]: Option.getOrElse(settings.bucketLocation, () => "auto"),
+  [LSM_TRACE_SAMPLE_RATE_SETTING]: String(settings.traceSampleRate),
 });
 
 /**

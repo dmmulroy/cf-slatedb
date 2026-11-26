@@ -265,7 +265,7 @@ const metaCorrupted = (
     section,
     reason,
     offset,
-    message: `The ${section} section of SST ${sstId} at offset ${offset} is unreadable (${detail}). The stored object is damaged; restore it from a checkpoint or recompact its inputs.`,
+    message: `The ${section} section of SST ${sstId} at offset ${offset} is unreadable (${detail}). The stored object is damaged: restore the database from a checkpoint created before the SST, or drop the SST once compaction reports it (docs/operations.md, "Corruption runbook").`,
   });
 
 const verifySection = (

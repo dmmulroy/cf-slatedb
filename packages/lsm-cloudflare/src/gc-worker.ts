@@ -1,4 +1,5 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
+import { withLsmTracePolicy } from "./lsm-trace-policy.ts";
 import * as Alchemy from "alchemy";
 import type { HttpEffect } from "alchemy/Http";
 import { makeExecutionMemo } from "alchemy/Runtime/ExecutionMemo";
@@ -157,6 +158,6 @@ export const gcWorkerLayer = <R = never>(options: GcWorkerOptions<R>) =>
         ),
       ),
       Effect.provide(Layer.mergeAll(objectStoreLayer, lsmConfigurationLayer)),
-      Effect.provide(options.telemetry("cf-slatedb-gc")),
+      Effect.provide(withLsmTracePolicy(options.telemetry("cf-slatedb-gc"))),
     ),
   );

@@ -403,6 +403,20 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `object-store.test.ts`, `md5.test.ts`, `manifest.test.ts`, `compactor.test.ts`,
   `writer.workerd.ts` (multipart flush on local R2), the `repair` scenario. Formal: `GcSafety`
   `DropSst` with broken variant `dropDeletesObject`.
+- **Production telemetry (v1 workstream 8)** — done (D63).
+  - **Policy.** `lsm-trace-policy.ts` holds `withLsmTracePolicy`, `lsmPolicyTracer`,
+    `isExportedSpanAttribute`, and `traceIdSampled`. It is applied to every Worker's telemetry:
+    the API, compactor, BlockServer, GC, shard router, and probe.
+  - **Sample rate.** `LsmWorkerSettings.traceSampleRate` is bound as
+    `CF_SLATEDB_TRACE_SAMPLE_RATE` and read back by `lsmTraceSampleRate`.
+  - **Retention.** The TraceBucket expires `traces/` and `tails/` (`cfSlatedbTraceRetentionDays`).
+    The LsmBucket aborts stale multipart uploads.
+  - **Observability tooling.** `manifest.l0_ssts` on `Compactor.poll`;
+    `scenario-cli measure health|sampling`; `trace-cli pull --since-minutes`;
+    `preview-cli deploy --trace-sample-rate`. The "What to watch" section is in
+    `docs/operations.md`.
+  - **Tests.** `lsm-trace-policy.test.ts`, `lsm-worker-settings.test.ts`,
+    `preview-stage.test.ts`, and the `redaction` scenario.
 - **Routed reads see writes across a split (stale maps)** — done (D59). `DbWriter.probe`/`scan`
   report `sealedSuccessors`; `ReadOptions.refuseSealed` (`db-client.ts`); `ShardRouter` gets route
   through `withRouting` and scans resume shard by shard (`scanFrom`). Test: `sharding.test.ts` (a

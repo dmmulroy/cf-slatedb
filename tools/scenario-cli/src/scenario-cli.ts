@@ -27,6 +27,8 @@ import {
   measureManifestCas,
   measureR2Placement,
   measureTransactionAborts,
+  measureHealth,
+  measureSampling,
   measureWorkflowBurst,
   measureWriterMemory,
   measureWrites,
@@ -301,6 +303,26 @@ const measureWorkflowBurstCommand = Command.make(
   ({ stage, databases }) => runMeasurement(stage, measureWorkflowBurst(databases)),
 ).pipe(Command.withDescription("Many compaction Workflows started at once (D61)"));
 
+const measureHealthCommand = Command.make(
+  "health",
+  { stage: measureStage, minutes: Flag.Int("minutes").pipe(Flag.withDefault(60)) },
+  ({ stage, minutes }) => runMeasurement(stage, measureHealth(minutes)),
+).pipe(
+  Command.withDescription(
+    "A live stage's health from its tail records and spans: limits hit, refused writes, flushes, L0 backlog, corruption, GC (D63)",
+  ),
+);
+
+const measureSamplingCommand = Command.make(
+  "sampling",
+  { stage: measureStage, requests: Flag.Int("requests").pipe(Flag.withDefault(200)) },
+  ({ stage, requests }) => runMeasurement(stage, measureSampling(requests)),
+).pipe(
+  Command.withDescription(
+    "Head sampling: fraction of traces kept, each whole across Workers (D63)",
+  ),
+);
+
 const measure = Command.make("measure").pipe(
   Command.withDescription("Measurements against a live preview stage; JSON results"),
   Command.withSubcommands([
@@ -314,6 +336,8 @@ const measure = Command.make("measure").pipe(
     measureCompactionCpuCommand,
     measureWriterMemoryCommand,
     measureWorkflowBurstCommand,
+    measureHealthCommand,
+    measureSamplingCommand,
   ]),
 );
 

@@ -211,7 +211,7 @@ const corrupted = (
     section: "DataBlock",
     reason,
     offset: location.offset,
-    message: `Data block at offset ${location.offset} of SST ${location.sstId} is unreadable (${detail}). The stored object is damaged; restore it from a checkpoint or recompact its inputs.`,
+    message: `Data block at offset ${location.offset} of SST ${location.sstId} is unreadable (${detail}). The stored object is damaged: restore the database from a checkpoint created before the SST, or drop the SST once compaction reports it (docs/operations.md, "Corruption runbook").`,
   });
 
 /**

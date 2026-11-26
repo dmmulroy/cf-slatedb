@@ -1,4 +1,5 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
+import { withLsmTracePolicy } from "./lsm-trace-policy.ts";
 import type { HttpEffect } from "alchemy/Http";
 import { makeExecutionMemo } from "alchemy/Runtime/ExecutionMemo";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
@@ -94,6 +95,6 @@ export const blockServerWorkerLayer = <R = never>(options: BlockServerWorkerOpti
       return { fetch: withEventTelemetryFlush(Effect.flatten(router)) };
     }).pipe(
       Effect.provide(objectReaderLayer),
-      Effect.provide(options.telemetry("cf-slatedb-blocks")),
+      Effect.provide(withLsmTracePolicy(options.telemetry("cf-slatedb-blocks"))),
     ),
   );

@@ -138,9 +138,15 @@ const deploy = Command.make(
       ),
       Flag.optional,
     ),
+    traceSampleRate: Flag.Finite("trace-sample-rate").pipe(
+      Flag.withDescription(
+        "Fraction of traces kept (0 to 1), for a measurement deploy; previews otherwise keep every trace",
+      ),
+      Flag.optional,
+    ),
     json: jsonFlag,
   },
-  ({ stage, jurisdiction, devTimings, settings, json }) =>
+  ({ stage, jurisdiction, devTimings, settings, traceSampleRate, json }) =>
     Effect.gen(function* () {
       const current = yield* previewOutputs(yield* readStateRecords(Option.some(stage)), stage);
       const residency = deployJurisdiction(jurisdiction, current);
@@ -170,6 +176,7 @@ const deploy = Command.make(
         devTimings,
         jurisdiction: residency,
         settings: overrides,
+        traceSampleRate,
       });
       yield* Console.error(
         `Deploying ${CF_SLATEDB_STACK_NAME} to ${stage} with ${devTimings ? "dev" : "production"} timings, jurisdiction ${residency} (vp run ${deployTask(stage)})`,

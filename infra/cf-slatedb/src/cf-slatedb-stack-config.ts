@@ -292,6 +292,7 @@ export const cfSlatedbWorkerSettingsOf = (config: CfSlatedbStackConfig): LsmWork
   jurisdiction: config.jurisdiction === "none" ? Option.none() : Option.some(config.jurisdiction),
   bucketLocation:
     config.bucketLocation === "auto" ? Option.none() : Option.some(config.bucketLocation),
+  traceSampleRate: config.telemetry.traceSampleRate,
 });
 
 /**
@@ -317,6 +318,12 @@ const atPlanTime = <A>(
     if ((yield* Alchemy.ALCHEMY_PHASE) !== "plan") return atRuntime;
     return select(yield* cfSlatedbStackConfig.pipe(Effect.orDie));
   });
+
+/** Days the Stack configuration keeps traces and tail records (the trace bucket's lifecycle). */
+export const cfSlatedbTraceRetentionDays: Effect.Effect<number, never, Stage> = atPlanTime(
+  (config) => config.telemetry.traceRetentionDays,
+  DEFAULT_TRACE_RETENTION_DAYS,
+);
 
 /** The CPU limit (ms per invocation) the Stack configuration gives the API Worker. */
 export const cfSlatedbApiCpuLimit: Effect.Effect<number, never, Stage> = atPlanTime(

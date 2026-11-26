@@ -9,7 +9,7 @@ import { Base64 } from "effect/encoding";
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 import { HttpApiClient } from "effect/http-api";
 
-import { ScenarioStack, uniqueId } from "./scenario.ts";
+import { runTraceCli, ScenarioStack, uniqueId } from "./scenario.ts";
 
 /**
  * A measurement could not run or its data could not be read: `step` names what it was doing and
@@ -909,6 +909,253 @@ export const measureWorkflowBurst = (databases: number) =>
       allDoneSeconds,
       maxRunningObserved: maxRunning,
       compactorOutcomes: Object.fromEntries(outcomes),
+    };
+  });
+
+/** One span as `trace-cli grep --json` prints it (the fields the health report reads). */
+const GreppedSpan = Schema.Struct({
+  traceId: Schema.String,
+  name: Schema.String,
+  startTimeUnixNano: Schema.String,
+  durationMs: Schema.Number,
+  status: Schema.optional(
+    Schema.Struct({
+      code: Schema.optional(Schema.Unknown),
+      message: Schema.optional(Schema.NullOr(Schema.String)),
+    }),
+  ),
+  attributes: Schema.Record(Schema.String, Schema.Unknown),
+  events: Schema.optional(
+    Schema.Array(
+      Schema.Struct({
+        name: Schema.String,
+        attributes: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+      }),
+    ),
+  ),
+});
+const decodeGreppedSpans = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(Schema.Array(GreppedSpan)),
+);
+
+/** The trace store a measurement reads a stage's spans from: its own, so stages never mix. */
+const measurementStore = (stage: string) =>
+  fileURLToPath(new URL(`../../../.traces/measure/${stage}`, import.meta.url));
+
+/**
+ * Pulls the stage's spans from the last `minutes` into its measurement store (resuming where the
+ * last pull stopped).
+ */
+const pullMeasurementSpans = (minutes: number) =>
+  Effect.gen(function* () {
+    const { previewStage } = yield* ScenarioStack;
+    const stage = Option.getOrElse(previewStage, () => "local");
+    if (Option.isSome(previewStage)) {
+      yield* runTraceCli([
+        "pull",
+        "--stage",
+        stage,
+        "--store",
+        measurementStore(stage),
+        "--since-minutes",
+        String(minutes),
+      ]);
+    }
+    return Option.isSome(previewStage)
+      ? measurementStore(stage)
+      : fileURLToPath(new URL("../../../.traces", import.meta.url));
+  });
+
+/** Spans `trace-cli grep` finds in `store` with `args` that started at or after `sinceMs`. */
+const spansSince = (store: string, sinceMs: number, args: ReadonlyArray<string>) =>
+  Effect.gen(function* () {
+    const result = yield* runTraceCli(["grep", "--json", "--store", store, ...args]);
+    const step = `trace-cli grep ${args.join(" ")}`;
+    if (result.status !== 0) {
+      return yield* new MeasurementError({
+        step,
+        reason: "TraceCliFailed",
+        message: `Measurement step "${step}" failed: ${result.stderr || result.stdout}. Run the measurement again.`,
+      });
+    }
+    const spans = yield* decodeGreppedSpans(result.stdout || "[]").pipe(
+      Effect.mapError(failed(step)),
+    );
+    return spans.filter((span) => Number(BigInt(span.startTimeUnixNano) / 1_000_000n) >= sinceMs);
+  });
+
+/** The type of the exception a failed span recorded, such as `WriteStalledError`. */
+const exceptionType = (span: typeof GreppedSpan.Type) => {
+  const type = span.events?.find((event) => event.name === "exception")?.attributes?.[
+    "exception.type"
+  ];
+  return typeof type === "string" ? type : "unknown";
+};
+
+/** Counts of `values`, most frequent first. */
+const tally = (values: ReadonlyArray<string>) =>
+  Object.fromEntries(
+    [
+      ...values.reduce(
+        (counts, value) => counts.set(value, (counts.get(value) ?? 0) + 1),
+        new Map<string, number>(),
+      ),
+    ].sort((left, right) => right[1] - left[1]),
+  );
+
+/**
+ * Head sampling on a live stage (D63): sends `requests` writes, each its own trace, to one new
+ * database, then reports what fraction of traces was kept and whether each kept trace is whole: the
+ * API Worker's `WriterClient.write` and the writer Durable Object's `DbWriter.write` in the same
+ * trace, never one without the other. Deploy with `--trace-sample-rate` to measure a fraction.
+ *
+ * @returns The report, or `MeasurementError` when the database cannot be created or written.
+ */
+export const measureSampling = (requests: number) =>
+  Effect.gen(function* () {
+    const databaseId = DatabaseId.make(uniqueId("ms-sample"));
+    yield* createDatabase(databaseId);
+    const client = yield* dbApi;
+    const value = valueBytes(16, 3);
+    const sinceMs = yield* Clock.currentTimeMillis;
+    for (let request = 0; request < requests; request++) {
+      yield* client.databases
+        .write({
+          params: { databaseId },
+          payload: {
+            operations: [
+              { _tag: "Put", key: keyBytes(0, 0, request), value, ttlMillis: Option.none() },
+            ],
+          },
+        })
+        .pipe(Effect.mapError(failed("write")));
+    }
+    // Live stages export after each response: give the last ones time to arrive.
+    yield* Effect.sleep("20 seconds");
+    const store = yield* pullMeasurementSpans(10);
+    const tracesOf = (name: string) =>
+      spansSince(store, sinceMs, ["--name", name, "--db", databaseId]).pipe(
+        Effect.map((spans) => new Set(spans.map((span) => span.traceId))),
+      );
+    const apiSide = yield* tracesOf("WriterClient.write");
+    const writerSide = yield* tracesOf("DbWriter.write");
+    const whole = [...apiSide].filter((trace) => writerSide.has(trace)).length;
+    return {
+      databaseId,
+      requests,
+      tracesKept: apiSide.size,
+      keptFraction: apiSide.size / requests,
+      wholeTraces: whole,
+      apiSideOnly: apiSide.size - whole,
+      writerSideOnly: [...writerSide].filter((trace) => !apiSide.has(trace)).length,
+    };
+  });
+
+/**
+ * A live stage's health over the last `minutes` (D63), from its tail records and its spans: what
+ * `docs/operations.md` says to watch.
+ *
+ * - Invocations per Worker: outcomes (any `exceededCpu`, `exceededMemory`, or `exception` is an
+ *   issue) and CPU.
+ * - Writes refused (`DbWriter.write` errors, by message), flush duration, and the L0 backlog
+ *   (`manifest.l0_ssts` on `Compactor.poll`, highest per database).
+ * - Corrupted SSTs, failed collections and sweeps, and the most frequent error spans.
+ *
+ * Spans are sampled in production (P4), so span counts there are a sample; tail records are not.
+ *
+ * @returns The report with an `issues` list (empty when healthy), or `MeasurementError` when tail
+ *   records cannot be read.
+ */
+export const measureHealth = (minutes: number) =>
+  Effect.gen(function* () {
+    const sinceMs = (yield* Clock.currentTimeMillis) - minutes * 60_000;
+    const records = yield* readInvocationRecords(sinceMs);
+    const store = yield* pullMeasurementSpans(minutes);
+    const workers = new Map<string, Array<InvocationRecord>>();
+    for (const record of records) {
+      const worker = Option.getOrElse(record.scriptName, () => "unknown");
+      workers.set(worker, [...(workers.get(worker) ?? []), record]);
+    }
+    const invocations = Object.fromEntries(
+      [...workers].map(([worker, list]) => [
+        worker,
+        {
+          outcomes: tally(list.map((record) => record.outcome)),
+          cpuMs: summarize(list.map((record) => record.cpuTimeMs)),
+        },
+      ]),
+    );
+    const exceeded = records.filter((record) =>
+      ["exceededCpu", "exceededMemory", "exception"].includes(record.outcome),
+    );
+    const refusedWrites = yield* spansSince(store, sinceMs, [
+      "--name",
+      "DbWriter.write",
+      "--error",
+    ]);
+    const flushes = yield* spansSince(store, sinceMs, ["--name", "DbWriter.flush"]);
+    const polls = yield* spansSince(store, sinceMs, ["--name", "Compactor.poll"]);
+    const backlog = new Map<string, number>();
+    // Corruption is judged by each database's latest poll: a repaired one no longer reports it.
+    const latestPoll = new Map<string, typeof GreppedSpan.Type>();
+    for (const poll of polls) {
+      const id = poll.attributes["database.id"];
+      const database = typeof id === "string" ? id : "unknown";
+      const l0 = Number(poll.attributes["manifest.l0_ssts"] ?? 0);
+      backlog.set(database, Math.max(backlog.get(database) ?? 0, l0));
+      const seen = latestPoll.get(database);
+      if (seen === undefined || BigInt(seen.startTimeUnixNano) < BigInt(poll.startTimeUnixNano)) {
+        latestPoll.set(database, poll);
+      }
+    }
+    const corrupt = new Set(
+      [...latestPoll]
+        .filter(([, poll]) => Number(poll.attributes["compaction.corrupt_ssts"] ?? 0) > 0)
+        .map(([database]) => database),
+    );
+    // Sealed and fenced refusals are routing, not trouble; a stalled write is backpressure.
+    const stalled = refusedWrites.filter((span) => exceptionType(span) === "WriteStalledError");
+    const failedCollections = yield* spansSince(store, sinceMs, [
+      "--name",
+      "GarbageCollector.collect",
+      "--error",
+    ]);
+    const failedSweeps = yield* spansSince(store, sinceMs, [
+      "--name",
+      "MaintenanceSweep.sweepPage",
+      "--error",
+    ]);
+    const errors = yield* spansSince(store, sinceMs, ["--error"]);
+    const deepestBacklog = [...backlog].sort((left, right) => right[1] - left[1]).slice(0, 5);
+    const issues = [
+      ...exceeded.map(
+        (record) =>
+          `${Option.getOrElse(record.scriptName, () => "a Worker")} invocation ended ${record.outcome} (${record.eventKind}, ${record.cpuTimeMs} ms CPU)`,
+      ),
+      ...[...corrupt].map(
+        (database) => `database ${database} has corrupted SSTs: see docs/operations.md`,
+      ),
+      ...(failedCollections.length > 0 ? [`${failedCollections.length} collections failed`] : []),
+      ...(failedSweeps.length > 0 ? [`${failedSweeps.length} maintenance sweeps failed`] : []),
+      ...(stalled.length > 0
+        ? [`${stalled.length} writes stalled (WriteStalled): L0 or unflushed bytes at their limit`]
+        : []),
+    ];
+    return {
+      minutes,
+      healthy: issues.length === 0,
+      issues,
+      invocations,
+      writes: {
+        refusedByError: tally(refusedWrites.map(exceptionType)),
+      },
+      flushMs: summarize(flushes.map((span) => span.durationMs)),
+      l0Backlog: { deepest: Object.fromEntries(deepestBacklog), databases: backlog.size },
+      corruptSsts: [...corrupt],
+      gc: { failedCollections: failedCollections.length, failedSweeps: failedSweeps.length },
+      errorSpans: Object.fromEntries(
+        Object.entries(tally(errors.map((span) => span.name))).slice(0, 10),
+      ),
     };
   });
 
