@@ -278,18 +278,34 @@ describe("GarbageCollector", () => {
       const options = { keyRange: Option.none(), databaseOptions: DEFAULT_DATABASE_OPTIONS };
       const idle = Array.from({ length: 14 }, (_, index) => DatabaseId.make(`idle-${index}`));
       for (const databaseId of idle) yield* store.initialize(initialManifest(databaseId, options));
-      // A fork still reading its source, and a database whose manifests piled up uncollected.
+      // A fork still reading its source, a fork that rewrote its source's SSTs but still holds it
+      // (its collection releases the hold, D77), and a database whose manifests piled up.
+      const holding = (databaseId: DatabaseId, checkpoint: string) =>
+        replaceManifestFields(initialManifest(databaseId, options), {
+          externalRefs: [
+            { owner: DatabaseId.make("idle-0"), checkpointId: CheckpointId.make(checkpoint) },
+          ],
+        });
       const fork = DatabaseId.make("fork-a");
       yield* store.initialize(
-        replaceManifestFields(initialManifest(fork, options), {
-          externalRefs: [
+        replaceManifestFields(holding(fork, "01JD0000000000000000000001"), {
+          l0: [
             {
-              owner: DatabaseId.make("idle-0"),
-              checkpointId: CheckpointId.make("01JD0000000000000000000001"),
+              id: SstId.make("01JD0000000000000000000009"),
+              firstKey: Uint8Array.of(1),
+              lastKey: Uint8Array.of(2),
+              sizeBytes: 100,
+              rowCount: 2,
+              metaOffset: 0,
+              metaLength: 0,
+              owner: Option.some(DatabaseId.make("idle-0")),
+              view: Option.none(),
             },
           ],
         }),
       );
+      const rewritten = DatabaseId.make("fork-b");
+      yield* store.initialize(holding(rewritten, "01JD0000000000000000000002"));
       const busy = DatabaseId.make("busy-a");
       yield* store.initialize(initialManifest(busy, options));
       for (let round = 0; round <= MAX_UNCOLLECTED_MANIFESTS; round++) {
@@ -321,10 +337,10 @@ describe("GarbageCollector", () => {
       Effect.provide(TestClock.layer()),
       Effect.runPromise,
     );
-    // 17 databases (14 idle, the fork, the busy one, the ghost) in pages of at most 5.
-    expect(outcome.pages).toEqual([5, 5, 5, 2]);
+    // 18 databases (14 idle, two forks, the busy one, the ghost) in pages of at most 5.
+    expect(outcome.pages).toEqual([5, 5, 5, 3]);
     expect(outcome.calls.woken).toEqual(["fork-a"]);
-    expect(outcome.calls.collectionsRequested).toEqual(["busy-a"]);
+    expect(outcome.calls.collectionsRequested).toEqual(["busy-a", "fork-b"]);
     expect(outcome.ghostLeft).toBe(0);
     expect(outcome.again).toBe(5);
   });

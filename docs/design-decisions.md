@@ -320,7 +320,7 @@ The compactor notices finished jobs on its next poll rather than by a callback.
 
 The compactor fences in (`compactorEpoch + 1`) on its first wake and keeps the epoch in Durable
 Object storage, so jobs it started stay valid across evictions; only a different compactor fences
-it. Its alarm polls every `compactorPollInterval` while jobs run or wait for budget, and stops
+it (D78: a fenced compactor now fences in again on its next start). Its alarm polls every `compactorPollInterval` while jobs run or wait for budget, and stops
 otherwise. Writers wake it after a flush leaves at least `minCompactionSources` L0 SSTs, and again
 when a write stalls on `l0MaxSsts`. `CompactionBudget` is a global Durable Object (`compaction-budget`
 ledger: fair share among groups holding or waiting for leases, leases renewed on each poll and
@@ -353,6 +353,9 @@ write acknowledged before the call. `ManifestStore.update` now passes the manife
 so the checkpoint pins exactly the manifest its CAS applied to.
 
 ## D38. Forks rewrite external SSTs with one full compaction, then release
+
+> **Release rule corrected by D77.** A fork no longer releases its hold on the compactor's next
+> poll: its own collection releases it once no manifest it keeps names another database's SST.
 
 Size-tiered planning alone may never touch a fork's bottom run, which would keep the source's files
 alive indefinitely. When nothing else is running or planned and the manifest still reads another
@@ -994,8 +997,9 @@ wall-time limits and silently stop partway.
     `POST /v1/gc` runs one page. A run's cost is bounded by the page, whatever the number of databases.
 - The GC Worker now also reports to the CPU Tail Worker.
 
-Tests: `garbage-collector.test.ts` runs the sweep over 17 databases in pages of 5 and checks every
-database is visited once per cycle (fork woken, piled-up manifests requested, leftovers swept) and
+Tests: `garbage-collector.test.ts` runs the sweep over 18 databases in pages of 5 and checks every
+database is visited once per cycle (fork woken, piled-up manifests and, since D77, a rewritten
+fork still holding its source requested, leftovers swept) and
 that the next run starts over. `compactor.test.ts` shows collection due `gcMinAge` after a
 compaction, run by the alarm, then idle with no alarm. The `gc` scenario asserts that the
 compactor's alarm collected (`GarbageCollector.collect` under `Compactor.alarm` with
@@ -1849,7 +1853,10 @@ idle compactor took 5.4 to 9.2 s to reach its handler, which then ran 0.3 to 0.5
 flush that wrote its SST in 5.4 s and committed in 0.5 s took 12.8 s. The wake is now
 `BackgroundWork` (the Durable Object's `waitUntil`), as a fork's has been since D57. A lost wake
 is repeated by the next flush that leaves enough L0 SSTs, and a write refused for L0 backlog
-wakes the compactor the same way.
+wakes the compactor the same way. Correction (D78): a wake no longer serialized by the flush lock
+can reach a cold compactor while the previous wake is still fencing in. Two fence-ins then left
+the compactor fenced by itself, so its database never compacted again. D78 makes the fence-in
+single-flight.
 
 **SST blocks are encoded a chunk of rows at a time.** `SstStore.write` made one stream per row.
 Mapping each chunk of rows to the blocks it closes took a 60 MB flush from 1.93 s to 1.60 s in
@@ -1934,6 +1941,11 @@ of CPU. No soak could show it: their memtables hold a few hundred rows.
   that gave up, or one that failed after the flush was recorded) kept the alarm due, and an alarm
   that found nothing to flush set itself for now again. A flush that writes nothing now rescans
   when the counters still show unflushed rows (none: counters showing nothing are never wrong).
+- **An interrupted write is still counted and still sets its alarm.** A request interrupted
+  after its rows reached SQLite, and before the counters or the alarm were updated, left rows
+  nothing would flush until the next write (found in review of the fix above, with a failing
+  test). The mark, the SQLite commit, and the counters' update are now uninterruptible together,
+  and the alarm is scheduled when the write ends however it ends.
 - **The alarm decides from the counters** `scheduleFlush` set it from, so the two cannot
   disagree, and an alarm costs no scan.
 - **`status` reports the counters**: no scan on a transaction's begin or on a status request.
@@ -2033,6 +2045,205 @@ variant `noReadUpperBound` fails it, and `noReadHorizonCheck` now fails it too. 
 
 **Not fixed here.** A fork's manifests name its source's SSTs, and the fork released its hold on
 the source too early for readers of its older manifests (D77).
+
+## D77. A fork keeps its hold on its source while a reader may still hold a manifest that reads it
+
+**The defect.** D38 released a fork's hold on its source as soon as the fork's newest manifest,
+and the manifests its own checkpoints pin, no longer named the source's SSTs. It ignored the
+fork's manifests replaced less than `gcMinAge` ago. A reader may hold those: a snapshot from
+`DbClient.snapshot` (promised for `gcMinAge`), a manifest a Worker isolate cached, or a
+transaction's begin manifest. Every other part of the system keeps what such a manifest needs
+(D29, D33, `MayBeHeld` in `GcSafety.tla`). Two scratch tests from an interaction audit proved the
+consequences. Seconds after the fork's rewrite, the hold was gone. The source's collection then
+deleted 5 SSTs the fork's snapshot named, or the source could be removed. The snapshot then
+failed with `StorageUnavailable` on every retry, as did a transaction whose begin manifest was
+the writer's fence-in manifest.
+
+**A second early release, found while fixing it.** A fork of a fork (D13) reads the original
+owner's SSTs under the owner's id, through its hold on the middle database. D38 matched a hold to
+the owners its handles name. So the grandchild's hold on the middle database counted as
+releasable before the grandchild's rewrite: any idle poll could release it, for example one
+waiting for compaction budget. Without that hold the middle database's own hold on the owner
+lapses, and the owner's SSTs can be deleted under the grandchild. The `manifest.test.ts` case
+fails on the code before.
+
+**The rule.** A fork releases its hold only when none of its manifests that a reader may still
+hold names another database's SST. Those manifests are exactly the ones GC keeps:
+
+- the newest;
+- every manifest a checkpoint pins;
+- every manifest superseded less than `gcMinAge` ago, measured from its successor's write time
+  (D33).
+
+A database has at most one external reference: only `forkManifest` creates one, and every other
+database's SST the database reads came through it. So the hold is needed while any kept manifest
+names any other database's SST, whichever owner's id it carries.
+
+**The design: the fork's own collection releases the hold.** `GarbageCollector.collect` already
+computes the kept manifests (`planManifestCollection`) and loads them to plan SST deletes. After
+that, `releasableExternalRefs(newest, kept)` returns the hold when none of them names another
+database's SST. Releasing is two idempotent CAS steps, as before:
+
+1. remove the checkpoint from the owner's manifest;
+2. remove the reference from the fork's own manifest.
+
+A crash between them leaves the reference, and the next collection releases again. If any kept
+manifest cannot be loaded, the collection releases nothing.
+
+A manifest newer than the ones the collection listed names no other database's SST that they do
+not. Flushes and compactions add only the database's own SSTs, `dropSstFromManifest` removes one,
+and no edit after `forkManifest` adds a handle owned by another database. So checking the listed
+kept manifests is enough, and nothing beyond what GC already loads is read.
+
+**What brings the release about.**
+
+- **The compactor's alarm.** The compactor sets a collection due `gcMinAge` after it sees the
+  rewrite finish (D60). That collection finds the pre-rewrite manifests old enough and releases.
+- **The maintenance sweep.** It now asks for a collection of any database that still holds a
+  source but no longer reads another database's SSTs. It still wakes the compactor of one that
+  does. The sweep is the backstop for a lost alarm, and for a middle database whose fork just
+  released its hold on it: that database's collection is not otherwise due. A collection asked
+  for early releases nothing while the pre-rewrite manifests are young.
+
+**Rejected.**
+
+- **A second "may still be held" rule in the compactor**, for example "release `gcMinAge` after
+  the rewrite". It would copy GC's rule and drift from it, and it would not see the fork's own
+  pins.
+- **Loading every kept manifest in the compactor's poll.** That is the collection's work done
+  twice, on every poll.
+- **Delaying source collection or removal instead.** The source cannot know which of the fork's
+  manifests readers may hold; only the fork's collection can.
+
+**What it costs.** The source keeps the SSTs a fork read for about `gcMinAge` longer after the
+fork's rewrite: an hour in production, 10 s with dev timings. For a split, the sealed database
+cannot be removed (`DatabaseHasDependentsError`) until that time has passed for both halves.
+Nothing in a split waits on it: `ShardSplit` never removes the sealed database, and whoever does
+retries the removal later (`writer.workerd.ts` retries it). A middle database of a fork chain
+releases its own hold only at its next collection after its fork's release, which the sweep asks
+for within a sweep cycle.
+
+**Tests and model.**
+
+- `database-lifecycle.test.ts`:
+  - **Split.** Each fork keeps its hold after the rewrite and the source cannot be removed. One
+    `gcMinAge` later the fork's own due collection releases the hold, and the source is removed.
+  - **Snapshot.** A fork's snapshot taken before the rewrite stays readable through the fork's
+    and the source's collections and through an attempt to remove the source. After `gcMinAge`
+    the hold is released, the source is removed, and the snapshot reads `SnapshotExpired`.
+  - **Fork of a fork.** Its holds are kept down the chain while any kept manifest names the
+    original owner.
+- `garbage-collector.test.ts`: the sweep asks a rewritten fork to collect and wakes one still
+  reading its source.
+- `manifest.test.ts`: a fork of a fork's hold is kept before its rewrite.
+- All four `lsm-cloudflare` tests fail on the code before. Seven mutations are each caught.
+- `GcSafety.tla` gains an abstract fork (`GcSafetyFork.cfg`: `ForkStart`, `ForkRewrite`,
+  `ForkRelease`) and the invariant `ForkReadsComplete`. The broken variant `earlyForkRelease`
+  (D38's rule) fails it.
+
+## D78. One compactor fence-in per start, state written by read-modify-write, and a fenced compactor fences in again
+
+**Found live.** `measure manifest-cas --stage preview-3` (30 small flushes back to back) on the
+final code failed with `WriteStalled`. Database `ms-cas-mwy5ujbj` had 16 L0 SSTs at 2026-11-26
+23:05 UTC and was still stuck twelve minutes later. Its compaction status was
+`{"compactorEpoch":1,"running":[],"fenced":true}`, while the manifest's compactor epoch was 2 (the
+spans: `agents/compactorfence/evidence/timeline.txt`).
+
+**What happened** (`compactor.ts` before this change):
+
+1. Flush 4 woke the cold compactor. Since D73 the wake is background work, so flush 5 woke it
+   again 0.65 s later, while the first wake was still inside `ensureState`.
+2. `ensureState` had no lock. Both wakes found no state, and both committed `fenceCompactor`:
+   epochs 1 and 2 (manifests 8 and 9).
+3. The first wake stored epoch 1 and set the alarm. Its poll loaded manifest 8 (epoch 1) and
+   started a compaction for epoch 1. Meanwhile the second wake stored epoch 2.
+4. The poll ended by writing back `{...state, running}` from the state it had read at its start,
+   which overwrote epoch 2 with epoch 1.
+5. The job found epoch 2 in the manifest and was discarded. The next poll saw
+   `manifest.compactorEpoch !== state.compactorEpoch` and stored `fenced: true`.
+6. A fenced compactor was terminal. `wake` skipped the poll, `runAlarm` returned at once, and
+   `dropSst` refused. There is one compactor Durable Object per database, so no newer compactor
+   existed to take over. The database stopped compacting, and once it reached `l0MaxSsts` every
+   write was refused.
+
+Before D73 a flush awaited the wake under its flush lock, which hid the race for flushes. Other
+callers could reach it all along: the maintenance sweep, `requestCollection`, `dropSst`, and the
+stalled-write wake. A Durable Object's input gate does not serialize two requests across a
+manifest commit on R2.
+
+**The rules.**
+
+- **One fence-in per start.** `ensureState` runs under `startLock`, so concurrent first callers
+  share one `fenceCompactor` commit. The lock order is written where the locks are declared:
+  `planLock`, then `collectionLock` (never held with the others), then `startLock` (an SST drop
+  takes it under `planLock`), then `stateLock`.
+- **Every state write is a read-modify-write.** `updateState` applies a function to the stored
+  state and writes the result under `stateLock`, around no other I/O. Each field has owners (see
+  `CompactorState`):
+  - A poll writes `running` and `corruptSsts` onto the current state, and only brings
+    `collectionDueAt` forward.
+  - It writes nothing over a newer epoch; its jobs carry the old epoch, are discarded, and have
+    their leases released.
+  - A collection sets `collectionDueAt` from its report only if no request moved it while the
+    collection ran.
+  - `requestCollection`, the alarm's retry, and an SST drop change only their own field.
+- **A fenced compactor fences in again.** `fenced: true` is SlateDB's compactor process that
+  exited on `Fenced`; SlateDB's next compactor start fences in with a new epoch. Here the next
+  start is the next `wake`, `requestCollection`, `dropSst`, or alarm.
+  - It commits `fenceCompactor` again and releases the old epoch's leases.
+  - It keeps the corruption reports and the collection due time.
+  - `commitCompaction`'s epoch check discards the old epoch's jobs, so "no fenced compactor
+    commits" still holds: every commit carries its job's epoch.
+- **No ping-pong.** No guard against two instances fencing each other is needed. Only this Durable
+  Object fences in for its database, and the runtime runs at most one instance of it, sharing one
+  storage. A newer epoch it did not store therefore means its own state was lost or overwritten,
+  and fencing in again is the repair. Each re-fence needs a stored `fenced: true`, which only a
+  poll that saw a newer epoch writes, so re-fences are bounded by those polls.
+- **The compaction status** (`GET /v1/databases/{id}/compaction`) keeps its shape. `fenced` can
+  now be true only between the poll that saw a newer epoch and the next start.
+- **Revival.** A database already stuck, like the one above, recovers on its next start: a wake
+  from the next flush or the stalled-write wake, the sweep's request, or an operator's drop.
+
+**Rejected.**
+
+- **Clearing the state on fencing, so the next wake starts fresh.** That would lose corruption
+  reports and the collection due time.
+- **A compare-and-set on the stored epoch only at the poll's write.** It fixes the one proven site
+  but not the class. `collectionDueAt` was also lost when `requestCollection` or a collection
+  stored it during a poll, and D77 relies on requested collections.
+- **Making the wake synchronous again in the flush.** That would bring back D73's flush times, and
+  the other callers would still race.
+
+**Tests** (`compactor.test.ts`; every gate is a `Deferred` in a wrapped manifest store, reader, or
+collector, not a sleep):
+
+- **Two overlapping cold wakes.** On the code before, the test ends in the live state: two
+  fence-ins, manifest epoch 2, stored epoch 1, `fenced`, and L0 at 4 after three more wakes. Now
+  there is one fence-in, and the compaction commits.
+- **A poll that ran across a fence-in** stores nothing over the newer epoch.
+- **A collection requested during a poll**, and one requested during a collection, are still due
+  afterwards.
+- **A stored `fenced: true` with an older epoch** fences in again on a wake (epoch 3; the
+  compaction commits), and again from the alarm alone (epoch 5), keeping the collection due time.
+- **Six mutations, all caught:** the start lock removed, the poll's due time taken from its
+  starting state, the poll's whole starting state written back, a collection overwriting a request,
+  no re-fence on wake, and no re-fence from the alarm.
+
+**The same pattern elsewhere.** These are the first-call initializers that write to R2 or a
+manifest, checked against two concurrent first calls:
+
+- **`DbWriter.startWriter`** runs under `initLock` and re-reads the phase inside it.
+- **`DatabaseLifecycle.create`** is a create-if-absent of manifest 1, so exactly one succeeds
+  (also measured live with `create-race`).
+- **`CompactionBudget` and `ShardDirectory`** do their read-modify-write under a lock, with no
+  other I/O inside it.
+- **`MaintenanceSweep`** is a cron, not a Durable Object. Its cursor is a plain object, and two
+  overlapping runs visit the same page twice, which is harmless (each visit is idempotent).
+
+**Model.** `ManifestCasFencing.tla` already treats each fence-in as a compactor with its own epoch,
+and a compactor that fences in again is one more of those. The overwritten epoch was in the
+compactor's own Durable Object state, not in the manifest, so it is a property of that state, and
+the tests check it. No step changed; reran, and every broken variant fails (the skill records it).
 
 ## D79. The sharded API answers refused requests with the public envelope; it is not part of `/v1`'s contract
 

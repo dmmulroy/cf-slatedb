@@ -390,8 +390,35 @@ describe("manifest edits", () => {
       sortedRuns: [{ id: SortedRunId.make(0), ssts: [handle(9, 1, 2)] }],
     });
     expect(releasableExternalRefs(rewritten, [])).toEqual([{ owner: DB, checkpointId }]);
-    // But a checkpoint the fork holds pins a manifest that still reads the owner's SST (D13).
+    // But a manifest GC keeps (one a checkpoint pins, D13, or one superseded less than gcMinAge
+    // ago, D77) still reads the owner's SST.
     expect(releasableExternalRefs(rewritten, [fork])).toEqual([]);
+  });
+
+  it("keeps a fork of a fork's hold on its source while it reads the original owner's SSTs", () => {
+    const source = Result.getOrThrow(flush(empty, 1));
+    const middleId = DatabaseId.make("orders-b");
+    const middle = forkManifest(source, {
+      databaseId: middleId,
+      checkpointId: CheckpointId.make("01JD0000000000000000000CP5"),
+      range: FULL_KEY_RANGE,
+    });
+    const holdOnMiddle = CheckpointId.make("01JD0000000000000000000CP6");
+    const grandchild = forkManifest(middle, {
+      databaseId: DatabaseId.make("orders-c"),
+      checkpointId: holdOnMiddle,
+      range: FULL_KEY_RANGE,
+    });
+    // Its SSTs carry the original owner's id, but its hold is on the middle database, whose
+    // checkpoint is what keeps the middle database's own hold on the original owner.
+    expect(grandchild.l0[0]?.owner).toEqual(Option.some(DB));
+    expect(grandchild.externalRefs).toEqual([{ owner: middleId, checkpointId: holdOnMiddle }]);
+    expect(releasableExternalRefs(grandchild, [])).toEqual([]);
+    const rewritten = manifestWith(grandchild, {
+      l0: [],
+      sortedRuns: [{ id: SortedRunId.make(0), ssts: [handle(9, 1, 2)] }],
+    });
+    expect(releasableExternalRefs(rewritten, [])).toEqual(grandchild.externalRefs);
   });
 });
 

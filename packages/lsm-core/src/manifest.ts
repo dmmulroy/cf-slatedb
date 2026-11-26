@@ -862,28 +862,35 @@ export const forkManifest = (
 };
 
 /**
- * The external references a fork can release (a pure function): those whose owner no SST in the
- * newest manifest or in any manifest its own checkpoints pin still belongs to.
+ * The external references a fork can release (a pure function): all of them once no manifest a
+ * reader may still hold names another database's SST, none before (D77).
  *
  * **Details**
  *
- * A fork of a fork keeps reading the original owner's files through handles copied from its
- * source, and holds a checkpoint only on that source (D13). The source therefore keeps its own
- * reference to the original owner while any manifest it must keep (including the one its fork pins)
- * still names that owner.
+ * `kept` must be every manifest GC keeps (`planManifestCollection`'s retained set): the newest,
+ * every manifest a checkpoint pins, and every manifest superseded less than `gcMinAge` ago. A reader
+ * holding any of them reads the SSTs it names, so the hold that protects those SSTs stays.
  *
- * @param pinned - The manifests the newest manifest's checkpoints pin.
+ * A database has at most one external reference, the hold `forkManifest` names on its direct
+ * source, and every other database's SST it reads came through that source's checkpoint. A fork of
+ * a fork reads the original owner's files under the original owner's id (D13) through its hold on
+ * the middle database, so the hold is needed while any kept manifest names any other database's
+ * SST, not only the holder's own.
+ *
+ * A database's manifests only ever lose other databases' SSTs (flushes and compactions add its own,
+ * drops remove, and only `forkManifest` creates a manifest naming another's), so a manifest newer
+ * than the ones in `kept` names none that they do not.
+ *
+ * @param kept - Every manifest of `latest`'s database a reader may still hold, `latest` included or
+ *   not.
  */
 export const releasableExternalRefs = (
   latest: Manifest,
-  pinned: ReadonlyArray<Manifest>,
-): ReadonlyArray<ExternalRef> => {
-  const stillRead = new Set<DatabaseId>();
-  for (const manifest of [latest, ...pinned]) {
-    for (const owner of externalOwners(manifest)) stillRead.add(owner);
-  }
-  return latest.externalRefs.filter((ref) => !stillRead.has(ref.owner));
-};
+  kept: ReadonlyArray<Manifest>,
+): ReadonlyArray<ExternalRef> =>
+  [latest, ...kept].some((manifest) => externalOwners(manifest).size > 0)
+    ? []
+    : latest.externalRefs;
 
 /** Owners other than the database itself whose SSTs the manifest still reads. */
 export const externalOwners = (manifest: Manifest): ReadonlySet<DatabaseId> => {

@@ -740,96 +740,106 @@ export const makeDbWriter = Effect.gen(function* () {
     beforeCommit: Effect.Effect<void, E>,
   ) =>
     Effect.gen(function* () {
-      const receipt = yield* commitLock.withPermits(1)(
-        Effect.gen(function* () {
-          let ready = yield* writableReady(databaseId);
-          const { bytes } = yield* Ref.get(unflushed);
-          if (bytes >= settings.maxUnflushedBytes) {
-            yield* Metric.update(writeStalls, 1);
-            yield* scheduleFlush(databaseId);
-            return yield* Effect.fail(
-              new WriteStalledError({
-                databaseId,
-                reason: "UnflushedBytes",
-                retryAfterMs: 1_000,
-                message: `Database ${databaseId} has ${bytes} unflushed bytes, above its ${settings.maxUnflushedBytes} limit, so the write was refused. Retry the same batch after a short wait; nothing was written.`,
-              }),
-            );
-          }
-          if (ready.manifest.manifest.l0.length >= settings.l0MaxSsts) {
-            // The cached manifest may predate compactions: reload before refusing.
-            const latest = yield* manifests
-              .update(databaseId, (manifest) => Result.succeed(manifest))
-              .pipe(Effect.catchTags(manifestFailures(databaseId, "write")));
-            ready = { ...ready, manifest: latest };
-            yield* Ref.set(phase, ready);
-            if (latest.manifest.l0.length >= settings.l0MaxSsts) {
+      const receipt = yield* commitLock
+        .withPermits(1)(
+          Effect.gen(function* () {
+            let ready = yield* writableReady(databaseId);
+            const { bytes } = yield* Ref.get(unflushed);
+            if (bytes >= settings.maxUnflushedBytes) {
               yield* Metric.update(writeStalls, 1);
-              // Compaction is behind: make sure the compactor is awake (a lost wake would stall forever).
-              yield* wakeCompactor(databaseId);
+              yield* scheduleFlush(databaseId);
               return yield* Effect.fail(
                 new WriteStalledError({
                   databaseId,
-                  reason: "L0Backlog",
-                  retryAfterMs: 5_000,
-                  message: `Database ${databaseId} has ${latest.manifest.l0.length} L0 SSTs waiting for compaction, at its ${settings.l0MaxSsts} limit, so the write was refused. Retry the same batch later; nothing was written.`,
+                  reason: "UnflushedBytes",
+                  retryAfterMs: 1_000,
+                  message: `Database ${databaseId} has ${bytes} unflushed bytes, above its ${settings.maxUnflushedBytes} limit, so the write was refused. Retry the same batch after a short wait; nothing was written.`,
                 }),
               );
             }
-          }
-          yield* beforeCommit;
-          const manifest: Manifest = ready.manifest.manifest;
-          const writes = yield* Effect.fromResult(
-            collapseWriteBatch(batch, {
-              databaseId,
-              keyRange: manifest.keyRange,
-              mergeOperator: Option.map(
-                manifest.options.mergeOperator,
-                (name) => MERGE_OPERATORS[name],
-              ),
-            }),
-          );
-          const meta = yield* memTable.meta.pipe(Effect.mapError(unavailable(databaseId, "write")));
-          // Monotonic clock: never behind the newest tick already handed out or flushed.
-          const now = yield* Clock.currentTimeMillis;
-          const createTs = Timestamp.make(Math.max(now, meta.clockTick));
-          const added = writes.reduce((sum, item) => sum + memTableWriteBytes(item), 0);
-          // A refresh scanning while this commit runs must not install its figures (see
-          // `refreshUnflushedCounters`): mark the commit before its rows reach SQLite, and add
-          // them in the same step that ends it. The mark and its removal are one resource, so an
-          // interruption between them cannot leave the mark set, which would keep every later
-          // refresh from installing.
-          const seq = yield* Effect.acquireUseRelease(
-            Ref.update(unflushed, (current) => ({
-              ...current,
-              generation: current.generation + 1,
-              committing: true,
-            })),
-            () => memTable.commit(writes, createTs),
-            (_, exit) =>
-              Ref.update(unflushed, (current) => {
-                const ended = {
+            if (ready.manifest.manifest.l0.length >= settings.l0MaxSsts) {
+              // The cached manifest may predate compactions: reload before refusing.
+              const latest = yield* manifests
+                .update(databaseId, (manifest) => Result.succeed(manifest))
+                .pipe(Effect.catchTags(manifestFailures(databaseId, "write")));
+              ready = { ...ready, manifest: latest };
+              yield* Ref.set(phase, ready);
+              if (latest.manifest.l0.length >= settings.l0MaxSsts) {
+                yield* Metric.update(writeStalls, 1);
+                // Compaction is behind: make sure the compactor is awake (a lost wake would stall forever).
+                yield* wakeCompactor(databaseId);
+                return yield* Effect.fail(
+                  new WriteStalledError({
+                    databaseId,
+                    reason: "L0Backlog",
+                    retryAfterMs: 5_000,
+                    message: `Database ${databaseId} has ${latest.manifest.l0.length} L0 SSTs waiting for compaction, at its ${settings.l0MaxSsts} limit, so the write was refused. Retry the same batch later; nothing was written.`,
+                  }),
+                );
+              }
+            }
+            yield* beforeCommit;
+            const manifest: Manifest = ready.manifest.manifest;
+            const writes = yield* Effect.fromResult(
+              collapseWriteBatch(batch, {
+                databaseId,
+                keyRange: manifest.keyRange,
+                mergeOperator: Option.map(
+                  manifest.options.mergeOperator,
+                  (name) => MERGE_OPERATORS[name],
+                ),
+              }),
+            );
+            const meta = yield* memTable.meta.pipe(
+              Effect.mapError(unavailable(databaseId, "write")),
+            );
+            // Monotonic clock: never behind the newest tick already handed out or flushed.
+            const now = yield* Clock.currentTimeMillis;
+            const createTs = Timestamp.make(Math.max(now, meta.clockTick));
+            const added = writes.reduce((sum, item) => sum + memTableWriteBytes(item), 0);
+            // A refresh scanning while this commit runs must not install its figures (see
+            // `refreshUnflushedCounters`): mark the commit before its rows reach SQLite, and add
+            // them in the same step that ends it. The three steps are uninterruptible together: an
+            // interruption after the mark would leave it set and keep every later refresh from
+            // installing, and one after SQLite committed would leave the row out of the counters,
+            // with no alarm to flush it until the next write.
+            const seq = yield* Effect.uninterruptible(
+              Effect.gen(function* () {
+                yield* Ref.update(unflushed, (current) => ({
                   ...current,
                   generation: current.generation + 1,
-                  committing: false,
-                };
-                // A failed commit rolled back: none of its rows is in SQLite.
-                return exit._tag === "Success"
-                  ? {
-                      ...ended,
-                      bytes: current.bytes + added,
-                      rows: current.rows + writes.length,
-                      oldest: Option.isSome(current.oldest)
-                        ? current.oldest
-                        : Option.some(createTs),
-                    }
-                  : ended;
+                  committing: true,
+                }));
+                const exit = yield* Effect.exit(memTable.commit(writes, createTs));
+                yield* Ref.update(unflushed, (current) => {
+                  const ended = {
+                    ...current,
+                    generation: current.generation + 1,
+                    committing: false,
+                  };
+                  // A failed commit rolled back: none of its rows is in SQLite.
+                  return exit._tag === "Success"
+                    ? {
+                        ...ended,
+                        bytes: current.bytes + added,
+                        rows: current.rows + writes.length,
+                        oldest: Option.isSome(current.oldest)
+                          ? current.oldest
+                          : Option.some(createTs),
+                      }
+                    : ended;
+                });
+                return yield* exit;
               }),
-          ).pipe(Effect.mapError(unavailable(databaseId, "write")));
-          return { seq, createTs };
-        }),
-      );
-      yield* scheduleFlush(databaseId);
+            ).pipe(Effect.mapError(unavailable(databaseId, "write")));
+            return { seq, createTs };
+          }),
+        )
+        .pipe(
+          // Even when the request is interrupted: rows that reached SQLite need their alarm, or
+          // nothing flushes them until the next write.
+          Effect.ensuring(scheduleFlush(databaseId)),
+        );
       yield* Effect.annotateCurrentSpan({ seq: receipt.seq });
       return receipt;
     });
