@@ -87,6 +87,9 @@ Live stages require `Authorization: Bearer <token>`. Each stage has two rotatabl
 
 ## Documentation
 
+- [`docs/invariants.md`](docs/invariants.md): what makes a write acknowledged and what makes it
+  flushed, what each kind of read may see, and when GC may reclaim an SST, with the code, tests,
+  and models that hold each. Read it before changing a write path, a read path, or GC.
 - [`docs/operations.md`](docs/operations.md): deploying, rolling back, tokens, telemetry, what to
   watch, and the corruption runbook.
 - [`docs/measurements.md`](docs/measurements.md): throughput, latency, and limits, measured on
