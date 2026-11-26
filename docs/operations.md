@@ -102,11 +102,13 @@ creating a new installation and forking or copying databases into it.
   (D60).
 - **The sweep.** A cron every 5 minutes runs a paged maintenance sweep of 50 databases. It removes
   what deleted databases left behind, wakes forks' compactors, and asks for collection where
-  manifests piled up.
+  manifests piled up or where a fork has rewritten its source's SSTs but still holds it.
 - **Collect now:** `POST /v1/gc/databases/<id>` on the GC Worker.
 - **Removing a database:** `DELETE /v1/databases/<id>`. It fails with `DatabaseHasDependents`
-  while forks still read its SSTs. Remove them first, or wait until their compactions have
-  rewritten what they read.
+  while forks still read its SSTs. Remove them first, or wait until each fork has rewritten what it
+  read and `gcMinAge` (1 hour) has passed since. The fork's own collection releases its hold then,
+  once no snapshot or cached manifest of the fork can still read the source (D77). After a split,
+  the sealed database can be removed about an hour after both halves' rewrites.
 
 ## Capacity
 
@@ -212,16 +214,16 @@ It prints `healthy: false` and an `issues` list when any of the conditions below
 `--minutes` (default 15). Each keeps its spans in `.traces/measure/<name>`: the preview's name, or
 the collector URL's host for `--collector-url`, so production and a preview never share a store.
 
-| Signal                       | Where                                                                                            | Act when                                                                                    |
-| ---------------------------- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
-| Invocations that hit a limit | Tail records: outcome `exceededCpu`, `exceededMemory`, `exception`                               | Any. CPU limits are 30 s (API, writers) and 60 s (compactor); see `docs/measurements.md`    |
-| Writes stalled               | `DbWriter.write` errors with `WriteStalledError`; public `WriteStalled` (503)                    | Sustained: L0 is not draining (compaction backlog or corruption) or a writer is overloaded  |
-| Flush duration               | `DbWriter.flush` span duration                                                                   | p99 above about 30 s, or rising                                                             |
-| Compaction backlog           | `manifest.l0_ssts` on `Compactor.poll`                                                           | Near `l0MaxSsts` (16), where writes stall                                                   |
-| Corrupted SSTs               | `lsm_compaction_corrupt_ssts`; `compaction.corrupt_ssts` on `Compactor.poll`; `GET …/compaction` | Any: follow the corruption runbook                                                          |
-| Upload integrity             | `lsm_object_part_integrity_retries`, `lsm_object_parts_unverified`                               | Retries: transient, unless frequent. Any unverified part on R2: parts are no longer checked |
-| Garbage collection           | `GarbageCollector.collect` and `MaintenanceSweep.sweepPage` errors                               | Repeated failures: storage unreachable or a manifest unreadable                             |
-| Error spans                  | `trace-cli grep --error`, after a `pull`                                                         | A new name in the top errors                                                                |
+| Signal                       | Where                                                                                            | Act when                                                                                                                             |
+| ---------------------------- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Invocations that hit a limit | Tail records: outcome `exceededCpu`, `exceededMemory`, `exception`                               | Any. CPU limits are 30 s (API, writers) and 60 s (compactor); see `docs/measurements.md`                                             |
+| Writes stalled               | `DbWriter.write` errors with `WriteStalledError`; public `WriteStalled` (503)                    | Sustained: L0 is not draining (compaction backlog or corruption) or a writer is overloaded                                           |
+| Flush duration               | `DbWriter.flush` span duration                                                                   | p99 above about 30 s, or rising                                                                                                      |
+| Compaction backlog           | `manifest.l0_ssts` on `Compactor.poll`; `compactor.fenced`, `compactor.refenced` on its spans    | Near `l0MaxSsts` (16), where writes stall. A fenced compactor fences in again on its next wake (D78); one that stays fenced is a bug |
+| Corrupted SSTs               | `lsm_compaction_corrupt_ssts`; `compaction.corrupt_ssts` on `Compactor.poll`; `GET …/compaction` | Any: follow the corruption runbook                                                                                                   |
+| Upload integrity             | `lsm_object_part_integrity_retries`, `lsm_object_parts_unverified`                               | Retries: transient, unless frequent. Any unverified part on R2: parts are no longer checked                                          |
+| Garbage collection           | `GarbageCollector.collect` and `MaintenanceSweep.sweepPage` errors                               | Repeated failures: storage unreachable or a manifest unreadable                                                                      |
+| Error spans                  | `trace-cli grep --error`, after a `pull`                                                         | A new name in the top errors                                                                                                         |
 
 Expected errors that are not trouble: `DatabaseSealedError` (a stale router's write to a sealed
 shard; the router retries), `TransactionConflictError`, and `DatabaseAlreadyExists` on create.

@@ -1,12 +1,13 @@
 import {
   DatabaseId,
   DEFAULT_DATABASE_OPTIONS,
+  fenceCompactor,
   initialManifest,
   SortedRunId,
   SstId,
   Timestamp,
 } from "@shaledb/lsm-core";
-import { Context, Effect, Layer, Option, Ref } from "effect";
+import { Context, Deferred, Effect, Fiber, Layer, Option, Ref, Result } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -73,6 +74,140 @@ const startCompactor = Effect.gen(function* () {
   // As the runtime does: the alarm is cleared when it fires, then the handler runs.
   const fire = Effect.andThen(alarm.cancel, compactor.runAlarm);
   return { compactor, alarm, fire, cell: Context.get(built, CompactorStateCell) };
+});
+
+/**
+ * Gates in front of the compactor's manifest access, so a test can hold one call while others run.
+ * Each armed gate holds the next call that reaches it until the test opens it.
+ */
+interface ManifestGates {
+  /** Holds the next `ManifestStore.update` calls, one gate each, in arrival order. */
+  readonly updates: Ref.Ref<ReadonlyArray<Deferred.Deferred<void>>>;
+  /** Called by the next `ManifestReader.loadLatest` after it loaded: signals, then waits. */
+  readonly loadLatest: Ref.Ref<
+    Option.Option<{
+      readonly loaded: Deferred.Deferred<void>;
+      readonly resume: Deferred.Deferred<void>;
+    }>
+  >;
+  /** Called by the next `GarbageCollector.collect` before it collects: signals, then waits. */
+  readonly collect: Ref.Ref<
+    Option.Option<{
+      readonly loaded: Deferred.Deferred<void>;
+      readonly resume: Deferred.Deferred<void>;
+    }>
+  >;
+  /** Fence-ins the compactor committed (its `update` calls). */
+  readonly updateCalls: Ref.Ref<number>;
+}
+
+/** A compactor like {@link startCompactor}, whose manifest store and reader pass through gates. */
+const startGatedCompactor = Effect.gen(function* () {
+  const gates: ManifestGates = {
+    updates: yield* Ref.make<ReadonlyArray<Deferred.Deferred<void>>>([]),
+    loadLatest: yield* Ref.make<
+      Option.Option<{
+        readonly loaded: Deferred.Deferred<void>;
+        readonly resume: Deferred.Deferred<void>;
+      }>
+    >(Option.none()),
+    collect: yield* Ref.make<
+      Option.Option<{
+        readonly loaded: Deferred.Deferred<void>;
+        readonly resume: Deferred.Deferred<void>;
+      }>
+    >(Option.none()),
+    updateCalls: yield* Ref.make(0),
+  };
+  const store = yield* ManifestStore;
+  const reader = yield* ManifestReader;
+  const gatedStore = ManifestStore.of({
+    ...store,
+    update: (databaseId, edit) =>
+      Effect.gen(function* () {
+        yield* Ref.update(gates.updateCalls, (count) => count + 1);
+        const gate = yield* Ref.modify(gates.updates, (pending) => [pending[0], pending.slice(1)]);
+        if (gate !== undefined) yield* Deferred.await(gate);
+        return yield* store.update(databaseId, edit);
+      }),
+  });
+  const gatedReader = ManifestReader.of({
+    ...reader,
+    loadLatest: (databaseId) =>
+      Effect.gen(function* () {
+        const loaded = yield* reader.loadLatest(databaseId);
+        const gate = yield* Ref.getAndSet(gates.loadLatest, Option.none());
+        if (Option.isSome(gate)) {
+          yield* Deferred.succeed(gate.value.loaded, undefined);
+          yield* Deferred.await(gate.value.resume);
+        }
+        return loaded;
+      }),
+  });
+  const collector = yield* GarbageCollector;
+  const gatedCollector = GarbageCollector.of({
+    collect: (databaseId) =>
+      Effect.gen(function* () {
+        const gate = yield* Ref.getAndSet(gates.collect, Option.none());
+        if (Option.isSome(gate)) {
+          yield* Deferred.succeed(gate.value.loaded, undefined);
+          yield* Deferred.await(gate.value.resume);
+        }
+        return yield* collector.collect(databaseId);
+      }),
+  });
+  const shared = yield* Effect.context<
+    CompactionLauncher | CompactionBudget | LsmConfiguration | GarbageCollector
+  >();
+  const built = yield* Layer.build(
+    compactorLayerWithoutDependencies.pipe(
+      Layer.provideMerge(Layer.mergeAll(compactorStateCellTestLayer, durableObjectAlarmTestLayer)),
+      Layer.provide(
+        Layer.succeedContext(
+          shared.pipe(
+            Context.add(ManifestStore, gatedStore),
+            Context.add(ManifestReader, gatedReader),
+            Context.add(GarbageCollector, gatedCollector),
+          ),
+        ),
+      ),
+    ),
+  );
+  const compactor = Context.get(built, Compactor);
+  const alarm = Context.get(built, DurableObjectAlarm);
+  const fire = Effect.andThen(alarm.cancel, compactor.runAlarm);
+  /** Arms the next `loadLatest`: returns when it has loaded, and a way to let it go on. */
+  const holdNextLoad = Effect.gen(function* () {
+    const loaded = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    yield* Ref.set(gates.loadLatest, Option.some({ loaded, resume }));
+    return { loaded, resume };
+  });
+  /** Arms the next collection: returns when it is about to collect, and a way to let it go on. */
+  const holdNextCollection = Effect.gen(function* () {
+    const loaded = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    yield* Ref.set(gates.collect, Option.some({ loaded, resume }));
+    return { loaded, resume };
+  });
+  /** Arms the next `count` `update` calls, each behind its own gate. */
+  const holdUpdates = (count: number) =>
+    Effect.gen(function* () {
+      const held: Array<Deferred.Deferred<void>> = [];
+      for (let index = 0; index < count; index++) held.push(yield* Deferred.make<void>());
+      yield* Ref.set(gates.updates, held);
+      return held;
+    });
+  return {
+    compactor,
+    alarm,
+    fire,
+    cell: Context.get(built, CompactorStateCell),
+    gates,
+    holdNextLoad,
+    holdNextCollection,
+    holdUpdates,
+  };
 });
 
 const createWithL0 = (databaseId: DatabaseId, flushes: number) =>
@@ -447,5 +582,182 @@ describe("Compactor", () => {
     expect(outcome.woken.message).toContain("written by a newer shaledb (format 2");
     // Its alarm compacts nothing.
     expect([outcome.jobs, outcome.l0]).toEqual([0, 4]);
+  });
+});
+
+describe("Compactor fence-in (D78)", () => {
+  it("two wakes that overlap inside the first fence-in share one fence, and compaction commits (D78)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createWithL0(ORDERS, 4);
+        const { compactor, fire, cell, gates, holdNextLoad, holdUpdates } =
+          yield* startGatedCompactor;
+        // Hold the first two manifest updates: two cold wakes both reach their fence-in.
+        const [firstFence, secondFence] = yield* holdUpdates(2);
+        const first = yield* Effect.forkChild(compactor.wake(ORDERS));
+        yield* Effect.yieldNow;
+        const second = yield* Effect.forkChild(compactor.wake(ORDERS));
+        yield* Effect.yieldNow;
+        // The first fence-in commits and stores its state; its alarm is due now.
+        if (firstFence !== undefined) yield* Deferred.succeed(firstFence, undefined);
+        yield* Fiber.join(first);
+        // Its poll loads the manifest (epoch 1) and is held there while the second wake finishes.
+        const pollGate = yield* holdNextLoad;
+        const poll = yield* Effect.forkChild(fire);
+        yield* Deferred.await(pollGate.loaded);
+        if (secondFence !== undefined) yield* Deferred.succeed(secondFence, undefined);
+        yield* Fiber.join(second);
+        yield* Deferred.succeed(pollGate.resume, undefined);
+        yield* Fiber.join(poll);
+        // Later polls, and a wake from the next flush.
+        for (let round = 0; round < 3; round++) {
+          yield* TestClock.adjust("5 seconds");
+          yield* compactor.wake(ORDERS);
+          yield* fire;
+        }
+        const latest = yield* (yield* ManifestReader).loadLatest(ORDERS);
+        const state = Option.getOrThrow(yield* cell.get);
+        const jobs = yield* Ref.get(yield* CompactionLauncherRecord);
+        return {
+          fenceIns: yield* Ref.get(gates.updateCalls),
+          manifestEpoch: latest.manifest.compactorEpoch,
+          stateEpoch: state.compactorEpoch,
+          fenced: state.fenced,
+          l0: latest.manifest.l0.length,
+          committed: [...jobs.values()].filter(
+            (job) => job !== "Failed" && job._tag === "Committed",
+          ).length,
+        };
+      }),
+    );
+    expect(outcome).toEqual({
+      fenceIns: 1,
+      manifestEpoch: 1,
+      stateEpoch: 1,
+      fenced: false,
+      l0: 0,
+      committed: 1,
+    });
+  });
+  it("a collection requested while a poll runs is still due after the poll writes its state (D78)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createWithL0(ORDERS, 4);
+        const { compactor, fire, cell, holdNextLoad } = yield* startGatedCompactor;
+        yield* compactor.wake(ORDERS);
+        const before = Option.flatMap(yield* cell.get, (state) => state.collectionDueAt);
+        // The poll loads the manifest and is held; the maintenance sweep asks for a collection.
+        const pollGate = yield* holdNextLoad;
+        const poll = yield* Effect.forkChild(fire);
+        yield* Deferred.await(pollGate.loaded);
+        yield* TestClock.adjust("1 second");
+        yield* compactor.requestCollection(ORDERS);
+        yield* Deferred.succeed(pollGate.resume, undefined);
+        yield* Fiber.join(poll);
+        const state = Option.getOrThrow(yield* cell.get);
+        return { before, due: state.collectionDueAt, running: state.running.length };
+      }),
+    );
+    expect(outcome.before).toEqual(Option.none());
+    // The poll started a compaction and kept the request it did not see.
+    expect(outcome.running).toBe(1);
+    expect(outcome.due).toEqual(Option.some(1_000));
+  });
+
+  it("a collection requested while a collection runs is still due after it (D78)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createWithL0(ORDERS, 1);
+        const { compactor, fire, cell, holdNextCollection } = yield* startGatedCompactor;
+        yield* compactor.requestCollection(ORDERS);
+        // The alarm's collection is held; a second request arrives meanwhile.
+        const collectGate = yield* holdNextCollection;
+        const alarmRun = yield* Effect.forkChild(fire);
+        yield* Deferred.await(collectGate.loaded);
+        yield* TestClock.adjust("1 second");
+        yield* compactor.requestCollection(ORDERS);
+        yield* Deferred.succeed(collectGate.resume, undefined);
+        yield* Fiber.join(alarmRun);
+        return Option.flatMap(yield* cell.get, (state) => state.collectionDueAt);
+      }),
+    );
+    // The report (nothing more to collect) predates the request, which stands.
+    expect(outcome).toEqual(Option.some(1_000));
+  });
+
+  it("a poll never writes its older epoch over a fence-in that happened while it ran (D78)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createWithL0(ORDERS, 4);
+        const store = yield* ManifestStore;
+        const { compactor, fire, cell, holdNextLoad } = yield* startGatedCompactor;
+        yield* compactor.wake(ORDERS);
+        const pollGate = yield* holdNextLoad;
+        const poll = yield* Effect.forkChild(fire);
+        yield* Deferred.await(pollGate.loaded);
+        // While the poll runs on epoch 1, a fence-in commits epoch 2 and stores it (the overwrite
+        // seen live on preview-3).
+        const fenced = yield* store.update(ORDERS, (manifest) =>
+          Result.succeed(fenceCompactor(manifest)),
+        );
+        const current = Option.getOrThrow(yield* cell.get);
+        yield* cell.set({ ...current, compactorEpoch: fenced.manifest.compactorEpoch });
+        yield* Deferred.succeed(pollGate.resume, undefined);
+        yield* Fiber.join(poll);
+        const state = Option.getOrThrow(yield* cell.get);
+        return [state.compactorEpoch, state.fenced, state.running.length];
+      }),
+    );
+    // The poll's job carries epoch 1 and is discarded; epoch 2's state stands, and it is not fenced.
+    expect(outcome).toEqual([2, false, 0]);
+  });
+
+  it("a compactor stored as fenced by an older epoch fences in again on its next start and compacts (D78)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createWithL0(ORDERS, 4);
+        const store = yield* ManifestStore;
+        const reader = yield* ManifestReader;
+        const { compactor, fire, cell } = yield* startCompactor;
+        // The state preview-3's ms-cas-mwy5ujbj was left in: epoch 1 stored and fenced, epoch 2
+        // in the manifest.
+        yield* compactor.wake(ORDERS);
+        const stuck = Option.getOrThrow(yield* cell.get);
+        yield* store.update(ORDERS, (manifest) => Result.succeed(fenceCompactor(manifest)));
+        yield* cell.set({ ...stuck, fenced: true });
+        // A wake (the next flush, or the stalled-write wake) fences in again and compacts.
+        const woken = yield* compactor.wake(ORDERS);
+        yield* fire;
+        yield* TestClock.adjust("5 seconds");
+        yield* fire;
+        const afterWake = yield* reader.loadLatest(ORDERS);
+        // Fenced again with a collection due: the alarm alone fences in again.
+        yield* store.update(ORDERS, (manifest) => Result.succeed(fenceCompactor(manifest)));
+        yield* fire;
+        const fencedByPoll = Option.getOrThrow(yield* cell.get);
+        yield* fire;
+        const afterAlarm = Option.getOrThrow(yield* cell.get);
+        const jobs = yield* Ref.get(yield* CompactionLauncherRecord);
+        return {
+          woken: [woken.compactorEpoch, woken.fenced],
+          afterWake: [afterWake.manifest.compactorEpoch, afterWake.manifest.l0.length],
+          jobs: [...jobs.values()].map((job) => (job === "Failed" ? job : job._tag)),
+          fencedByPoll: [fencedByPoll.compactorEpoch, fencedByPoll.fenced],
+          afterAlarm: [
+            afterAlarm.compactorEpoch,
+            afterAlarm.fenced,
+            Option.isSome(afterAlarm.collectionDueAt),
+          ],
+          manifestEpoch: (yield* reader.loadLatest(ORDERS)).manifest.compactorEpoch,
+        };
+      }),
+    );
+    expect(outcome.woken).toEqual([3, false]);
+    expect(outcome.afterWake).toEqual([3, 0]);
+    expect(outcome.jobs).toEqual(["Committed"]);
+    expect(outcome.fencedByPoll).toEqual([3, true]);
+    // The re-fence keeps the collection the finished compaction made due.
+    expect(outcome.afterAlarm).toEqual([5, false, true]);
+    expect(outcome.manifestEpoch).toBe(5);
   });
 });

@@ -66,6 +66,12 @@ views and ranges), `writer.workerd.ts` (the same split through the public API).
 
 ## Maintenance notes
 
+- D77: a successor's hold on the sealed database is now released by the successor's own
+  collection, `gcMinAge` after its rewrite, instead of by its compactor's next idle poll. The
+  holds still come from the seal's commit and the forks still read from them; only how long the
+  sealed database stays changes. No step of this model changed (it ends at the forks); the release
+  rule is in `verify-gc-safety` (`GcSafetyFork.cfg`). Reran; all broken variants still fail.
+
 - D73: `DbWriter.flushThen`, which the seal runs under the commit lock, no longer waits for the
   compactor it wakes (`BackgroundWork`). The wake changes no state the model has; the seal's
   commit and the order of seal, holds, and forks are unchanged. A flush now writes only the
@@ -87,7 +93,7 @@ views and ranges), `writer.workerd.ts` (the same split through the public API).
 
 ## Keeping it in step with the code
 
-Sync commit: the v1 workstream 3 commit (`splits pause briefly`, D57); before it `c4ea735`. When a covered function changes after it, update the model
+Sync commit: the D77 commit (a fork releases its hold from its own collection); before it the v1 workstream 3 commit (`splits pause briefly`, D57). When a covered function changes after it, update the model
 so each action is still one awaited effect in the code, rerun, and show each invariant still fails on
 a broken variant before moving the sync commit. For drift that skipped this skill, use
 `.agents/skills/maintain-formal-verification-skill/SKILL.md`.
