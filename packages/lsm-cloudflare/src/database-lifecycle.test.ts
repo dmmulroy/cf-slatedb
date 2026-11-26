@@ -311,7 +311,9 @@ describe("DatabaseLifecycle", () => {
         // The fork's compactor rewrites the source's SSTs into its own.
         const left = yield* compactorOf(LEFT);
         const rewritten = (yield* reader.loadLatest(LEFT)).manifest;
-        // The source collects and an operator tries to remove it, seconds after the rewrite.
+        // Seconds after the rewrite the fork collects (an operator's collect-now, or the
+        // maintenance sweep's request), then the source collects and an operator tries to remove it.
+        yield* gc.collect(LEFT);
         yield* gc.collect(SOURCE);
         const removeRefused = yield* Effect.flip(lifecycle.remove(SOURCE));
         const soon = {
@@ -323,6 +325,7 @@ describe("DatabaseLifecycle", () => {
         // Just under gcMinAge later the snapshot is still promised, and still readable.
         yield* TestClock.adjust(HOUR - 10_000);
         yield* left.runDue;
+        yield* gc.collect(LEFT);
         yield* gc.collect(SOURCE);
         const late = {
           holds: (yield* reader.loadLatest(SOURCE)).manifest.checkpoints.length,
