@@ -91,7 +91,9 @@ export const makeSstStore = Effect.gen(function* () {
       });
       let info = Option.none<SstInfo>();
       const body = options.rows.pipe(
-        Stream.flatMap((row: Row) => Stream.fromIterable(builder.add(row))),
+        // A chunk of rows at a time: one stream per row costs more than encoding the row.
+        Stream.mapArray((rows) => [rows.flatMap((row: Row) => builder.add(row))] as const),
+        Stream.flattenIterable,
         Stream.concat(
           Stream.suspend(() => {
             if (builder.count === 0) return Stream.empty;
