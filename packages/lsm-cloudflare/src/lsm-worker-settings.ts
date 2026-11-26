@@ -4,6 +4,7 @@ import * as Output from "alchemy/Output";
 import { CurrentRuntimeContext } from "alchemy/RuntimeContext";
 import { Effect, Option, Redacted, Schema } from "effect";
 
+import { LSM_BUCKET_LOCATION_SETTING, type LsmBucketLocation } from "./lsm-bucket.ts";
 import { LSM_SETTINGS_BINDING } from "./lsm-configuration.ts";
 import { LSM_JURISDICTION_SETTING, type LsmJurisdiction } from "./lsm-jurisdiction.ts";
 
@@ -16,6 +17,8 @@ export interface LsmWorkerSettings {
   readonly lsmSettings: LsmSettings;
   /** The Stack's data-residency jurisdiction, or `None` for an unrestricted Stack. */
   readonly jurisdiction: Option.Option<LsmJurisdiction>;
+  /** The LSM bucket's location hint, or `None` to let R2 place it. */
+  readonly bucketLocation: Option.Option<LsmBucketLocation>;
 }
 
 /**
@@ -29,8 +32,9 @@ const encodeLsmSettingsJson = Schema.encodeSync(Schema.fromJsonString(LsmSetting
 
 /**
  * The bindings that carry `settings` to a Worker, by binding name: the complete settings as JSON
- * under `CF_SLATEDB_LSM_SETTINGS` and the jurisdiction (`eu`, `fedramp`, or `none`) under
- * `CF_SLATEDB_JURISDICTION`. Neither is ever absent, so a deploy can never leave an earlier value
+ * under `CF_SLATEDB_LSM_SETTINGS`, the jurisdiction (`eu`, `fedramp`, or `none`) under
+ * `CF_SLATEDB_JURISDICTION`, and the bucket's location hint (or `auto`) under
+ * `CF_SLATEDB_BUCKET_LOCATION`. None is ever absent, so a deploy can never leave an earlier value
  * bound (D55).
  */
 export const lsmWorkerSettingsBindings = (
@@ -38,6 +42,7 @@ export const lsmWorkerSettingsBindings = (
 ): Readonly<Record<string, string>> => ({
   [LSM_SETTINGS_BINDING]: encodeLsmSettingsJson(settings.lsmSettings),
   [LSM_JURISDICTION_SETTING]: Option.getOrElse(settings.jurisdiction, () => "none"),
+  [LSM_BUCKET_LOCATION_SETTING]: Option.getOrElse(settings.bucketLocation, () => "auto"),
 });
 
 /**

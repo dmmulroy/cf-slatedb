@@ -190,6 +190,8 @@ export const previewSecret = Effect.fn("PreviewStage.previewSecret")(function* (
 const PREVIEW_DECIDED_VARIABLES = [
   "CF_SLATEDB_LSM_SETTINGS",
   "CF_SLATEDB_JURISDICTION",
+  // Previews let R2 place their bucket: a hint left in the shell would replace it.
+  "CF_SLATEDB_BUCKET_LOCATION",
   "CF_SLATEDB_TRACE_SAMPLE_RATE",
   "CF_SLATEDB_TRACE_RETENTION_DAYS",
 ] as const;

@@ -18,6 +18,8 @@ export interface StackUrls {
   readonly api: string;
   readonly gc: string;
   readonly shards: string;
+  /** The telemetry probe Worker (also the R2 placement probe, `GET /v1/probe/r2`). */
+  readonly probe: string;
   /**
    * The live preview stage the Workers belong to, whose spans are pulled from its trace collector
    * before each trace assertion; `None` for `vp run dev`, whose spans reach the local receiver

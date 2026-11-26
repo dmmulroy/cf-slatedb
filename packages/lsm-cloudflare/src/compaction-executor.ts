@@ -26,6 +26,7 @@ import {
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Clock, Context, Data, Effect, Layer, Metric, Option, Schema, Stream } from "effect";
 
+import { backgroundWorkTestLayer, inlineBackgroundWorkLayer } from "./background-work.ts";
 import { LsmConfiguration, lsmConfigurationTestLayer } from "./lsm-configuration.ts";
 import type { DatabaseNotFoundError } from "./lsm-errors.ts";
 import {
@@ -357,6 +358,8 @@ export const compactionExecutorLayerWithoutDependencies = Layer.effect(
   Layer.provide(
     manifestStoreLayerWithoutDependencies.pipe(
       Layer.provideMerge(manifestReaderLayerWithoutDependencies),
+      // The executor runs inside Workflow steps, which have no `waitUntil`.
+      Layer.provide(inlineBackgroundWorkLayer),
     ),
   ),
 );
@@ -373,6 +376,7 @@ export const compactionExecutorTestLayer = (
     Layer.provideMerge(
       manifestStoreLayerWithoutDependencies.pipe(
         Layer.provideMerge(manifestReaderLayerWithoutDependencies),
+        Layer.provide(backgroundWorkTestLayer),
       ),
     ),
     Layer.provideMerge(Layer.mergeAll(objectStoreTestLayer, lsmConfigurationTestLayer(overrides))),

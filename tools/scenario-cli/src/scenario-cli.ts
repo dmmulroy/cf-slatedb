@@ -22,6 +22,8 @@ import {
   MeasurementCollector,
   measureFlushCpu,
   measureSplitPause,
+  measureManifestCas,
+  measureR2Placement,
   measureTransactionAborts,
   measureWrites,
 } from "./measurements.ts";
@@ -45,6 +47,7 @@ const decodePreviewUrls = Schema.decodeUnknownEffect(
       apiUrl: Schema.String,
       gcUrl: Schema.String,
       shardsUrl: Schema.String,
+      probeUrl: Schema.String,
       jurisdiction: Schema.optionalKey(Schema.String),
     }),
   ),
@@ -110,6 +113,7 @@ const run = Command.make(
     api: Flag.String("api").pipe(Flag.withDefault("http://localhost:1337")),
     gc: Flag.String("gc").pipe(Flag.withDefault("http://localhost:1340")),
     shards: Flag.String("shards").pipe(Flag.withDefault("http://localhost:1341")),
+    probe: Flag.String("probe").pipe(Flag.withDefault("http://localhost:8790")),
     stage: Flag.String("stage").pipe(
       Flag.withDescription(
         "Run against a live preview stage (preview-1, preview-2, preview-3) instead of vp run dev",
@@ -117,7 +121,7 @@ const run = Command.make(
       Flag.optional,
     ),
   },
-  ({ names, api, gc, shards, stage }) =>
+  ({ names, api, gc, shards, probe, stage }) =>
     runScenarios(names).pipe(
       Effect.provide(
         Option.match(stage, {
@@ -127,6 +131,7 @@ const run = Command.make(
                 api,
                 gc,
                 shards,
+                probe,
                 previewStage: Option.none(),
                 workersCache: false,
               }),
@@ -153,6 +158,7 @@ const previewStackLayer = (stage: string) =>
           api: urls.apiUrl,
           gc: urls.gcUrl,
           shards: urls.shardsUrl,
+          probe: urls.probeUrl,
           previewStage: Option.some(stage),
           workersCache: (urls.jurisdiction ?? "none") === "none",
         }),
@@ -232,6 +238,26 @@ const measureTransactionsCommand = Command.make(
   ({ stage, ...load }) => runMeasurement(stage, measureTransactionAborts(load)),
 ).pipe(Command.withDescription("How often a flush aborts a transaction (SnapshotTooOld, D50)"));
 
+const measureManifestCasCommand = Command.make(
+  "manifest-cas",
+  {
+    stage: measureStage,
+    flushes: Flag.Int("flushes").pipe(Flag.withDefault(30)),
+    rowsPerFlush: Flag.Int("rows-per-flush").pipe(Flag.withDefault(10)),
+  },
+  ({ stage, ...load }) => runMeasurement(stage, measureManifestCas(load)),
+).pipe(Command.withDescription("Manifest CAS and small-flush latency on the server (D56)"));
+
+const measureR2PlacementCommand = Command.make(
+  "r2-placement",
+  { stage: measureStage, samples: Flag.Int("samples").pipe(Flag.withDefault(20)) },
+  ({ stage, samples }) => runMeasurement(stage, measureR2Placement(samples)),
+).pipe(
+  Command.withDescription(
+    "R2 latency from a Durable Object in each region to the LSM bucket (D56)",
+  ),
+);
+
 const measure = Command.make("measure").pipe(
   Command.withDescription("Measurements against a live preview stage; JSON results"),
   Command.withSubcommands([
@@ -239,6 +265,8 @@ const measure = Command.make("measure").pipe(
     measureFlushCommand,
     measureSplitCommand,
     measureTransactionsCommand,
+    measureManifestCasCommand,
+    measureR2PlacementCommand,
   ]),
 );
 

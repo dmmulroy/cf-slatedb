@@ -74,6 +74,12 @@ them. The `nonAtomicProbe` variant reproduces it.
 
 ## Maintenance notes
 
+- Checked against the v1 workstream 2 commit (D56). `DbWriter.flushNow` and `DbWriter.seal` commit
+  through `ManifestStore.updateFrom` from the writer's own view: still one manifest commit between
+  the upload and the truncate, which may internally reload and retry (as `update` did); a refused
+  or conflicting first attempt writes nothing the reader sees. The `LATEST` hint is now written in
+  the background, and `loadLatest` probes from above GC's boundary; the `Latest` read path's probe of
+  `flushed_seq` is unchanged. No model step changed; reran, both broken variants still fail.
 - Checked against `c4ea735` (Phases 9–10). `DbWriter.write` now commits through `commitBatch`
   (the same commit lock and SQLite commit; the ack after it); `commitTransaction` runs its conflict
   check inside that lock before the same commit, so it is one more kind of `Commit`/`Write`.
@@ -87,7 +93,7 @@ them. The `nonAtomicProbe` variant reproduces it.
 
 ## Keeping it in step with the code
 
-Sync commit: `c4ea735`. When a covered function changes after it, update the model so
+Sync commit: the v1 workstream 2 commit (`fast manifest commits`, D56). When a covered function changes after it, update the model so
 each action is still one awaited effect in the code, rerun, and show each invariant still fails on a
 broken variant before moving the sync commit. For drift that skipped this skill, use
 `.agents/skills/maintain-formal-verification-skill/SKILL.md`.

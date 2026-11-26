@@ -209,7 +209,7 @@ const writeRead: Scenario = {
 const flushScenario: Scenario = {
   name: "flush",
   description:
-    "A flush uploads one L0 SST and commits exactly one manifest, then empties the memtable.",
+    "A flush uploads one L0 SST and commits exactly one manifest from the writer's own view (no load), then empties the memtable.",
   run: Effect.gen(function* () {
     const databaseId = DatabaseId.make(uniqueId("sc-flush"));
     yield* createDatabase(databaseId);
@@ -223,11 +223,21 @@ const flushScenario: Scenario = {
       [flushed.flushedSeq, 0],
     );
     yield* expectEqual("flushedSeq", status.flushedSeq, status.lastSeq);
-    yield* assertTraces("one SST and one manifest commit per flush", {
+    yield* assertTraces("one SST and one manifest commit per flush, from the writer's own view", {
       select: { databaseId, containing: { name: "DbWriter.requestFlush" } },
       checks: [
         { _tag: "SpanCount", span: { name: "SstStore.write" }, count: { equals: 1 } },
         { _tag: "SpanCount", span: { name: "ManifestStore.create" }, count: { equals: 1 } },
+        // Nothing else committed since the writer fenced in: one create, no load (D56).
+        {
+          _tag: "SpanCount",
+          span: {
+            name: "ManifestStore.update",
+            attributes: { "manifest.start": "OwnView", "manifest.cas_attempts": "1" },
+          },
+          count: { equals: 1 },
+        },
+        { _tag: "NoSpan", span: { name: "ManifestReader.loadLatest" } },
         { _tag: "NoErrorStatus" },
       ],
     });
@@ -597,14 +607,17 @@ const createRace: Scenario = {
       checks: [
         {
           _tag: "SpanCount",
-          span: { name: "ObjectStore.putIfAbsent", attributes: { "object.outcome": "Created" } },
+          span: {
+            name: "ObjectStore.putIfAbsent",
+            attributes: { "object.kind": "Manifest", "object.outcome": "Created" },
+          },
           count: { equals: 1 },
         },
         {
           _tag: "SpanCount",
           span: {
             name: "ObjectStore.putIfAbsent",
-            attributes: { "object.outcome": "AlreadyExists" },
+            attributes: { "object.kind": "Manifest", "object.outcome": "AlreadyExists" },
           },
           count: { equals: CREATE_RACERS - 1 },
         },

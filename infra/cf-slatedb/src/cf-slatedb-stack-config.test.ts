@@ -25,6 +25,7 @@ describe("CfSlatedbStackConfig", () => {
     expect(preview).toEqual({
       stage: "preview-1",
       jurisdiction: "none",
+      bucketLocation: "auto",
       lsmSettings: DEFAULT_LSM_SETTINGS,
       telemetry: { traceSampleRate: 1, traceRetentionDays: 14 },
       access: { mode: "BearerToken" },
@@ -38,6 +39,9 @@ describe("CfSlatedbStackConfig", () => {
   });
 
   it("applies each variable, merging setting overrides into the defaults", async () => {
+    expect(
+      (await resolve("preview-3", { CF_SLATEDB_BUCKET_LOCATION: "weur" })).bucketLocation,
+    ).toBe("weur");
     const config = await resolve("preview-2", {
       CF_SLATEDB_JURISDICTION: "eu",
       CF_SLATEDB_LSM_SETTINGS: '{"gcMinAge":10000,"compactorPollInterval":1000}',
@@ -67,6 +71,16 @@ describe("CfSlatedbStackConfig", () => {
     expect(
       await refusedVariable("preview-1", { CF_SLATEDB_LSM_SETTINGS: '{"minCompactionSources":9}' }),
     ).toBe("CF_SLATEDB_LSM_SETTINGS");
+    expect(await refusedVariable("preview-1", { CF_SLATEDB_BUCKET_LOCATION: "mars" })).toBe(
+      "CF_SLATEDB_BUCKET_LOCATION",
+    );
+    // R2 places a jurisdiction's bucket itself.
+    expect(
+      await refusedVariable("preview-2", {
+        CF_SLATEDB_JURISDICTION: "eu",
+        CF_SLATEDB_BUCKET_LOCATION: "weur",
+      }),
+    ).toBe("CF_SLATEDB_BUCKET_LOCATION");
     expect(await refusedVariable("preview-1", { CF_SLATEDB_TRACE_SAMPLE_RATE: "2" })).toBe(
       "CF_SLATEDB_TRACE_SAMPLE_RATE",
     );
@@ -80,6 +94,7 @@ describe("CfSlatedbStackConfig", () => {
       cfSlatedbWorkerSettingsOf(await resolve("preview-1", {})),
     );
     expect(unrestricted["CF_SLATEDB_JURISDICTION"]).toBe("none");
+    expect(unrestricted["CF_SLATEDB_BUCKET_LOCATION"]).toBe("auto");
     expect(JSON.parse(unrestricted["CF_SLATEDB_LSM_SETTINGS"] ?? "{}")).toEqual(
       DEFAULT_LSM_SETTINGS,
     );

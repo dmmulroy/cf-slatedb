@@ -5,6 +5,7 @@ import { Effect, Layer } from "effect";
 import { HttpRouter } from "effect/http";
 import { HttpApiBuilder } from "effect/http-api";
 
+import { durableObjectBackgroundWorkLayer } from "./background-work.ts";
 import { CompactionBudget } from "./compaction-budget.ts";
 import { CompactionLauncher } from "./compaction-launcher.ts";
 import {
@@ -79,6 +80,11 @@ export const compactorServerLayerWithoutDependencies = CompactorServer.make(
         Layer.provide(
           manifestStoreLayerWithoutDependencies.pipe(
             Layer.provideMerge(manifestReaderLayerWithoutDependencies),
+            Layer.provide(
+              durableObjectBackgroundWorkLayer.pipe(
+                Layer.provide(Layer.succeed(Cloudflare.DurableObjectState, state)),
+              ),
+            ),
           ),
         ),
         Layer.provide(

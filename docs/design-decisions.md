@@ -770,3 +770,61 @@ with the dev timings), then by a bare `vp run @cf-slatedb/infra#deploy:preview-1
 `CF_SLATEDB_*` variables (every Worker bound the complete production settings and `none`).
 `preview-3`, never deployed before, went `eu` → `none`, and every Worker was bound `none`. All three
 previews were then redeployed with the final code.
+
+## D56. Manifest commits start from the committer's own view; the LATEST hint is background work
+
+A manifest CAS cost ~1.1 s on R2 (`docs/measurements.md`): `loadLatest` (~300 ms: hint, manifest,
+probe of `id + 1`), the create-if-absent PUT (~400 ms), the GC-boundary re-read (~60 ms), and the
+best-effort `LATEST` hint (a read and a PUT, ~420 ms). Every flush, seal, checkpoint, fork, and
+compaction commit paid it.
+
+- **Optimistic create from the committer's own view.** `ManifestStore.updateFrom(view, edit)`
+  applies the edit to the newest manifest the caller knows and creates `view.id + 1` without
+  loading. Create-if-absent plus the boundary re-read prove the view was the head, so a written
+  commit is trusted. Anything else reloads and continues as `update` does: a conflict, an edit
+  failure, or "already applied" against the view (an older view can answer those wrongly, for
+  example a checkpoint added after it would read as not found). The writer uses it for flushes and
+  the seal (`DbWriter.flushNow`, `DbWriter.seal`), holding the manifest it last committed.
+  Compaction commits keep `update`: they run in a Workflow long after planning, so a view there
+  would almost always be stale.
+- **The hint leaves the critical path.** `ManifestStore.create` hands the hint to a new
+  `BackgroundWork` service: `waitUntil` in Worker events, `state.waitUntil` in Durable Objects, and
+  inline in Workflow steps (which have no `waitUntil`). The test layer forks, so tests see the hint
+  land late. The write is conditional (read the hint, write only if newer, `If-Match` or
+  create-if-absent), so a late write never moves it back.
+- **The reader no longer depends on the hint.** Found while modeling: `loadLatest` probed forward
+  from the hint until the first missing id. With a lagging hint (a lost write, already possible when
+  the hint PUT failed, and likelier once it is background work) and a checkpoint keeping manifest
+  `h` while GC deleted `h + 1`, it stopped at `h`. A committer would then conflict on every attempt,
+  and a `Latest` reader would read an old manifest. Now it reads the hint and GC's manifest boundary
+  together and probes from `max(hint, boundary + 1)`. Manifests above the boundary are never deleted
+  and are contiguous up to the newest, so the probe cannot stop early. It also probes the start and
+  the id after it in parallel. No extra round trip.
+- **R2 placement.** A probe Durable Object per location hint (`GET /v1/probe/r2`, local and preview
+  stages only) timed the engine's object store calls against `preview-1`'s bucket (ENAM).
+  Create-if-absent costs ~285 ms p50 even from IAD, beside the bucket. From the US west coast it is
+  ~510 ms, from Europe ~550–590 ms, from APAC and Oceania ~900–1,000 ms. `preview-1`'s writers
+  already run near its bucket, so placement could not speed it up. An installation chooses its
+  bucket's location once: `CF_SLATEDB_BUCKET_LOCATION` (`wnam` … `oc`, default `auto`, meaning R2
+  places it near the deploy) in the Stack config, bound to every Worker with the other settings and
+  read by `LsmBucket`. It is refused with a jurisdiction (R2 places those itself), and changing it
+  replaces the bucket.
+- **`object.kind`** (`Manifest`, `LatestHint`, `ManifestBoundary`, `Sst`, `Changelog`, `Gc`,
+  `Other`) is a new safe attribute on every ObjectStore span. The `create-race` scenario now counts
+  manifest creates only, since the background hint's first write is also a create-if-absent.
+
+Model: `ManifestCasFencing.tla` now models the optimistic first attempt, the boundary re-read as
+part of each create, `loadLatest` from `max(hint, boundary + 1)`, hint writes that land in any order
+or never, and (in the new `ManifestCasFencingGc.cfg`) GC deleting any manifest at or below an
+advancing boundary. It adds two invariants, `CommitOnce` and `LoadFindsHead`, and two broken
+variants that fail: `noBoundaryReread` (fails `CommitOnce`) and `hintOnlyProbe` (the old reader,
+fails `LoadFindsHead`). Mutations of the real code are caught by `manifest-store.test.ts`.
+
+Measured on `preview-1` with production settings, 30 small flushes in sequence:
+
+|                            |   Before |  After |   Target |
+| -------------------------- | -------: | -----: | -------: |
+| `ManifestStore.update` p50 | 1,092 ms | 357 ms | ≤ 500 ms |
+| own-view commit p50        |        – | 340 ms |          |
+| `loadLatest` p50           |   274 ms | 180 ms |          |
+| `DbWriter.flush` p50       | 1,508 ms | 709 ms | ≤ 900 ms |

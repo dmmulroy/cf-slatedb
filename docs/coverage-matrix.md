@@ -97,11 +97,30 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 
 - **Writer init fencing loop** — done. `ensureReady` (`ManifestStore.update(fenceWriter)` with CAS
   retry, epoch stored in `writer_meta`, sequence oracle and clock seeded from the manifest) (D19).
-- **`manifest/LATEST` hint + probe `id+1`; no LIST on read paths** — done.
-  `manifest-reader.ts` (`loadLatest`; LIST only to recover when the hint names a collected
-  manifest); GC rewrites the hint before deleting manifests. Tests: `manifest-store.test.ts` (lagging
-  hint, collected hinted manifest). Trace: the `write-read` scenario and the Phase 5 dev check assert
-  no `ObjectStore.list` on a `Flushed` read.
+- **`manifest/LATEST` hint + probe `id+1`; no LIST on read paths** — done, revised (D56).
+  `manifest-reader.ts` `loadLatest` reads the hint and GC's manifest boundary together and probes
+  from `max(hint, boundary + 1)` (the start and the next id in parallel); LIST only to recover a
+  missing start. The hint is advanced in the background, never backwards (`advanceLatestHint`,
+  `background-work.ts`); GC no longer rewrites it. Tests: `manifest-store.test.ts` (lagging hint,
+  collected hinted manifest, a hint lagging below manifests GC deleted, the background hint never
+  moving back). Trace: the `write-read` scenario and the Phase 5 dev check assert no
+  `ObjectStore.list` on a `Flushed` read. Formal: `ManifestCasFencingGc.cfg` (`LoadFindsHead`;
+  `hintOnlyProbe` fails).
+- **Fast manifest commits (v1 workstream 2)** — done (D56). `ManifestStore.updateFrom` (an optimistic
+  create from the committer's own view; only a written commit trusted from it), used by
+  `DbWriter.flushNow` and `DbWriter.seal`; `BackgroundWork` (`background-work.ts`: Worker,
+  Durable Object, inline-for-Workflows, and forking test layers) carries the hint off the critical
+  path; `object.kind` on ObjectStore spans; `CF_SLATEDB_BUCKET_LOCATION` in the Stack config
+  (`LsmBucket` `locationHint`). Tests: `manifest-store.test.ts` (own view with one create and no
+  load, from traces; stale view; collected next id; failure and no-op rechecked; hint), each
+  mutation of the real code caught; `object-store.test.ts` (`objectKindOfKey`);
+  `cf-slatedb-stack-config.test.ts`, `lsm-worker-settings.test.ts` (bucket location). Trace: the
+  `flush` scenario (one `ManifestStore.update` from `OwnView` in one attempt, no
+  `ManifestReader.loadLatest`), `create-race` (manifest creates by `object.kind`). Formal:
+  `ManifestCasFencing` (three configs; `CommitOnce`, `LoadFindsHead`; `noBoundaryReread`,
+  `hintOnlyProbe`). Live (`preview-1`, production settings): `ManifestStore.update` p50 1,092 →
+  357 ms, small flush p50 1,508 → 709 ms; R2 latency per region (`measure r2-placement`);
+  11/11 scenarios.
 - **Compactor edit replaces exactly its inputs, else fails** — done. `commitCompaction`
   (`manifest.test.ts`: replace, idempotent retry, `CompactionInputsChangedError`,
   `CompactorFencedError`, `SstBelowGcBoundaryError`); `CompactionExecutor.prepare` re-checks the

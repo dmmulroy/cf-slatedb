@@ -415,8 +415,10 @@ export const makeDbWriter = Effect.gen(function* () {
           const changelog = Option.isSome(options.changelog)
             ? yield* exportChangelog(databaseId, meta.flushedSeq, cut)
             : Option.none();
+          // From the writer's own view: usually nothing else committed since, so the commit is one
+          // create with no load (D56).
           const committed = yield* manifests
-            .update(databaseId, (manifest) =>
+            .updateFrom(ready.manifest, (manifest) =>
               commitL0Flush(manifest, {
                 writerEpoch: ready.writerEpoch,
                 sst: written.value.handle,
@@ -767,8 +769,10 @@ export const makeDbWriter = Effect.gen(function* () {
           return meta.flushedSeq;
         }
         const flushedSeq = yield* flushNow(databaseId);
+        // The view the final flush left, so the seal usually commits with one create (D56).
+        const view = (yield* ensureReady(databaseId)).manifest;
         const sealed = yield* manifests
-          .update(databaseId, (manifest) => {
+          .updateFrom(view, (manifest) => {
             if (manifest.writerEpoch !== ready.writerEpoch) {
               return Result.fail(
                 new WriterFencedError({

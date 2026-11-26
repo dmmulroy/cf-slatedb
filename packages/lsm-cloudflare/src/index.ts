@@ -43,5 +43,6 @@ export * from "./db-services.ts";
 export * from "./lsm-http-server.ts";
 export * from "./lsm-jurisdiction.ts";
 export * from "./lsm-worker-settings.ts";
+export * from "./background-work.ts";
 export * from "./lsm-test-runtime.ts";
 export * from "./durable-object-cell.ts";

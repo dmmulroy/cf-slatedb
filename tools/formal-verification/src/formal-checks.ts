@@ -56,6 +56,24 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
         expect: "AckedDataVisible",
         timeLimitSeconds: 60,
       },
+      {
+        config: "ManifestCasFencingGc.cfg",
+        broken: "none",
+        expect: "pass",
+        timeLimitSeconds: 150,
+      },
+      {
+        config: "ManifestCasFencingGc.cfg",
+        broken: "noBoundaryReread",
+        expect: "CommitOnce",
+        timeLimitSeconds: 60,
+      },
+      {
+        config: "ManifestCasFencingGc.cfg",
+        broken: "hintOnlyProbe",
+        expect: "LoadFindsHead",
+        timeLimitSeconds: 60,
+      },
     ],
   },
   {

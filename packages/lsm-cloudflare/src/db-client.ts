@@ -20,6 +20,7 @@ import {
 } from "@cf-slatedb/lsm-core";
 import { Bytes, Context, Effect, Layer, Option, Schema, Stream } from "effect";
 
+import { backgroundWorkTestLayer } from "./background-work.ts";
 import { blockCacheLayerWithoutDependencies } from "./block-cache.ts";
 import { blockSourceTestLayer } from "./block-source.ts";
 import {
@@ -691,6 +692,7 @@ export const dbClientTestLayer = (
       manifestStoreLayerWithoutDependencies.pipe(
         Layer.provideMerge(manifestReaderLayerWithoutDependencies),
         Layer.provideMerge(objectStore),
+        Layer.provide(backgroundWorkTestLayer),
       ),
     ),
     Layer.provideMerge(

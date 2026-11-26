@@ -109,6 +109,8 @@ const CfSlatedbStack = Alchemy.Stack(
       apiUrl: api.url,
       /** Data-residency jurisdiction of every bucket, Durable Object, and the Workflow (D49). */
       jurisdiction: config.jurisdiction,
+      /** The LSM bucket's R2 location hint, or `auto` (D56). */
+      bucketLocation: config.bucketLocation,
       /** URL of the sharded API (the sharding package's example Worker). */
       shardsUrl: shards.url,
       /** URL of the GC operator API: the dev port locally, workers.dev on live stages. */

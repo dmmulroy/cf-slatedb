@@ -7,6 +7,7 @@ import { Effect, Layer } from "effect";
 import { HttpRouter } from "effect/http";
 import { HttpApiBuilder } from "effect/http-api";
 
+import { workerBackgroundWorkLayer } from "./background-work.ts";
 import { GarbageCollector, garbageCollectorLayerWithoutDependencies } from "./garbage-collector.ts";
 import { GcHttpApi } from "./gc-http-api.ts";
 import { lsmAccessGateForStage } from "./lsm-access-gate.ts";
@@ -93,7 +94,9 @@ export const gcWorkerLayer = <R = never>(options: GcWorkerOptions<R>) =>
       return { fetch: withEventTelemetryFlush(withAccessGate(Effect.flatten(router))) };
     }).pipe(
       Effect.provide(Cloudflare.Workers.CronEventSourceLive),
-      Effect.provide(garbageCollectorLayerWithoutDependencies),
+      Effect.provide(
+        garbageCollectorLayerWithoutDependencies.pipe(Layer.provide(workerBackgroundWorkLayer)),
+      ),
       Effect.provide(Layer.mergeAll(objectStoreLayer, lsmConfigurationLayer)),
       Effect.provide(options.telemetry("cf-slatedb-gc")),
     ),

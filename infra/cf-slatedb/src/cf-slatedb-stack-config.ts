@@ -1,8 +1,10 @@
 import { DEFAULT_LSM_SETTINGS, LsmSettings } from "@cf-slatedb/lsm-core";
 import {
   isLocalLsmStage,
+  LSM_BUCKET_LOCATION_SETTING,
   LSM_JURISDICTION_SETTING,
   LSM_SETTINGS_BINDING,
+  LsmBucketLocation,
   type LsmWorkerSettings,
   type LsmWorkerSettingsSource,
 } from "@cf-slatedb/lsm-cloudflare";
@@ -35,6 +37,15 @@ const TraceSampleRate = Schema.Number.check(Schema.isBetween({ minimum: 0, maxim
 /** Schema for how many whole days a live stage keeps traces and tail records. */
 const TraceRetentionDays = Schema.Int.check(Schema.isGreaterThan(0));
 
+/**
+ * Schema for where an unrestricted Stack's LSM bucket is created: an R2 location hint, or `auto`
+ * (R2 places it near the deploy that creates it).
+ */
+export const CfSlatedbBucketLocation = Schema.Literals(["auto", ...LsmBucketLocation.literals]);
+
+/** Where an unrestricted Stack's LSM bucket is created. */
+export type CfSlatedbBucketLocation = typeof CfSlatedbBucketLocation.Type;
+
 /** Schema for the Stack's data residency: `eu`, `fedramp`, or `none` (unrestricted). */
 export const CfSlatedbJurisdiction = Schema.Literals(["eu", "fedramp", "none"]);
 
@@ -58,6 +69,8 @@ export type CfSlatedbAccessMode = typeof CfSlatedbAccessMode.Type;
  * - `stage`: the Alchemy stage being planned.
  * - `jurisdiction`: data residency of the buckets, Durable Objects, and Workflow; fixed per
  *   installation (D49).
+ * - `bucketLocation`: the LSM bucket's R2 location hint, near the writers; fixed per installation
+ *   (R2 cannot move a bucket) and only for an unrestricted Stack (D56).
  * - `lsmSettings`: the complete engine settings, the defaults merged with the deploy's overrides.
  * - `telemetry.traceSampleRate`: fraction of requests whose traces are kept.
  * - `telemetry.traceRetentionDays`: days a live stage keeps traces and tail records.
@@ -66,6 +79,7 @@ export type CfSlatedbAccessMode = typeof CfSlatedbAccessMode.Type;
 export const CfSlatedbStackConfig = Schema.Struct({
   stage: Schema.String,
   jurisdiction: CfSlatedbJurisdiction,
+  bucketLocation: CfSlatedbBucketLocation,
   lsmSettings: LsmSettings,
   telemetry: Schema.Struct({
     traceSampleRate: TraceSampleRate,
@@ -92,6 +106,7 @@ export class CfSlatedbStackConfigError extends Data.TaggedError("CfSlatedbStackC
 
 // The deploy's environment is the boundary: its values are untrusted text.
 const decodeJurisdiction = Schema.decodeUnknownEffect(CfSlatedbJurisdiction);
+const decodeBucketLocation = Schema.decodeUnknownEffect(CfSlatedbBucketLocation);
 const decodeSettingsOverrides = Schema.decodeEffect(
   Schema.fromJsonString(Schema.Record(Schema.String, Schema.Number)),
 );
@@ -123,6 +138,8 @@ const refused = (name: string, reason: string) =>
  * **Details**
  *
  * - `CF_SLATEDB_JURISDICTION`: `eu`, `fedramp`, or `none` (default `none`).
+ * - `CF_SLATEDB_BUCKET_LOCATION`: `wnam`, `enam`, `weur`, `eeur`, `apac`, `oc`, or `auto` (default
+ *   `auto`); refused together with a jurisdiction.
  * - `CF_SLATEDB_LSM_SETTINGS`: a JSON object of setting overrides by field name (default `{}`).
  *   Unknown names and contradictory combinations are refused.
  * - `CF_SLATEDB_TRACE_SAMPLE_RATE`: 0 to 1 (default 1; 0.1 in production).
@@ -143,6 +160,24 @@ export const resolveCfSlatedbStackConfig = Effect.fn("CfSlatedbStackConfig.resol
         ),
       ),
   });
+  const bucketLocation = yield* Option.match(variable(environment, LSM_BUCKET_LOCATION_SETTING), {
+    onNone: () => Effect.succeed<CfSlatedbBucketLocation>("auto"),
+    onSome: (text) =>
+      decodeBucketLocation(text.trim()).pipe(
+        Effect.mapError(() =>
+          refused(
+            LSM_BUCKET_LOCATION_SETTING,
+            `"${text}" is not one of wnam, enam, weur, eeur, apac, oc, or auto`,
+          ),
+        ),
+      ),
+  });
+  if (bucketLocation !== "auto" && jurisdiction !== "none") {
+    return yield* refused(
+      LSM_BUCKET_LOCATION_SETTING,
+      `a location hint does not apply to a bucket restricted to the ${jurisdiction} jurisdiction; use auto`,
+    );
+  }
   const overrides = yield* Option.match(variable(environment, LSM_SETTINGS_BINDING), {
     onNone: () => Effect.succeed<Readonly<Record<string, number>>>({}),
     onSome: (text) =>
@@ -188,6 +223,7 @@ export const resolveCfSlatedbStackConfig = Effect.fn("CfSlatedbStackConfig.resol
   return {
     stage,
     jurisdiction,
+    bucketLocation,
     lsmSettings,
     telemetry: { traceSampleRate, traceRetentionDays },
     access: { mode: accessMode },
@@ -208,6 +244,8 @@ export const cfSlatedbStackConfig = Effect.gen(function* () {
 export const cfSlatedbWorkerSettingsOf = (config: CfSlatedbStackConfig): LsmWorkerSettings => ({
   lsmSettings: config.lsmSettings,
   jurisdiction: config.jurisdiction === "none" ? Option.none() : Option.some(config.jurisdiction),
+  bucketLocation:
+    config.bucketLocation === "auto" ? Option.none() : Option.some(config.bucketLocation),
 });
 
 /**

@@ -373,6 +373,140 @@ export const measureFlushCpu = (megabytes: number) =>
     };
   });
 
+/** Options of {@link measureManifestCas}. */
+export interface ManifestCasLoad {
+  /** Small flushes to run, one after another. */
+  readonly flushes: number;
+  /** Rows written before each flush (100-byte values). */
+  readonly rowsPerFlush: number;
+}
+
+/**
+ * Runs `flushes` small flushes on a new database, one at a time (a small write, then `POST
+ * /flush`), and reports how long each manifest CAS and each flush took on the server
+ * (`ManifestStore.update` by how it started: from the writer's own view or a loaded manifest;
+ * `DbWriter.flush`), and the flush request as the client saw it.
+ *
+ * @returns The report, or `MeasurementError` when a write, a flush, or reading spans fails.
+ */
+export const measureManifestCas = (load: ManifestCasLoad) =>
+  Effect.gen(function* () {
+    const databaseId = DatabaseId.make(uniqueId("ms-cas"));
+    yield* createDatabase(databaseId);
+    const client = yield* dbApi;
+    const value = valueBytes(100, 7);
+    const flushClientMs: Array<number> = [];
+    for (let sequence = 0; sequence < load.flushes; sequence++) {
+      yield* client.databases
+        .write({
+          params: { databaseId },
+          payload: {
+            operations: Array.from({ length: load.rowsPerFlush }, (_, row) => ({
+              _tag: "Put" as const,
+              key: keyBytes(0, sequence, row),
+              value,
+              ttlMillis: Option.none(),
+            })),
+          },
+        })
+        .pipe(Effect.mapError(failed("write")));
+      const started = yield* Clock.currentTimeMillis;
+      yield* client.databases
+        .flush({ params: { databaseId } })
+        .pipe(Effect.mapError(failed("flush")));
+      flushClientMs.push((yield* Clock.currentTimeMillis) - started);
+    }
+    // Spans export after each response.
+    yield* Effect.sleep("10 seconds");
+    const updates = yield* pulledSpans("ManifestStore.update", databaseId);
+    const flushes = yield* pulledSpans("DbWriter.flush", databaseId);
+    const loads = yield* pulledSpans("ManifestReader.loadLatest", databaseId);
+    const startedFrom = (start: string) =>
+      updates
+        .filter((span) => span.attributes["manifest.start"] === start)
+        .map((span) => span.durationMs);
+    return {
+      databaseId,
+      flushes: load.flushes,
+      rowsPerFlush: load.rowsPerFlush,
+      manifestUpdateMs: summarize(updates.map((span) => span.durationMs)),
+      manifestUpdateFromOwnViewMs: summarize(startedFrom("OwnView")),
+      manifestUpdateLoadedMs: summarize(startedFrom("Loaded")),
+      casAttempts: summarize(
+        updates.map((span) =>
+          typeof span.attributes["manifest.cas_attempts"] === "number"
+            ? span.attributes["manifest.cas_attempts"]
+            : 0,
+        ),
+      ),
+      loadLatestMs: summarize(loads.map((span) => span.durationMs)),
+      writerFlushMs: summarize(flushes.map((span) => span.durationMs)),
+      flushClientMs: summarize(flushClientMs),
+    };
+  });
+
+/** Durable Object location hints the R2 placement probe measures from. */
+const R2_PROBE_REGIONS = [
+  "wnam",
+  "enam",
+  "sam",
+  "weur",
+  "eeur",
+  "apac",
+  "oc",
+  "afr",
+  "me",
+] as const;
+
+const R2ProbeReport = Schema.Struct({
+  colo: Schema.NullOr(Schema.String),
+  samples: Schema.Number,
+  timingsMs: Schema.Struct({
+    putIfAbsent: Schema.Array(Schema.Number),
+    get: Schema.Array(Schema.Number),
+    put: Schema.Array(Schema.Number),
+    getVersioned: Schema.Array(Schema.Number),
+  }),
+});
+const decodeR2ProbeReport = Schema.decodeUnknownEffect(Schema.fromJsonString(R2ProbeReport));
+
+/**
+ * Measures R2 latency to the stage's LSM bucket from a Durable Object created in each region (the
+ * probe Worker's `GET /v1/probe/r2`): `samples` rounds of create-if-absent, read, write, and
+ * versioned read per region, with the data center each object landed in.
+ *
+ * @returns Per region: the data center and each operation's latency percentiles, or
+ *   `MeasurementError` when a probe fails.
+ */
+export const measureR2Placement = (samples: number) =>
+  Effect.gen(function* () {
+    const { probe } = yield* ScenarioStack;
+    const http = yield* HttpClient.HttpClient;
+    const regions = yield* Effect.forEach(R2_PROBE_REGIONS, (region) =>
+      Effect.gen(function* () {
+        const response = yield* http
+          .execute(
+            HttpClientRequest.get(
+              `${probe.replace(/\/$/, "")}/v1/probe/r2?region=${region}&samples=${samples}`,
+            ),
+          )
+          .pipe(Effect.mapError(failed(`probe ${region}`)));
+        const report = yield* decodeR2ProbeReport(yield* response.text.pipe(Effect.orDie)).pipe(
+          Effect.mapError(failed(`read the ${region} probe`)),
+        );
+        return {
+          region,
+          colo: report.colo,
+          putIfAbsentMs: summarize(report.timingsMs.putIfAbsent),
+          getMs: summarize(report.timingsMs.get),
+          putMs: summarize(report.timingsMs.put),
+          getVersionedMs: summarize(report.timingsMs.getVersioned),
+        };
+      }),
+    );
+    return { samples, regions };
+  });
+
 /** Options of {@link measureSplitPause}. */
 export interface SplitLoad {
   readonly writers: number;

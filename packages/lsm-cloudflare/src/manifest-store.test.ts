@@ -12,7 +12,7 @@ import {
   WriterEpoch,
 } from "@cf-slatedb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
-import { Effect, Layer, Option, Result, Stream } from "effect";
+import { Effect, Layer, Option, Result, Stream, Tracer } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -278,5 +278,133 @@ describe("ManifestStore", () => {
       }),
     );
     expect(outcome).toEqual({ failure: "rejected", id: 1 });
+  });
+
+  it("commits from its own view with one create and no load, and through a reload from a stale one", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const created = yield* initialize;
+        const store = yield* ManifestStore;
+        // The span names each commit records: a fresh view must not load the newest manifest.
+        const spansOf = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+          Effect.gen(function* () {
+            const names: Array<string> = [];
+            const recording = Tracer.make({
+              span: (options) => {
+                names.push(options.name);
+                return new Tracer.NativeSpan(options);
+              },
+            });
+            const value = yield* Effect.withTracer(effect, recording);
+            return { value, names };
+          });
+        const first = yield* spansOf(store.updateFrom(created, flushEdit(1, WriterEpoch.make(0))));
+        // Another committer moves on; the writer's view (manifest 2) is now stale.
+        yield* store.update(DB, flushEdit(2, WriterEpoch.make(0)));
+        const fromStale = yield* spansOf(
+          store.updateFrom(first.value, flushEdit(3, WriterEpoch.make(0))),
+        );
+        return { first, fromStale };
+      }),
+    );
+    expect(outcome.first.value.id).toBe(2);
+    expect(outcome.first.names).not.toContain("ManifestReader.loadLatest");
+    expect(outcome.first.names.filter((name) => name === "ManifestStore.create")).toHaveLength(1);
+    expect(outcome.fromStale.value.id).toBe(4);
+    expect(outcome.fromStale.names).toContain("ManifestReader.loadLatest");
+    expect(outcome.fromStale.value.manifest.l0.map((sst) => sst.id)).toEqual(
+      [3, 2, 1].map((n) => handle(n).id),
+    );
+  });
+
+  it("reloads instead of committing when its own view's next id was collected by GC", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* initialize;
+        const store = yield* ManifestStore;
+        const objects = yield* ObjectStore;
+        const view = yield* store.update(DB, flushEdit(1, WriterEpoch.make(0)));
+        for (const n of [2, 3]) yield* store.update(DB, flushEdit(n, WriterEpoch.make(0)));
+        // GC collected manifests 2 and 3; the view's next id (3) is free again.
+        yield* store.advanceManifestBoundary(DB, ManifestId.make(3));
+        yield* objects.delete([
+          manifestKey(DB, ManifestId.make(2)),
+          manifestKey(DB, ManifestId.make(3)),
+        ]);
+        return yield* store.updateFrom(view, flushEdit(4, WriterEpoch.make(0)));
+      }),
+    );
+    expect(outcome.id).toBe(5);
+    expect(outcome.manifest.l0).toHaveLength(4);
+  });
+
+  it("trusts only a written commit from its own view: a failure or no-op there is rechecked", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* initialize;
+        const store = yield* ManifestStore;
+        const view = yield* store.update(DB, flushEdit(1, WriterEpoch.make(0)));
+        yield* store.update(DB, flushEdit(2, WriterEpoch.make(0)));
+        // An edit whose answer depends on what the view holds: it needs two L0 SSTs.
+        const needsTwo = (manifest: Parameters<typeof commitL0Flush>[0]) =>
+          manifest.l0.length >= 2
+            ? Result.mapError(flushEdit(3, WriterEpoch.make(0))(manifest), (error) => error._tag)
+            : Result.fail("TooFew" as const);
+        const afterFailure = yield* store.updateFrom(view, needsTwo);
+        // An edit that is a no-op on the view but not on the newest manifest.
+        const noOpBelowThree = (manifest: Parameters<typeof commitL0Flush>[0]) =>
+          manifest.l0.length >= 3
+            ? flushEdit(4, WriterEpoch.make(0))(manifest)
+            : Result.succeed(manifest);
+        const afterNoOp = yield* store.updateFrom(view, noOpBelowThree);
+        return { afterFailure: afterFailure.id, afterNoOp: afterNoOp.id };
+      }),
+    );
+    expect(outcome).toEqual({ afterFailure: 4, afterNoOp: 5 });
+  });
+
+  it("advances the LATEST hint in the background and never moves it back", async () => {
+    const hints = await run(
+      Effect.gen(function* () {
+        yield* initialize;
+        const store = yield* ManifestStore;
+        const objects = yield* ObjectStore;
+        const hint = Effect.gen(function* () {
+          // Background work lands after the commit returns.
+          yield* Effect.sleep("20 millis");
+          const body = yield* objects.get(latestManifestKey(DB));
+          return Option.map(body, (bytes) => new TextDecoder().decode(bytes));
+        });
+        yield* store.update(DB, flushEdit(1, WriterEpoch.make(0)));
+        const advanced = yield* hint;
+        // A hint already ahead (a later commit's write landed first) stays where it is.
+        yield* objects.put(latestManifestKey(DB), new TextEncoder().encode("9"));
+        yield* store.update(DB, flushEdit(2, WriterEpoch.make(0)));
+        const kept = yield* hint;
+        return [advanced, kept];
+      }),
+    );
+    expect(hints).toEqual([Option.some("2"), Option.some("9")]);
+  });
+
+  it("finds the newest manifest when the hint lags below manifests GC deleted", async () => {
+    const newest = await run(
+      Effect.gen(function* () {
+        yield* initialize;
+        const store = yield* ManifestStore;
+        const objects = yield* ObjectStore;
+        for (const n of [1, 2, 3, 4, 5]) yield* store.update(DB, flushEdit(n, WriterEpoch.make(0)));
+        // The hint's writes were lost at 2; a checkpoint keeps manifest 2 while GC deleted 3 and 4.
+        yield* Effect.sleep("20 millis");
+        yield* objects.put(latestManifestKey(DB), new TextEncoder().encode("2"));
+        yield* store.advanceManifestBoundary(DB, ManifestId.make(4));
+        yield* objects.delete([
+          manifestKey(DB, ManifestId.make(3)),
+          manifestKey(DB, ManifestId.make(4)),
+        ]);
+        return (yield* (yield* ManifestReader).loadLatest(DB)).id;
+      }),
+    );
+    expect(newest).toBe(6);
   });
 });

@@ -1,9 +1,14 @@
 import { type DatabaseId, Manifest, ManifestId, ManifestJson } from "@cf-slatedb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
-import { Context, Data, Effect, Layer, Option, Schema } from "effect";
+import { Context, Data, Effect, Layer, Option, Result, Schema } from "effect";
 
 import { DatabaseNotFoundError } from "./lsm-errors.ts";
-import { latestManifestKey, manifestKey, manifestPrefix } from "./object-keys.ts";
+import {
+  latestManifestKey,
+  manifestGcBoundaryKey,
+  manifestKey,
+  manifestPrefix,
+} from "./object-keys.ts";
 import {
   ObjectStore,
   objectStoreLayer,
@@ -32,11 +37,29 @@ export class ManifestReadError extends Data.TaggedError("ManifestReadError")<{
   readonly message: string;
 }> {}
 
+/**
+ * GC's manifest boundary (`gc/manifest.boundary`, SlateDB RFC 0026): GC may delete manifests at or
+ * below it and never deletes one above it, and it is always below the newest manifest.
+ */
+export interface ManifestBoundary {
+  /** The boundary id; 0 before GC first advances it. */
+  readonly id: number;
+  /** The boundary object's version, for a conditional update; `None` before it exists. */
+  readonly version: Option.Option<string>;
+}
+
 /** Reads a database's manifests. */
 export interface IManifestReader {
   /**
-   * Finds and reads the newest manifest: reads the `manifest/LATEST` hint, then probes `id + 1`
-   * until one is missing. Never lists objects on this path.
+   * Finds and reads the newest manifest: reads the `manifest/LATEST` hint and GC's manifest
+   * boundary together, then probes forward from the later of the hint and the id above the
+   * boundary until an id is missing. Never lists objects on this path.
+   *
+   * **Details**
+   *
+   * The hint is written in the background and may lag, even below manifests GC has deleted.
+   * Manifests above the boundary are never deleted and their ids are contiguous up to the newest,
+   * so the probe cannot stop early at a gap GC left (D56).
    *
    * @returns The newest manifest, `DatabaseNotFoundError` when the database has none, or
    *   `ManifestReadError`.
@@ -54,6 +77,15 @@ export interface IManifestReader {
     databaseId: DatabaseId,
     manifestId: ManifestId,
   ) => Effect.Effect<Option.Option<Manifest>, ManifestReadError, RuntimeContext>;
+  /**
+   * Reads GC's manifest boundary.
+   *
+   * @returns The boundary (id 0 before GC first advances it), or `ManifestReadError`:
+   *   `StoredManifestInvalid` when the stored boundary is not a manifest id.
+   */
+  readonly loadManifestBoundary: (
+    databaseId: DatabaseId,
+  ) => Effect.Effect<ManifestBoundary, ManifestReadError, RuntimeContext>;
 }
 
 /** The contextual manifest reader. */
@@ -66,6 +98,9 @@ const decodeManifestIdText = Schema.decodeEffect(
   Schema.NumberFromString.pipe(Schema.decodeTo(ManifestId)),
 );
 const textDecoder = new TextDecoder();
+const decodeManifestBoundaryText = Schema.decodeUnknownResult(
+  Schema.NumberFromString.pipe(Schema.decodeTo(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)))),
+);
 
 /**
  * Decodes a stored manifest body and checks that it belongs to `databaseId`.
@@ -153,40 +188,77 @@ export const makeManifestReader = Effect.gen(function* () {
     return newest;
   });
 
+  const loadManifestBoundary = Effect.fn("ManifestReader.loadManifestBoundary")(function* (
+    databaseId: DatabaseId,
+  ) {
+    const stored = yield* objects
+      .getVersioned(manifestGcBoundaryKey(databaseId))
+      .pipe(storageUnavailable(databaseId, Option.none()));
+    if (Option.isNone(stored)) return { id: 0, version: Option.none<string>() };
+    const decoded = decodeManifestBoundaryText(textDecoder.decode(stored.value.bytes));
+    if (Result.isFailure(decoded)) {
+      return yield* new ManifestReadError({
+        databaseId,
+        manifestId: Option.none(),
+        reason: "StoredManifestInvalid",
+        message: `Database ${databaseId}'s GC manifest boundary is not a manifest id. Restore it from the largest deleted manifest id; manifest writes stay blocked until then.`,
+      });
+    }
+    return { id: decoded.success, version: Option.some(stored.value.version) };
+  });
+
+  const notFound = (databaseId: DatabaseId) =>
+    new DatabaseNotFoundError({
+      databaseId,
+      message: `Database ${databaseId} does not exist. Create it before reading or writing it.`,
+    });
+
   const loadLatest = Effect.fn("ManifestReader.loadLatest")(function* (databaseId: DatabaseId) {
     yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
-    const hintBody = yield* objects
-      .get(latestManifestKey(databaseId))
-      .pipe(storageUnavailable(databaseId, Option.none()));
+    const { hintBody, boundary } = yield* Effect.all(
+      {
+        hintBody: objects
+          .get(latestManifestKey(databaseId))
+          .pipe(storageUnavailable(databaseId, Option.none())),
+        boundary: loadManifestBoundary(databaseId),
+      },
+      { concurrency: 2 },
+    );
     const hint = Option.isSome(hintBody)
       ? yield* decodeManifestIdText(textDecoder.decode(hintBody.value)).pipe(Effect.option)
       : Option.none<ManifestId>();
-    let id = Option.getOrElse(hint, () => ManifestId.make(1));
-    let manifest = yield* load(databaseId, id);
+    // Ids above the boundary are never deleted: start there when the hint lags below it.
+    let id = ManifestId.make(
+      Math.max(
+        Option.getOrElse(hint, () => 1),
+        boundary.id + 1,
+      ),
+    );
+    // The start and the id after it together: the hint is usually the newest or one behind.
+    const [start, after] = yield* Effect.all(
+      [load(databaseId, id), load(databaseId, ManifestId.make(id + 1))],
+      { concurrency: 2 },
+    );
+    let manifest = start;
+    let next = after;
+    let probes = 1;
     if (Option.isNone(manifest)) {
-      if (Option.isNone(hint)) {
-        return yield* new DatabaseNotFoundError({
-          databaseId,
-          message: `Database ${databaseId} does not exist. Create it before reading or writing it.`,
-        });
-      }
+      if (Option.isNone(hint) && Option.isNone(boundary.version))
+        return yield* notFound(databaseId);
+      // Not expected (the start is above the boundary or a hint the GC has not reached): recover by
+      // listing rather than fail.
       const newest = yield* newestByListing(databaseId);
-      if (Option.isNone(newest)) {
-        return yield* new DatabaseNotFoundError({
-          databaseId,
-          message: `Database ${databaseId} does not exist. Create it before reading or writing it.`,
-        });
-      }
+      if (Option.isNone(newest)) return yield* notFound(databaseId);
       id = newest.value;
       manifest = yield* load(databaseId, id);
-    }
-    let probes = 0;
-    for (;;) {
-      const next = yield* load(databaseId, ManifestId.make(id + 1));
+      next = yield* load(databaseId, ManifestId.make(id + 1));
       probes++;
-      if (Option.isNone(next)) break;
+    }
+    while (Option.isSome(next)) {
       id = ManifestId.make(id + 1);
       manifest = next;
+      next = yield* load(databaseId, ManifestId.make(id + 1));
+      probes++;
     }
     yield* Effect.annotateCurrentSpan({ "manifest.id": id, "manifest.probes": probes });
     if (Option.isNone(manifest)) {
@@ -200,7 +272,7 @@ export const makeManifestReader = Effect.gen(function* () {
     return { id, manifest: manifest.value };
   });
 
-  return ManifestReader.of({ load, loadLatest });
+  return ManifestReader.of({ load, loadLatest, loadManifestBoundary });
 });
 
 /** Provides the manifest reader, leaving the object store requirement visible. */

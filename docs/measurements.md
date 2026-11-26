@@ -126,6 +126,63 @@ batches to the same database, for 150 s, production settings.
 
 A transaction aborts only if it outlasts a whole flush (D50); live flushes take at least ~1.5 s.
 
+## Manifest commits and small flushes (v1 workstream 2, D56)
+
+`measure manifest-cas` runs 30 small flushes in sequence on a new database (10 rows of 100 bytes,
+then `POST /flush`, repeated) and reads the server spans back from the stage's collector.
+`preview-1`, production settings (`preview-cli bindings preview-1`: `production` on every Worker),
+2026-11-25. "Before" is the code at `012bdb5`; "after" is D56. Values are p50 / p90 / p99 in ms.
+
+```sh
+node tools/scenario-cli/src/scenario-cli.ts measure manifest-cas --stage preview-1 --flushes 30
+```
+
+| Span                                                  | Before                | After               |
+| ----------------------------------------------------- | --------------------- | ------------------- |
+| `ManifestStore.update` (every commit)                 | 1,092 / 1,269 / 1,470 | 357 / 998 / 1,095   |
+| … from the writer's own view (flushes)                | –                     | 340 / 539 / 651     |
+| … from a loaded manifest (fences, compaction commits) | –                     | 995 / 1,095 / 1,095 |
+| `ManifestReader.loadLatest`                           | 274 / 383 / 478       | 180 / 253 / 299     |
+| `DbWriter.flush` (small memtable)                     | 1,508 / 1,683 / 3,678 | 709 / 917 / 1,801   |
+| `POST /flush` at the client                           | 1,584 / 1,724 / 3,754 | 796 / 1,012 / 1,844 |
+
+Commits: 40 before, 39 after
+(30 flush commits plus the writer's and compactor's fences and compaction commits). **Targets met:**
+`ManifestStore.update` p50 357 ms (≤ 500 ms) and a small flush p50
+709 ms (≤ 900 ms). A commit from the writer's own view is one
+create-if-absent (~285 ms here) and the boundary re-read (~76 ms); a loaded commit adds
+`loadLatest` (~180 ms, down from ~274 ms: the hint and boundary read together, two probes in
+parallel) and loses races to concurrent flushes more often.
+
+## R2 latency by region (v1 workstream 2, D56)
+
+`measure r2-placement` creates a probe Durable Object with each location hint and times the
+engine's object store calls (128-byte objects) against `preview-1`'s LSM bucket, which Cloudflare
+reports in **ENAM**. 20 samples per region; p50 / p90 in ms.
+
+```sh
+node tools/scenario-cli/src/scenario-cli.ts measure r2-placement --stage preview-1 --samples 20
+```
+
+| Hint | Data center | create-if-absent | read      | write         | versioned read |
+| ---- | ----------- | ---------------- | --------- | ------------- | -------------- |
+| wnam | SJC         | 511 / 559        | 229 / 275 | 558 / 667     | 230 / 268      |
+| enam | IAD         | 284 / 325        | 86 / 122  | 352 / 379     | 76 / 98        |
+| sam  | IAD         | 285 / 333        | 76 / 114  | 354 / 400     | 85 / 115       |
+| weur | CDG         | 560 / 785        | 265 / 297 | 630 / 742     | 262 / 308      |
+| eeur | MXP         | 586 / 896        | 290 / 331 | 658 / 972     | 281 / 308      |
+| apac | HKG         | 984 / 1,575      | 550 / 607 | 1,029 / 1,088 | 558 / 606      |
+| oc   | SYD         | 911 / 967        | 501 / 541 | 979 / 1,023   | 499 / 558      |
+| afr  | CDG         | 548 / 596        | 278 / 295 | 604 / 666     | 259 / 294      |
+| me   | FRA         | 535 / 628        | 272 / 317 | 601 / 694     | 268 / 301      |
+
+**Reading.** A write to R2 costs ~280–350 ms even from the data center beside the bucket (IAD for
+ENAM; `sam` landed in IAD too), and a read ~80 ms. Each region farther away adds roughly its round
+trip: ~510 ms from the US west coast, ~550–590 ms from Europe, ~900–1,000 ms from Asia-Pacific and
+Oceania. `preview-1`'s writers run near its bucket (an own-view commit is one ~285 ms create plus a
+~76 ms read), so placement could not speed it up. An installation whose writers sit elsewhere should
+create its bucket there: `CF_SLATEDB_BUCKET_LOCATION` (fixed at creation; unrestricted Stacks only).
+
 ## Live checks
 
 | Check                                       | Result                         | How                                                                                                                                                                                                                                                                                                                                                                                             |

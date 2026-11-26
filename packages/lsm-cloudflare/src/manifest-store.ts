@@ -2,6 +2,7 @@ import { type DatabaseId, type Manifest, ManifestId, ManifestJson } from "@cf-sl
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Context, Data, Effect, Layer, Metric, Option, Result, Schedule, Schema } from "effect";
 
+import { BackgroundWork, backgroundWorkTestLayer } from "./background-work.ts";
 import type { DatabaseNotFoundError } from "./lsm-errors.ts";
 import {
   ManifestReader,
@@ -55,7 +56,8 @@ export class DatabaseAlreadyExistsError extends Data.TaggedError("DatabaseAlread
  * written exactly once and concurrent writers serialize. GC deletes old manifests, after which
  * create-if-absent no longer remembers their ids, so a create also checks GC's manifest boundary
  * (`gc/manifest.boundary`, SlateDB RFC 0026): an id at or below it is a conflict, not a commit.
- * After a successful create, the `manifest/LATEST` hint is updated on a best-effort basis.
+ * After a successful create, the `manifest/LATEST` hint is advanced in the background
+ * (`BackgroundWork`): it may land late or never, and readers do not depend on it (D56).
  */
 export interface IManifestStore {
   /**
@@ -102,6 +104,28 @@ export interface IManifestStore {
     RuntimeContext
   >;
   /**
+   * Like {@link IManifestStore.update}, but the first attempt applies the edit to `view`, the
+   * newest manifest the caller knows (the one it last loaded or committed), without loading.
+   *
+   * **Details**
+   *
+   * For committers that keep their own view, such as a writer between flushes: when nothing else
+   * committed since, the commit costs one create and no load. Only a written commit is trusted
+   * from `view` (create-if-absent and the boundary re-read prove it was the newest). An edit that
+   * fails or reports "already applied" against `view`, or a create that conflicts, reloads and
+   * continues as `update` does, since an older view can give a wrong answer for those.
+   *
+   * @returns As {@link IManifestStore.update}.
+   */
+  readonly updateFrom: <E>(
+    view: VersionedManifest,
+    edit: (manifest: Manifest, manifestId: ManifestId) => Result.Result<Manifest, E>,
+  ) => Effect.Effect<
+    VersionedManifest,
+    E | DatabaseNotFoundError | ManifestReadError | ManifestWriteError,
+    RuntimeContext
+  >;
+  /**
    * Advances GC's manifest boundary to at least `manifestId` (it never moves back). GC calls this
    * before deleting manifests at or below `manifestId`.
    */
@@ -126,16 +150,22 @@ export const manifestCasConflicts = Metric.counter("lsm_manifest_cas_conflicts",
 
 const CAS_ATTEMPTS = 12;
 
-const ManifestBoundary = Schema.NumberFromString.pipe(
-  Schema.decodeTo(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+/** Attempts to advance the `LATEST` hint when another writer moved it concurrently. */
+const HINT_ATTEMPTS = 3;
+
+const decodeManifestIdText = Schema.decodeUnknownOption(
+  Schema.NumberFromString.pipe(Schema.decodeTo(ManifestId)),
 );
-const decodeManifestBoundary = Schema.decodeUnknownResult(ManifestBoundary);
 const textDecoder = new TextDecoder();
 
-/** Constructs the manifest store over the contextual object store and manifest reader. */
+/**
+ * Constructs the manifest store over the contextual object store, manifest reader, and background
+ * work runner.
+ */
 export const makeManifestStore = Effect.gen(function* () {
   const objects = yield* ObjectStore;
   const reader = yield* ManifestReader;
+  const background = yield* BackgroundWork;
 
   // The wrapped calls fail only with `ObjectStoreUnavailableError`, which has one meaning here.
   const writeUnavailable = (databaseId: DatabaseId) =>
@@ -150,21 +180,39 @@ export const makeManifestStore = Effect.gen(function* () {
 
   /** GC's manifest boundary and its object version; 0 and none before GC first advances it. */
   const readManifestBoundary = (databaseId: DatabaseId) =>
-    Effect.gen(function* () {
-      const stored = yield* objects
-        .getVersioned(manifestGcBoundaryKey(databaseId))
-        .pipe(writeUnavailable(databaseId));
-      if (Option.isNone(stored)) return { value: 0, version: Option.none<string>() };
-      const decoded = decodeManifestBoundary(textDecoder.decode(stored.value.bytes));
-      if (Result.isFailure(decoded)) {
-        return yield* new ManifestWriteError({
-          databaseId,
-          reason: "StorageUnavailable",
-          message: `Database ${databaseId}'s GC manifest boundary is not a manifest id. Restore it from the largest deleted manifest id; manifest writes stay blocked until then.`,
-        });
-      }
-      return { value: decoded.success, version: Option.some(stored.value.version) };
+    reader.loadManifestBoundary(databaseId).pipe(
+      Effect.mapError(
+        (error) =>
+          new ManifestWriteError({
+            databaseId,
+            reason: "StorageUnavailable",
+            message: error.message,
+          }),
+      ),
+    );
+
+  /**
+   * Advances the `LATEST` hint to `manifestId` unless it already names a newer manifest, so a hint
+   * write that lands late never moves it back. Best effort: an outage or repeated races leave it
+   * behind, which only costs readers a probe.
+   */
+  const advanceLatestHint = (databaseId: DatabaseId, manifestId: ManifestId) => {
+    const key = latestManifestKey(databaseId);
+    const body = textEncoder.encode(String(manifestId));
+    const attempt = Effect.gen(function* () {
+      const current = yield* objects.getVersioned(key);
+      if (Option.isNone(current)) return (yield* objects.putIfAbsent(key, body)) === "Created";
+      const hinted = decodeManifestIdText(textDecoder.decode(current.value.bytes));
+      if (Option.isSome(hinted) && hinted.value >= manifestId) return true;
+      return (yield* objects.putIfVersion(key, body, current.value.version)) === "Written";
     });
+    return attempt.pipe(
+      Effect.repeat({ until: (done) => done, times: HINT_ATTEMPTS - 1 }),
+      Effect.asVoid,
+      Effect.catchTags({ ObjectStoreUnavailableError: () => Effect.void }),
+      Effect.annotateSpans({ "database.id": databaseId, "manifest.id": manifestId }),
+    );
+  };
 
   const advanceManifestBoundary = Effect.fn("ManifestStore.advanceManifestBoundary")(function* (
     databaseId: DatabaseId,
@@ -175,7 +223,7 @@ export const makeManifestStore = Effect.gen(function* () {
     const body = textEncoder.encode(String(manifestId));
     const attempt = Effect.gen(function* () {
       const current = yield* readManifestBoundary(databaseId);
-      if (current.value >= manifestId) return true;
+      if (current.id >= manifestId) return true;
       const outcome = Option.isNone(current.version)
         ? (yield* objects.putIfAbsent(key, body).pipe(writeUnavailable(databaseId))) === "Created"
         : (yield* objects
@@ -219,19 +267,20 @@ export const makeManifestStore = Effect.gen(function* () {
     // Checked after the create: GC advances the boundary before deleting, so an id it may have
     // deleted (and that this create could have reused) is at or below it.
     const boundary = yield* readManifestBoundary(databaseId);
-    if (manifestId <= boundary.value) {
+    if (manifestId <= boundary.id) {
       yield* Metric.update(manifestCasConflicts, 1);
-      yield* Effect.annotateCurrentSpan({ "manifest.gc_boundary": boundary.value });
+      yield* Effect.annotateCurrentSpan({ "manifest.gc_boundary": boundary.id });
       return yield* new ManifestConflictError({
         databaseId,
         manifestId,
-        message: `Manifest ${manifestId} of database ${databaseId} is at or below GC's manifest boundary ${boundary.value}: the id was used before and its manifest collected. Reload and reapply.`,
+        message: `Manifest ${manifestId} of database ${databaseId} is at or below GC's manifest boundary ${boundary.id}: the id was used before and its manifest collected. Reload and reapply.`,
       });
     }
-    // Best effort: the hint may lag, and readers probe past it.
-    yield* objects
-      .put(latestManifestKey(databaseId), textEncoder.encode(String(manifestId)))
-      .pipe(Effect.catchTags({ ObjectStoreUnavailableError: () => Effect.void }));
+    // Off the critical path: the hint may land late or never; readers probe past it (D56).
+    yield* background.run(
+      "ManifestStore.advanceLatestHint",
+      advanceLatestHint(databaseId, manifestId),
+    );
   });
 
   const initialize = Effect.fn("ManifestStore.initialize")(function* (manifest: Manifest) {
@@ -250,13 +299,41 @@ export const makeManifestStore = Effect.gen(function* () {
     return { id, manifest };
   });
 
-  const update = <E>(
+  /**
+   * The CAS loop of `update` and `updateFrom`. The first attempt applies the edit to `ownView` when
+   * there is one and trusts only a written commit from it; every other attempt loads the newest
+   * manifest.
+   */
+  const commitEdit = <E>(
     databaseId: DatabaseId,
     edit: (manifest: Manifest, manifestId: ManifestId) => Result.Result<Manifest, E>,
+    ownView: Option.Option<VersionedManifest>,
   ) =>
     Effect.gen(function* () {
-      yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
+      yield* Effect.annotateCurrentSpan({
+        "database.id": databaseId,
+        "manifest.start": Option.isSome(ownView) ? "OwnView" : "Loaded",
+      });
       let attempt = 0;
+      if (Option.isSome(ownView)) {
+        attempt++;
+        const view = ownView.value;
+        const edited = edit(view.manifest, view.id);
+        if (Result.isSuccess(edited) && edited.success !== view.manifest) {
+          const nextId = ManifestId.make(view.id + 1);
+          const committedFromView = yield* create(databaseId, nextId, edited.success).pipe(
+            Effect.as(true),
+            Effect.catchTags({ ManifestConflictError: () => Effect.succeed(false) }),
+          );
+          if (committedFromView) {
+            yield* Effect.annotateCurrentSpan({
+              "manifest.id": nextId,
+              "manifest.cas_attempts": attempt,
+            });
+            return { id: nextId, manifest: edited.success };
+          }
+        }
+      }
       // The edit's own failure travels in the success channel, so the CAS loop's error channel
       // holds only known tags.
       const once = Effect.gen(function* () {
@@ -295,13 +372,29 @@ export const makeManifestStore = Effect.gen(function* () {
       return result;
     }).pipe(Effect.withSpan("ManifestStore.update"));
 
-  return ManifestStore.of({ create, initialize, update, advanceManifestBoundary });
+  const update = <E>(
+    databaseId: DatabaseId,
+    edit: (manifest: Manifest, manifestId: ManifestId) => Result.Result<Manifest, E>,
+  ) => commitEdit(databaseId, edit, Option.none());
+
+  const updateFrom = <E>(
+    view: VersionedManifest,
+    edit: (manifest: Manifest, manifestId: ManifestId) => Result.Result<Manifest, E>,
+  ) => commitEdit(view.manifest.databaseId, edit, Option.some(view));
+
+  return ManifestStore.of({ create, initialize, update, updateFrom, advanceManifestBoundary });
 });
 
-/** Provides the manifest store, leaving the object store and manifest reader visible. */
+/**
+ * Provides the manifest store, leaving the object store, manifest reader, and background work runner
+ * visible.
+ */
 export const manifestStoreLayerWithoutDependencies = Layer.effect(ManifestStore, makeManifestStore);
 
-/** Provides the manifest store, the reader, and the R2-backed object store they share. */
+/**
+ * Provides the manifest store, the reader, and the R2-backed object store they share, leaving the
+ * background work runner to the host (a Worker, Durable Object, or Workflow provides its own).
+ */
 export const manifestStoreLayer = manifestStoreLayerWithoutDependencies.pipe(
   Layer.provideMerge(manifestReaderLayerWithoutDependencies),
   Layer.provideMerge(objectStoreLayer),
@@ -314,4 +407,5 @@ export const manifestStoreLayer = manifestStoreLayerWithoutDependencies.pipe(
 export const manifestStoreTestLayer = manifestStoreLayerWithoutDependencies.pipe(
   Layer.provideMerge(manifestReaderLayerWithoutDependencies),
   Layer.provideMerge(objectStoreTestLayer),
+  Layer.provide(backgroundWorkTestLayer),
 );

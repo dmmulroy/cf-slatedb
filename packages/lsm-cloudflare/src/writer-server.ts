@@ -4,6 +4,7 @@ import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Effect, Layer } from "effect";
 import { HttpRouter } from "effect/http";
 
+import { durableObjectBackgroundWorkLayer } from "./background-work.ts";
 import { CompactionTrigger } from "./compaction-trigger.ts";
 import { DbWriter, dbWriterLayerWithoutDependencies } from "./db-writer.ts";
 import { LsmConfiguration, lsmConfigurationLayer } from "./lsm-configuration.ts";
@@ -61,6 +62,11 @@ export const writerServerLayerWithoutDependencies = WriterServer.make(
         Layer.provide(
           manifestStoreLayerWithoutDependencies.pipe(
             Layer.provide(manifestReaderLayerWithoutDependencies),
+            Layer.provide(
+              durableObjectBackgroundWorkLayer.pipe(
+                Layer.provide(Layer.succeed(Cloudflare.DurableObjectState, state)),
+              ),
+            ),
           ),
         ),
         Layer.provide(

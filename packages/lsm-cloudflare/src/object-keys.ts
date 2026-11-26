@@ -48,3 +48,28 @@ export const gcPrefix = (databaseId: DatabaseId): string => `${databasePrefix(da
  */
 export const manifestGcBoundaryKey = (databaseId: DatabaseId): string =>
   `${gcPrefix(databaseId)}manifest.boundary`;
+
+/** What an object key holds, by the key layout above: a safe span attribute (`object.kind`). */
+export type ObjectKind =
+  | "Manifest"
+  | "LatestHint"
+  | "ManifestBoundary"
+  | "Sst"
+  | "Changelog"
+  | "Gc"
+  | "Other";
+
+/** The {@link ObjectKind} of `key`. */
+export const objectKindOfKey = (key: string): ObjectKind => {
+  const match =
+    /^db\/[^/]+\/(manifest\/(LATEST|\d+)|compacted\/|changelog\/|gc\/(manifest\.boundary)?)/.exec(
+      key,
+    );
+  if (match === null) return "Other";
+  if (match[2] === "LATEST") return "LatestHint";
+  if (match[2] !== undefined) return "Manifest";
+  if (match[3] !== undefined) return "ManifestBoundary";
+  if (match[1]?.startsWith("compacted/")) return "Sst";
+  if (match[1]?.startsWith("changelog/")) return "Changelog";
+  return "Gc";
+};

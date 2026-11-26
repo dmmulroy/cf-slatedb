@@ -1,8 +1,16 @@
+import { DatabaseId, ManifestId, SstId } from "@cf-slatedb/lsm-core";
 import { Arbitrary, Bytes, Effect, Option, Schema, Stream } from "effect";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { describe, expect, it } from "vite-plus/test";
 
 import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
+import {
+  latestManifestKey,
+  manifestGcBoundaryKey,
+  manifestKey,
+  objectKindOfKey,
+  sstKey,
+} from "./object-keys.ts";
 import { ObjectStore, objectStoreTestLayer, toUniformParts } from "./object-store.ts";
 
 const smallInt = (minimum: number, maximum: number) =>
@@ -88,5 +96,18 @@ describe("ObjectStore (in-memory)", () => {
       }),
     );
     expect(prefixes).toEqual({ prefixes: ["db/a/", "db/b/"], cursor: Option.none() });
+  });
+});
+
+describe("objectKindOfKey", () => {
+  it("names what each key in the layout holds, for the object.kind span attribute", () => {
+    const db = DatabaseId.make("orders");
+    expect(objectKindOfKey(manifestKey(db, ManifestId.make(7)))).toBe("Manifest");
+    expect(objectKindOfKey(latestManifestKey(db))).toBe("LatestHint");
+    expect(objectKindOfKey(manifestGcBoundaryKey(db))).toBe("ManifestBoundary");
+    expect(objectKindOfKey(`db/${db}/gc/sst.boundary`)).toBe("Gc");
+    expect(objectKindOfKey(sstKey(db, SstId.make("01JD0000000000000000000001")))).toBe("Sst");
+    expect(objectKindOfKey(`db/${db}/changelog/00000000000000000009-x.sst`)).toBe("Changelog");
+    expect(objectKindOfKey("probe/r2/run/1")).toBe("Other");
   });
 });

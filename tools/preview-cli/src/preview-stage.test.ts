@@ -111,6 +111,7 @@ describe("deployEnvironment", () => {
       CF_SLATEDB_LSM_SETTINGS: '{"gcMinAge":1}',
       CF_SLATEDB_JURISDICTION: "eu",
       CF_SLATEDB_TRACE_SAMPLE_RATE: "0.5",
+      CF_SLATEDB_BUCKET_LOCATION: "weur",
     };
     expect(deployEnvironment(shell, { devTimings: false, jurisdiction: "none" })).toEqual({
       PATH: "/bin",

@@ -42,6 +42,21 @@ hand-off is below.
   the R2 API. Scenarios: 11/11 locally; `write-read` and `transactions` on `preview-1`. All three
   previews redeployed with the final code (`preview-1` and `preview-3` unrestricted, `preview-2`
   `eu`; production settings).
+- **2. Fast manifest commits (D56).** `ManifestStore.updateFrom`: the writer's flushes and seal create
+  `view.id + 1` from the manifest they last committed, without loading; only a written commit is
+  trusted from that view (a conflict, failure, or no-op reloads). The `LATEST` hint is advanced in
+  the background (`BackgroundWork`: `waitUntil` in Workers and Durable Objects, inline in Workflow
+  steps) and conditionally, so it never moves back. **Finding (fixed):** `loadLatest` probed from the
+  hint alone, so a lagging hint plus a checkpoint keeping manifest `h` while GC deleted `h + 1` made
+  it stop at `h`; it now probes from `max(hint, boundary + 1)`, reading both together, and GC no
+  longer rewrites the hint. Model: GC deletes, hint writes in any order or never, the optimistic
+  attempt; new invariants `CommitOnce`, `LoadFindsHead`; new broken variants `noBoundaryReread`,
+  `hintOnlyProbe` fail; 23/23 TLC runs. **Live (`preview-1`, production settings):**
+  `ManifestStore.update` p50 1,092 → 357 ms (target ≤ 500), small flush p50 1,508 → 709 ms (target
+  ≤ 900). **R2 placement:** create-if-absent ~285 ms even beside the bucket (ENAM, from IAD), ~510 ms
+  from the US west coast, ~550–590 ms from Europe, ~900–1,000 ms from APAC/Oceania; `preview-1`'s
+  writers are already near its bucket. `CF_SLATEDB_BUCKET_LOCATION` (default `auto`) lets an
+  installation place its bucket once. Scenarios: 11/11 locally and on `preview-1`.
 
 ## Remaining-work log
 
@@ -424,6 +439,12 @@ workstream builds the recommended default, records it as a decision, and keeps i
 | P4  | Production telemetry                | The stage's own `TraceCollector`, a 14-day R2 lifecycle rule, head sampling at 10% (100% on previews).                                                       | pending |
 | P5  | Plan and limits                     | Workers Paid; `limits.cpu_ms` on the API and compactor Workers set to workstream 6's measurement plus 2× headroom.                                           | pending |
 | P6  | Release go-ahead                    | Dillon reviews `docs/release-v1.md`, adds `production` to the deploy guard, then says "deploy" or runs the deploy task himself.                              | pending |
+
+Related to P2 (found in workstream 2, D56): the production LSM bucket's R2 location is fixed when it
+is created. `CF_SLATEDB_BUCKET_LOCATION` defaults to `auto` (R2 places it near the machine that
+deploys). If production callers are concentrated somewhere else (for example Europe), choose that
+region (`weur`) before the first production deploy; writes cost ~285 ms beside the bucket and up to
+~1 s from the far side of the world (`docs/measurements.md`).
 
 The two optional measurements and the optimizations of the last round's open questions are now
 workstreams 2, 3, and 6 of the v1 plan.

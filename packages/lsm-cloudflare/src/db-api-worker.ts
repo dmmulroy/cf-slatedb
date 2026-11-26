@@ -15,6 +15,7 @@ import {
   compactorClientLayer,
 } from "./compactor-client.ts";
 import { blockSourceLayer } from "./block-source.ts";
+import { workerBackgroundWorkLayer } from "./background-work.ts";
 import { DbClient, dbClientLayerWithoutDependencies } from "./db-client.ts";
 import { dbHttpRouterLayer } from "./db-http-handlers.ts";
 import { dbReaderLayer } from "./db-reader.ts";
@@ -118,6 +119,7 @@ export const dbApiWorkerLayer = <R = never>(options: DbApiWorkerOptions<R>) =>
           Layer.provideMerge(
             manifestStoreLayerWithoutDependencies.pipe(
               Layer.provideMerge(manifestReaderLayerWithoutDependencies),
+              Layer.provide(workerBackgroundWorkLayer),
             ),
           ),
         ),

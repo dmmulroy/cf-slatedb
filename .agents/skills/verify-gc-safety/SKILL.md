@@ -70,7 +70,9 @@ moment ago counted as old and its SSTs could be deleted under a reader. `ownUplo
   states, about 40 s). Three SSTs or a longer clock exceed the time limit.
 - One GC run at a time; its steps interleave with every other action. Manifest CAS is atomic here
   (`verify-manifest-cas-fencing` checks it); stale manifest creates over collected ids are refused by
-  `gc/manifest.boundary` (`manifest-store.test.ts`).
+  `gc/manifest.boundary`, which `ManifestCasFencingGc.cfg` model-checks (`CommitOnce`, broken variant
+  `noBoundaryReread`) together with optimistic commits from a committer's own view and `loadLatest`
+  starting above the boundary (D56), and `manifest-store.test.ts` tests.
 - The `noMinBoundary` variant (delete below the cutoff rather than below `min(boundary, cutoff)`)
   passes within these bounds: the pre-check already advances the boundary whenever an old SST is
   unreferenced. The code keeps the `min` as defense for overlapping GC runs, which the model does not
@@ -80,6 +82,11 @@ moment ago counted as old and its SSTs could be deleted under a reader. `ownUplo
 
 ## Maintenance notes
 
+- Checked against the v1 workstream 2 commit (D56). `collect` is unchanged; GC's manifest boundary
+  is now read by `ManifestReader.loadManifestBoundary` for both `create`'s re-read and
+  `loadLatest`'s starting point, and the commit path may start from a committer's own view. Neither
+  changes a step here: commits stay atomic in this model, and `ManifestCasFencingGc.cfg` checks the
+  boundary re-read and the reader against GC deletes. Reran; all broken variants still fail.
 - Checked against `3226177` (Phase 7). `collect` now sweeps a `db/<id>/` prefix that has no
   manifest (objects older than `gcMinAge`): outside this one-database model. It relies on creation
   writing the first manifest before any other object and removal deleting manifests last, so such a
@@ -89,7 +96,7 @@ moment ago counted as old and its SSTs could be deleted under a reader. `ownUplo
 
 ## Keeping it in step with the code
 
-Sync commit: `3226177`. When a covered function changes after it, update the model
+Sync commit: the v1 workstream 2 commit (`fast manifest commits`, D56). When a covered function changes after it, update the model
 so each action is still one awaited effect in the code, rerun, and show each invariant still fails on
 a broken variant before moving the sync commit. For drift that skipped this skill, use
 `.agents/skills/maintain-formal-verification-skill/SKILL.md`.

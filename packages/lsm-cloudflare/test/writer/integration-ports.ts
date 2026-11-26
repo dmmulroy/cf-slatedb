@@ -31,4 +31,5 @@ export const INTEGRATION_WORKER_SETTINGS: LsmWorkerSettingsSource = Effect.succe
     gcMinAge: 1000,
   },
   jurisdiction: Option.none(),
+  bucketLocation: Option.none(),
 });

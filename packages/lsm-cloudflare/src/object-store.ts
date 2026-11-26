@@ -4,6 +4,7 @@ import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Bytes, Clock, Context, Data, Effect, Layer, Option, Ref, Schedule, Stream } from "effect";
 
 import { LsmBucketClient, lsmBucketClientLayer } from "./lsm-bucket.ts";
+import { objectKindOfKey } from "./object-keys.ts";
 
 /** Metadata of one stored object. */
 export interface ObjectInfo {
@@ -217,6 +218,7 @@ export const makeObjectStore = Effect.gen(function* () {
 
   return ObjectStore.of({
     get: Effect.fn("ObjectStore.get")(function* (key: string) {
+      yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
       const object = yield* bucket
         .get(key)
         .pipe(Effect.retry(r2RetrySchedule), Effect.mapError(unavailable("get", key)));
@@ -224,6 +226,7 @@ export const makeObjectStore = Effect.gen(function* () {
       return Option.some(yield* object.bytes().pipe(Effect.mapError(unavailable("get", key))));
     }),
     getRange: Effect.fn("ObjectStore.getRange")(function* (key: string, range: ByteRange) {
+      yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
       yield* Effect.annotateCurrentSpan({
         "object.offset": range.offset,
         "object.length": range.length,
@@ -235,6 +238,7 @@ export const makeObjectStore = Effect.gen(function* () {
       return Option.some(yield* object.bytes().pipe(Effect.mapError(unavailable("getRange", key))));
     }),
     getVersioned: Effect.fn("ObjectStore.getVersioned")(function* (key: string) {
+      yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
       const object = yield* bucket
         .get(key)
         .pipe(Effect.retry(r2RetrySchedule), Effect.mapError(unavailable("get", key)));
@@ -247,6 +251,7 @@ export const makeObjectStore = Effect.gen(function* () {
       body: Uint8Array,
       version: string,
     ) {
+      yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
       const written = yield* bucket
         .put(key, body, { onlyIf: new Headers({ "If-Match": version }) })
         .pipe(Effect.retry(r2RetrySchedule), Effect.mapError(unavailable("putIfVersion", key)));
@@ -255,12 +260,14 @@ export const makeObjectStore = Effect.gen(function* () {
       return outcome;
     }),
     head: Effect.fn("ObjectStore.head")(function* (key: string) {
+      yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
       const object = yield* bucket
         .head(key)
         .pipe(Effect.retry(r2RetrySchedule), Effect.mapError(unavailable("head", key)));
       return object === null ? Option.none() : Option.some(info(object));
     }),
     putIfAbsent: Effect.fn("ObjectStore.putIfAbsent")(function* (key: string, body: Uint8Array) {
+      yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
       // The Headers form, not the `R2Conditional` object: the object form once treated `*` as a
       // literal etag (workerd #2572).
       const written = yield* bucket
@@ -271,6 +278,7 @@ export const makeObjectStore = Effect.gen(function* () {
       return outcome;
     }),
     put: Effect.fn("ObjectStore.put")(function* (key: string, body: Uint8Array) {
+      yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
       yield* Effect.annotateCurrentSpan({ "object.size": body.length });
       yield* bucket
         .put(key, body)
@@ -278,6 +286,7 @@ export const makeObjectStore = Effect.gen(function* () {
     }),
     putMultipart: <E, R>(key: string, body: Stream.Stream<Uint8Array, E, R>, partSize: number) =>
       Effect.gen(function* () {
+        yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
         let upload = Option.none<Cloudflare.R2.MultipartUpload>();
         let pendingFirstPart = Option.none<Uint8Array>();
         const uploaded: Array<Cloudflare.R2.UploadedPart> = [];
@@ -426,9 +435,11 @@ const inMemoryObjectStore = Effect.gen(function* () {
 
   return ObjectStore.of({
     get: Effect.fn("ObjectStore.get")(function* (key: string) {
+      yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
       return Option.map(yield* read(key), (object) => object.bytes.slice());
     }),
     getRange: Effect.fn("ObjectStore.getRange")(function* (key: string, range: ByteRange) {
+      yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
       yield* Effect.annotateCurrentSpan({
         "object.offset": range.offset,
         "object.length": range.length,
@@ -438,6 +449,7 @@ const inMemoryObjectStore = Effect.gen(function* () {
       );
     }),
     getVersioned: Effect.fn("ObjectStore.getVersioned")(function* (key: string) {
+      yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
       return Option.map(yield* read(key), (object) => ({
         bytes: object.bytes.slice(),
         version: `"${object.version}"`,
@@ -448,6 +460,7 @@ const inMemoryObjectStore = Effect.gen(function* () {
       body: Uint8Array,
       version: string,
     ) {
+      yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
       const uploadedAt = Timestamp.make(yield* Clock.currentTimeMillis);
       const outcome = yield* Ref.modify(
         objects,
@@ -462,6 +475,7 @@ const inMemoryObjectStore = Effect.gen(function* () {
       return outcome;
     }),
     head: Effect.fn("ObjectStore.head")(function* (key: string) {
+      yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
       return Option.map(yield* read(key), (object) => ({
         key,
         sizeBytes: object.bytes.length,
@@ -469,6 +483,7 @@ const inMemoryObjectStore = Effect.gen(function* () {
       }));
     }),
     putIfAbsent: Effect.fn("ObjectStore.putIfAbsent")(function* (key: string, body: Uint8Array) {
+      yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
       const uploadedAt = Timestamp.make(yield* Clock.currentTimeMillis);
       const outcome = yield* Ref.modify(
         objects,
@@ -481,11 +496,13 @@ const inMemoryObjectStore = Effect.gen(function* () {
       return outcome;
     }),
     put: Effect.fn("ObjectStore.put")(function* (key: string, body: Uint8Array) {
+      yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
       yield* Effect.annotateCurrentSpan({ "object.size": body.length });
       yield* store(key, body);
     }),
     putMultipart: <E, R>(key: string, body: Stream.Stream<Uint8Array, E, R>, partSize: number) =>
       Effect.gen(function* () {
+        yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
         const parts = yield* Stream.runCollect(toUniformParts(body, partSize));
         if (parts.length > 1 && partSize < R2_MIN_PART_SIZE) {
           return yield* Effect.die(

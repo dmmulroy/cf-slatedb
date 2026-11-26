@@ -14,6 +14,7 @@ import {
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Clock, Context, Effect, Layer, Metric, Option, Result, Schema } from "effect";
 
+import { backgroundWorkTestLayer } from "./background-work.ts";
 import { LsmConfiguration, lsmConfigurationTestLayer } from "./lsm-configuration.ts";
 import type { DatabaseNotFoundError } from "./lsm-errors.ts";
 import {
@@ -26,7 +27,6 @@ import {
   changelogPrefix,
   compactedPrefix,
   databasePrefix,
-  latestManifestKey,
   manifestKey,
   manifestPrefix,
 } from "./object-keys.ts";
@@ -232,10 +232,8 @@ export const makeGarbageCollector = Effect.gen(function* () {
       yield* manifests
         .advanceManifestBoundary(databaseId, ManifestId.make(newestDeletable))
         .pipe(Effect.catchTags({ ManifestWriteError: unavailable(databaseId) }));
-      // Readers start probing at the LATEST hint; keep it past every manifest about to go.
-      yield* objects
-        .put(latestManifestKey(databaseId), new TextEncoder().encode(String(committed.id)))
-        .pipe(Effect.catchTags(objectFailed));
+      // Readers start probing above this boundary, so they never stop at a gap these deletes
+      // leave, whatever the LATEST hint says (D56).
       yield* objects
         .delete(plan.deletable.map((id) => manifestKey(databaseId, id)))
         .pipe(Effect.catchTags(objectFailed));
@@ -291,7 +289,9 @@ export const makeGarbageCollector = Effect.gen(function* () {
   return GarbageCollector.of({ collect, collectAll });
 });
 
-/** Provides the collector, leaving the object store and settings visible. */
+/**
+ * Provides the collector, leaving the object store, settings, and background work runner visible.
+ */
 export const garbageCollectorLayerWithoutDependencies = Layer.effect(
   GarbageCollector,
   makeGarbageCollector,
@@ -308,5 +308,6 @@ export const garbageCollectorTestLayer = (
   overrides: Parameters<typeof lsmConfigurationTestLayer>[0] = {},
 ) =>
   garbageCollectorLayerWithoutDependencies.pipe(
+    Layer.provide(backgroundWorkTestLayer),
     Layer.provideMerge(Layer.mergeAll(objectStoreTestLayer, lsmConfigurationTestLayer(overrides))),
   );

@@ -11,9 +11,10 @@ import {
 } from "@cf-slatedb/lsm-core";
 import type { HttpEffect } from "alchemy/Http";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
-import { Effect, Option } from "effect";
+import { Effect, Layer, Option } from "effect";
 import { HttpServerRequest, HttpServerResponse } from "effect/http";
 
+import { workerBackgroundWorkLayer } from "../../src/background-work.ts";
 import { eventTelemetryFlushForStage } from "../../src/lsm-telemetry.ts";
 import { ManifestReader } from "../../src/manifest-reader.ts";
 import { ManifestStore, manifestStoreLayer } from "../../src/manifest-store.ts";
@@ -105,7 +106,7 @@ export const objectStoreProbeWorkerLayer = ObjectStoreProbeWorker.make(
         withEventTelemetryFlush,
       ),
     };
-  }).pipe(Effect.provide(manifestStoreLayer)),
+  }).pipe(Effect.provide(manifestStoreLayer.pipe(Layer.provide(workerBackgroundWorkLayer)))),
 );
 
 /** Stack body for the object store workerd test. */
