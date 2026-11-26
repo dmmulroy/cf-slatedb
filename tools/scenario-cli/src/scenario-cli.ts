@@ -221,8 +221,18 @@ const measureWritesCommand = Command.make(
 
 const measureFlushCommand = Command.make(
   "flush-cpu",
-  { stage: measureStage, megabytes: Flag.Int("megabytes").pipe(Flag.withDefault(16)) },
-  ({ stage, megabytes }) => runMeasurement(stage, measureFlushCpu(megabytes)),
+  {
+    stage: measureStage,
+    megabytes: Flag.Int("megabytes").pipe(Flag.withDefault(16)),
+    valueBytes: Flag.Int("value-bytes").pipe(
+      Flag.withDescription(
+        "Bytes per value; the same megabytes as fewer, larger rows or more, smaller ones",
+      ),
+      Flag.withDefault(1000),
+    ),
+  },
+  ({ stage, megabytes, valueBytes }) =>
+    runMeasurement(stage, measureFlushCpu(megabytes, valueBytes)),
 ).pipe(Command.withDescription("Writer CPU time per MiB flushed to L0 (design §12)"));
 
 const measureSplitCommand = Command.make(

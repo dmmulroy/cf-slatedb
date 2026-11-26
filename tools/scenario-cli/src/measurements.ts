@@ -330,13 +330,14 @@ const pulledSpans = (name: string, databaseId: string) =>
  * @returns The report, or `MeasurementError` when a write, the flush, or reading tail records or
  *   spans fails.
  */
-export const measureFlushCpu = (megabytes: number) =>
+export const measureFlushCpu = (megabytes: number, rowValueBytes = 1000) =>
   Effect.gen(function* () {
     const databaseId = DatabaseId.make(uniqueId("ms-flush"));
     yield* createDatabase(databaseId);
     const client = yield* dbApi;
-    const batchRows = 2000;
-    const rowValueBytes = 1000;
+    // About 2 MB of values per batch whatever the value size, so the same bytes are written as
+    // many small rows or few large ones: flush CPU that follows the row count is per-row work.
+    const batchRows = Math.max(1, Math.round(2_000_000 / rowValueBytes));
     const batches = Math.ceil((megabytes * 1_048_576) / (batchRows * rowValueBytes));
     const value = valueBytes(rowValueBytes, 11);
     const since = yield* Clock.currentTimeMillis;
@@ -394,6 +395,8 @@ export const measureFlushCpu = (megabytes: number) =>
     return {
       databaseId,
       megabytesWritten: megabytes,
+      valueBytes: rowValueBytes,
+      rowsWritten: batches * batchRows,
       unflushedBytesBeforeFlush: before.unflushedBytes,
       flushes: flushes.length,
       sstMiB: sstBytes / 1_048_576,
@@ -406,6 +409,7 @@ export const measureFlushCpu = (megabytes: number) =>
       cpuMs,
       wallMs,
       cpuMsPerMiB: sstBytes === 0 ? 0 : cpuMs / (sstBytes / 1_048_576),
+      cpuMicrosPerRow: (cpuMs * 1000) / (batches * batchRows),
       writeBatches: {
         rowsPerBatch: batchRows,
         writerCpuMs: summarize(writerWrites.map((record) => record.cpuTimeMs)),
@@ -748,11 +752,22 @@ export const measureCompactionCpu = (megabytesPerFlush: number) =>
       const kind = record.eventKind;
       byKind.set(kind, [...(byKind.get(kind) ?? []), record.cpuTimeMs]);
     }
+    const writerWrites = records.filter(
+      (record) =>
+        Option.isSome(record.durableObjectId) &&
+        Option.exists(record.path, (path) => path.endsWith(`/databases/${databaseId}/batches`)),
+    );
+    const sumOf = (values: ReadonlyArray<number>) =>
+      values.reduce((total, value) => total + value, 0);
     return {
       databaseId,
       megabytesPerFlush,
       compacted,
       compactedAfterSeconds,
+      // A flush's work is split between the alarm that starts it and the flush request that joins
+      // it, so one flush's CPU is the sum over both, not either record alone.
+      flushCpuMsPerFlush: sumOf(writerFlushes.map((record) => record.cpuTimeMs)) / 4,
+      writeCpuMsTotal: sumOf(writerWrites.map((record) => record.cpuTimeMs)),
       flushCpuMs: summarize(writerFlushes.map((record) => record.cpuTimeMs)),
       flushWallMs: summarize(writerFlushes.map((record) => record.wallTimeMs)),
       compactorCpuMsByEventKind: Object.fromEntries(
