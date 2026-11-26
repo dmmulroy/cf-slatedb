@@ -315,7 +315,7 @@ describe("DatabaseLifecycle", () => {
         // maintenance sweep's request), then the source collects and an operator tries to remove it.
         yield* gc.collect(LEFT);
         yield* gc.collect(SOURCE);
-        const removeRefused = yield* Effect.flip(lifecycle.remove(SOURCE));
+        const removeAttempt = yield* Effect.result(lifecycle.remove(SOURCE));
         const soon = {
           holds: (yield* reader.loadLatest(SOURCE)).manifest.checkpoints.length,
           refs: rewritten.externalRefs.length,
@@ -339,12 +339,13 @@ describe("DatabaseLifecycle", () => {
           holds: (yield* reader.loadLatest(SOURCE)).manifest.checkpoints.length,
           refs: (yield* reader.loadLatest(LEFT)).manifest.externalRefs.length,
         };
-        yield* lifecycle.remove(SOURCE);
+        const finalRemove = yield* Effect.result(lifecycle.remove(SOURCE));
         return {
+          finalRemove: finalRemove._tag,
           rewrittenOwners: manifestSstHandles(rewritten).map((sst) =>
             Option.getOrUndefined(sst.owner),
           ),
-          removeRefused: removeRefused._tag,
+          removeAttempt: removeAttempt._tag === "Success" ? "removed" : removeAttempt.failure._tag,
           soon,
           late,
           released,
@@ -354,7 +355,8 @@ describe("DatabaseLifecycle", () => {
       }),
     );
     expect(outcome.rewrittenOwners.every((owner) => owner === undefined)).toBe(true);
-    expect(outcome.removeRefused).toBe("DatabaseHasDependentsError");
+    expect(outcome.removeAttempt).toBe("DatabaseHasDependentsError");
+    expect(outcome.finalRemove).toBe("Success");
     expect(outcome.soon).toEqual({ holds: 1, refs: 1, read: "B", retry: "B" });
     expect(outcome.late).toEqual({ holds: 1, read: "B" });
     expect(outcome.released).toEqual({ holds: 0, refs: 0 });
