@@ -112,6 +112,10 @@ export const mergeRowStreams = <E, R>(
         );
         const heap = new CursorHeap();
         let started = false;
+        // `undefined` rather than `Option` for these two: they are read and replaced once per row
+        // merged, and stay private to this loop, so an `Option` would allocate on every row of
+        // every scan and compaction for no reader's benefit.
+        /** The last row emitted, to drop an exact duplicate from a later input. */
         let previous: Row | undefined;
         /** The input whose chunk ran out in the last batch: pulled before the next row is taken. */
         let exhausted: number | undefined;
