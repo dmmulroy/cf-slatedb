@@ -242,7 +242,7 @@ hand-off is below.
     trees. A shell script edited while it runs re-executes lines.
   - **Verified.** `vp run ready` exit 0, `vp run verify` exit 0 (28/28), 13/13 scenarios locally
     and on `preview-3` (`--dev-timings`), 5-minute soaks passing on `preview-2` and `preview-3`
-    for each arm. Forty-four mutations of the new code are each caught by a test.
+    for each arm. Thirty-five mutations of the new code are each caught by a test.
 
 ## Remaining-work log
 
