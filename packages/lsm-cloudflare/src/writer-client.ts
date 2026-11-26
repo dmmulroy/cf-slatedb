@@ -28,6 +28,7 @@ import {
   type SealReceipt,
   type WriterStatus,
 } from "./db-writer.ts";
+import { backgroundWorkTestLayer } from "./background-work.ts";
 import type { CompactionTrigger } from "./compaction-trigger.ts";
 import type { LsmConfiguration } from "./lsm-configuration.ts";
 import {
@@ -347,6 +348,7 @@ export const writerClientTestLayer = Layer.effect(
               memTableLayerWithoutDependencies.pipe(Layer.provide(writerSqlStorageTestLayer)),
             ),
             Layer.provide(durableObjectAlarmTestLayer),
+            Layer.provide(backgroundWorkTestLayer),
             Layer.provide(Layer.succeedContext(shared)),
           );
           const writer = Context.get(yield* Layer.buildWithScope(writerLayer, scope), DbWriter);

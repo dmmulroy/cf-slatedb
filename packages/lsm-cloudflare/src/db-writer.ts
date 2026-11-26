@@ -58,6 +58,7 @@ import {
 } from "./manifest-store.ts";
 import { changelogKey, sstKey } from "./object-keys.ts";
 import { SstStore, sstStoreLayerWithoutDependencies } from "./sst-store.ts";
+import { BackgroundWork, backgroundWorkTestLayer } from "./background-work.ts";
 import { CompactionTrigger, compactionTriggerTestLayer } from "./compaction-trigger.ts";
 import { DurableObjectAlarm, durableObjectAlarmTestLayer } from "./durable-object-alarm.ts";
 
@@ -269,6 +270,16 @@ export const makeDbWriter = Effect.gen(function* () {
   const alarm = yield* DurableObjectAlarm;
   const settings = yield* LsmConfiguration;
   const compaction = yield* CompactionTrigger;
+  const background = yield* BackgroundWork;
+
+  /**
+   * Wakes the database's compactor without waiting for it. A compactor that was idle takes
+   * seconds to answer its first call, and a flush holds the flush lock (a seal, the commit lock
+   * too), so the wake is background work. A lost wake is repeated by the next flush that leaves
+   * enough L0 SSTs.
+   */
+  const wakeCompactor = (databaseId: DatabaseId) =>
+    background.run("wakeCompactor", compaction.wake(databaseId));
 
   const phase = yield* Ref.make<WriterPhase>({ _tag: "Uninitialized" });
   const unflushedBytes = yield* Ref.make(0);
@@ -564,7 +575,7 @@ export const makeDbWriter = Effect.gen(function* () {
           yield* Metric.update(flushBytes, written.value.info.sizeBytes);
           // Enough L0 SSTs to compact: wake the compactor (an idle database has no compactor alarm).
           if (committed.manifest.l0.length >= settings.minCompactionSources) {
-            yield* compaction.wake(databaseId);
+            yield* wakeCompactor(databaseId);
           }
           yield* Effect.annotateCurrentSpan({
             "sst.id": written.value.handle.id,
@@ -659,7 +670,7 @@ export const makeDbWriter = Effect.gen(function* () {
             if (latest.manifest.l0.length >= settings.l0MaxSsts) {
               yield* Metric.update(writeStalls, 1);
               // Compaction is behind: make sure the compactor is awake (a lost wake would stall forever).
-              yield* compaction.wake(databaseId);
+              yield* wakeCompactor(databaseId);
               return yield* Effect.fail(
                 new WriteStalledError({
                   databaseId,
@@ -1084,6 +1095,7 @@ export const dbWriterTestLayer = (
         memTableTestLayer,
         durableObjectAlarmTestLayer,
         compactionTriggerTestLayer,
+        backgroundWorkTestLayer,
         lsmConfigurationTestLayer(overrides),
       ),
     ),
