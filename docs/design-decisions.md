@@ -1749,12 +1749,35 @@ whichever answers first.
 - Only a success of the bucket read counts. Its failures leave the outcome to the `BlockServer`
   read, so a hedge never fails a read that would have been answered, and the loser is
   interrupted.
-- The `BlockServer` read still runs, so the block still enters Workers Cache for the next reader.
+- The losing `BlockServer` read is interrupted, and its `fetch` aborted with it. Whether Workers
+  Cache still keeps a block whose reader hung up was not determined. The share of `HIT` answers
+  did not fall with hedging on: 69% without it and 82% with it, on `preview-3` (the table below).
 - Block fetches, p50 / p90 / p99 / max: 7 / 96 / 439 / 1,896 ms → 7 / 74 / 101 / 159 ms. 21% of
   fetches were hedged and the bucket read won a third of those, so about a fifth more bucket
   reads.
-- In a restricted (`eu`, `fedramp`) Stack there is no Workers Cache, and from a client an ocean
-  away both paths cost the same: measured on `preview-2`, no change either way.
+- **No hedging in a restricted (`eu`, `fedramp`) Stack.** There the `BlockServer` runs without
+  Workers Cache (D49), so both reads take the same road to the same bucket. Measured from 5-minute
+  soaks at 100% sampling (found in review):
+
+  | Stage                              | Fetches | Hedged | Won by the bucket | `getRange` spans | Fetch p50 / p90 / p99 (ms) | Workers Cache |
+  | ---------------------------------- | ------: | -----: | ----------------: | ---------------: | -------------------------- | ------------- |
+  | `preview-2` (`eu`), hedge at 50 ms |   1,494 |    90% |      2% of hedged |            2,437 | 180 / 771 / 1,030          | none          |
+  | `preview-2` (`eu`), no hedge       |   1,553 |      0 |                 — |            1,148 | 159 / 593 / 1,144          | none          |
+  | `preview-3`, no hedge (D67)        |   1,744 |      0 |                 — |              512 | 7 / 96 / 439               | 69% `HIT`     |
+  | `preview-3`, hedge at 50 ms        |   1,706 |    20% |     34% of hedged |              773 | 7 / 74 / 107               | 82% `HIT`     |
+
+  In `eu` the hedge doubled the bucket reads and won almost nothing. `hedgeBlockSource` therefore
+  hedges only when the Stack has no jurisdiction, by the rule the `BlockServer` uses to turn
+  Workers Cache on (`lsmStackHasWorkersCache`); `blockReadHedgeAfterMs` has no effect in a
+  restricted Stack. A local stage has no jurisdiction and hedges, although Workers Cache is not
+  emulated there: one rule for every stage, and the scenarios exercise the hedge.
+
+- **A stated limit: queueing alone can start a hedge.** The 50 ms timer starts when the read is
+  issued, not when it gets a connection. A Worker invocation has six connections waiting for
+  response headers at most, and further `fetch` and R2 calls queue behind them. On a scan wide
+  enough to queue, a hedge can start only because its read waited in that queue, and the hedge
+  then queues too. The measured net effect on `preview-3` is in the table above. A cap on hedges
+  in flight is not adopted: no measurement supports one yet.
 - `block.hedged` and `block.hedge_won` are span attributes on the cache read that started them.
 
 **Scans stop reading when they have what they asked for.**
@@ -1782,6 +1805,11 @@ soak starts 12 to 14 writers in five minutes for the databases and shards it cre
 round of reads for an unchanged manifest), `block-source.test.ts` (six cases of the hedge under
 the test clock), `db-client.test.ts` (the short scan reads two blocks and reads on past deleted
 rows; the read-ahead estimate), and the merge's property tests. Sixteen mutations caught.
+Added in review: `block-source.test.ts` builds `hedgeBlockSource` over a `BlockServer` that never
+answers and checks that block and metadata reads of a source database's SST answer from the
+bucket at the configured delay and not before, that a delay of 0 and a restricted Stack never
+read the bucket, and catches four mutations (no jurisdiction rule, the delay ignored, metadata not
+hedged, the wrong bucket key).
 
 ## D73. The flush path: the compactor wake leaves it, rows are encoded a chunk at a time; concurrent part uploads declined
 

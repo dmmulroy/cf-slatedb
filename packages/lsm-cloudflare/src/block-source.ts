@@ -10,6 +10,7 @@ import { HttpApiClient } from "effect/http-api";
 import { BlockServerHttpApi } from "./block-server-http-api.ts";
 import { BlockServerWorker } from "./block-server-worker.ts";
 import { LsmConfiguration, lsmConfigurationLayer } from "./lsm-configuration.ts";
+import { lsmJurisdiction, lsmStackHasWorkersCache } from "./lsm-jurisdiction.ts";
 import { sstKey } from "./object-keys.ts";
 import {
   type IObjectReader,
@@ -262,32 +263,51 @@ export const hedgedBlockRead = <A, E, R, E2, R2>(
       );
 
 /**
- * Constructs the block source readers use: the `BlockServer` service binding, hedged with reads
- * straight from the bucket after `blockReadHedgeAfterMs` (see {@link hedgedBlockRead}).
+ * `blockServer` with each block and metadata read hedged by a read straight from the contextual
+ * bucket after `blockReadHedgeAfterMs` (see {@link hedgedBlockRead}), when the Stack has Workers
+ * Cache; otherwise `blockServer` itself.
+ *
+ * **Details**
+ *
+ * In a Stack restricted to a jurisdiction the `BlockServer` runs without Workers Cache (D49), so
+ * it reads the same bucket by the same road, and a hedge doubles the bucket reads and wins
+ * nothing: on `preview-2` (`eu`) 90% of block reads were hedged and the bucket won 2% of those
+ * (D72). The rule is the one the `BlockServer` uses, {@link lsmStackHasWorkersCache}. A local
+ * stage has no jurisdiction and hedges: Workers Cache is not emulated there, but its scenarios
+ * then exercise the hedge.
+ *
+ * @param blockServer - Reads through the `BlockServer` (production: {@link makeBlockSource}).
  */
-export const makeHedgedBlockSource = Effect.gen(function* () {
-  const blockServer = yield* makeBlockSource;
-  const objects = yield* ObjectReader;
-  const settings = yield* LsmConfiguration;
-  const fromBucket = readSstRangeFromBucket(objects.getRange);
-  // No span of its own: the `BlockServer` read keeps the one `BlockSource.block` span per fetch,
-  // the bucket read has `ObjectReader.getRange`, and `block.hedged` lands on the caller's span.
-  return BlockSource.of({
-    block: (owner, sstId, offset, length) =>
-      hedgedBlockRead(
-        blockServer.block(owner, sstId, offset, length),
-        fromBucket(owner, sstId, offset, length),
-        settings.blockReadHedgeAfterMs,
-      ),
-    meta: (owner, sstId, offset, length) =>
-      hedgedBlockRead(
-        blockServer.meta(owner, sstId, offset, length),
-        fromBucket(owner, sstId, offset, length),
-        settings.blockReadHedgeAfterMs,
-      ),
-    purge: blockServer.purge,
+export const hedgeBlockSource = (blockServer: IBlockSource) =>
+  Effect.gen(function* () {
+    if (!lsmStackHasWorkersCache(yield* lsmJurisdiction)) return BlockSource.of(blockServer);
+    const objects = yield* ObjectReader;
+    const settings = yield* LsmConfiguration;
+    const fromBucket = readSstRangeFromBucket(objects.getRange);
+    // No span of its own: the `BlockServer` read keeps the one `BlockSource.block` span per fetch,
+    // the bucket read has `ObjectReader.getRange`, and `block.hedged` lands on the caller's span.
+    return BlockSource.of({
+      block: (owner, sstId, offset, length) =>
+        hedgedBlockRead(
+          blockServer.block(owner, sstId, offset, length),
+          fromBucket(owner, sstId, offset, length),
+          settings.blockReadHedgeAfterMs,
+        ),
+      meta: (owner, sstId, offset, length) =>
+        hedgedBlockRead(
+          blockServer.meta(owner, sstId, offset, length),
+          fromBucket(owner, sstId, offset, length),
+          settings.blockReadHedgeAfterMs,
+        ),
+      purge: blockServer.purge,
+    });
   });
-});
+
+/**
+ * Constructs the block source readers use: the `BlockServer` service binding, hedged with reads
+ * straight from the bucket where the Stack has Workers Cache (see {@link hedgeBlockSource}).
+ */
+export const makeHedgedBlockSource = Effect.flatMap(makeBlockSource, hedgeBlockSource);
 
 /** Provides the block source over the `BlockServer` service binding alone (for purges). */
 export const blockSourceLayer = Layer.effect(BlockSource, makeBlockSource);

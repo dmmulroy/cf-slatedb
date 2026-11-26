@@ -3,7 +3,7 @@ import { withLsmTracePolicy } from "./lsm-trace-policy.ts";
 import type { HttpEffect } from "alchemy/Http";
 import { makeExecutionMemo } from "alchemy/Runtime/ExecutionMemo";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
-import { Effect, Layer, Option } from "effect";
+import { Effect, Layer } from "effect";
 import { HttpRouter } from "effect/http";
 
 import {
@@ -11,7 +11,7 @@ import {
   blockServerHttpRouterLayer,
   databaseCacheTag,
 } from "./block-server-http-handlers.ts";
-import { lsmJurisdiction } from "./lsm-jurisdiction.ts";
+import { lsmJurisdiction, lsmStackHasWorkersCache } from "./lsm-jurisdiction.ts";
 import { bindLsmWorkerSettings, type LsmWorkerSettingsSource } from "./lsm-worker-settings.ts";
 import { lsmWorkerCompatibility } from "./lsm-stage.ts";
 import { eventTelemetryFlushForStage, type LsmWorkerTelemetry } from "./lsm-telemetry.ts";
@@ -63,7 +63,7 @@ export const blockServerWorkerLayer = <R = never>(options: BlockServerWorkerOpti
       const jurisdiction = yield* lsmJurisdiction;
       const cache = yield* Cloudflare.cache({
         crossVersionCache: true,
-        enabled: Option.isNone(jurisdiction),
+        enabled: lsmStackHasWorkersCache(jurisdiction),
       });
       const objects = yield* ObjectReader;
       const withEventTelemetryFlush = yield* eventTelemetryFlushForStage;
