@@ -100,9 +100,9 @@ PENDING(d78): D78 merged, with its tests, and `ms-cas-mwy5ujbj` on `preview-3` r
 - **The deployment guard.** Its allowlist names only the pre-rename project path, which the guard
   skips. `scripts/allowlist-shaledb-deploys.sh` must be rerun from the main checkout, and its stage
   list does not keep agents off `production` (`docs/release-v1.md` §10 step 2).
-- **No metrics are collected.** The trace collector discards OTLP metrics, so the three
-  `lsm_*` counters `docs/operations.md` names are readable nowhere (`docs/release-v1.md` §9). Either
-  collect them or take them out of `docs/operations.md`.
+- **Metrics are emitted, not collected (D82).** Every signal `docs/operations.md` names is now
+  read from a span or a tail record, and `measure health` judges each one. The `lsm_*` counters
+  stay for a future collector. The new span attributes are not yet deployed or tried live.
 - `docs/progress.md`'s workstream table still says "this commit" for workstream 9. It is `8a96667`.
 - Everything in `docs/release-v1.md` §9 ("Known limitations").
 

@@ -495,12 +495,17 @@ What v1 does not do, or has not measured.
 - **Production's collector URL** comes only from the deploy's printed `traceCollectorUrl`.
   `preview-cli url production` cannot read it, because it requires a probe URL that production
   lacks.
-- **Metrics are not collected.** The trace collector accepts OTLP metrics and discards them
-  (`acceptAndDiscard` on `/v1/metrics` in `infra/shaledb/src/trace-collector-worker.ts`).
-  `lsm_compaction_corrupt_ssts`, `lsm_object_part_integrity_retries`, and
-  `lsm_object_parts_unverified`, which `docs/operations.md` lists as signals, are therefore readable
-  on no live stage. Corruption and unverified parts are visible as span attributes instead (section
-  11). Part integrity retries are not visible anywhere.
+- **Metrics are not collected.** The trace collector and the local receiver accept OTLP metrics
+  and discard them, so the engine's twelve `lsm_*` counters are readable on no stage. Since D82
+  every signal the operations guide names is read from a span or a tail record instead, and
+  `measure health` judges them all (section 11). The counters stay in the code for a future
+  collector.
+- **Span-borne signals are a 10% sample in production.** A stall or a corruption repeats on every
+  write or poll and shows while it lasts. A single unverified part or fenced poll can be missed. A
+  database that neither writes nor compacts produces no spans, so `measure health` cannot see it
+  stuck (D82).
+- **The health report's L0 limit is the engine default** (16). A stage deployed with another
+  `l0MaxSsts` is judged against 16 (D82).
 - **The only production hostname is `workers.dev`.** The OpenAPI spec lists only the local server
   URL.
 - **Secrets Store is in open beta**, with one store per account (Cloudflare's
@@ -634,8 +639,8 @@ export SHALEDB_TRACE_COLLECTOR_URL='<traceCollectorUrl from the deploy>'
 S=.traces/production   # keeps production's spans apart from the previews'
 ```
 
-**The summary.** This prints `healthy` and an `issues` list built from the first, second, fifth,
-and seventh signals below:
+**The summary.** This prints `healthy` and an `issues` list. Every signal in the table below
+marked "issue" is judged there (D82), so the summary alone says whether to look further:
 
 ```sh
 node tools/scenario-cli/src/scenario-cli.ts measure health --collector-url "$SHALEDB_TRACE_COLLECTOR_URL" --minutes 60
@@ -648,17 +653,22 @@ where it stopped:
 node tools/trace-cli/src/trace-cli.ts pull --collector-url "$SHALEDB_TRACE_COLLECTOR_URL" --store "$S" --since-minutes 60
 ```
 
-| Signal                           | Production command                                                                                                                                                                                                                                                         | Act when                                                                                              |
-| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| Invocations that hit a limit     | `measure health …` (above): an `issues` entry `… invocation ended exceededCpu`, `exceededMemory`, or `exception`, and the per-Worker `invocations` outcomes. Tail records are read only by `measure health`                                                                | Any. Limits are 30 s (API, writers) and 60 s (compactor)                                              |
-| Writes stalled                   | `node tools/trace-cli/src/trace-cli.ts grep --store "$S" --name DbWriter.write --error`; `measure health`'s `writes.refusedByError` (`WriteStalledError` is the issue)                                                                                                     | Sustained: L0 is not draining (backlog, corruption, or a fenced compactor), or a writer is overloaded |
-| Flush duration                   | `node tools/trace-cli/src/trace-cli.ts stats --store "$S" --name DbWriter.flush`; `measure health`'s `flushMs`                                                                                                                                                             | p99 above about 30 s, or rising                                                                       |
-| Compaction backlog               | `measure health`'s `l0Backlog.deepest` (the 5 deepest databases, from `manifest.l0_ssts` on `Compactor.poll`)                                                                                                                                                              | Near `l0MaxSsts` (16), where writes stall                                                             |
-| Corrupted SSTs                   | `measure health`'s `corruptSsts` (from each database's latest `Compactor.poll`, `compaction.corrupt_ssts`). The metric `lsm_compaction_corrupt_ssts` is not collected (section 9)                                                                                          | Any: follow the corruption runbook in `docs/operations.md`                                            |
-| Upload integrity                 | `node tools/trace-cli/src/trace-cli.ts grep --store "$S" --name ObjectStore.putMultipart --json \| jq '[.[] \| select((.attributes["object.parts_unverified"] // 0 \| tonumber) > 0)] \| length'`. Re-uploaded parts are counted only in an uncollected metric (section 9) | Any unverified part: R2 stopped returning part digests                                                |
-| Garbage collection               | `node tools/trace-cli/src/trace-cli.ts grep --store "$S" --name GarbageCollector.collect --error` and the same with `--name MaintenanceSweep.sweepPage`; `measure health`'s `gc`                                                                                           | Repeated failures: storage unreachable or a manifest unreadable                                       |
-| Error spans                      | `node tools/trace-cli/src/trace-cli.ts stats --store "$S" --error` (count per span name)                                                                                                                                                                                   | A new name in the list                                                                                |
-| A database that stops compacting | `curl -H "Authorization: Bearer $SHALEDB_TOKEN" "<apiUrl>/v1/databases/<id>/compaction"`: `compactor.fenced` and `l0Ssts`. PENDING(d78): what the status reports after D78, and whether `fenced: true` can still be seen                                                   | `fenced: true`, or `l0Ssts` at 16 with nothing `running`                                              |
+| Signal                       | Production command                                                                                                                                  | Act when                                                                                               |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| Invocations that hit a limit | `measure health`: issue `… invocation ended exceededCpu` (or `exceededMemory`, `exception`), and the per-Worker `invocations` outcomes              | Any. Limits are 30 s (API, writers) and 60 s (compactor)                                               |
+| Writes stalled               | `measure health`: issue per database and reason (`L0Backlog`, `UnflushedBytes`); `trace-cli grep --store "$S" --name DbWriter.write --error`        | Sustained: L0 is not draining (backlog, corruption, a fenced compactor), or a writer is overloaded     |
+| Flush duration               | `measure health`: `flushMs`, issue above 30 s at p99; `trace-cli stats --store "$S" --name DbWriter.flush`                                          | p99 above about 30 s, or rising                                                                        |
+| Compaction backlog           | `measure health`: `l0Backlog.deepest` (5 deepest databases), issue at 16                                                                            | Near `l0MaxSsts` (16), where writes stall                                                              |
+| Fenced compactor             | `measure health`: issue per database; `curl -H "Authorization: Bearer $SHALEDB_TOKEN" "<apiUrl>/v1/databases/<id>/compaction"` (`compactor.fenced`) | Any: since D78 it fences in again on its next start, but its state was overwritten, a defect to report |
+| Corrupted SSTs               | `measure health`: issue and `corruptSsts`, from each database's latest poll; `GET …/compaction` (`corruptSsts`)                                     | Any: follow the corruption runbook in `docs/operations.md`                                             |
+| Unverified parts             | `measure health`: issue and `uploads.withUnverifiedPart`                                                                                            | Any: R2 stopped returning part digests                                                                 |
+| Re-sent parts                | `measure health`: `uploads.withRetriedPart` (a count, not an issue)                                                                                 | Frequent                                                                                               |
+| Garbage collection           | `measure health`: issue and `gc`; `trace-cli grep --store "$S" --name GarbageCollector.collect --error` (and `MaintenanceSweep.sweepPage`)          | Repeated failures: storage unreachable or a manifest unreadable                                        |
+| Error spans                  | `measure health`: `errorSpans`; `trace-cli stats --store "$S" --error`                                                                              | A new name in the list                                                                                 |
+
+The `trace-cli` commands are `node tools/trace-cli/src/trace-cli.ts …`. The compaction status
+keeps its shape after D78; `fenced` is true only between the poll that saw a newer epoch and the
+compactor's next start (D78).
 
 These errors are expected and are not trouble: `DatabaseSealedError` (a stale router retrying),
 `TransactionConflictError`, and `DatabaseAlreadyExists` on create.

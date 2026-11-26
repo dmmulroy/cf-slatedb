@@ -446,8 +446,8 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   dev timings). Live: `docs/measurements.md` "Writer throughput and limits".
 - **Corruption: prevent, detect, repair (v1 workstream 7)** — done (D62). Upload integrity in
   `object-store.ts` (`sha256` on single-part puts; `uploadPartVerified` with native WebCrypto MD5,
-  falling back to lsm-core `md5Hex`; `lsm_object_part_integrity_retries`,
-  `lsm_object_parts_unverified`; `objectStoreWithTransitCorruptionTestLayer`). Repair:
+  falling back to lsm-core `md5Hex`; `object.part_retried` and `object.parts_unverified` on
+  `ObjectStore.putMultipart`, D82; `objectStoreWithTransitCorruptionTestLayer`). Repair:
   lsm-core `dropSstFromManifest`, `DroppedSst`, `Manifest.droppedSsts`, `SstNotInManifestError`;
   `Compactor.dropSst` under the planning lock (`SstDropRefusedError`), `CompactorClient.dropSst`,
   `DatabaseLifecycle.dropSst` (confirmation); public `POST /v1/databases/:id/ssts/:sstId/drop`
@@ -471,6 +471,13 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
     `docs/operations.md`.
   - **Tests.** `lsm-trace-policy.test.ts`, `lsm-worker-settings.test.ts`,
     `preview-stage.test.ts`, and the `redaction` scenario.
+- **Every watched signal readable on a live stage (D82)** — done. Span attributes
+  `writer.stall_reason` (`db-writer.ts`), `object.part_retried` (`object-store.ts`), and
+  `database.id` on the fenced `Compactor.poll` (`compactor.ts`); the health judgement
+  `summarizeHealth` (`tools/scenario-cli/src/health-report.ts`), called by `measureHealth`.
+  Metrics are emitted and not collected (`docs/operations.md`, "What to watch"). Tests:
+  `health-report.test.ts`; the span attributes in `db-writer.test.ts`, `object-store.test.ts`,
+  `compactor.test.ts`; the exported keys in `lsm-trace-policy.test.ts`.
 - **Production readiness (v1 workstream 9)** — done (D64).
   - **Tokens.** `lsmAccessGateFrom`, `lsmAccessGateOver`, `LsmAccessTokenSource`, and
     `lsmStageAccessTokens` (`lsm-access-gate.ts`). In infra: `shaledbAccessTokens`

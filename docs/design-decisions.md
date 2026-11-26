@@ -2244,3 +2244,119 @@ manifest, checked against two concurrent first calls:
 and a compactor that fences in again is one more of those. The overwritten epoch was in the
 compactor's own Durable Object state, not in the manifest, so it is a property of that state, and
 the tests check it. No step changed; reran, and every broken variant fails (the skill records it).
+
+## D82. Every signal the operations guide names is read from a span or a tail record; metrics are not collected
+
+**The finding.** `docs/operations.md` ("What to watch") told an operator to watch three metrics:
+`lsm_compaction_corrupt_ssts`, `lsm_object_part_integrity_retries`, and
+`lsm_object_parts_unverified`. No live stage keeps any metric. The stage's trace collector accepts
+OTLP metrics and discards them (`acceptAndDiscard` on `/v1/metrics`,
+`infra/shaledb/src/trace-collector-worker.ts`), and so does the local receiver
+(`tools/trace-cli/src/otlp-receiver.ts`). Nothing in the repository reads a metric. The health
+report, which is the release soak's health criterion, also missed four signals the guide names:
+
+- **Unverified parts.** Visible as `object.parts_unverified` on `ObjectStore.putMultipart`, but
+  never checked.
+- **A fenced compactor.** Its poll carried `compactor.fenced` but no `database.id`.
+- **L0 at its limit.** Reported as a number, never as an issue.
+- **Slow flushes.** Reported as percentiles, never as an issue.
+
+A write stalled with `WriteStalled` was an issue, but without the database or the reason.
+
+**D78's stuck database, read against the old report.** The report said "N writes stalled" only
+while writes kept arriving and their spans were sampled. It named no database and gave no reason.
+The stuck compactor no longer polled, so its L0 backlog was missing. Its one fenced poll was not
+read. A database with no further writes would have looked healthy.
+
+**The inventory.** Every signal `docs/operations.md`, `docs/release-v1.md` §11, and the
+corruption runbook name, and where it can be read now:
+
+| Signal                | Produced by                                                                                                    | Readable on a live stage through                                                                 |
+| --------------------- | -------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| Limit hits            | the runtime, in tail records (`cpu-tail-worker.ts`; every non-`ok` invocation kept, D71)                       | `measure health` (issue)                                                                         |
+| Stalled writes        | `WriteStalledError` on `DbWriter.write`, now with `writer.stall_reason` (`db-writer.ts`)                       | `measure health` (issue per database and reason); `trace-cli grep --name DbWriter.write --error` |
+| Flush duration        | `DbWriter.flush` span                                                                                          | `measure health` (`flushMs`; issue above 30 s at p99); `trace-cli stats --name DbWriter.flush`   |
+| L0 backlog            | `manifest.l0_ssts` on `Compactor.poll`                                                                         | `measure health` (`l0Backlog`; issue at `l0MaxSsts`)                                             |
+| Fenced compactor      | `compactor.fenced` on `Compactor.poll`, now with `database.id`; `compactor.refenced` on the start's span (D78) | `measure health` (issue per database); `GET /v1/databases/:id/compaction` (`compactor.fenced`)   |
+| Corrupted SSTs        | `compaction.corrupt_ssts` on `Compactor.poll`; the compactor's error log, a span event there                   | `measure health` (issue, from each database's latest poll); `GET …/compaction` (`corruptSsts`)   |
+| Unverified parts      | `object.parts_unverified` on `ObjectStore.putMultipart`                                                        | `measure health` (issue)                                                                         |
+| Re-sent parts         | now `object.part_retried` on `ObjectStore.putMultipart`, and the warning log already a span event there        | `measure health` (`uploads.withRetriedPart`, a count, not an issue)                              |
+| GC and sweep failures | error status on `GarbageCollector.collect`, `MaintenanceSweep.sweepPage`                                       | `measure health` (issue)                                                                         |
+| Error spans           | any span with an error status                                                                                  | `measure health` (`errorSpans`); `trace-cli stats --error`                                       |
+
+The twelve metrics the engine defines (`rg "Metric\.counter"`) are listed below. No stage reads any
+of them:
+
+- `lsm_block_cache_requests` (`block-cache.ts`);
+- `lsm_compaction_corrupt_ssts`, `lsm_compactions_started`, and `lsm_ssts_dropped` (`compactor.ts`);
+- `lsm_compactions_committed` (`compaction-executor.ts`);
+- `lsm_flush_bytes` and `lsm_write_stalls` (`db-writer.ts`);
+- `lsm_gc_deleted_objects` (`garbage-collector.ts`);
+- `lsm_manifest_cas_conflicts` (`manifest-store.ts`);
+- `lsm_object_part_integrity_retries` and `lsm_object_parts_unverified` (`object-store.ts`);
+- `lsm_sst_bytes_written` (`sst-store.ts`).
+
+Each has a span attribute or span error that carries the same event, so none is the only record
+of anything an operator needs.
+
+**The decision: spans carry the signals, the health report judges them.**
+
+- **Three span attributes, one line each.**
+  - `writer.stall_reason` (`L0Backlog` or `UnflushedBytes`), on the write a stall refused.
+  - `object.part_retried` on a multipart upload that re-sent a part. That was the one signal
+    visible nowhere as an attribute; the warning log was already a span event.
+  - `database.id` on the poll that finds its compactor fenced.
+
+  All three keys are in namespaces the redaction policy already exports (`writer.`, `object.`,
+  `database.`; D63). `lsm-trace-policy.test.ts` now lists them with the other keys the report
+  reads.
+
+- **The report's judgement is a pure function**, `summarizeHealth`
+  (`tools/scenario-cli/src/health-report.ts`), so it is unit-tested without a stage.
+  `measureHealth` reads the tail records and spans and calls it. Its issues:
+  - limit hits;
+  - stalled writes per database and reason;
+  - corruption by each database's latest poll, judged by start time, because `trace-cli grep`
+    lists spans by trace;
+  - L0 at `l0MaxSsts` (the engine default, 16);
+  - a fenced compactor per database. Only its own Durable Object fences in for a database, so a
+    fenced poll means its state was overwritten, which is a defect even though D78 repairs it;
+  - any unverified part;
+  - a flush p99 above 30 s;
+  - failed collections and sweeps.
+
+  Re-sent parts are counted, not an issue: the guide calls them transient unless frequent.
+
+- **Metrics stay emitted and are not collected.** The engine keeps its `Metric` counters, for the
+  local receiver and a future collector. The guide no longer names them as signals. Collecting
+  them would need a store and a reader for metrics. Every signal an operator needs already
+  travels on a span, so that is not built.
+
+**What this does not cover.**
+
+- **Sampling.** In production 10% of traces are kept (P4), so a rare span-borne signal can be
+  missed in a short window. A stall or corruption repeats on every write or poll, so a sustained
+  one is seen. One unverified part or one fenced poll can go unseen at 10%. Tail records of
+  invocations that did not end `ok` are always kept (D71); spans are not.
+- **Silent databases.** A database that neither writes nor polls produces no spans, so the report
+  cannot see that it is stuck. D78's fix makes a fenced compactor fence in again on its next
+  start, so that state no longer persists.
+- **The threshold.** The L0 limit is the engine default. A stage deployed with another
+  `l0MaxSsts` is judged against 16.
+- **Not tried live.** The new attributes are on code not yet deployed.
+
+**Tests:**
+
+- `health-report.test.ts` (8 tests) covers: quiet signals; stalls per database and reason;
+  D78's stuck database (a fenced poll, L0 at 16, refused writes); the configurable L0 limit;
+  corruption by the latest poll, in either order; unverified parts against re-sent parts; the
+  30 s flush threshold; and limit hits with failed collections and sweeps.
+- `db-writer.test.ts`: a stalled write's span names `UnflushedBytes`.
+- `object-store.test.ts`: a re-sent part marks the span, and a first-time verified part does not.
+- `compactor.test.ts`: the fenced poll names its database.
+- **Mutations.** Ten mutations of the report, and the removal of each of the three attributes,
+  are each caught by a test (`/tmp/shale-work/agents/signals/mutations.log`). One of the ten
+  survived at first: two counts the test compared were equal, so the test was strengthened. One
+  more mutation is not counted, because `later` is symmetric and the mutation changed nothing.
+  `writer.stall_reason` for `L0Backlog` has no test of its own; the same line for
+  `UnflushedBytes` does.
