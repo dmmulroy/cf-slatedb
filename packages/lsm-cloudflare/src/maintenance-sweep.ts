@@ -1,4 +1,4 @@
-import { DatabaseId } from "@shaledb/lsm-core";
+import { DatabaseId, externalOwners } from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Context, Effect, Layer, Option, Schema } from "effect";
 
@@ -32,7 +32,10 @@ export interface MaintenanceSweepReport {
   readonly sweptLeftovers: ReadonlyArray<GarbageCollectionReport>;
   /** Compactors woken because their database still reads another database's SSTs. */
   readonly woken: number;
-  /** Compactors asked to collect because their database's manifests piled up. */
+  /**
+   * Compactors asked to collect: their database's manifests piled up, or it still holds a source
+   * it no longer reads.
+   */
   readonly collectionsRequested: number;
   /** Where the next page starts; none when this page reached the end (the next starts over). */
   readonly cursor: Option.Option<string>;
@@ -47,8 +50,10 @@ export interface MaintenanceSweepReport {
  * misses, so its cost per run is bounded by the page size, whatever the number of databases:
  *
  * - a prefix with no manifest (a removed database's leftovers) is swept;
- * - a database whose manifest still names external refs (a fork reading its source) has its
- *   compactor woken, so a lost wake only delays the fork's rewrite;
+ * - a database whose newest manifest still reads another database's SSTs (a fork before its
+ *   rewrite) has its compactor woken, so a lost wake only delays the fork's rewrite;
+ * - a database that no longer reads them but still holds its source has its compactor asked to
+ *   collect: its collection releases the hold once no manifest it keeps names the source (D77);
  * - a database with more than {@link MAX_UNCOLLECTED_MANIFESTS} manifests past GC's boundary has its
  *   compactor asked to collect.
  *
@@ -103,9 +108,15 @@ export const makeMaintenanceSweep = Effect.gen(function* () {
       }
       const manifest = latest.value.manifest;
       if (manifest.state._tag === "Removed") return { visit: "Nothing", report: Option.none() };
-      if (manifest.externalRefs.length > 0) {
+      if (manifest.externalRefs.length > 0 && externalOwners(manifest).size > 0) {
         yield* compactors.wake(databaseId).pipe(Effect.scoped);
         return { visit: "Woken", report: Option.none() };
+      }
+      // Rewritten but still holding its source: its collection releases the hold once no manifest
+      // it keeps names another database's SST (D77), even if its own alarm was lost.
+      if (manifest.externalRefs.length > 0) {
+        yield* compactors.requestCollection(databaseId).pipe(Effect.scoped);
+        return { visit: "CollectionRequested", report: Option.none() };
       }
       const boundary = yield* reader.loadManifestBoundary(databaseId);
       if (latest.value.id - boundary.id > MAX_UNCOLLECTED_MANIFESTS) {
