@@ -27,7 +27,7 @@ import {
   WriterFencedError,
   TransactionConflictError,
   type TransactionCommit,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import {
   Clock,
@@ -228,7 +228,7 @@ export interface IDbWriter {
 }
 
 /** The contextual database writer. */
-export class DbWriter extends Context.Service<DbWriter, IDbWriter>()("@cf-slatedb/DbWriter") {}
+export class DbWriter extends Context.Service<DbWriter, IDbWriter>()("@shaledb/DbWriter") {}
 
 /** Bytes flushed to L0 (SlateDB RFC-0021 parity). */
 export const flushBytes = Metric.counter("lsm_flush_bytes", {

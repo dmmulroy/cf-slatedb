@@ -16,12 +16,12 @@ const EVENT_TELEMETRY_FLUSH_TIMEOUT = "10 seconds";
 export interface LsmTelemetryOptions {
   /** OTLP/HTTP base URL; `/v1/traces` is appended. Bound onto the Worker at deploy time. */
   readonly baseUrl: string;
-  /** `service.name` the Worker's spans carry, such as `cf-slatedb-api`. */
+  /** `service.name` the Worker's spans carry, such as `shaledb-api`. */
   readonly serviceName: string;
 }
 
 /**
- * Telemetry Layer every cf-slatedb Worker provides on its init Effect: OTLP/HTTP trace export to
+ * Telemetry Layer every shaledb Worker provides on its init Effect: OTLP/HTTP trace export to
  * `baseUrl`, built per event by the Alchemy runtime bridges.
  *
  * **Details**
@@ -37,7 +37,7 @@ export const lsmTelemetryLayer = (options: LsmTelemetryOptions): Layer.Layer<nev
   });
 
 /**
- * Builds one Worker's telemetry Layer from its `service.name`. Every cf-slatedb Worker layer takes
+ * Builds one Worker's telemetry Layer from its `service.name`. Every shaledb Worker layer takes
  * one, so a Stack chooses where its spans go: a fixed URL locally ({@link lsmOtlpTelemetry}), or a
  * destination it deploys itself on live stages.
  *

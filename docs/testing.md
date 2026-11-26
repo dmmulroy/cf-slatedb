@@ -2,12 +2,12 @@
 
 ## Strategy
 
-cf-slatedb tests **locally by default**. Every layer of the system has a local form that is faithful
+shaledb tests **locally by default**. Every layer of the system has a local form that is faithful
 enough to prove its contract, and the default suite never touches a live Cloudflare account.
 
 The confidence ladder, from narrowest to widest:
 
-1. **Unit and property tests** on pure code in `@cf-slatedb/lsm-core` and on services through
+1. **Unit and property tests** on pure code in `@shaledb/lsm-core` and on services through
    their faithful test Layers: codecs, the merge iterator, manifest edits, the compaction
    scheduler, the memtable, the writer, the reader, compaction, GC, and lifecycle. Property tests
    generate inputs with Effect's `Arbitrary` (fast-check underneath) and compare against a plain

@@ -1,4 +1,4 @@
-import { md5Hex, Timestamp } from "@cf-slatedb/lsm-core";
+import { md5Hex, Timestamp } from "@shaledb/lsm-core";
 import * as Cloudflare from "@alchemy.run/cloudflare";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import {
@@ -168,7 +168,7 @@ export interface IObjectStore {
 
 /** The contextual object store. */
 export class ObjectStore extends Context.Service<ObjectStore, IObjectStore>()(
-  "@cf-slatedb/ObjectStore",
+  "@shaledb/ObjectStore",
 ) {}
 
 /** Retry for transient R2 failures: three retries, exponential from 50 ms with jitter. */

@@ -1,7 +1,7 @@
 import { Config, Effect, Option, Schema } from "effect";
 
 /**
- * Schema for a cf-slatedb Stack's data-residency jurisdiction: `eu` (the European Union) or
+ * Schema for a shaledb Stack's data-residency jurisdiction: `eu` (the European Union) or
  * `fedramp` (FedRAMP-compliant data centers). R2, Durable Objects, and Workflows all support both.
  */
 export const LsmJurisdiction = Schema.Literals(["eu", "fedramp"]);
@@ -22,7 +22,7 @@ const jurisdictionOfSetting = (
  * no restriction, but a deploy that stops setting it leaves the previous value bound on the Workers
  * (Cloudflare keeps a script's secrets across uploads, D54), so deploys set `none` explicitly.
  */
-export const LSM_JURISDICTION_SETTING = "CF_SLATEDB_JURISDICTION";
+export const LSM_JURISDICTION_SETTING = "SHALEDB_JURISDICTION";
 
 /**
  * The Stack's jurisdiction (design §12, "Data residency"), one for the whole installation: it is
@@ -60,7 +60,7 @@ export const lsmJurisdictionAtDeclaration: Option.Option<LsmJurisdiction> = Opti
 
 /**
  * A Durable Object namespace narrowed to the Stack's jurisdiction, or the namespace itself when the
- * Stack has none. Every Durable Object a cf-slatedb Worker addresses goes through this, so the same
+ * Stack has none. Every Durable Object a shaledb Worker addresses goes through this, so the same
  * name always reaches the same object; an object addressed in one jurisdiction is a different
  * object in another.
  */

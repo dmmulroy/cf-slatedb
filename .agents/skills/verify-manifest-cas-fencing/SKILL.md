@@ -1,6 +1,6 @@
 ---
 name: verify-manifest-cas-fencing
-description: "Model-check cf-slatedb's manifest CAS and writer/compactor epoch fencing with TLA+ (TLC), including optimistic commits from a committer's own view, the background LATEST hint, and GC deleting manifests. Use after any change to ManifestStore.update/updateFrom/create, ManifestReader.loadLatest, the LATEST hint, ObjectStore.putIfAbsent, GC's manifest boundary, or the manifest edits fenceWriter, fenceCompactor, commitL0Flush, commitCompaction, and before trusting a fencing or CAS change."
+description: "Model-check shaledb's manifest CAS and writer/compactor epoch fencing with TLA+ (TLC), including optimistic commits from a committer's own view, the background LATEST hint, and GC deleting manifests. Use after any change to ManifestStore.update/updateFrom/create, ManifestReader.loadLatest, the LATEST hint, ObjectStore.putIfAbsent, GC's manifest boundary, or the manifest edits fenceWriter, fenceCompactor, commitL0Flush, commitCompaction, and before trusting a fencing or CAS change."
 ---
 
 # Verify manifest CAS and fencing

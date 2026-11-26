@@ -32,38 +32,38 @@ describe("workspace boundaries", () => {
 
   it("reports an infra workspace that declares exports", () => {
     const root = makeFakeRepository({
-      "infra/cf-slatedb/package.json": packageJson({
-        name: "@cf-slatedb/infra",
+      "infra/shaledb/package.json": packageJson({
+        name: "@shaledb/infra",
         exports: { ".": "./src/index.ts" },
       }),
     });
 
     expect(findWorkspaceBoundaryViolations(root)).toEqual([
-      expect.stringContaining('infra/cf-slatedb/package.json declares "exports"'),
+      expect.stringContaining('infra/shaledb/package.json declares "exports"'),
     ]);
   });
 
   it("reports a dependency on an infra or tools workspace", () => {
     const root = makeFakeRepository({
-      "infra/cf-slatedb/package.json": packageJson({ name: "@cf-slatedb/infra" }),
-      "tools/trace-cli/package.json": packageJson({ name: "@cf-slatedb/tools-trace-cli" }),
+      "infra/shaledb/package.json": packageJson({ name: "@shaledb/infra" }),
+      "tools/trace-cli/package.json": packageJson({ name: "@shaledb/tools-trace-cli" }),
       "packages/lsm-cloudflare/package.json": packageJson({
-        name: "@cf-slatedb/lsm-cloudflare",
-        dependencies: { "@cf-slatedb/infra": "workspace:*" },
-        devDependencies: { "@cf-slatedb/tools-trace-cli": "workspace:*" },
+        name: "@shaledb/lsm-cloudflare",
+        dependencies: { "@shaledb/infra": "workspace:*" },
+        devDependencies: { "@shaledb/tools-trace-cli": "workspace:*" },
       }),
     });
 
     expect(findWorkspaceBoundaryViolations(root)).toEqual([
-      expect.stringContaining("lists @cf-slatedb/infra in dependencies"),
-      expect.stringContaining("lists @cf-slatedb/tools-trace-cli in devDependencies"),
+      expect.stringContaining("lists @shaledb/infra in dependencies"),
+      expect.stringContaining("lists @shaledb/tools-trace-cli in devDependencies"),
     ]);
   });
 
   it("reports a Cloudflare import or dependency in the pure core", () => {
     const root = makeFakeRepository({
       "packages/lsm-core/package.json": packageJson({
-        name: "@cf-slatedb/lsm-core",
+        name: "@shaledb/lsm-core",
         dependencies: { alchemy: "catalog:" },
       }),
       "packages/lsm-core/src/row.ts": [
@@ -83,23 +83,23 @@ describe("workspace boundaries", () => {
   it("reports a sharding import of a non-public path or another workspace", () => {
     const root = makeFakeRepository({
       "packages/lsm-sharding/package.json": packageJson({
-        name: "@cf-slatedb/sharding",
-        dependencies: { "@cf-slatedb/lsm-cloudflare": "workspace:*" },
+        name: "@shaledb/sharding",
+        dependencies: { "@shaledb/lsm-cloudflare": "workspace:*" },
       }),
       "packages/lsm-sharding/src/shard-router.ts": [
-        importLine("{ DbClient }", "@cf-slatedb/lsm-cloudflare"),
-        importLine("{ MemTable }", "@cf-slatedb/lsm-cloudflare/src/mem-table.ts"),
+        importLine("{ DbClient }", "@shaledb/lsm-cloudflare"),
+        importLine("{ MemTable }", "@shaledb/lsm-cloudflare/src/mem-table.ts"),
       ].join("\n"),
     });
 
     expect(findWorkspaceBoundaryViolations(root)).toEqual([
-      expect.stringContaining('imports "@cf-slatedb/lsm-cloudflare/src/mem-table.ts"'),
+      expect.stringContaining('imports "@shaledb/lsm-cloudflare/src/mem-table.ts"'),
     ]);
   });
 
   it("reports a relative import that leaves its workspace", () => {
     const root = makeFakeRepository({
-      "packages/lsm-cloudflare/package.json": packageJson({ name: "@cf-slatedb/lsm-cloudflare" }),
+      "packages/lsm-cloudflare/package.json": packageJson({ name: "@shaledb/lsm-cloudflare" }),
       "packages/lsm-cloudflare/src/db-reader.ts": [
         importLine("{ a }", "./local.ts"),
         importLine("{ b }", "../../lsm-core/src/row.ts"),

@@ -1,4 +1,4 @@
-import { type DatabaseId, type Manifest, ManifestId, ManifestJson } from "@cf-slatedb/lsm-core";
+import { type DatabaseId, type Manifest, ManifestId, ManifestJson } from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Context, Data, Effect, Layer, Metric, Option, Result, Schedule, Schema } from "effect";
 
@@ -137,7 +137,7 @@ export interface IManifestStore {
 
 /** The contextual manifest store. */
 export class ManifestStore extends Context.Service<ManifestStore, IManifestStore>()(
-  "@cf-slatedb/ManifestStore",
+  "@shaledb/ManifestStore",
 ) {}
 
 const encodeManifestJson = Schema.encodeSync(ManifestJson);

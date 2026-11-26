@@ -16,7 +16,7 @@ export interface IDurableObjectAlarm {
 
 /** The contextual Durable Object alarm. */
 export class DurableObjectAlarm extends Context.Service<DurableObjectAlarm, IDurableObjectAlarm>()(
-  "@cf-slatedb/DurableObjectAlarm",
+  "@shaledb/DurableObjectAlarm",
 ) {}
 
 /** Provides the alarm of a Durable Object's native storage. */

@@ -23,7 +23,7 @@ import {
   sstHandleOwner,
   sstHandleVisibleRange,
   Timestamp,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Clock, Context, Data, Effect, Layer, Metric, Option, Schema, Stream } from "effect";
 
@@ -151,7 +151,7 @@ export interface ICompactionExecutor {
 
 /** The contextual compaction executor. */
 export class CompactionExecutor extends Context.Service<CompactionExecutor, ICompactionExecutor>()(
-  "@cf-slatedb/CompactionExecutor",
+  "@shaledb/CompactionExecutor",
 ) {}
 
 /** Constructs the executor over the contextual object store, SST store, manifests, and settings. */

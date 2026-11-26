@@ -1,6 +1,6 @@
 ------------------------------- MODULE GcSafety -------------------------------
 (***************************************************************************)
-(* GC safety for one cf-slatedb database: garbage collection never deletes *)
+(* GC safety for one shaledb database: garbage collection never deletes *)
 (* an SST that a live manifest, a checkpoint (including a fork's hold on   *)
 (* its source), or a reader still within gcMinAge references, and never    *)
 (* deletes an SST that is uploaded but not yet committed while its commit  *)

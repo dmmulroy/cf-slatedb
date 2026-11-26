@@ -1,6 +1,6 @@
 # Error Design
 
-Errors are part of cf-slatedb's public interface and its observability model. They must help a human or Agent understand what happened, decide what to do next, and correlate a public failure with internal traces without exposing private implementation details.
+Errors are part of shaledb's public interface and its observability model. They must help a human or Agent understand what happened, decide what to do next, and correlate a public failure with internal traces without exposing private implementation details.
 
 These principles are informed by [“When life gives you lemons, write better error messages”](https://wix-ux.com/when-life-gives-you-lemons-write-better-error-messages-46c5223e1a2f).
 
@@ -40,7 +40,7 @@ Treat failures seriously. Avoid jokes, cutesy language, excessive apologies, and
 
 ### Avoid blame and implementation jargon
 
-Describe the problem rather than blaming the caller or a third party. Public messages use cf-slatedb and storage vocabulary (database, key, write, read, snapshot), not SQL tables, Durable Object mechanics, stack traces, vendor exceptions, or internal service names.
+Describe the problem rather than blaming the caller or a third party. Public messages use shaledb and storage vocabulary (database, key, write, read, snapshot), not SQL tables, Durable Object mechanics, stack traces, vendor exceptions, or internal service names.
 
 Internal errors may name the failing internal capability when that context helps an operator diagnose the failure, but they still use precise language rather than blame.
 
@@ -95,7 +95,7 @@ Choose status from the caller-visible meaning, not the implementation that faile
 - `405` — the route does not support the request method;
 - `409` — current resource state conflicts with the requested operation;
 - `415` — the request uses an unsupported media type;
-- `500` — cf-slatedb cannot complete the operation because of an internal invariant or non-transient internal failure; and
+- `500` — shaledb cannot complete the operation because of an internal invariant or non-transient internal failure; and
 - `503` — a required capability is temporarily unavailable.
 
 The concrete public `HttpApi` owns each endpoint's exact status and error schemas. Infrastructure such as Cloudflare Access may reject a request before it reaches that application contract.

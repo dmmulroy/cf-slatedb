@@ -1,9 +1,9 @@
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { DatabaseId } from "@cf-slatedb/lsm-core";
-import { DbHttpApi, GcHttpApi } from "@cf-slatedb/lsm-cloudflare";
-import { ShardedHttpApi, ShardGroup } from "@cf-slatedb/sharding";
+import { DatabaseId } from "@shaledb/lsm-core";
+import { DbHttpApi, GcHttpApi } from "@shaledb/lsm-cloudflare";
+import { ShardedHttpApi, ShardGroup } from "@shaledb/sharding";
 import { Clock, Context, Data, Effect, Option, Schema } from "effect";
 import { Base64 } from "effect/encoding";
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
@@ -33,7 +33,7 @@ export interface IMeasurementCollector {
 export class MeasurementCollector extends Context.Service<
   MeasurementCollector,
   IMeasurementCollector
->()("@cf-slatedb/scenario/MeasurementCollector") {}
+>()("@shaledb/scenario/MeasurementCollector") {}
 
 /** Percentile (nearest rank) of `values`, in their unit; `0` when empty. */
 export const percentile = (values: ReadonlyArray<number>, fraction: number): number => {
@@ -194,7 +194,7 @@ export const measureWrites = (load: WriteLoad) =>
     };
   });
 
-/** Schema of the Tail Worker's invocation records (`infra/cf-slatedb/src/cpu-tail-worker.ts`). */
+/** Schema of the Tail Worker's invocation records (`infra/shaledb/src/cpu-tail-worker.ts`). */
 const InvocationRecord = Schema.Struct({
   scriptName: Schema.OptionFromNullOr(Schema.String),
   durableObjectId: Schema.OptionFromNullOr(Schema.String),

@@ -9,7 +9,7 @@ import {
   type SstId,
   type SstIndexEntry,
   type SstMeta,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import { Context, Effect, Layer, Metric, Option } from "effect";
 
 import {
@@ -67,9 +67,7 @@ export interface IBlockCache {
 }
 
 /** The contextual L1 block cache. */
-export class BlockCache extends Context.Service<BlockCache, IBlockCache>()(
-  "@cf-slatedb/BlockCache",
-) {}
+export class BlockCache extends Context.Service<BlockCache, IBlockCache>()("@shaledb/BlockCache") {}
 
 /** Cache key of a byte range of one SST: its owner, id, and range (SSTs are immutable). */
 const rangeKey = (owner: DatabaseId, sstId: SstId, offset: number, length: number) =>

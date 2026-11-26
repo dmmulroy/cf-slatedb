@@ -5,7 +5,7 @@ import {
   initialManifest,
   type ReadConsistency,
   SeqNum,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import { Arbitrary, Effect, Option, Schema, Stream } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";

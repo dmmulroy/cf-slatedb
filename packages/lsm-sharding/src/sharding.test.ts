@@ -1,11 +1,11 @@
-import { DatabaseId, DEFAULT_DATABASE_OPTIONS, FULL_KEY_RANGE } from "@cf-slatedb/lsm-core";
+import { DatabaseId, DEFAULT_DATABASE_OPTIONS, FULL_KEY_RANGE } from "@shaledb/lsm-core";
 import {
   DatabaseLifecycle,
   DbClient,
   dbServicesTestLayer,
   ManifestReader,
   lsmTestRuntimeContextLayer,
-} from "@cf-slatedb/lsm-cloudflare";
+} from "@shaledb/lsm-cloudflare";
 import { Arbitrary, Bytes, Effect, Fiber, Layer, Option, Schema, Stream } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 

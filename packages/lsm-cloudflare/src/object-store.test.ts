@@ -1,4 +1,4 @@
-import { DatabaseId, ManifestId, md5Hex, SstId } from "@cf-slatedb/lsm-core";
+import { DatabaseId, ManifestId, md5Hex, SstId } from "@shaledb/lsm-core";
 import { Arbitrary, Bytes, Effect, Option, Schema, Stream } from "effect";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { describe, expect, it } from "vite-plus/test";

@@ -1,6 +1,6 @@
-# cf-slatedb v1 hand-off: from working previews to a production release
+# shaledb v1 hand-off: from working previews to a production release
 
-This document lets a new agent, on any machine, take cf-slatedb from where it is (every design item
+This document lets a new agent, on any machine, take shaledb from where it is (every design item
 built, verified locally and on live previews) to a **v1 that Dillon can deploy to production**. Read
 it in full before you change anything. The prompt to start the agent is at the end.
 
@@ -44,7 +44,7 @@ State at commit `cb405ff` (2026-11-25):
    `node tools/preview-cli/src/preview-cli.ts status`: it must list `preview-1` and `preview-2`.
    Never commit credentials.
 6. If pi's Cloudflare deployment guard runs on this machine, Dillon runs
-   `scripts/allowlist-cf-slatedb-deploys.sh` once (stages `dev`, `preview-1..3`; `alchemy destroy`
+   `scripts/allowlist-shaledb-deploys.sh` once (stages `dev`, `preview-1..3`; `alchemy destroy`
    stays blocked). It does **not** allow `production`; see "Production".
 7. Traits: `.pi/mcp.json` configures the traits checker (needs `TYPESAFE_API_KEY` and a Claude Code
    login). It is a probabilistic per-chunk classifier: read its findings against
@@ -86,7 +86,7 @@ record it as a decision, and keep it easy to change.
 | #   | Decision                            | Recommended default                                                                                                                                                                               |
 | --- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | P1  | How production callers authenticate | Keep the access gate for production, with **rotatable** tokens: two valid tokens at a time, held as Secrets Store secrets, rotated by a `vp run` task. Cloudflare Access in front stays optional. |
-| P2  | Production data residency           | None (`CF_SLATEDB_JURISDICTION=none`). It is fixed per installation; changing it later means a new installation.                                                                                  |
+| P2  | Production data residency           | None (`SHALEDB_JURISDICTION=none`). It is fixed per installation; changing it later means a new installation.                                                                                     |
 | P3  | Production hostname                 | The API Worker's `workers.dev` URL. A custom domain needs a zone in the account; take the zone name if he gives one.                                                                              |
 | P4  | Production telemetry                | The stage's own `TraceCollector`, with a 14-day R2 lifecycle rule and head sampling at 10% (100% on previews).                                                                                    |
 | P5  | Plan and limits                     | Workers Paid. Raise the per-invocation CPU limit (`limits.cpu_ms`) of the API and compactor Workers to what workstream 6 measures plus 2× headroom.                                               |
@@ -101,18 +101,18 @@ one "superseded by Dnn".
 
 ### 1. The Stack owns its configuration (root cause of D54)
 
-**Problem.** Engine settings (`CF_SLATEDB_LSM_SETTINGS`) and the jurisdiction
-(`CF_SLATEDB_JURISDICTION`) reach Workers through Alchemy's `Config` interception. A value a deploy
+**Problem.** Engine settings (`SHALEDB_LSM_SETTINGS`) and the jurisdiction
+(`SHALEDB_JURISDICTION`) reach Workers through Alchemy's `Config` interception. A value a deploy
 stops setting stays bound, because Cloudflare keeps secrets across uploads. D54 patched this in
 `preview-cli` by always passing both. Any other deploy path — a production task, a manual
 `vp run …#deploy:*` — still gets stale values. For the jurisdiction, that means Workers addressing
 the wrong Durable Objects.
 
-**Proper fix.** One typed Stack configuration, decoded once in `infra/cf-slatedb` at plan time from
+**Proper fix.** One typed Stack configuration, decoded once in `infra/shaledb` at plan time from
 the deploy's environment with a schema and complete defaults. Every Worker is bound the **full**
 resolved value on every deploy, so "unset" can no longer mean "whatever was there before":
 
-- `CfSlatedbStackConfig` (infra): `stage`, `jurisdiction` (`eu` | `fedramp` | `none`), the full
+- `ShaledbStackConfig` (infra): `stage`, `jurisdiction` (`eu` | `fedramp` | `none`), the full
   `LsmSettings` (defaults merged with overrides), `telemetry` (sample rate, trace retention days),
   and access-token policy. Decode it with Schema from `process.env` in one place.
 - Bind it explicitly onto each Worker. Either the Worker props' `env`, or `runtimeContext.set` as
@@ -279,7 +279,7 @@ freeze. CPU limits are the defaults, and a 64 MiB flush costs 3.5–6 s of CPU.
 - If decoding is a large share, switch the **internal** `WriterHttpApi` batch body to a compact
   binary encoding: length-prefixed keys and values with varints, reusing `byte-codec.ts`. The API
   Worker and `WriterServer` deploy in one script, so there is no compatibility window. Keep the
-  public JSON body. Add an optional public `application/x-cf-slatedb-batch` body later only if
+  public JSON body. Add an optional public `application/x-shaledb-batch` body later only if
   callers need it; it would be additive.
 - Measure CPU per compaction step and per flush at production sizes with the tail Worker. Set
   `limits.cpu_ms` on the API and compactor Workers (P5) with 2× headroom, in the Stack config.
@@ -356,10 +356,10 @@ locally.
 
   If Dillon picks Cloudflare Access instead, keep the gate and add Access in front.
 
-- **Production tasks.** `plan:production` and `deploy:production` in `infra/cf-slatedb/vite.config.ts`
+- **Production tasks.** `plan:production` and `deploy:production` in `infra/shaledb/vite.config.ts`
   (`cache: false`):
   - They decode the Stack config with production values (P2–P5) and use production names and
-    retention (`LsmBucket` keeps `cf-slatedb` and is retained).
+    retention (`LsmBucket` keeps `shaledb` and is retained).
   - The trace bucket and every preview-only resource are absent or stage-appropriate.
   - Nothing runs them until P6.
 - **Public contract.**
@@ -370,7 +370,7 @@ locally.
 - **Format versions.** Add an additive `formatVersion` (default 1) to the manifest and the compactor
   state, and refuse to write a manifest older code can't read. Prove old manifests decode.
 - **Documentation.**
-  - A `README.md`: what cf-slatedb is, quick start, the API, links.
+  - A `README.md`: what shaledb is, quick start, the API, links.
   - `docs/operations.md`: deploy, rollback (redeploy the previous commit; Durable Objects and data
     are untouched), token rotation, jurisdiction policy, corruption runbook, GC and removal,
     capacity numbers from `docs/measurements.md`, alerts.
@@ -425,7 +425,7 @@ locally.
 ## Prompt for the new agent
 
 ```text
-You're finishing cf-slatedb v1: a SlateDB-style LSM key-value store on Cloudflare R2 and Durable
+You're finishing shaledb v1: a SlateDB-style LSM key-value store on Cloudflare R2 and Durable
 Objects, written with Effect 4 and Alchemy v2, already built and verified locally and on live preview
 stages. Read docs/handoff-v1.md in full first, then AGENTS.md, the "Hand-off" section of
 docs/progress.md, docs/measurements.md, and the standards it lists. Set up the machine per "Set up on

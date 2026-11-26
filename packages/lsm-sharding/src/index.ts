@@ -1,4 +1,4 @@
-/** `@cf-slatedb/sharding`: range-sharded groups of databases, built only on the public APIs. */
+/** `@shaledb/sharding`: range-sharded groups of databases, built only on the public APIs. */
 export * from "./shard-directory.ts";
 export * from "./shard-directory-server.ts";
 export * from "./shard-map.ts";

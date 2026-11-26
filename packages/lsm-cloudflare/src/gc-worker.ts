@@ -163,6 +163,6 @@ export const gcWorkerLayer = <R = never>(options: GcWorkerOptions<R>) =>
         ),
       ),
       Effect.provide(Layer.mergeAll(objectStoreLayer, lsmConfigurationLayer)),
-      Effect.provide(withLsmTracePolicy(options.telemetry("cf-slatedb-gc"))),
+      Effect.provide(withLsmTracePolicy(options.telemetry("shaledb-gc"))),
     ),
   );

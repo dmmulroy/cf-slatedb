@@ -6,15 +6,15 @@ The path says what a workspace is:
 
 - `packages/*` are libraries. They deploy nothing and expose an intentional public entrypoint
   (`src/index.ts`) through `exports`.
-  - `packages/lsm-core` (`@cf-slatedb/lsm-core`) is pure: ids, rows, codecs, the merge iterator,
+  - `packages/lsm-core` (`@shaledb/lsm-core`) is pure: ids, rows, codecs, the merge iterator,
     the manifest schema and its edits, and the compaction scheduler. It imports no Cloudflare or
     Alchemy module (`@alchemy.run/*`, `alchemy`, `cloudflare:*`, `@cloudflare/*`).
-  - `packages/lsm-cloudflare` (`@cf-slatedb/lsm-cloudflare`) is the storage engine on R2 and
+  - `packages/lsm-cloudflare` (`@shaledb/lsm-cloudflare`) is the storage engine on R2 and
     Durable Objects: services, servers, Workers, and the Workflow.
-  - `packages/lsm-sharding` (`@cf-slatedb/sharding`) is optional and uses only the public
-    entrypoints of `@cf-slatedb/lsm-cloudflare` and `@cf-slatedb/lsm-core`.
-- `infra/*` are independent composition roots: one Alchemy Stack each. `infra/cf-slatedb`
-  (`@cf-slatedb/infra`) declares the full Stack.
+  - `packages/lsm-sharding` (`@shaledb/sharding`) is optional and uses only the public
+    entrypoints of `@shaledb/lsm-cloudflare` and `@shaledb/lsm-core`.
+- `infra/*` are independent composition roots: one Alchemy Stack each. `infra/shaledb`
+  (`@shaledb/infra`) declares the full Stack.
 - `tools/*` is repository tooling that nothing imports: the trace CLI, the scenario CLI, formal
   verification, Traits, and the workspace boundary check.
 
@@ -39,8 +39,8 @@ anticipate hypothetical reuse.
 
 `tools/workspace-boundaries` enforces these rules as a test, so `vp run ready` fails when a
 workspace under `infra/` declares `exports`, any workspace depends on an `infra/` or `tools/`
-workspace, `@cf-slatedb/lsm-core` imports a Cloudflare or Alchemy module, the sharding package
-depends on a library other than `@cf-slatedb/lsm-core` and `@cf-slatedb/lsm-cloudflare` (or
+workspace, `@shaledb/lsm-core` imports a Cloudflare or Alchemy module, the sharding package
+depends on a library other than `@shaledb/lsm-core` and `@shaledb/lsm-cloudflare` (or
 imports one of their non-public paths), or a source file imports a relative path outside its own
 workspace.
 

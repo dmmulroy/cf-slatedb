@@ -34,12 +34,12 @@ describe("Stack jurisdiction", () => {
   it("reads the setting, and refuses to start on a value that is not a jurisdiction", async () => {
     const unset = await readJurisdiction({});
     expect(unset._tag === "Success" ? unset.value : "failed").toEqual(Option.none());
-    const eu = await readJurisdiction({ CF_SLATEDB_JURISDICTION: "eu" });
+    const eu = await readJurisdiction({ SHALEDB_JURISDICTION: "eu" });
     expect(eu._tag === "Success" ? eu.value : "failed").toEqual(Option.some("eu"));
     // Deploys bind `none` explicitly: an unset value would leave the previous one bound (D54).
-    const none = await readJurisdiction({ CF_SLATEDB_JURISDICTION: "none" });
+    const none = await readJurisdiction({ SHALEDB_JURISDICTION: "none" });
     expect(none._tag === "Success" ? none.value : "failed").toEqual(Option.none());
-    const invalid = await readJurisdiction({ CF_SLATEDB_JURISDICTION: "mars" });
+    const invalid = await readJurisdiction({ SHALEDB_JURISDICTION: "mars" });
     expect(invalid._tag).toBe("Failure");
   });
 });

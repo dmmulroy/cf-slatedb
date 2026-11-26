@@ -1,5 +1,5 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
-import { CompactionBudgetLedger } from "@cf-slatedb/lsm-core";
+import { CompactionBudgetLedger } from "@shaledb/lsm-core";
 import type { HttpEffect } from "alchemy/Http";
 import { makeExecutionMemo } from "alchemy/Runtime/ExecutionMemo";
 import type { RuntimeContext } from "alchemy/RuntimeContext";

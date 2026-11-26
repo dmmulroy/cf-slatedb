@@ -1,5 +1,5 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
-import { CompactorEpoch, type DatabaseId, type Timestamp } from "@cf-slatedb/lsm-core";
+import { CompactorEpoch, type DatabaseId, type Timestamp } from "@shaledb/lsm-core";
 import { makeExecutionMemo } from "alchemy/Runtime/ExecutionMemo";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Cache, Context, Effect, Layer, Option, Ref, type Scope } from "effect";
@@ -58,7 +58,7 @@ export interface ICompactorClient {
 
 /** The contextual compactor client. */
 export class CompactorClient extends Context.Service<CompactorClient, ICompactorClient>()(
-  "@cf-slatedb/CompactorClient",
+  "@shaledb/CompactorClient",
 ) {}
 
 /**
@@ -178,7 +178,7 @@ export interface CompactorClientCalls {
 export class CompactorClientRecord extends Context.Service<
   CompactorClientRecord,
   Ref.Ref<CompactorClientCalls>
->()("@cf-slatedb/CompactorClientRecord") {}
+>()("@shaledb/CompactorClientRecord") {}
 
 /**
  * Provides a compactor client with no compactors: it records the databases it was asked to destroy,

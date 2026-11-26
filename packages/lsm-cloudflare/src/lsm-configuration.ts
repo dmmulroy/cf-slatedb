@@ -1,9 +1,9 @@
-import { DEFAULT_LSM_SETTINGS, LsmSettings } from "@cf-slatedb/lsm-core";
+import { DEFAULT_LSM_SETTINGS, LsmSettings } from "@shaledb/lsm-core";
 import { Config, Context, Effect, Layer, Option, Schema } from "effect";
 
 /** The engine's settings for the current Worker or Durable Object. */
 export class LsmConfiguration extends Context.Service<LsmConfiguration, LsmSettings>()(
-  "@cf-slatedb/LsmConfiguration",
+  "@shaledb/LsmConfiguration",
 ) {}
 
 /**
@@ -11,7 +11,7 @@ export class LsmConfiguration extends Context.Service<LsmConfiguration, LsmSetti
  * Deployments bind the complete settings (`bindLsmWorkerSettings`); a partial object, as tests and
  * deploys before D55 bound, overrides the defaults.
  */
-export const LSM_SETTINGS_BINDING = "CF_SLATEDB_LSM_SETTINGS";
+export const LSM_SETTINGS_BINDING = "SHALEDB_LSM_SETTINGS";
 
 const decodeLsmSettingsOverrides = Schema.decodeEffect(
   Schema.fromJsonString(Schema.Record(Schema.String, Schema.Number)),

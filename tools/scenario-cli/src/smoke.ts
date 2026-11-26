@@ -1,5 +1,5 @@
-import { DatabaseId, SeqNum } from "@cf-slatedb/lsm-core";
-import { DbHttpApi } from "@cf-slatedb/lsm-cloudflare";
+import { DatabaseId, SeqNum } from "@shaledb/lsm-core";
+import { DbHttpApi } from "@shaledb/lsm-cloudflare";
 import { Data, Effect, Option } from "effect";
 import { HttpClient } from "effect/http";
 import { HttpApiClient } from "effect/http-api";

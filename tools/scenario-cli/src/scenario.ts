@@ -35,7 +35,7 @@ export interface StackUrls {
 
 /** The Stack a scenario runs against: `vp run dev`, or a live preview stage. */
 export class ScenarioStack extends Context.Service<ScenarioStack, StackUrls>()(
-  "@cf-slatedb/scenario/ScenarioStack",
+  "@shaledb/scenario/ScenarioStack",
 ) {}
 
 /** Services every scenario may use. */

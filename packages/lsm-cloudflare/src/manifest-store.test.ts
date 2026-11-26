@@ -10,7 +10,7 @@ import {
   Timestamp,
   type SstHandle,
   WriterEpoch,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Effect, Layer, Option, Result, Stream, Tracer } from "effect";
 import { TestClock } from "effect/testing";
@@ -270,7 +270,7 @@ describe("ManifestStore", () => {
       Effect.gen(function* () {
         yield* initialize;
         const objects = yield* ObjectStore;
-        // Manifest 2, as a later cf-slatedb would write it: format 2, with a field this one lacks.
+        // Manifest 2, as a later shaledb would write it: format 2, with a field this one lacks.
         const current = Option.getOrThrow(yield* objects.get(manifestKey(DB, ManifestId.make(1))));
         const newer = JSON.parse(new TextDecoder().decode(current));
         newer.formatVersion = 2;
@@ -289,7 +289,7 @@ describe("ManifestStore", () => {
     );
     for (const error of [outcome.read, outcome.written]) {
       expect(error._tag).toBe("ManifestReadError");
-      expect(error.message).toContain("written by a newer cf-slatedb (format 2");
+      expect(error.message).toContain("written by a newer shaledb (format 2");
     }
     expect(outcome.third).toEqual(Option.none());
   });

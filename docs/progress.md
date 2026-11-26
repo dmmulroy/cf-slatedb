@@ -27,7 +27,7 @@ hand-off is below.
   `.tlc/` present; Alchemy logged in to the account (`preview-cli status` lists `preview-1` and
   `preview-2`). Before any change: `vp run ready` exit 0, `vp run verify` exit 0 (20/20). P1–P6
   written under "Open questions" and asked.
-- **1. The Stack owns its configuration (D55, supersedes D54's mechanism).** `CfSlatedbStackConfig`
+- **1. The Stack owns its configuration (D55, supersedes D54's mechanism).** `ShaledbStackConfig`
   (infra) is resolved once from the deploy's environment with complete defaults (stage,
   jurisdiction, complete `LsmSettings`, telemetry, access mode) before the Stack declares anything; a
   refused variable fails the plan. Every Worker layer takes a `settings` source and binds the
@@ -55,7 +55,7 @@ hand-off is below.
   `ManifestStore.update` p50 1,092 → 357 ms (target ≤ 500), small flush p50 1,508 → 709 ms (target
   ≤ 900). **R2 placement:** create-if-absent ~285 ms even beside the bucket (ENAM, from IAD), ~510 ms
   from the US west coast, ~550–590 ms from Europe, ~900–1,000 ms from APAC/Oceania; `preview-1`'s
-  writers are already near its bucket. `CF_SLATEDB_BUCKET_LOCATION` (default `auto`) lets an
+  writers are already near its bucket. `SHALEDB_BUCKET_LOCATION` (default `auto`) lets an
   installation place its bucket once. Scenarios: 11/11 locally and on `preview-1`.
 - **3. Splits pause briefly and never fail (D57).** One manifest commit seals the shard, flushes
   the last rows, and takes each successor's hold; the forks start from their holds concurrently
@@ -161,13 +161,29 @@ hand-off is below.
     workstream 1 manifest is checked in as a fixture.
   - **Documentation.** `README.md` is new and `docs/operations.md` is complete. The dead preview
     gate is removed.
+- **Renamed to shaledb (D68).** Every project reference changed: packages, paths, the Stack,
+  environment variables, bindings, and live names. Upstream SlateDB references are kept. The
+  previews are redeployed as new `Shaledb/<stage>` stacks; the old `CfSlatedb/<stage>` stacks
+  remain for Dillon to destroy.
+- **10. Soak (in progress; D65–D67).**
+  - **New tools.** `scenario-cli soak` and `scenario-cli smoke`; the smoke test passed on
+    `preview-3`.
+  - **The soak's first runs** lost or hid no acknowledged write, but found a defect, now fixed
+    (D66): the API Worker's block cache shared reads in flight across requests, which caused
+    5-minute hangs and a 500 during a redeploy.
+  - **Fixed in the soak tool:** request timeouts, retryable sharded errors, and trace pulls that
+    keep up.
+  - **Also made:** scans now read ahead 8 blocks per SST (D67), the collector serves pages of
+    500, and the shard router has tail records.
+  - **Sampling.** The soak runs at production's 10% sampling; at 100% a busy preview exports
+    faster than it can be read back.
 
 ## Remaining-work log
 
 - **Set up (new session).** Node 24.22, `vp` 1.8, pnpm 12.14; `repos/slatedb` and `.tlc/` present;
-  the deploy guard already allowlists `CfSlatedb` for `dev`, `preview-1..3`. `vp run ready` exit 0
+  the deploy guard already allowlists `Shaledb` for `dev`, `preview-1..3`. `vp run ready` exit 0
   before any change.
-- **1. Portable Alchemy state.** `cfSlatedbStateLayer` picks `localState()` for local stages and
+- **1. Portable Alchemy state.** `shaledbStateLayer` picks `localState()` for local stages and
   `Cloudflare.state({ accountId })` (the account's default state store, pinned to Dillon's account)
   for every live stage. `isLocalLsmStage` (lsm-cloudflare) is now the one local-stage rule, shared
   with the telemetry flush policy. `vp run dev` still runs offline. D43.
@@ -208,7 +224,7 @@ hand-off is below.
      writes (D40, D48). **Finding (recorded):** the best-effort `LATEST` hint is ~40% of every CAS and
      the forks' compactor wake-ups add ~4 s to a split; moving them off the critical path is left for a
      change that re-runs the manifest CAS model. CPU comes from a new live-only Tail Worker (D48).
-- **5. Data residency, per Stack.** `CF_SLATEDB_JURISDICTION` (`eu` | `fedramp` | unset;
+- **5. Data residency, per Stack.** `SHALEDB_JURISDICTION` (`eu` | `fedramp` | unset;
   `preview-cli deploy --jurisdiction`) restricts both R2 buckets, every Durable Object namespace
   (through `inLsmJurisdiction` in each client), and the compaction Workflow, and turns Workers Cache
   off (it would keep block bytes anywhere). The advisory per-database option is removed; old
@@ -234,8 +250,8 @@ hand-off is below.
   SST leaves the manifest.
 - **Finding (fixed, D54):** a `Config`-bound setting that a later deploy stops setting stays bound on
   the Workers (Cloudflare keeps secrets across uploads), so `preview-1` kept the dev timings after
-  redeploys without `--dev-timings`. The preview CLI now binds `CF_SLATEDB_LSM_SETTINGS` (`{}` by
-  default) and `CF_SLATEDB_JURISDICTION` (new value `none`) on every deploy; verified in the
+  redeploys without `--dev-timings`. The preview CLI now binds `SHALEDB_LSM_SETTINGS` (`{}` by
+  default) and `SHALEDB_JURISDICTION` (new value `none`) on every deploy; verified in the
   Workers' bindings. `docs/measurements.md` states which settings applied to its runs.
 - **Standards review** (`158b6ad`): the traits checker over the new code; the access gate's `401`
   and the trace collector's errors now use the public error envelope (declared in `DbHttpApi`, no
@@ -249,7 +265,7 @@ hand-off is below.
 - **Phase 0 — repository setup** (`b3a4e84`). pnpm workspace with iac's catalog (effect 4.1.4,
   alchemy and `@alchemy.run/cloudflare` 2.0.0-beta.87, vite-plus 1.2.0, typescript ^7), iac's lint
   rules and tsconfig, `.node-version`, `.gitignore`, workspaces `packages/lsm-core`,
-  `packages/lsm-cloudflare`, `packages/lsm-sharding`, `infra/cf-slatedb`,
+  `packages/lsm-cloudflare`, `packages/lsm-sharding`, `infra/shaledb`,
   `tools/{trace-cli,scenario-cli,formal-verification,traits,workspace-boundaries}`. Boundary test
   adapted (pure core, sharding public-API-only, no `exports` under `infra/`). Docs adapted;
   `docs/testing.md` rewritten local-first; `AGENTS.md` written; iac traits copied; SlateDB cloned
@@ -264,16 +280,16 @@ hand-off is below.
     `OtlpTracer` in both serializations.
   - Review fix: `list` is one pass (summarize, filter, bounded binary-insert top-`limit`) and
     `summarizeTrace` is one pass over spans plus a pass over root candidates only.
-  - `lsmTelemetryLayer` (`@cf-slatedb/lsm-cloudflare`) wraps `Telemetry.layerOtlp`.
+  - `lsmTelemetryLayer` (`@shaledb/lsm-cloudflare`) wraps `Telemetry.layerOtlp`.
   - OTLP flush bug **confirmed on beta.87**. Alchemy is not patched (review). Workaround (D5): a
     stage-selected flush policy. Local stages (`dev`, `test`, `test-*`, ...) export a handler's spans
     before the response; live stages (`production`, previews, ...) add no export latency and rely on
     the bridge's `waitUntil` flush. Both modes are covered by unit tests and by workerd tests
     (`telemetry-smoke.workerd.ts`, `telemetry-smoke-live-policy.workerd.ts`).
-  - `infra/cf-slatedb/alchemy.run.ts` + `vp run dev` run a telemetry probe Worker + DO under
+  - `infra/shaledb/alchemy.run.ts` + `vp run dev` run a telemetry probe Worker + DO under
     `alchemy dev`; verified with the trace CLI (Worker → DO span nesting, alarm span,
     `assert` pass/fail exit codes).
-  - `@cf-slatedb/lsm-cloudflare` `test` now runs unit tests and the workerd suite (`--mode workerd`).
+  - `@shaledb/lsm-cloudflare` `test` now runs unit tests and the workerd suite (`--mode workerd`).
 - **Phase 2 — lsm-core.** Branded ids (`DatabaseId`, `SeqNum`, `SstId` ULID, `ManifestId`,
   writer/compactor epochs, `SortedRunId`, `CheckpointId`, `Timestamp`), `KeyRange`, `Row`/`RowValue`
   (`Data.TaggedEnum`), key order via `Bytes.Order` (key asc, seq desc), CRC32C, Bloom filter
@@ -393,7 +409,7 @@ hand-off is below.
 
 ### What was built
 
-cf-slatedb, a SlateDB-style LSM key-value store on Cloudflare R2 and Durable Objects:
+shaledb, a SlateDB-style LSM key-value store on Cloudflare R2 and Durable Objects:
 
 - `packages/lsm-core` (pure): ids, rows and resolution (merge operators, TTL), CRC32C, Bloom filters,
   block and SST codecs, the k-way merge, the manifest and its pure edits, the size-tiered scheduler
@@ -407,7 +423,7 @@ cf-slatedb, a SlateDB-style LSM key-value store on Cloudflare R2 and Durable Obj
   removal), `DbClient`, the public `DbHttpApi`, the access gate for live stages, and the Stack's
   jurisdiction.
 - `packages/lsm-sharding`: range-sharded groups over the public APIs.
-- `infra/cf-slatedb`: the Alchemy Stack. On live stages it adds a `TraceCollector` Worker, a
+- `infra/shaledb`: the Alchemy Stack. On live stages it adds a `TraceCollector` Worker, a
   `CpuTailWorker`, and per-stage access and trace tokens; state lives in the account's Cloudflare
   state store.
 - `tools/`: `trace-cli` (with `pull`/`tail --stage`), `scenario-cli` (11 scenarios; `--stage`;
@@ -493,8 +509,8 @@ Details and methods are in [`docs/measurements.md`](measurements.md).
   (Findings).
 - Not measured: whether Durable Object SQLite's page cache counts against 128 MB, and the Workflows
   concurrent-instance limit on the plan.
-- A production deploy task, if ever approved, must bind `CF_SLATEDB_LSM_SETTINGS` and
-  `CF_SLATEDB_JURISDICTION` explicitly (D54) and keep production names and retention
+- A production deploy task, if ever approved, must bind `SHALEDB_LSM_SETTINGS` and
+  `SHALEDB_JURISDICTION` explicitly (D54) and keep production names and retention
   (`lsm-bucket.ts`).
 
 ### Destroying the previews (Dillon runs these; agents never do)
@@ -502,9 +518,9 @@ Details and methods are in [`docs/measurements.md`](measurements.md).
 All three previews are deployed (`preview-3` since v1 workstream 1).
 
 ```sh
-vp run @cf-slatedb/infra#destroy:preview-1
-vp run @cf-slatedb/infra#destroy:preview-2
-vp run @cf-slatedb/infra#destroy:preview-3
+vp run @shaledb/infra#destroy:preview-1
+vp run @shaledb/infra#destroy:preview-2
+vp run @shaledb/infra#destroy:preview-3
 ```
 
 `node tools/preview-cli/src/preview-cli.ts destroy-command <stage>` prints the same. Each removes
@@ -540,14 +556,14 @@ explicit go-ahead.
 | #   | Decision                            | Recommended default (building this until answered)                                                                                                           | Answer               |
 | --- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------- |
 | P1  | How production callers authenticate | The access gate, with rotatable tokens: two valid at a time, held as Secrets Store secrets, rotated by a `vp run` task. Cloudflare Access in front optional. | decided: the default |
-| P2  | Production data residency           | None (`CF_SLATEDB_JURISDICTION=none`). Fixed per installation; changing it later means a new installation.                                                   | decided: the default |
+| P2  | Production data residency           | None (`SHALEDB_JURISDICTION=none`). Fixed per installation; changing it later means a new installation.                                                      | decided: the default |
 | P3  | Production hostname                 | The API Worker's `workers.dev` URL. A custom domain needs a zone in the account.                                                                             | decided: the default |
 | P4  | Production telemetry                | The stage's own `TraceCollector`, a 14-day R2 lifecycle rule, head sampling at 10% (100% on previews).                                                       | decided: the default |
 | P5  | Plan and limits                     | Workers Paid; `limits.cpu_ms` on the API and compactor Workers set to workstream 6's measurement plus 2× headroom.                                           | decided: the default |
 | P6  | Release go-ahead                    | Dillon reviews `docs/release-v1.md`, adds `production` to the deploy guard, then says "deploy" or runs the deploy task himself.                              | pending              |
 
 Related to P2 (found in workstream 2, D56): the production LSM bucket's R2 location is fixed when it
-is created. `CF_SLATEDB_BUCKET_LOCATION` defaults to `auto` (R2 places it near the machine that
+is created. `SHALEDB_BUCKET_LOCATION` defaults to `auto` (R2 places it near the machine that
 deploys). If production callers are concentrated somewhere else (for example Europe), choose that
 region (`weur`) before the first production deploy; writes cost ~285 ms beside the bucket and up to
 ~1 s from the far side of the world (`docs/measurements.md`).

@@ -1,6 +1,6 @@
 ---
 name: verify-no-acked-write-lost
-description: "Model-check that cf-slatedb never loses or hides an acknowledged write across writer eviction, flush, a crash between L0 upload and manifest commit, and the delete-after-commit rule, and that a Latest read sees every acknowledged write. Use after any change to DbWriter write/flushNow/probe/scan/ensureReady, MemTable commit/truncate/consistently, or the Latest read path."
+description: "Model-check that shaledb never loses or hides an acknowledged write across writer eviction, flush, a crash between L0 upload and manifest commit, and the delete-after-commit rule, and that a Latest read sees every acknowledged write. Use after any change to DbWriter write/flushNow/probe/scan/ensureReady, MemTable commit/truncate/consistently, or the Latest read path."
 ---
 
 # Verify: no acknowledged write is lost or hidden

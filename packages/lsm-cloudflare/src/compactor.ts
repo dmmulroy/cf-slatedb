@@ -17,7 +17,7 @@ import {
   SstId,
   SstNotInManifestError,
   Timestamp,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Clock, Context, Effect, Layer, Metric, Option, Result, Schema, Semaphore } from "effect";
 
@@ -93,7 +93,7 @@ export type CompactorState = typeof CompactorState.Type;
 export class CompactorStateCell extends Context.Service<
   CompactorStateCell,
   DurableObjectCell<CompactorState>
->()("@cf-slatedb/CompactorStateCell") {}
+>()("@shaledb/CompactorStateCell") {}
 
 /**
  * The compactor could not reach the manifest to start. Retryable: wake it again.
@@ -281,7 +281,7 @@ export interface ICompactor {
 }
 
 /** The contextual compactor. */
-export class Compactor extends Context.Service<Compactor, ICompactor>()("@cf-slatedb/Compactor") {}
+export class Compactor extends Context.Service<Compactor, ICompactor>()("@shaledb/Compactor") {}
 
 /** Constructs the compactor over its state cell, alarm, manifests, launcher, budget, and settings. */
 export const makeCompactor = Effect.gen(function* () {
@@ -319,14 +319,14 @@ export const makeCompactor = Effect.gen(function* () {
 
   const holder = (state: CompactorState, jobId: string) => `${state.databaseId}/${jobId}`;
 
-  /** Refuses state a newer cf-slatedb wrote: this one would rewrite it in an older format. */
+  /** Refuses state a newer shaledb wrote: this one would rewrite it in an older format. */
   const checkFormat = (state: CompactorState) =>
     state.formatVersion <= COMPACTOR_STATE_FORMAT_VERSION
       ? Effect.void
       : Effect.fail(
           new CompactorUnavailableError({
             databaseId: state.databaseId,
-            message: `The compactor state of database ${state.databaseId} was written by a newer cf-slatedb (format ${state.formatVersion}; this version reads up to format ${COMPACTOR_STATE_FORMAT_VERSION}), so this version does not compact it. Deploy that version or a later one.`,
+            message: `The compactor state of database ${state.databaseId} was written by a newer shaledb (format ${state.formatVersion}; this version reads up to format ${COMPACTOR_STATE_FORMAT_VERSION}), so this version does not compact it. Deploy that version or a later one.`,
           }),
         );
 
@@ -585,7 +585,7 @@ export const makeCompactor = Effect.gen(function* () {
     if (Option.isNone(before) || before.value.fenced) return;
     if (before.value.formatVersion > COMPACTOR_STATE_FORMAT_VERSION) {
       return yield* Effect.logError(
-        `The compactor of database ${before.value.databaseId} is idle: its state was written by a newer cf-slatedb (format ${before.value.formatVersion}). Deploy that version or a later one.`,
+        `The compactor of database ${before.value.databaseId} is idle: its state was written by a newer shaledb (format ${before.value.formatVersion}). Deploy that version or a later one.`,
       );
     }
     const now = yield* Clock.currentTimeMillis;

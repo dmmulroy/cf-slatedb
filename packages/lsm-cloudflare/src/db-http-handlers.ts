@@ -1,4 +1,4 @@
-import { DEFAULT_DATABASE_OPTIONS, SstId, sstCreatedAt } from "@cf-slatedb/lsm-core";
+import { DEFAULT_DATABASE_OPTIONS, SstId, sstCreatedAt } from "@shaledb/lsm-core";
 import { Chunk, Stream } from "effect";
 import { Effect, Layer, Option } from "effect";
 import { HttpApiBuilder } from "effect/http-api";

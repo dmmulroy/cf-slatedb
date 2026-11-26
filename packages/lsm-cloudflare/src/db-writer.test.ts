@@ -6,7 +6,7 @@ import {
   type Row,
   SeqNum,
   type WriteBatch,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Context, Effect, Layer, Option, Ref } from "effect";
 import { TestClock } from "effect/testing";

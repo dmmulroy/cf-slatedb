@@ -8,7 +8,7 @@ import type {
   SstNotInManifestError,
   WriteBatchInvalidError,
   WriterFencedError,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import { Option } from "effect";
 
 import {

@@ -4,7 +4,7 @@ import {
   DEFAULT_DATABASE_OPTIONS,
   initialManifest,
   SortedRunId,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import { Arbitrary, Context, Effect, Layer, Option, Ref, Schema } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";

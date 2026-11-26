@@ -15,7 +15,7 @@ import {
   WriteReceipt,
   SstId,
   Timestamp,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import { Schema } from "effect";
 import { HttpApi, HttpApiEndpoint, HttpApiGroup, HttpApiSchema, OpenApi } from "effect/http-api";
 
@@ -476,7 +476,7 @@ export class DbHttpApi extends HttpApi.make("DbHttpApi")
   .prefix("/v1")
   .annotateMerge(
     OpenApi.annotations({
-      title: "cf-slatedb",
+      title: "shaledb",
       version: "1.0.0",
       description:
         "A SlateDB-style LSM key-value store on R2 and Durable Objects. Keys and values are base64 in JSON. Every response carries `x-request-id`; error bodies repeat it as `requestId`.",

@@ -1,6 +1,6 @@
 ----------------------------- MODULE Transactions -----------------------------
 (***************************************************************************)
-(* SerializableSnapshot transactions in one cf-slatedb database admit only *)
+(* SerializableSnapshot transactions in one shaledb database admit only *)
 (* serializable histories: every committed transaction read exactly the    *)
 (* values the database held when it committed, so committing in commit     *)
 (* order (one at a time, under the writer's commit lock) is a serial order. *)

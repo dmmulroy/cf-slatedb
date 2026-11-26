@@ -1,7 +1,7 @@
 # `/v1` compatibility policy
 
-`/v1` is cf-slatedb's public HTTP API. Its contract is
-[`openapi/cf-slatedb-v1.json`](openapi/cf-slatedb-v1.json). The OpenAPI test fails whenever the
+`/v1` is shaledb's public HTTP API. Its contract is
+[`openapi/shaledb-v1.json`](openapi/shaledb-v1.json). The OpenAPI test fails whenever the
 code and the checked-in specification differ, and every change to the specification is reviewed in
 its diff.
 

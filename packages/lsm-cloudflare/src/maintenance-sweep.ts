@@ -1,4 +1,4 @@
-import { DatabaseId } from "@cf-slatedb/lsm-core";
+import { DatabaseId } from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Context, Effect, Layer, Option, Schema } from "effect";
 
@@ -69,7 +69,7 @@ export interface IMaintenanceSweep {
 
 /** The contextual maintenance sweep. */
 export class MaintenanceSweep extends Context.Service<MaintenanceSweep, IMaintenanceSweep>()(
-  "@cf-slatedb/MaintenanceSweep",
+  "@shaledb/MaintenanceSweep",
 ) {}
 
 const decodeDatabaseId = Schema.decodeUnknownOption(DatabaseId);

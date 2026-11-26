@@ -12,7 +12,7 @@ import {
   WriteReceipt,
   WriterEpoch,
   Checkpoint,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import { Option, Schema } from "effect";
 import { OpenApi } from "effect/http-api";
 
@@ -474,7 +474,7 @@ const annotateOperation = (
           schema: { type: "string" },
           required: true,
           description:
-            "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`.",
+            "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`.",
         },
       },
       ...(json === undefined || example === undefined
@@ -559,7 +559,7 @@ const completeSpec = (spec: OpenApi.OpenAPISpec): OpenApi.OpenAPISpec => {
           type: "http",
           scheme: "bearer",
           description:
-            "The stage's access token as `Authorization: Bearer <token>`. A live stage accepts either of its two rotatable tokens (`vp run @cf-slatedb/infra#tokens`); a preview also accepts the token `preview-cli token <stage>` prints. Local stages are not gated.",
+            "The stage's access token as `Authorization: Bearer <token>`. A live stage accepts either of its two rotatable tokens (`vp run @shaledb/infra#tokens`); a preview also accepts the token `preview-cli token <stage>` prints. Local stages are not gated.",
         },
       },
     },
@@ -567,8 +567,8 @@ const completeSpec = (spec: OpenApi.OpenAPISpec): OpenApi.OpenAPISpec => {
   };
 };
 
-/** The public database API's OpenAPI specification, as checked in at `docs/openapi/cf-slatedb-v1.json`. */
+/** The public database API's OpenAPI specification, as checked in at `docs/openapi/shaledb-v1.json`. */
 export const dbOpenApiSpec = (): OpenApi.OpenAPISpec => completeSpec(OpenApi.fromApi(DbHttpApi));
 
 /** Where the generated specification is checked in, from the repository root. */
-export const DB_OPENAPI_SPEC_PATH = "docs/openapi/cf-slatedb-v1.json";
+export const DB_OPENAPI_SPEC_PATH = "docs/openapi/shaledb-v1.json";

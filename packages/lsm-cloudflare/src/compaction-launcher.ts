@@ -40,7 +40,7 @@ export type CompactionJobProgress =
 
 /** The contextual compaction launcher. */
 export class CompactionLauncher extends Context.Service<CompactionLauncher, ICompactionLauncher>()(
-  "@cf-slatedb/CompactionLauncher",
+  "@shaledb/CompactionLauncher",
 ) {}
 
 /** Runs each step directly, without persisting results. */
@@ -50,7 +50,7 @@ export const directStepRunner: CompactionStepRunner = (_name, _schema, step) => 
 export class CompactionLauncherRecord extends Context.Service<
   CompactionLauncherRecord,
   Ref.Ref<ReadonlyMap<string, CompactionJobOutcome | "Failed">>
->()("@cf-slatedb/CompactionLauncherRecord") {}
+>()("@shaledb/CompactionLauncherRecord") {}
 
 /**
  * Provides a launcher that runs each job to completion in-process when it starts (with

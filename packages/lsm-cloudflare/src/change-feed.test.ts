@@ -5,7 +5,7 @@ import {
   pruneChangelog,
   SeqNum,
   Timestamp,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import { Arbitrary, Effect, Option, Result, Schema } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";

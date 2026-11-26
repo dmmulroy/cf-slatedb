@@ -4,18 +4,18 @@ import { dirname, join, relative, resolve, sep } from "node:path";
 import { Schema } from "effect";
 
 /** Package name prefix of every workspace in this repository. */
-const WORKSPACE_PACKAGE_NAME_PREFIX = "@cf-slatedb/";
+const WORKSPACE_PACKAGE_NAME_PREFIX = "@shaledb/";
 
 /** Package name of the pure LSM core, which must not import Cloudflare or Alchemy. */
-const LSM_CORE_PACKAGE_NAME = "@cf-slatedb/lsm-core";
+const LSM_CORE_PACKAGE_NAME = "@shaledb/lsm-core";
 
 /** Package name of the optional sharding package, which may use only the public library APIs. */
-const SHARDING_PACKAGE_NAME = "@cf-slatedb/sharding";
+const SHARDING_PACKAGE_NAME = "@shaledb/sharding";
 
 /** Libraries the sharding package may depend on, each through its public entrypoint only. */
 const SHARDING_ALLOWED_WORKSPACE_DEPENDENCIES = new Set([
-  "@cf-slatedb/lsm-core",
-  "@cf-slatedb/lsm-cloudflare",
+  "@shaledb/lsm-core",
+  "@shaledb/lsm-cloudflare",
 ]);
 
 /** Module specifiers the pure core must never import: Cloudflare runtime and Alchemy modules. */
@@ -123,9 +123,9 @@ const listSourceFiles = (directory: string): ReadonlyArray<string> =>
  *
  * - A workspace under `infra/` declares no `exports`, so no other workspace can import it.
  * - No workspace depends on a workspace under `infra/` or `tools/`.
- * - `@cf-slatedb/lsm-core` neither depends on nor imports a Cloudflare or Alchemy module.
- * - `@cf-slatedb/sharding` depends on no workspace other than `@cf-slatedb/lsm-core` and
- *   `@cf-slatedb/lsm-cloudflare`, and imports each only through its public entrypoint.
+ * - `@shaledb/lsm-core` neither depends on nor imports a Cloudflare or Alchemy module.
+ * - `@shaledb/sharding` depends on no workspace other than `@shaledb/lsm-core` and
+ *   `@shaledb/lsm-cloudflare`, and imports each only through its public entrypoint.
  * - No source file reaches outside its own workspace through a relative import.
  *
  * @returns One searchable sentence per violation; empty when the boundaries hold.
@@ -173,7 +173,7 @@ export const findWorkspaceBoundaryViolations = (repositoryRoot: string): Readonl
           violations.push(
             `Workspace boundary violation: ${workspace.directory}/package.json lists ` +
               `${dependencyName} in ${field}. The LSM core stays pure; move Cloudflare code to ` +
-              "@cf-slatedb/lsm-cloudflare.",
+              "@shaledb/lsm-cloudflare.",
           );
         }
         if (
@@ -184,7 +184,7 @@ export const findWorkspaceBoundaryViolations = (repositoryRoot: string): Readonl
           violations.push(
             `Workspace boundary violation: ${workspace.directory}/package.json lists ` +
               `${dependencyName} in ${field}. The sharding package may depend only on ` +
-              "@cf-slatedb/lsm-core and @cf-slatedb/lsm-cloudflare.",
+              "@shaledb/lsm-core and @shaledb/lsm-cloudflare.",
           );
         }
       }
@@ -212,7 +212,7 @@ export const findWorkspaceBoundaryViolations = (repositoryRoot: string): Readonl
         ) {
           violations.push(
             `Workspace boundary violation: ${sourcePath} imports "${specifier}". The LSM core ` +
-              "stays pure; move Cloudflare code to @cf-slatedb/lsm-cloudflare.",
+              "stays pure; move Cloudflare code to @shaledb/lsm-cloudflare.",
           );
         }
         if (
@@ -222,8 +222,8 @@ export const findWorkspaceBoundaryViolations = (repositoryRoot: string): Readonl
         ) {
           violations.push(
             `Workspace boundary violation: ${sourcePath} imports "${specifier}". The sharding ` +
-              "package uses only the public entrypoints of @cf-slatedb/lsm-core and " +
-              "@cf-slatedb/lsm-cloudflare.",
+              "package uses only the public entrypoints of @shaledb/lsm-core and " +
+              "@shaledb/lsm-cloudflare.",
           );
         }
       }

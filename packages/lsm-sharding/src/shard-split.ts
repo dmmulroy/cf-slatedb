@@ -1,9 +1,9 @@
-import type { DatabaseId } from "@cf-slatedb/lsm-core";
+import type { DatabaseId } from "@shaledb/lsm-core";
 import {
   DatabaseLifecycle,
   type DatabaseLifecycleError,
   type DatabaseLifecycleServices,
-} from "@cf-slatedb/lsm-cloudflare";
+} from "@shaledb/lsm-cloudflare";
 import { Context, Effect, Layer, Option } from "effect";
 
 import { ShardDirectory, type ShardDirectoryError } from "./shard-directory.ts";
@@ -40,9 +40,7 @@ export interface IShardSplit {
 }
 
 /** The contextual shard split. */
-export class ShardSplit extends Context.Service<ShardSplit, IShardSplit>()(
-  "@cf-slatedb/ShardSplit",
-) {}
+export class ShardSplit extends Context.Service<ShardSplit, IShardSplit>()("@shaledb/ShardSplit") {}
 
 /** Constructs the split over the contextual database lifecycle and shard directory. */
 export const makeShardSplit = Effect.gen(function* () {

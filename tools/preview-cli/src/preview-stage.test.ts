@@ -1,4 +1,4 @@
-import { DEFAULT_LSM_SETTINGS } from "@cf-slatedb/lsm-core";
+import { DEFAULT_LSM_SETTINGS } from "@shaledb/lsm-core";
 import { Effect, Option } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -15,21 +15,21 @@ import {
 } from "./preview-stage.ts";
 
 const outputs = {
-  apiUrl: "https://cfslatedb-dbapiworker-preview-1-abc.example.workers.dev",
-  shardsUrl: "https://cfslatedb-shardrouterworker-preview-1-abc.example.workers.dev",
-  gcUrl: "https://cfslatedb-gcworker-preview-1-abc.example.workers.dev",
-  blockServerWorkerName: "cfslatedb-blockserverworker-preview-1-abc",
-  probeUrl: "https://cfslatedb-telemetryprobeworker-abc.example.workers.dev",
+  apiUrl: "https://shaledb-dbapiworker-preview-1-abc.example.workers.dev",
+  shardsUrl: "https://shaledb-shardrouterworker-preview-1-abc.example.workers.dev",
+  gcUrl: "https://shaledb-gcworker-preview-1-abc.example.workers.dev",
+  blockServerWorkerName: "shaledb-blockserverworker-preview-1-abc",
+  probeUrl: "https://shaledb-telemetryprobeworker-abc.example.workers.dev",
 };
 
-// What `vp run @cf-slatedb/infra#state:read -r CfSlatedb/preview-1` prints: the task banner, then
+// What `vp run @shaledb/infra#state:read -r Shaledb/preview-1` prints: the task banner, then
 // the records as JSON.
 const stateRead = [
-  "~/infra/cf-slatedb$ alchemy state read --backend cloudflare -r CfSlatedb/preview-1 ⊘ cache disabled",
+  "~/infra/shaledb$ alchemy state read --backend cloudflare -r Shaledb/preview-1 ⊘ cache disabled",
   JSON.stringify(
     {
-      "CfSlatedb/preview-1/output": outputs,
-      "CfSlatedb/preview-1/LsmAccessToken": {
+      "Shaledb/preview-1/output": outputs,
+      "Shaledb/preview-1/LsmAccessToken": {
         resourceType: "Alchemy.Random",
         attr: { text: { __redacted__: "f".repeat(64) } },
       },
@@ -42,7 +42,7 @@ const stateRead = [
 describe("preview state", () => {
   it("reads a deployed stage's outputs and access token from `alchemy state read`", async () => {
     const parsed = await Effect.gen(function* () {
-      const records = yield* parseStateRead(stateRead, "CfSlatedb/preview-1");
+      const records = yield* parseStateRead(stateRead, "Shaledb/preview-1");
       return {
         outputs: yield* previewOutputs(records, "preview-1"),
         token: yield* previewSecret(records, "preview-1", "LsmAccessToken"),
@@ -60,11 +60,11 @@ describe("preview state", () => {
 
   it("treats a missing path as nothing deployed and anything else unreadable as an error", async () => {
     const missing = await parseStateRead(
-      "~/infra/cf-slatedb$ alchemy state read ...\nerror: CfSlatedb: path does not exist\n",
-      "CfSlatedb",
+      "~/infra/shaledb$ alchemy state read ...\nerror: Shaledb: path does not exist\n",
+      "Shaledb",
     ).pipe(Effect.runPromise);
     expect(missing.size).toBe(0);
-    const failure = await parseStateRead("error: unauthorized", "CfSlatedb").pipe(
+    const failure = await parseStateRead("error: unauthorized", "Shaledb").pipe(
       Effect.flip,
       Effect.runPromise,
     );
@@ -74,8 +74,8 @@ describe("preview state", () => {
   it("refuses an output record that is not this Stack's", async () => {
     const failure = await Effect.gen(function* () {
       const records = yield* parseStateRead(
-        JSON.stringify({ "CfSlatedb/preview-2/output": { apiUrl: 1 } }),
-        "CfSlatedb",
+        JSON.stringify({ "Shaledb/preview-2/output": { apiUrl: 1 } }),
+        "Shaledb",
       );
       return yield* Effect.flip(previewOutputs(records, "preview-2"));
     }).pipe(Effect.runPromise);
@@ -83,7 +83,7 @@ describe("preview state", () => {
   });
 
   it("prints a destroy command for Dillon that goes through the stage's vp task", () => {
-    expect(destroyCommand("preview-3")).toBe("vp run @cf-slatedb/infra#destroy:preview-3");
+    expect(destroyCommand("preview-3")).toBe("vp run @shaledb/infra#destroy:preview-3");
   });
 });
 
@@ -109,10 +109,10 @@ describe("deployEnvironment", () => {
   it("decides the Stack's variables from the flags alone, whatever the shell holds", () => {
     const shell = {
       PATH: "/bin",
-      CF_SLATEDB_LSM_SETTINGS: '{"gcMinAge":1}',
-      CF_SLATEDB_JURISDICTION: "eu",
-      CF_SLATEDB_TRACE_SAMPLE_RATE: "0.5",
-      CF_SLATEDB_BUCKET_LOCATION: "weur",
+      SHALEDB_LSM_SETTINGS: '{"gcMinAge":1}',
+      SHALEDB_JURISDICTION: "eu",
+      SHALEDB_TRACE_SAMPLE_RATE: "0.5",
+      SHALEDB_BUCKET_LOCATION: "weur",
     };
     expect(
       deployEnvironment(shell, {
@@ -123,7 +123,7 @@ describe("deployEnvironment", () => {
       }),
     ).toEqual({
       PATH: "/bin",
-      CF_SLATEDB_JURISDICTION: "none",
+      SHALEDB_JURISDICTION: "none",
     });
     expect(
       deployEnvironment(shell, {
@@ -134,9 +134,9 @@ describe("deployEnvironment", () => {
       }),
     ).toEqual({
       PATH: "/bin",
-      CF_SLATEDB_LSM_SETTINGS:
+      SHALEDB_LSM_SETTINGS:
         '{"gcMinAge":10000,"compactorPollInterval":1000,"transactionRetentionMs":5000}',
-      CF_SLATEDB_JURISDICTION: "fedramp",
+      SHALEDB_JURISDICTION: "fedramp",
     });
   });
 });
@@ -152,12 +152,12 @@ describe("deployEnvironment settings", () => {
         traceSampleRate: Option.some(0.25),
       },
     );
-    expect(JSON.parse(environment["CF_SLATEDB_LSM_SETTINGS"] ?? "{}")).toEqual({
+    expect(JSON.parse(environment["SHALEDB_LSM_SETTINGS"] ?? "{}")).toEqual({
       ...PREVIEW_DEV_TIMINGS,
       l0SstSize: 268_435_456,
       gcMinAge: 20_000,
     });
-    expect(environment["CF_SLATEDB_TRACE_SAMPLE_RATE"]).toBe("0.25");
+    expect(environment["SHALEDB_TRACE_SAMPLE_RATE"]).toBe("0.25");
   });
 });
 
@@ -169,27 +169,27 @@ describe("previewWorkerBindings", () => {
     const complete = JSON.stringify(DEFAULT_LSM_SETTINGS);
     const records = new Map<string, unknown>([
       [
-        "CfSlatedb/preview-1/DbApiWorker",
+        "Shaledb/preview-1/DbApiWorker",
         {
           resourceType: "Cloudflare.Worker",
           props: {
             env: {
-              CF_SLATEDB_LSM_SETTINGS: bound(complete),
-              CF_SLATEDB_JURISDICTION: bound("none"),
-              CF_SLATEDB_ACCESS_TOKEN: bound("secret"),
+              SHALEDB_LSM_SETTINGS: bound(complete),
+              SHALEDB_JURISDICTION: bound("none"),
+              SHALEDB_ACCESS_TOKEN: bound("secret"),
             },
           },
         },
       ],
       [
-        "CfSlatedb/preview-1/BlockServerWorker",
+        "Shaledb/preview-1/BlockServerWorker",
         {
           resourceType: "Cloudflare.Worker",
-          props: { env: { CF_SLATEDB_JURISDICTION: bound("eu") } },
+          props: { env: { SHALEDB_JURISDICTION: bound("eu") } },
         },
       ],
-      ["CfSlatedb/preview-1/CpuTailWorker", { resourceType: "Cloudflare.Worker", props: {} }],
-      ["CfSlatedb/preview-1/LsmBucket", { resourceType: "Cloudflare.R2.Bucket", props: {} }],
+      ["Shaledb/preview-1/CpuTailWorker", { resourceType: "Cloudflare.Worker", props: {} }],
+      ["Shaledb/preview-1/LsmBucket", { resourceType: "Cloudflare.R2.Bucket", props: {} }],
     ]);
     expect(previewWorkerBindings(records, "preview-1")).toEqual([
       { worker: "BlockServerWorker", lsmSettings: Option.none(), jurisdiction: Option.some("eu") },

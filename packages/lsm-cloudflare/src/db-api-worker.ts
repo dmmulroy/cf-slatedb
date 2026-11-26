@@ -142,6 +142,6 @@ export const dbApiWorkerLayer = <R = never>(options: DbApiWorkerOptions<R>) =>
       // lifecycle and the compaction endpoint call it too.
       Effect.provide(compactionTriggerLayer.pipe(Layer.provideMerge(compactorClientLayer))),
       Effect.provide(Layer.mergeAll(objectStoreLayer, lsmConfigurationLayer)),
-      Effect.provide(withLsmTracePolicy(options.telemetry("cf-slatedb-api"))),
+      Effect.provide(withLsmTracePolicy(options.telemetry("shaledb-api"))),
     ),
   );

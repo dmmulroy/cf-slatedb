@@ -7,7 +7,7 @@ import {
   type Timestamp,
   type WriteBatch,
   type WriteReceipt,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import {
   DbClient,
   type DbClientReadError,
@@ -15,7 +15,7 @@ import {
   type DbWriteError,
   type ReadOptions,
   type ScanReadOptions,
-} from "@cf-slatedb/lsm-cloudflare";
+} from "@shaledb/lsm-cloudflare";
 import { Bytes, Clock, Context, Effect, Layer, Option, Ref, Result, Schema, Stream } from "effect";
 
 import { ShardDirectory, type ShardDirectoryError } from "./shard-directory.ts";
@@ -89,7 +89,7 @@ export interface IShardRouter {
 
 /** The contextual shard router. */
 export class ShardRouter extends Context.Service<ShardRouter, IShardRouter>()(
-  "@cf-slatedb/ShardRouter",
+  "@shaledb/ShardRouter",
 ) {}
 
 /** Failures that mean the cached map is stale (or a split is still publishing). */

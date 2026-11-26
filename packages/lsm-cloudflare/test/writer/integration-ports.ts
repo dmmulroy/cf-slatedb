@@ -1,4 +1,4 @@
-import { DEFAULT_LSM_SETTINGS } from "@cf-slatedb/lsm-core";
+import { DEFAULT_LSM_SETTINGS } from "@shaledb/lsm-core";
 import { Effect, Option } from "effect";
 
 import type { LsmWorkerSettingsSource } from "../../src/lsm-worker-settings.ts";

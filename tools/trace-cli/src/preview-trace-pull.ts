@@ -155,7 +155,7 @@ export const pullPreviewTraces = (
     const fetchPage = (from: Option.Option<string>) =>
       Effect.gen(function* () {
         const url = new URL("/v1/traces/batches", collector.url);
-        url.searchParams.set("limit", "100");
+        url.searchParams.set("limit", "500");
         if (Option.isSome(from)) url.searchParams.set("after", from.value);
         const response = yield* client
           .execute(

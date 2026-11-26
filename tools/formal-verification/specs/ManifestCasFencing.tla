@@ -1,6 +1,6 @@
 ---------------------------- MODULE ManifestCasFencing ----------------------------
 (***************************************************************************)
-(* Manifest CAS and epoch fencing for one cf-slatedb database.             *)
+(* Manifest CAS and epoch fencing for one shaledb database.             *)
 (*                                                                         *)
 (* Code this models (packages/):                                           *)
 (*  - lsm-cloudflare/src/manifest-store.ts  ManifestStore.update: load the *)

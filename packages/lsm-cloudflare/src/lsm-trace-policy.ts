@@ -6,10 +6,10 @@ import { Config, Context, Effect, Layer, Option, Schema, Tracer } from "effect";
  * Name of the binding that carries the Stack's trace sample rate (0 to 1) to every Worker. Bound
  * with the other worker settings on every deploy (D55, D63).
  */
-export const LSM_TRACE_SAMPLE_RATE_SETTING = "CF_SLATEDB_TRACE_SAMPLE_RATE";
+export const LSM_TRACE_SAMPLE_RATE_SETTING = "SHALEDB_TRACE_SAMPLE_RATE";
 
 /**
- * First segments of the span attributes cf-slatedb's own code sets (`database.id`, `sst.id`,
+ * First segments of the span attributes shaledb's own code sets (`database.id`, `sst.id`,
  * `manifest.id`, `object.size`, ...). Each holds only safe identifiers, sizes, counts, and
  * outcomes: never a key, a value, or a secret (`AGENTS.md`).
  */
@@ -100,13 +100,13 @@ export const traceIdSampled = (traceId: string, sampleRate: number): boolean => 
  * **Details**
  *
  * - **Head sampling by trace id.** A span that starts a trace here (no parent, an explicit root, or
- *   a parent from another process: a caller's or another cf-slatedb Worker's `traceparent`) is
+ *   a parent from another process: a caller's or another shaledb Worker's `traceparent`) is
  *   kept when {@link traceIdSampled} says so for its trace id. Every hop of one trace, the API
  *   Worker and the Durable Objects and Workers it calls, decides the same, so a kept trace stays
  *   whole. A caller's `traceparent` joins our spans to its trace but cannot force them to be kept:
  *   instrumented clients send the sampled flag on every request, which would keep every trace.
  *   Spans under a local parent inherit its decision, as Effect does.
- * - **Redaction at the source.** Every attribute set on a span, by cf-slatedb or by the HTTP
+ * - **Redaction at the source.** Every attribute set on a span, by shaledb or by the HTTP
  *   middleware, is checked with {@link isExportedSpanAttribute}; anything else is never recorded.
  */
 export const lsmPolicyTracer = (inner: Tracer.Tracer, policy: LsmTracePolicy): Tracer.Tracer =>
@@ -147,7 +147,7 @@ export const lsmTraceSampleRate = Config.schema(
 /**
  * Applies the trace policy to a Worker's telemetry Layer (D63): the Layer still binds the exporters'
  * destinations, and each event's tracer becomes {@link lsmPolicyTracer} over them, with the bound
- * sample rate. Every cf-slatedb Worker provides its telemetry through this.
+ * sample rate. Every shaledb Worker provides its telemetry through this.
  *
  * **Details**
  *

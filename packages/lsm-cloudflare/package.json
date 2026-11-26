@@ -1,5 +1,5 @@
 {
-  "name": "@cf-slatedb/lsm-cloudflare",
+  "name": "@shaledb/lsm-cloudflare",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -11,7 +11,7 @@
   },
   "dependencies": {
     "@alchemy.run/cloudflare": "catalog:",
-    "@cf-slatedb/lsm-core": "workspace:*",
+    "@shaledb/lsm-core": "workspace:*",
     "alchemy": "catalog:",
     "effect": "catalog:"
   },

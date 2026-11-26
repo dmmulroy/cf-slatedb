@@ -1,6 +1,6 @@
-# cf-slatedb hand-off
+# shaledb hand-off
 
-This document lets a new agent, on any machine, pick up cf-slatedb and finish it. Read it in full
+This document lets a new agent, on any machine, pick up shaledb and finish it. Read it in full
 before you change anything. The prompt to start the agent is at the end.
 
 > **Status (2026-11-25): every item under "Remaining work" is done.** The final hand-off — what was
@@ -10,7 +10,7 @@ before you change anything. The prompt to start the agent is at the end.
 > "State at hand-off" section below describes the state before that work. **The next step — a
 > production v1 — is planned in [`docs/handoff-v1.md`](handoff-v1.md).**
 
-## What cf-slatedb is
+## What shaledb is
 
 A SlateDB-style LSM key-value store on Cloudflare: R2 for SSTs and manifests, a writer Durable Object
 whose SQLite table is both the WAL and the memtable, reads in the caller's isolate behind an L1
@@ -47,13 +47,13 @@ Layout:
 packages/lsm-core/        pure: ids, rows, codecs, merge, manifest + edits, scheduler, GC plans, transactions
 packages/lsm-cloudflare/  ObjectStore (R2), manifests, writer DO, reader, BlockServer, compaction, GC, lifecycle, DbClient, public /v1 API
 packages/lsm-sharding/    optional range sharding over public APIs only
-infra/cf-slatedb/         the Alchemy Stack (alchemy.run.ts); no exports
+infra/shaledb/         the Alchemy Stack (alchemy.run.ts); no exports
 tools/trace-cli/          local OTLP receiver + list/show/tail/grep/stats/diff/assert
 tools/scenario-cli/       end-to-end scenarios with trace assertions against a running Stack
 tools/formal-verification/  TLC runner (`vp run verify`), specs in specs/
 .agents/skills/verify-*   one project-local verify skill per formal check (bounds, covered code, sync commit)
 .agents/skills/{create,maintain}-formal-verification-skill, statechart   pstack skills (open by path)
-scripts/allowlist-cf-slatedb-deploys.sh   adds this Stack to the pi deployment guard (Dillon runs it)
+scripts/allowlist-shaledb-deploys.sh   adds this Stack to the pi deployment guard (Dillon runs it)
 ```
 
 ## Set up on a new machine
@@ -76,7 +76,7 @@ scripts/allowlist-cf-slatedb-deploys.sh   adds this Stack to the pi deployment g
    The account is Dillon's personal account `99459fce09d9a9eec83befd957af4ec5`. Never commit
    credentials; `.env*` and `.alchemy/` are gitignored.
 8. If this machine runs pi with the Cloudflare deployment guard, Dillon runs
-   `scripts/allowlist-cf-slatedb-deploys.sh` once. It allowlists stages `dev`, `preview-1`,
+   `scripts/allowlist-shaledb-deploys.sh` once. It allowlists stages `dev`, `preview-1`,
    `preview-2`, `preview-3` and makes the repository exempt from the guard, except that
    `alchemy destroy` is always blocked. Never edit the guard's policy file yourself.
 
@@ -103,7 +103,7 @@ Do these in order. Each ends with `vp run ready` and `vp run verify` passing, a 
 
 ### 1. Portable Alchemy state for previews
 
-The Stack uses `localState()` (`infra/cf-slatedb/alchemy.run.ts`), so a preview deployed from one
+The Stack uses `localState()` (`infra/shaledb/alchemy.run.ts`), so a preview deployed from one
 machine can't be managed from another. Use `Cloudflare.state()` for preview stages, as
 `../iac` does, and keep `localState()` for the local `dev` stage. Record it as a design decision.
 
@@ -175,7 +175,7 @@ left. Give Dillon the commands to destroy each preview stage.
 ## Prompt for the new agent
 
 ```text
-You're continuing cf-slatedb, a SlateDB-style LSM key-value store on Cloudflare R2 and Durable
+You're continuing shaledb, a SlateDB-style LSM key-value store on Cloudflare R2 and Durable
 Objects, written with Effect 4 and Alchemy v2. Read docs/handoff.md in full first, then AGENTS.md,
 docs/implementation-brief.md, and the design at docs/show-me-r2-lsm-design.html. Set up the machine
 per "Set up on a new machine" and confirm `vp run ready` passes before changing anything. Then do

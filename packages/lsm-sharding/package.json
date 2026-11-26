@@ -1,5 +1,5 @@
 {
-  "name": "@cf-slatedb/sharding",
+  "name": "@shaledb/sharding",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -11,8 +11,8 @@
   },
   "dependencies": {
     "@alchemy.run/cloudflare": "catalog:",
-    "@cf-slatedb/lsm-cloudflare": "workspace:*",
-    "@cf-slatedb/lsm-core": "workspace:*",
+    "@shaledb/lsm-cloudflare": "workspace:*",
+    "@shaledb/lsm-core": "workspace:*",
     "alchemy": "catalog:",
     "effect": "catalog:"
   },

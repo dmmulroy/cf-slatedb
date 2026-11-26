@@ -93,6 +93,6 @@ export const compactorWorkerLayer = <R = never>(options: CompactorWorkerOptions<
       ),
       Effect.provide(compactionExecutorLayerWithoutDependencies),
       Effect.provide(Layer.mergeAll(objectStoreLayer, lsmConfigurationLayer)),
-      Effect.provide(withLsmTracePolicy(options.telemetry("cf-slatedb-compactor"))),
+      Effect.provide(withLsmTracePolicy(options.telemetry("shaledb-compactor"))),
     ),
   );

@@ -10,7 +10,7 @@ import {
   planCompactions,
   SortedRunId,
   type SstHandle,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import { Arbitrary, Bytes, Effect, Layer, Option, Result, Schema, Stream } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";

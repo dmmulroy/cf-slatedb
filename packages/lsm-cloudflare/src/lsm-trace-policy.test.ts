@@ -154,7 +154,7 @@ describe("lsmPolicyTracer (D63)", () => {
     await Effect.gen(function* () {
       const otlp = yield* OtlpTracer.make({
         url: "http://collector.test/v1/traces",
-        resource: { serviceName: "cf-slatedb-test" },
+        resource: { serviceName: "shaledb-test" },
       });
       const policy = lsmPolicyTracer(otlp, { sampleRate: 1 });
       yield* Effect.annotateCurrentSpan({

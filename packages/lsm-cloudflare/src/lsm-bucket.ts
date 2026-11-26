@@ -19,7 +19,7 @@ export type LsmBucketLocation = typeof LsmBucketLocation.Type;
  * `auto` to let R2 place it (near the deploy that creates it). Fixed per installation: R2 cannot
  * move a bucket, so a change replaces it.
  */
-export const LSM_BUCKET_LOCATION_SETTING = "CF_SLATEDB_BUCKET_LOCATION";
+export const LSM_BUCKET_LOCATION_SETTING = "SHALEDB_BUCKET_LOCATION";
 
 const LsmBucketLocationSetting = Schema.Literals(["auto", ...LsmBucketLocation.literals]);
 
@@ -45,7 +45,7 @@ export const LSM_PRODUCTION_STAGE = "production";
  *
  * **Details**
  *
- * Production would use the name `cf-slatedb` and be retained; every other stage gets a generated
+ * Production would use the name `shaledb` and be retained; every other stage gets a generated
  * name and a bucket that destroying the stage empties and deletes. It is created in the Stack's jurisdiction (`lsmJurisdiction`), if any. Under
  * `alchemy dev` it is Alchemy's local R2 simulator.
  */
@@ -55,7 +55,7 @@ export const LsmBucket = Effect.gen(function* () {
   const jurisdiction = yield* lsmJurisdiction;
   const location = yield* lsmBucketLocation;
   return yield* Cloudflare.R2.Bucket("LsmBucket", {
-    ...(production ? { name: "cf-slatedb" } : {}),
+    ...(production ? { name: "shaledb" } : {}),
     // The Stack's jurisdiction (D49). Changing it replaces the bucket: it is fixed per installation.
     ...(Option.isSome(jurisdiction) ? { jurisdiction: jurisdiction.value } : {}),
     // Where an unrestricted Stack's writers are (D56). Changing it replaces the bucket.
@@ -78,7 +78,7 @@ export const LsmBucket = Effect.gen(function* () {
 export class LsmBucketClient extends Context.Service<
   LsmBucketClient,
   Cloudflare.R2.ReadWriteBucketClient
->()("@cf-slatedb/LsmBucketClient") {}
+>()("@shaledb/LsmBucketClient") {}
 
 /**
  * Binds {@link LsmBucket} read-write to the Worker being initialized and provides its client.

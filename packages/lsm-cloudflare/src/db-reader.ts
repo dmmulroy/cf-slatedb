@@ -23,7 +23,7 @@ import {
   Timestamp,
   decodeDataBlock,
   decodeSstMeta,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Bytes, Clock, Context, Data, Effect, Layer, Option, Schema, Stream } from "effect";
 
@@ -141,7 +141,7 @@ export interface IDbReader {
 }
 
 /** The contextual database reader. */
-export class DbReader extends Context.Service<DbReader, IDbReader>()("@cf-slatedb/DbReader") {}
+export class DbReader extends Context.Service<DbReader, IDbReader>()("@shaledb/DbReader") {}
 
 /** Every SST a manifest references, grouped by level, newest level first: each L0 SST, then each run. */
 const levels = (manifest: Manifest): ReadonlyArray<ReadonlyArray<SstHandle>> => [

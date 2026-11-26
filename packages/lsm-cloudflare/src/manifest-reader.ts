@@ -4,7 +4,7 @@ import {
   MANIFEST_FORMAT_VERSION,
   ManifestId,
   ManifestJson,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Context, Data, Effect, Layer, Option, Result, Schema } from "effect";
 
@@ -96,7 +96,7 @@ export interface IManifestReader {
 
 /** The contextual manifest reader. */
 export class ManifestReader extends Context.Service<ManifestReader, IManifestReader>()(
-  "@cf-slatedb/ManifestReader",
+  "@shaledb/ManifestReader",
 ) {}
 
 const decodeManifestJson = Schema.decodeEffect(ManifestJson);
@@ -137,7 +137,7 @@ export const decodeStoredManifest = (
               databaseId,
               manifestId: Option.some(manifestId),
               reason: "StoredManifestInvalid",
-              message: `Manifest ${manifestId} of database ${databaseId} was written by a newer cf-slatedb (format ${manifest.formatVersion}; this version reads up to format ${MANIFEST_FORMAT_VERSION}), so this version neither reads nor writes it. Deploy that version or a later one.`,
+              message: `Manifest ${manifestId} of database ${databaseId} was written by a newer shaledb (format ${manifest.formatVersion}; this version reads up to format ${MANIFEST_FORMAT_VERSION}), so this version neither reads nor writes it. Deploy that version or a later one.`,
             }),
           )
         : manifest.databaseId === databaseId

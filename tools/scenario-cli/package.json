@@ -1,5 +1,5 @@
 {
-  "name": "@cf-slatedb/tools-scenario-cli",
+  "name": "@shaledb/tools-scenario-cli",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -7,10 +7,10 @@
     "test": "vp test run"
   },
   "dependencies": {
-    "@cf-slatedb/lsm-cloudflare": "workspace:*",
-    "@cf-slatedb/lsm-core": "workspace:*",
-    "@cf-slatedb/sharding": "workspace:*",
     "@effect/platform-node": "catalog:",
+    "@shaledb/lsm-cloudflare": "workspace:*",
+    "@shaledb/lsm-core": "workspace:*",
+    "@shaledb/sharding": "workspace:*",
     "effect": "catalog:"
   },
   "devDependencies": {

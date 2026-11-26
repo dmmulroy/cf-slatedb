@@ -1,4 +1,4 @@
-import { DatabaseId, keyRangeContains } from "@cf-slatedb/lsm-core";
+import { DatabaseId, keyRangeContains } from "@shaledb/lsm-core";
 import { Arbitrary, Bytes, Effect, Option, Result, Schema } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 

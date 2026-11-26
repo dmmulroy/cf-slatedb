@@ -5,11 +5,11 @@ or deviates from it, with the reason. Newest last.
 
 ## D1. Repository layout and package names
 
-- Libraries: `@cf-slatedb/lsm-core` (`packages/lsm-core`), `@cf-slatedb/lsm-cloudflare`
-  (`packages/lsm-cloudflare`), and `@cf-slatedb/sharding` (`packages/lsm-sharding`, named as in
-  design §7 "the optional `@cf-slatedb/sharding` package").
-- Stack: `@cf-slatedb/infra` (`infra/cf-slatedb`), no `exports`.
-- Tools: `@cf-slatedb/tools-*`.
+- Libraries: `@shaledb/lsm-core` (`packages/lsm-core`), `@shaledb/lsm-cloudflare`
+  (`packages/lsm-cloudflare`), and `@shaledb/sharding` (`packages/lsm-sharding`, named as in
+  design §7 "the optional `@shaledb/sharding` package").
+- Stack: `@shaledb/infra` (`infra/shaledb`), no `exports`.
+- Tools: `@shaledb/tools-*`.
 
 Reason: the brief's layout (design §10) with iac's naming conventions. iac's `shared-infra`
 distinction does not apply here: the libraries are the product, and there is one Stack.
@@ -18,8 +18,8 @@ distinction does not apply here: the libraries are the product, and there is one
 
 iac's boundary test is adapted rather than copied: in addition to "no `exports` under `infra/`" and
 "no relative import leaves its workspace", it enforces the two rules that are specific to this
-design: `@cf-slatedb/lsm-core` imports no Cloudflare or Alchemy module, and
-`@cf-slatedb/sharding` uses only the public entrypoints of the two libraries (design §12: "The
+design: `@shaledb/lsm-core` imports no Cloudflare or Alchemy module, and
+`@shaledb/sharding` uses only the public entrypoints of the two libraries (design §12: "The
 sharding package only calls public APIs").
 
 ## D3. Formatter ignores the design page
@@ -78,7 +78,7 @@ Remove the workaround when an Alchemy release flushes before settling.
 
 ## D6. Local state store for the Stack
 
-`infra/cf-slatedb/alchemy.run.ts` uses `localState()` rather than iac's `Cloudflare.state()`,
+`infra/shaledb/alchemy.run.ts` uses `localState()` rather than iac's `Cloudflare.state()`,
 because no live stage exists and `Cloudflare.state()` needs account credentials. Switching to
 `Cloudflare.state()` is part of preparing a live stage, which needs approval.
 
@@ -114,7 +114,7 @@ the 8-byte hash pair per distinct key, not the keys, so a 64 MiB SST's filter ne
 
 ## D10. TTL is enforced on reads
 
-SlateDB returns expired rows from reads and relies on compaction to delete them. cf-slatedb hides
+SlateDB returns expired rows from reads and relies on compaction to delete them. shaledb hides
 them: an expired value reads as a delete and an expired merge operand is skipped
 (`resolveVisibleRow`). Compaction applies SlateDB's rules (expired value → tombstone, expired operand
 dropped; `retainKeyVersions`), so reads before and after compaction agree (property-tested).
@@ -236,8 +236,8 @@ adding an internal error is a type error until it is classified, which is the gu
 
 ## D26. Durable Object and Worker classes live in the library
 
-`WriterServer` and `DbApiWorker` are defined in `@cf-slatedb/lsm-cloudflare` (as Alchemy class +
-Layer), so the library's workerd tests can run them. `infra/cf-slatedb` only composes them into the
+`WriterServer` and `DbApiWorker` are defined in `@shaledb/lsm-cloudflare` (as Alchemy class +
+Layer), so the library's workerd tests can run them. `infra/shaledb` only composes them into the
 Stack with a bundle-entry module (`src/db-api-worker-entry.ts`), passed as `main`.
 
 ## D27. The SST metadata URL carries its range
@@ -400,7 +400,7 @@ failed; D48.) The core keeps no map
 versions. Batches are atomic only within a database, so a batch spanning shards is refused with
 `CrossShardBatchError`.
 
-The package uses only `@cf-slatedb/lsm-cloudflare`'s public entrypoint. `dbServicesLayer` gives any
+The package uses only `@shaledb/lsm-cloudflare`'s public entrypoint. `dbServicesLayer` gives any
 Worker in the Stack `DbClient` and `DatabaseLifecycle` over cross-script bindings; the example
 `ShardRouterWorker` (in the Stack, port 1341 under `vp run dev`) hosts the directories and serves a
 small sharded API.
@@ -444,8 +444,8 @@ behind retention gets `ChangelogUnavailable` (`Expired`) instead of a silent gap
 
 ## D43. Live stages keep Alchemy state in Cloudflare; local stages keep it on the machine
 
-`infra/cf-slatedb/alchemy.run.ts` selects its state Layer from the stage (`cfSlatedbStateLayer` in
-`infra/cf-slatedb/src/cf-slatedb-stage.ts`). Local stages (`dev`, `test`, `local`, and their `-*`
+`infra/shaledb/alchemy.run.ts` selects its state Layer from the stage (`shaledbStateLayer` in
+`infra/shaledb/src/shaledb-stage.ts`). Local stages (`dev`, `test`, `local`, and their `-*`
 variants, the same rule the telemetry flush policy uses: `isLocalLsmStage`) use `localState()`, so
 `vp run dev` and the workerd tests never contact Cloudflare. Every live stage (`preview-1`,
 `preview-2`, `preview-3`, and `production` should it ever be approved) uses `Cloudflare.state()`, as
@@ -455,7 +455,7 @@ Dillon for destruction from another.
 The store is pinned to Dillon's account (`accountId: 99459fce09d9a9eec83befd957af4ec5`), so a login
 that reaches several accounts can never read or write this Stack's state elsewhere. It uses the
 account's default `alchemy-state-store` Worker rather than a dedicated one: the Stack name
-(`CfSlatedb`) and stage already key its records apart from other projects', and a second store would
+(`Shaledb`) and stage already key its records apart from other projects', and a second store would
 add a second Worker and secret pair to the account for no isolation gain.
 
 ## D44. Live stages gate their public Workers with a per-stage access token
@@ -465,7 +465,7 @@ public `workers.dev` URLs, and the design leaves authorization to callers ("Call
 to the database before they fetch"). An ungated preview would be a public, writable database API.
 So every live stage generates one access token (`LsmAccessToken`, an Alchemy `Random` of 256 bits,
 created once and kept in the stage's state, so it survives redeploys and every machine reads the
-same value) and binds it to those Workers as a secret (`CF_SLATEDB_ACCESS_TOKEN`).
+same value) and binds it to those Workers as a secret (`SHALEDB_ACCESS_TOKEN`).
 `lsmAccessGateForStage` (`lsm-access-gate.ts`) wraps each `fetch` handler: a request without
 `Authorization: Bearer <token>` gets `401` with `WWW-Authenticate: Bearer` and the public error
 envelope (`UnauthenticatedPublicError`: `code: "Unauthenticated"`, `operation: "routeRequest"`,
@@ -483,23 +483,23 @@ an operator or the scenario CLI can collect a database on demand; locally it sta
 ## D45. The preview CLI drives Alchemy through vp tasks and reads outputs from state
 
 `tools/preview-cli` never calls the Alchemy CLI itself. `deploy <stage>` runs
-`vp run @cf-slatedb/infra#deploy:<stage>` (one explicit task per approved stage, so no stage name is
+`vp run @shaledb/infra#deploy:<stage>` (one explicit task per approved stage, so no stage name is
 ever interpolated into a deploy command) with the task's log on stderr, then reads the outputs back.
 `status`, `url`, and `token` read the Cloudflare state store through the read-only
-`@cf-slatedb/infra#state:read` task (`alchemy state read --backend cloudflare -r CfSlatedb[/<stage>]`)
-and parse the Stack output record (`CfSlatedb/<stage>/output`) and the token record; nothing is kept
+`@shaledb/infra#state:read` task (`alchemy state read --backend cloudflare -r Shaledb[/<stage>]`)
+and parse the Stack output record (`Shaledb/<stage>/output`) and the token record; nothing is kept
 on the local machine, so they work wherever the account's Alchemy login does.
 
 A preview's engine settings are the production defaults. `deploy --dev-timings` binds `vp run dev`'s
-short GC and compactor timings (`CF_SLATEDB_LSM_SETTINGS`); the CLI drops any value of that variable
+short GC and compactor timings (`SHALEDB_LSM_SETTINGS`); the CLI drops any value of that variable
 inherited from the shell, so only the flag decides, and a later deploy without the flag restores the
-defaults. `destroy-command <stage>` prints `vp run @cf-slatedb/infra#destroy:<stage>` for Dillon;
+defaults. `destroy-command <stage>` prints `vp run @shaledb/infra#destroy:<stage>` for Dillon;
 the deployment guard blocks agents from running `alchemy destroy`.
 
 ## D46. Live stages send spans to their own TraceCollector Worker; the trace CLI pulls them
 
 Deployed Workers cannot reach the trace CLI's `127.0.0.1:4318`. Every live stage therefore gets a
-`TraceCollectorWorker` (`infra/cf-slatedb/src/trace-collector-worker.ts`), and only live stages do:
+`TraceCollectorWorker` (`infra/shaledb/src/trace-collector-worker.ts`), and only live stages do:
 
 - **Receiving.** `POST /v1/traces` stores each OTLP/HTTP export as received (JSON or protobuf, with
   its content type) in the stage's own `TraceBucket` under `traces/<arrival ms, 15 digits>-<uuid>`,
@@ -519,7 +519,7 @@ Deployed Workers cannot reach the trace CLI's `127.0.0.1:4318`. Every live stage
   never mixes with database objects, GC never sees it, and removing a preview's traces cannot touch
   its data. It is generated-name and not retained, like every preview resource.
 - **Wiring.** Each Worker layer takes an `LsmWorkerTelemetry` factory (a `service.name` → telemetry
-  Layer). Tests pass `lsmOtlpTelemetry(url)`; the Stack passes `cfSlatedbTelemetry`, which on live
+  Layer). Tests pass `lsmOtlpTelemetry(url)`; the Stack passes `shaledbTelemetry`, which on live
   stages binds the collector's URL and token onto the Worker through `Telemetry.layerOtlp`. It
   reaches the collector through `Cloudflare.Worker.ref(TraceCollectorWorker)`, not by yielding the
   class: a same-program ref is bound to the declared Worker (the collector still deploys first), and
@@ -541,7 +541,7 @@ With the `global_fetch_strictly_public` compatibility flag the request goes out 
 every span arrives (probe: 10 of 10 complete traces; API: complete Worker → writer trees).
 
 `lsmWorkerCompatibility` (`lsm-stage.ts`) adds the flag on live stages only, for every Worker that
-exports spans. Calls between cf-slatedb's Workers use service bindings and Durable Object stubs,
+exports spans. Calls between shaledb's Workers use service bindings and Durable Object stubs,
 which the flag does not affect. Local stages leave it off, because their spans go to `127.0.0.1`,
 which a strictly public `fetch()` cannot reach.
 
@@ -551,7 +551,7 @@ which a strictly public `fetch()` cannot reach.
 
 Design §12 asks for flush CPU per MB and rows/s per writer, but a Worker cannot read its own CPU
 time (its clock advances only across I/O). Live stages therefore declare `CpuTailWorker`
-(`infra/cf-slatedb/src/cpu-tail-worker.ts`), a plain module Worker with a `tail()` handler — Alchemy's
+(`infra/shaledb/src/cpu-tail-worker.ts`), a plain module Worker with a `tail()` handler — Alchemy's
 Effect-native Workers cannot export one — attached as a tail consumer to the API Worker (writer
 Durable Objects) and the compactor Worker through a new `tailConsumers` option
 (`LsmWorkerTailConsumers`; `noLsmTailConsumers` locally and in tests). It stores one record per
@@ -568,7 +568,7 @@ so every write arriving early in a split failed. The window is now 30 seconds (e
 ## D49. Data residency is per Stack; the per-database option is gone
 
 Dillon chose per-Stack residency (open question 3). One jurisdiction — `eu`, `fedramp`, or none —
-applies to a whole installation: `CF_SLATEDB_JURISDICTION` in the deploy's environment
+applies to a whole installation: `SHALEDB_JURISDICTION` in the deploy's environment
 (`preview-cli deploy <stage> --jurisdiction eu|fedramp|none`), read with `Config` as
 `lsmJurisdiction` (`lsm-jurisdiction.ts`), so every Worker that reads it at plan time gets it bound and
 reads the same value at runtime. A value other than `eu` or `fedramp` stops the Worker. It is applied
@@ -719,25 +719,25 @@ SSTs; restoring the defect, or not blocking the source, fails the test.
 
 Alchemy binds a `Config` value read during a Worker's init as a `secret_text`, and Cloudflare keeps a
 script's secrets across uploads. So when a deploy _stops_ setting a value, nothing replaces it: on
-`preview-1`, `CF_SLATEDB_LSM_SETTINGS` from a `--dev-timings` deploy stayed bound through the next
+`preview-1`, `SHALEDB_LSM_SETTINGS` from a `--dev-timings` deploy stayed bound through the next
 deploys without the flag (found by reading the Workers' bindings in the state store). For the
 engine settings that only meant dev GC and compactor timings lingered; for the jurisdiction it would
 mean Workers still addressing EU Durable Objects after a Stack moved out of the EU.
 
-So the preview CLI always sets both explicitly (`deployEnvironment`): `CF_SLATEDB_LSM_SETTINGS` is
-`{}` (no overrides) unless `--dev-timings`, and `CF_SLATEDB_JURISDICTION` is `eu`, `fedramp`, or the
+So the preview CLI always sets both explicitly (`deployEnvironment`): `SHALEDB_LSM_SETTINGS` is
+`{}` (no overrides) unless `--dev-timings`, and `SHALEDB_JURISDICTION` is `eu`, `fedramp`, or the
 new value `none`, which `lsmJurisdiction` reads as no restriction. Verified on `preview-1`: every
 Worker's bindings now hold `{}` and `none`. A future production deploy task must do the same.
 
 ## D55. The Stack owns its configuration and binds every Worker its complete settings
 
 Supersedes D54's mechanism. D54 patched one deploy path: `preview-cli` always passed
-`CF_SLATEDB_LSM_SETTINGS` and `CF_SLATEDB_JURISDICTION`, so the values Alchemy's `Config`
+`SHALEDB_LSM_SETTINGS` and `SHALEDB_JURISDICTION`, so the values Alchemy's `Config`
 interception binds (and Cloudflare keeps across uploads) were overwritten. Any other path — a manual
 `vp run …#deploy:*`, a future production task — still left whatever an earlier deploy bound, and
 three Workers (`BlockServer`, the probe, the trace collector) never had the settings bound at all.
 
-Now one typed configuration, `CfSlatedbStackConfig` (`infra/cf-slatedb/src/cf-slatedb-stack-config.ts`),
+Now one typed configuration, `ShaledbStackConfig` (`infra/shaledb/src/shaledb-stack-config.ts`),
 is resolved from the deploy's environment with complete defaults: stage, jurisdiction (`eu` |
 `fedramp` | `none`, default `none`), the complete `LsmSettings` (defaults merged with the JSON
 overrides; unknown setting names refused), telemetry (trace sample rate: 1, or 0.1 in production;
@@ -774,8 +774,8 @@ and the trace collector) call the same function.
   deploy rerun.
 
 Verified live: `preview-1` deployed with `--dev-timings` (every Worker bound the complete settings
-with the dev timings), then by a bare `vp run @cf-slatedb/infra#deploy:preview-1` with no
-`CF_SLATEDB_*` variables (every Worker bound the complete production settings and `none`).
+with the dev timings), then by a bare `vp run @shaledb/infra#deploy:preview-1` with no
+`SHALEDB_*` variables (every Worker bound the complete production settings and `none`).
 `preview-3`, never deployed before, went `eu` → `none`, and every Worker was bound `none`. All three
 previews were then redeployed with the final code.
 
@@ -813,7 +813,7 @@ compaction commit paid it.
   Create-if-absent costs ~285 ms p50 even from IAD, beside the bucket. From the US west coast it is
   ~510 ms, from Europe ~550–590 ms, from APAC and Oceania ~900–1,000 ms. `preview-1`'s writers
   already run near its bucket, so placement could not speed it up. An installation chooses its
-  bucket's location once: `CF_SLATEDB_BUCKET_LOCATION` (`wnam` … `oc`, default `auto`, meaning R2
+  bucket's location once: `SHALEDB_BUCKET_LOCATION` (`wnam` … `oc`, default `auto`, meaning R2
   places it near the deploy) in the Stack config, bound to every Worker with the other settings and
   read by `LsmBucket`. It is refused with a jurisdiction (R2 places those itself), and changing it
   replaces the bucket.
@@ -1033,7 +1033,7 @@ writer CPU per 100-row batch is now 6 ms p50. A binary internal body would save 
 of a component that is not the bottleneck. It would also add a second batch codec to keep in step.
 The workstream's target, doubling the 100-row rate, was met without it (2.7×). The public body stays
 base64 JSON, and the internal `WriterHttpApi` body stays the same schema. An additive
-`application/x-cf-slatedb-batch` body remains possible later if callers need it.
+`application/x-shaledb-batch` body remains possible later if callers need it.
 
 **Flush paging no longer builds a temp B-tree per page.** D58's flush queries bounded `seq` with
 `seq > ? AND seq <= ?`. On a 60 MiB memtable SQLite chose the `seq` index and sorted each page in a
@@ -1054,10 +1054,10 @@ and within the bound; dropping either the contiguity or the size check fails it.
 SSTs then compacted in four steps (9.0 s CPU for the step measured after the fix; 17.7 s at most
 across a run) with every outcome `ok`.
 
-**CPU limits come from the Stack configuration (P5).** `CfSlatedbStackConfig.limits` sets
+**CPU limits come from the Stack configuration (P5).** `ShaledbStackConfig.limits` sets
 `apiCpuMs` (default 30,000) and `compactorCpuMs` (default 60,000). Both are bound as `limits.cpu_ms`
 on the API Worker, whose writers run under it, and on the compactor Worker.
-`CF_SLATEDB_API_CPU_MS` and `CF_SLATEDB_COMPACTOR_CPU_MS` override them, from 10 to 300,000 ms;
+`SHALEDB_API_CPU_MS` and `SHALEDB_COMPACTOR_CPU_MS` override them, from 10 to 300,000 ms;
 other values are refused. The defaults are the largest measured invocation times two:
 
 - **Writer:** a 256 MiB flush peaked at 9.8 s, so 2× is 19.7 s and fits the 30 s default.
@@ -1206,13 +1206,13 @@ request. Decided by trace id, it kept 45 of 200 (22.5%), and all 45 were whole: 
 neither side appeared without the other. A caller's `traceparent` still joins our spans to its
 trace.
 
-The rate is `CfSlatedbStackConfig.telemetry.traceSampleRate`: 0.1 in production, 1 elsewhere (P4).
-It reaches every Worker as one more always-bound worker setting, `CF_SLATEDB_TRACE_SAMPLE_RATE`;
+The rate is `ShaledbStackConfig.telemetry.traceSampleRate`: 0.1 in production, 1 elsewhere (P4).
+It reaches every Worker as one more always-bound worker setting, `SHALEDB_TRACE_SAMPLE_RATE`;
 an unbound Worker keeps every trace. `preview-cli deploy --trace-sample-rate` sets it for a
 measurement deploy.
 
 **Retention.** The trace bucket has lifecycle rules that delete `traces/` and `tails/` after the
-configured days (14). The value is read at plan time only (`cfSlatedbTraceRetentionDays`), like the
+configured days (14). The value is read at plan time only (`shaledbTraceRetentionDays`), like the
 CPU limits (D61). The LSM bucket aborts multipart uploads still open after a day; a Worker that
 dies mid-upload otherwise leaves its parts stored. Both are confirmed on `preview-3` through the
 Cloudflare API.
@@ -1260,7 +1260,7 @@ before the SST, or drop it) instead of "recompact its inputs", which no tool doe
 
 **Rotatable access tokens (P1).** Each live stage has two token slots, A and B. Each slot is a
 Secrets Store secret in the account's `default_secrets_store`, named
-`CF_SLATEDB_<STAGE>_ACCESS_TOKEN_<SLOT>`.
+`SHALEDB_<STAGE>_ACCESS_TOKEN_<SLOT>`.
 
 - **Binding.** The Stack binds both slots to the API, GC, shard-router, and probe Workers by
   reference (`Secret.lookup`). Alchemy never writes their values. Its `Secret` resource would write
@@ -1274,7 +1274,7 @@ Secrets Store secret in the account's `default_secrets_store`, named
     only on the lengths.
 - **Previews** also keep their state-held token. `preview-cli token` and the scenarios use it.
   Production has no readable token: its tokens are printed once, when created or rotated.
-- **`vp run @cf-slatedb/infra#tokens`** manages the slots with the Alchemy profile's credentials:
+- **`vp run @shaledb/infra#tokens`** manages the slots with the Alchemy profile's credentials:
   - `ensure <stage>` creates the missing slots; `preview-cli deploy` runs it first.
   - `check <stage>` fails unless both slots exist. The production deploy runs it, so a
     production token is never created inside a deploy's log.
@@ -1287,7 +1287,7 @@ Secrets Store secret in the account's `default_secrets_store`, named
 **Production tasks.** `plan:production` and `deploy:production` (infra, no cache) plan and deploy
 the `production` stage. They give it:
 
-- production names, including the retained `cf-slatedb` bucket;
+- production names, including the retained `shaledb` bucket;
 - 10% sampling;
 - no probe Worker (D62);
 - a trace collector, with 14-day expiry (D63).
@@ -1297,7 +1297,7 @@ state-held token out of production. Nothing runs these tasks until P6.
 
 **A checked-in contract.**
 
-- **Generation.** `vp run generate:openapi` writes `docs/openapi/cf-slatedb-v1.json` from
+- **Generation.** `vp run generate:openapi` writes `docs/openapi/shaledb-v1.json` from
   `DbHttpApi`, then completes it in `db-openapi.ts` with what the contract's schemas cannot carry.
 - **Examples.** Every operation's examples are typed as decoded values and encoded through the
   schemas they exemplify, so they conform by construction. They cover every parameter, request,
@@ -1332,8 +1332,139 @@ and that a compactor on format-2 state compacts nothing. Removing either check f
 
 **Documentation and cleanup.**
 
-- **`README.md`:** what cf-slatedb is, a quick start, the API, and the repository layout.
+- **`README.md`:** what shaledb is, a quick start, the API, and the repository layout.
 - **`docs/operations.md`:** now covers deploying, rolling back, tokens, data residency, GC and
   removal, and capacity, alongside the telemetry, watch list, and corruption runbook.
 - **Removed:** `lsmAccessGateForStage`, which described the gate as a preview stand-in for
   Cloudflare Access.
+
+## D65. The soak and the production smoke test
+
+**`scenario-cli soak`** (`soak.ts`) is the release gate's long test. It runs, concurrently, for
+`--minutes`:
+
+- **Writers**, one per database: batches of 20–140 puts and deletes on a fixed key space.
+- **Readers**: random keys at `Latest`, `AtLeast` the last acknowledged sequence number, and
+  `Flushed`.
+- **Scanners**: ranges at `Latest`.
+- **Transactors**: `SerializableSnapshot` increments of a per-database counter.
+- **Snapshotters**: a pinned snapshot every few minutes, whose sampled keys are read at the snapshot
+  four minutes later, then the checkpoint deleted.
+- **A remover**: creates a short-lived database, uses it, removes it, and checks that it no longer
+  answers.
+- **A sharded group**: written through the router and split twice (`--split-at`).
+- **A redeploy** of the stage midway (`--redeploy-at`), which evicts every Durable Object while the
+  workload continues. It keeps the stage's jurisdiction.
+
+**The model.** It records every acknowledged write as (sequence number, value), keeping each key's
+last few, and the values of the batch in flight.
+
+- **Concurrent reads.** A read that races a write is judged against what it may see: the value
+  acknowledged when it started, anything acknowledged since, or the batch in flight.
+- **Retried writes.** A failed write is retried as the same batch until acknowledged, so the final
+  value is deterministic. Its keys are excluded from snapshot comparisons, because a replayed batch
+  may have applied twice.
+- **Counters.** A transaction whose commit outcome is unknown widens its counter's allowed final
+  range by one.
+
+**At the end** the soak checks:
+
+- every key of every database at `Latest`, then after a flush at `Flushed`, against the model,
+  with no key read that was never written;
+- every counter;
+- every key of the sharded group.
+
+It also checks storage: after two collect-now runs, no database stores more SSTs older than
+`gcMinAge + gcInterval + 10 min` than its manifest uses. The count comes from a new probe endpoint
+(`GET /v1/probe/storage`, preview and local stages only).
+
+**Pass criteria:**
+
+- no mismatch and no failed operation;
+- `measure health` reports no issue over the soak's window (no `exceededCpu`, `exceededMemory`, or
+  `exception`, no current corruption, no GC failure, no stalled write);
+- no error span with an exception outside the ones the workload provokes on purpose
+  (`DatabaseSealedError` from router retries, `DatabaseNotFoundError` after removals,
+  `TransactionConflictError`, `WriterFencedError` across the redeploy, and the `HttpClientError`
+  calling side of those).
+
+p50 and p99 client latencies are recorded per operation.
+
+**How the soak reads spans and treats requests.**
+
+- **Sampling.** The soak runs at production's sampling (`--trace-sample-rate 0.1`, which its
+  redeploy keeps). At 100%, a busy stage exports about 40 traces a second, faster than they can be
+  read back: on `preview-2` a 500-export page covering 11 s of traffic took 14 s to read.
+- **Pulling.** It pulls spans every minute while it runs, without blocking its other fibers.
+- **Failed pulls.** A failed pull, or a window with no spans read, fails the soak instead of
+  passing silently. An earlier run reported no error spans because its pull had failed.
+- **Timeouts.** Every request has a 90 s timeout, which counts as a retryable failure. Retries,
+  timeouts, and failures are logged with their time, so they can be found in tail records and
+  traces.
+
+**`scenario-cli smoke`** (`smoke.ts`) is the production smoke test. It runs only operations safe on
+a live installation, on databases it names itself (`smoke-<time>-…`), which it removes at the end
+whatever happened. It checks:
+
+- create, write, and reads at `Latest`, `AtLeast`, and `Flushed`;
+- scan;
+- a transaction, and a conflicting one refused;
+- a checkpoint created, listed, and deleted;
+- eight concurrent creates of one id, of which exactly one wins.
+
+It makes no trace assertions, since production keeps a sample of traces. It takes `--api-url` with
+the token in `SHALEDB_TOKEN` (production), or `--stage` (previews). On `preview-3` it passed
+both ways, the second with a freshly rotated Secrets Store token.
+
+## D66. A Worker's caches share values across requests, never reads in flight
+
+**Found by the soak.** The first short soak on `preview-2` (`eu`) lost no data, but:
+
+- three API Worker requests hung about 301 s until the client gave up (outcome `canceled`);
+- one `get` failed with `InternalFailure` (500) during the redeploy.
+
+The error span named the cause:
+
+> Cannot call this AsyncLocalStorage bound function outside of the request in which it was created.
+
+**The cause.** It was raised in `BlockCache.meta`. The L1 block cache joined concurrent misses for
+one key into one read, through a `Deferred` in an isolate-wide map, across requests. In a Worker,
+I/O belongs to the request that started it, which gives two failures:
+
+- **Hangs.** If the runtime cancels that request (a client that hangs up, an isolate retired by a
+  deploy), its read never finishes, and every request waiting on it hangs.
+- **The 500.** When the read does finish after its request ended, resuming the waiter runs code
+  bound to the ended request, which throws.
+
+The unit tests ran in one process with no request boundaries, so they could not see this.
+
+**The fix.** The L1 caches keep sharing completed values (decoded metadata and blocks, plain data)
+across requests in the isolate, and no longer share reads in flight. Each miss reads with its own
+request's services. Duplicate concurrent misses cost a duplicate read, which Workers Cache (L2) and
+the `BlockServer` answer.
+
+**The rest of the engine.** Every other cache that runs I/O is per request (`makeExecutionMemo`),
+the manifest cache holds plain values, and the shard directory's `Deferred` signals are inside a
+Durable Object, where requests share one context.
+
+**Test.** `block-cache.test.ts` starts a read that never finishes, then a second read of the same
+block, which must complete within a second. It fails on the previous code and passes now. The old
+test that asserted joining was replaced by one asserting that a block, once read, is kept.
+
+## D68. The project is named shaledb
+
+Dillon renamed the project from cf-slatedb to **shaledb**.
+
+- **Packages and paths.** `@cf-slatedb/*` became `@shaledb/*`, `infra/cf-slatedb` became
+  `infra/shaledb`, and files named `cf-slatedb-*` became `shaledb-*`.
+- **The Stack and its configuration.** The Alchemy Stack `CfSlatedb` is now `Shaledb`, and every
+  `CF_SLATEDB_*` variable or binding is now `SHALEDB_*`.
+- **Live names.** Worker and bucket names follow, as do the production LSM bucket (`shaledb`) and
+  the Secrets Store token secrets (`SHALEDB_<STAGE>_ACCESS_TOKEN_<SLOT>`).
+- **Unchanged.** References to SlateDB itself (the reference design, `repos/slatedb`, its RFCs)
+  are untouched.
+
+Alchemy keys state by Stack name, so the next deploy of each preview created a new `Shaledb/<stage>`
+stack with new resources. The old `CfSlatedb/<stage>` previews and their Secrets Store secrets
+remain until Dillon destroys them from a checkout before the rename (`docs/progress.md`). Nothing
+was deployed to production under either name.

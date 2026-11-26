@@ -1,5 +1,5 @@
 {
-  "name": "@cf-slatedb/tools-trace-cli",
+  "name": "@shaledb/tools-trace-cli",
   "version": "0.0.0",
   "private": true,
   "type": "module",

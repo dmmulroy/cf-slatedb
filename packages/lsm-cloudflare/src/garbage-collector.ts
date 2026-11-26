@@ -11,7 +11,7 @@ import {
   type StoredManifest,
   type StoredSst,
   Timestamp,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Clock, Context, Effect, Layer, Metric, Option, Result, Schema } from "effect";
 
@@ -89,7 +89,7 @@ export interface IGarbageCollector {
 
 /** The contextual garbage collector. */
 export class GarbageCollector extends Context.Service<GarbageCollector, IGarbageCollector>()(
-  "@cf-slatedb/GarbageCollector",
+  "@shaledb/GarbageCollector",
 ) {}
 
 const decodeSstId = Schema.decodeUnknownOption(SstId);

@@ -1,6 +1,6 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
 import type * as cf from "@cloudflare/workers-types";
-import type { DatabaseId, SstId } from "@cf-slatedb/lsm-core";
+import type { DatabaseId, SstId } from "@shaledb/lsm-core";
 import { makeExecutionMemo } from "alchemy/Runtime/ExecutionMemo";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Context, Data, Effect, Layer, Option, type Scope } from "effect";
@@ -65,7 +65,7 @@ export interface IBlockSource {
 
 /** The contextual block source. */
 export class BlockSource extends Context.Service<BlockSource, IBlockSource>()(
-  "@cf-slatedb/BlockSource",
+  "@shaledb/BlockSource",
 ) {}
 
 /**

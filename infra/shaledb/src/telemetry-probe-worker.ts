@@ -11,15 +11,15 @@ import {
   objectKindOfKey,
   objectStoreLayer,
   withLsmTracePolicy,
-} from "@cf-slatedb/lsm-cloudflare";
+} from "@shaledb/lsm-cloudflare";
 import type { HttpEffect } from "alchemy/Http";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Clock, Effect, Option, Schema } from "effect";
 import { HttpClientRequest, HttpServerRequest, HttpServerResponse } from "effect/http";
 
-import { cfSlatedbAccessTokens } from "./cf-slatedb-access-tokens.ts";
-import { cfSlatedbWorkerSettings } from "./cf-slatedb-stack-config.ts";
-import { cfSlatedbTelemetry } from "./cf-slatedb-telemetry.ts";
+import { shaledbAccessTokens } from "./shaledb-access-tokens.ts";
+import { shaledbWorkerSettings } from "./shaledb-stack-config.ts";
+import { shaledbTelemetry } from "./shaledb-telemetry.ts";
 
 interface TelemetryProbeServerContract {
   readonly fetch: HttpEffect<RuntimeContext>;
@@ -266,9 +266,9 @@ export const telemetryProbeWorkerLayer = TelemetryProbeWorker.make(
     const r2Probes = yield* R2ProbeServer;
     const jurisdiction = yield* lsmJurisdiction;
     const withEventTelemetryFlush = yield* eventTelemetryFlushForStage;
-    const withAccessGate = yield* lsmAccessGateFrom(cfSlatedbAccessTokens);
+    const withAccessGate = yield* lsmAccessGateFrom(shaledbAccessTokens);
     // The probe addresses its Durable Object in the Stack's jurisdiction, like the engine Workers.
-    yield* bindLsmWorkerSettings(cfSlatedbWorkerSettings);
+    yield* bindLsmWorkerSettings(shaledbWorkerSettings);
     return {
       fetch: withAccessGate(
         Effect.gen(function* () {
@@ -335,7 +335,7 @@ export const telemetryProbeWorkerLayer = TelemetryProbeWorker.make(
     Effect.provide(telemetryProbeServerLayer),
     Effect.provide(r2ProbeServerLayer),
     Effect.provide(objectStoreLayer),
-    Effect.provide(withLsmTracePolicy(cfSlatedbTelemetry("cf-slatedb-telemetry-probe"))),
+    Effect.provide(withLsmTracePolicy(shaledbTelemetry("shaledb-telemetry-probe"))),
   ),
 );
 

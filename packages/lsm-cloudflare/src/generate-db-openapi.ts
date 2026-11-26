@@ -1,5 +1,5 @@
 /**
- * Writes the public database API's OpenAPI specification to `docs/openapi/cf-slatedb-v1.json`
+ * Writes the public database API's OpenAPI specification to `docs/openapi/shaledb-v1.json`
  * (`vp run generate:openapi`). Never edit that file by hand: change the contract (`DbHttpApi`) or
  * its examples (`db-openapi.ts`), regenerate, and inspect the diff.
  */

@@ -95,6 +95,6 @@ export const blockServerWorkerLayer = <R = never>(options: BlockServerWorkerOpti
       return { fetch: withEventTelemetryFlush(Effect.flatten(router)) };
     }).pipe(
       Effect.provide(objectReaderLayer),
-      Effect.provide(withLsmTracePolicy(options.telemetry("cf-slatedb-blocks"))),
+      Effect.provide(withLsmTracePolicy(options.telemetry("shaledb-blocks"))),
     ),
   );

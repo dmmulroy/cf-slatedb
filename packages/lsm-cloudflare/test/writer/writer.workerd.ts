@@ -1,5 +1,5 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
-import { DatabaseId, FULL_KEY_RANGE, type ReadConsistency } from "@cf-slatedb/lsm-core";
+import { DatabaseId, FULL_KEY_RANGE, type ReadConsistency } from "@shaledb/lsm-core";
 import * as Test from "@alchemy.run/test/Vitest";
 import { expect } from "@effect/vitest";
 import { Effect, Option, Schedule } from "effect";

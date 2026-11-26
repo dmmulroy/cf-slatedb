@@ -1,4 +1,4 @@
-import type { DatabaseId } from "@cf-slatedb/lsm-core";
+import type { DatabaseId } from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Context, Effect, Layer, Ref } from "effect";
 
@@ -12,14 +12,14 @@ export interface ICompactionTrigger {
 
 /** The contextual compaction trigger. */
 export class CompactionTrigger extends Context.Service<CompactionTrigger, ICompactionTrigger>()(
-  "@cf-slatedb/CompactionTrigger",
+  "@shaledb/CompactionTrigger",
 ) {}
 
 /** The databases a test trigger was asked to wake, in order. */
 export class CompactionTriggerRecord extends Context.Service<
   CompactionTriggerRecord,
   Ref.Ref<ReadonlyArray<DatabaseId>>
->()("@cf-slatedb/CompactionTriggerRecord") {}
+>()("@shaledb/CompactionTriggerRecord") {}
 
 /** Provides a trigger that only records wakes (in {@link CompactionTriggerRecord}, also output). */
 export const compactionTriggerTestLayer = Layer.effect(

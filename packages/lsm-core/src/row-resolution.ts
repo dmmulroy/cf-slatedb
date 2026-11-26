@@ -9,7 +9,7 @@ import { type Row, RowValue } from "./row.ts";
  *
  * **Details**
  *
- * Must be associative: cf-slatedb regroups operands across the memtable, flushes, and compactions,
+ * Must be associative: shaledb regroups operands across the memtable, flushes, and compactions,
  * and combines operands with no base (`existing` none) into one operand that later merges onto an
  * older value.
  */

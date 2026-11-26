@@ -1,6 +1,6 @@
 # Operations
 
-How to run cf-slatedb in production: deploying, rolling back, access tokens, data residency,
+How to run shaledb in production: deploying, rolling back, access tokens, data residency,
 garbage collection and removal, capacity, telemetry, what to watch, and the corruption runbook.
 
 Every endpoint below is on the API Worker under `/v1` and needs the stage's token
@@ -8,9 +8,9 @@ Every endpoint below is on the API Worker under `/v1` and needs the stage's toke
 
 ## Deploying
 
-Production is the `production` stage of the `CfSlatedb` Stack. It gets:
+Production is the `production` stage of the `Shaledb` Stack. It gets:
 
-- the LSM bucket named `cf-slatedb`, retained if the Stack is destroyed;
+- the LSM bucket named `shaledb`, retained if the Stack is destroyed;
 - 10% trace sampling;
 - no probe Worker;
 - the measured CPU limits: 30 s for the API Worker and its writers, 60 s for the compactor.
@@ -21,34 +21,34 @@ Every Worker is bound its complete settings on every deploy (D55).
    manager. They are printed only here.
 
    ```sh
-   vp run @cf-slatedb/infra#tokens ensure production
+   vp run @shaledb/infra#tokens ensure production
    ```
 
 2. **Review the plan:**
 
    ```sh
-   vp run @cf-slatedb/infra#plan:production
+   vp run @shaledb/infra#plan:production
    ```
 
 3. **Deploy:**
 
    ```sh
-   vp run @cf-slatedb/infra#deploy:production
+   vp run @shaledb/infra#deploy:production
    ```
 
    It first checks that both token secrets exist, and refuses otherwise.
 
 Settings come from the deploy's environment. All are optional; defaults are in
-`infra/cf-slatedb/src/cf-slatedb-stack-config.ts`:
+`infra/shaledb/src/shaledb-stack-config.ts`:
 
-| Variable                                               | Default (production)   | What it sets                                                                                       |
-| ------------------------------------------------------ | ---------------------- | -------------------------------------------------------------------------------------------------- |
-| `CF_SLATEDB_LSM_SETTINGS`                              | none (engine defaults) | JSON overrides of engine settings. Invalid combinations refuse the plan                            |
-| `CF_SLATEDB_JURISDICTION`                              | `none`                 | `eu` or `fedramp` restricts every bucket, Durable Object, and the Workflow. Fixed per installation |
-| `CF_SLATEDB_BUCKET_LOCATION`                           | `auto`                 | R2 location hint for the LSM bucket (unrestricted Stacks). Fixed per installation                  |
-| `CF_SLATEDB_TRACE_SAMPLE_RATE`                         | `0.1`                  | Fraction of traces kept                                                                            |
-| `CF_SLATEDB_TRACE_RETENTION_DAYS`                      | `14`                   | Days traces and tail records are kept                                                              |
-| `CF_SLATEDB_API_CPU_MS`, `CF_SLATEDB_COMPACTOR_CPU_MS` | `30000`, `60000`       | CPU limit per invocation                                                                           |
+| Variable                                         | Default (production)   | What it sets                                                                                       |
+| ------------------------------------------------ | ---------------------- | -------------------------------------------------------------------------------------------------- |
+| `SHALEDB_LSM_SETTINGS`                           | none (engine defaults) | JSON overrides of engine settings. Invalid combinations refuse the plan                            |
+| `SHALEDB_JURISDICTION`                           | `none`                 | `eu` or `fedramp` restricts every bucket, Durable Object, and the Workflow. Fixed per installation |
+| `SHALEDB_BUCKET_LOCATION`                        | `auto`                 | R2 location hint for the LSM bucket (unrestricted Stacks). Fixed per installation                  |
+| `SHALEDB_TRACE_SAMPLE_RATE`                      | `0.1`                  | Fraction of traces kept                                                                            |
+| `SHALEDB_TRACE_RETENTION_DAYS`                   | `14`                   | Days traces and tail records are kept                                                              |
+| `SHALEDB_API_CPU_MS`, `SHALEDB_COMPACTOR_CPU_MS` | `30000`, `60000`       | CPU limit per invocation                                                                           |
 
 The API's URL is the API Worker's `workers.dev` URL, printed as `apiUrl` when the deploy finishes.
 
@@ -69,7 +69,7 @@ nothing. Roll forward again to recover. v1 is format 1, the format of all data w
 
 The API, GC, and shard-router Workers accept a request that presents either of the stage's two
 tokens as `Authorization: Bearer <token>`. Each token is a Secrets Store secret
-(`CF_SLATEDB_<STAGE>_ACCESS_TOKEN_A` and `_B` in the account's `default_secrets_store`). Workers
+(`SHALEDB_<STAGE>_ACCESS_TOKEN_A` and `_B` in the account's `default_secrets_store`). Workers
 read the secrets at runtime and re-read them every 30 s, so a rotation needs no deploy.
 
 To replace a token without downtime:
@@ -78,7 +78,7 @@ To replace a token without downtime:
 2. Rotate the slot you replace:
 
    ```sh
-   vp run @cf-slatedb/infra#tokens rotate production A
+   vp run @shaledb/infra#tokens rotate production A
    ```
 
    It prints the new token. Within 30 s, Workers accept it and stop accepting the old one.
@@ -135,15 +135,15 @@ example with range sharding.
 Every Worker and Durable Object exports spans over OTLP to the stage's own trace collector, which
 stores them in the stage's trace bucket (D63):
 
-- **Sampling.** Production keeps 10% of traces (`CF_SLATEDB_TRACE_SAMPLE_RATE`, P4). Local and
+- **Sampling.** Production keeps 10% of traces (`SHALEDB_TRACE_SAMPLE_RATE`, P4). Local and
   preview stages keep every trace. The decision comes from each trace's id, so a kept trace is
   whole across the API Worker, its Durable Objects, and the BlockServer. A caller's `traceparent`
   joins our spans to its trace, but its sampled flag does not force them to be kept.
-- **Redaction.** Spans carry only cf-slatedb's own attributes (`database.id`, `sst.id`,
+- **Redaction.** Spans carry only shaledb's own attributes (`database.id`, `sst.id`,
   `manifest.id`, sizes, counts, outcomes) and the HTTP method, route, path, and status. A caller's
   address, user agent, full URL, query string, and headers are dropped where they are set.
 - **Retention.** The trace bucket deletes `traces/` and `tails/` objects after 14 days
-  (`CF_SLATEDB_TRACE_RETENTION_DAYS`).
+  (`SHALEDB_TRACE_RETENTION_DAYS`).
 - **Tail records.** The API, compactor, and GC Workers' invocations (their outcome, CPU time, and
   wall time) are stored unsampled under `tails/`.
 

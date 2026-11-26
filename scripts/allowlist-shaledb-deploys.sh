@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Adds cf-slatedb's Alchemy Stack to the pi Cloudflare deployment guard's allowlist, so agents can
+# Adds shaledb's Alchemy Stack to the pi Cloudflare deployment guard's allowlist, so agents can
 # deploy and test the preview stages. Run it yourself; the guard blocks agents from editing the policy.
 #
-# Usage: scripts/allowlist-cf-slatedb-deploys.sh
+# Usage: scripts/allowlist-shaledb-deploys.sh
 #
 # Idempotent: it replaces any existing entry for this project, backs up the policy first, and
 # validates the result before installing it. `alchemy destroy` stays blocked by the guard whatever the
@@ -12,8 +12,8 @@ set -euo pipefail
 POLICY_LINK="${HOME}/.pi/agent/cloudflare-deployment-allowlist.json"
 # Resolved from this script's location, so it works wherever the repo is cloned.
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-PROJECT="${REPO_ROOT}/infra/cf-slatedb/alchemy.run.ts"
-STACK="CfSlatedb"
+PROJECT="${REPO_ROOT}/infra/shaledb/alchemy.run.ts"
+STACK="Shaledb"
 # Reusable preview stages: redeployed in place rather than destroyed, so at most three exist.
 STAGES='["dev","preview-1","preview-2","preview-3"]'
 

@@ -218,7 +218,7 @@ importers:
         specifier: 'catalog:'
         version: 1.2.0(@types/node@24.19.2)(@vitest/ui@5.0.4)(jiti@2.7.0)(typescript@7.0.2)(yaml@2.9.1)
 
-  infra/cf-slatedb:
+  infra/shaledb:
     dependencies:
       effect:
         specifier: 'catalog:'
@@ -230,13 +230,13 @@ importers:
       '@alchemy.run/test':
         specifier: 'catalog:'
         version: 2.0.0-beta.87(@effect/vitest@4.1.4(effect@4.1.4)(vitest@5.0.4))(alchemy@2.0.0-beta.87(@effect/platform-node@4.1.4(effect@4.1.4)(redis@6.4.0))(@types/node@24.19.2)(effect@4.1.4)(jiti@2.7.0)(typescript@7.0.2)(ws@8.23.0))(effect@4.1.4)(vitest@5.0.4)
-      '@cf-slatedb/lsm-cloudflare':
+      '@shaledb/lsm-cloudflare':
         specifier: workspace:*
         version: link:../../packages/lsm-cloudflare
-      '@cf-slatedb/lsm-core':
+      '@shaledb/lsm-core':
         specifier: workspace:*
         version: link:../../packages/lsm-core
-      '@cf-slatedb/sharding':
+      '@shaledb/sharding':
         specifier: workspace:*
         version: link:../../packages/lsm-sharding
       '@cloudflare/workers-types':
@@ -269,7 +269,7 @@ importers:
       '@alchemy.run/cloudflare':
         specifier: 'catalog:'
         version: 2.0.0-beta.87(@effect/platform-node@4.1.4(effect@4.1.4)(redis@6.4.0))(@types/node@24.19.2)(alchemy@2.0.0-beta.87(@effect/platform-node@4.1.4(effect@4.1.4)(redis@6.4.0))(@types/node@24.19.2)(effect@4.1.4)(jiti@2.7.0)(typescript@7.0.2)(ws@8.23.0))(effect@4.1.4)(jiti@2.7.0)(typescript@7.0.2)(yaml@2.9.1)
-      '@cf-slatedb/lsm-core':
+      '@shaledb/lsm-core':
         specifier: workspace:*
         version: link:../lsm-core
       alchemy:
@@ -322,10 +322,10 @@ importers:
       '@alchemy.run/cloudflare':
         specifier: 'catalog:'
         version: 2.0.0-beta.87(@effect/platform-node@4.1.4(effect@4.1.4)(redis@6.4.0))(@types/node@24.19.2)(alchemy@2.0.0-beta.87(@effect/platform-node@4.1.4(effect@4.1.4)(redis@6.4.0))(@types/node@24.19.2)(effect@4.1.4)(jiti@2.7.0)(typescript@7.0.2)(ws@8.23.0))(effect@4.1.4)(jiti@2.7.0)(typescript@7.0.2)(yaml@2.9.1)
-      '@cf-slatedb/lsm-cloudflare':
+      '@shaledb/lsm-cloudflare':
         specifier: workspace:*
         version: link:../lsm-cloudflare
-      '@cf-slatedb/lsm-core':
+      '@shaledb/lsm-core':
         specifier: workspace:*
         version: link:../lsm-core
       alchemy:
@@ -362,7 +362,7 @@ importers:
 
   tools/preview-cli:
     dependencies:
-      '@cf-slatedb/lsm-core':
+      '@shaledb/lsm-core':
         specifier: workspace:*
         version: link:../../packages/lsm-core
       '@effect/platform-node':
@@ -384,13 +384,13 @@ importers:
 
   tools/scenario-cli:
     dependencies:
-      '@cf-slatedb/lsm-cloudflare':
+      '@shaledb/lsm-cloudflare':
         specifier: workspace:*
         version: link:../../packages/lsm-cloudflare
-      '@cf-slatedb/lsm-core':
+      '@shaledb/lsm-core':
         specifier: workspace:*
         version: link:../../packages/lsm-core
-      '@cf-slatedb/sharding':
+      '@shaledb/sharding':
         specifier: workspace:*
         version: link:../../packages/lsm-sharding
       '@effect/platform-node':
@@ -472,10 +472,10 @@ importers:
 
   tools/writer-bench:
     dependencies:
-      '@cf-slatedb/lsm-cloudflare':
+      '@shaledb/lsm-cloudflare':
         specifier: workspace:*
         version: link:../../packages/lsm-cloudflare
-      '@cf-slatedb/lsm-core':
+      '@shaledb/lsm-core':
         specifier: workspace:*
         version: link:../../packages/lsm-core
       effect:

@@ -1,6 +1,6 @@
 /**
  * Trace CLI: a local OTLP/HTTP receiver and trace store, and commands to inspect, compare, and
- * assert on the traces cf-slatedb's Workers and Durable Objects export.
+ * assert on the traces shaledb's Workers and Durable Objects export.
  *
  * Usage: `node tools/trace-cli/src/trace-cli.ts <command> [options]`. Every command accepts
  * `--store <dir>` (default `.traces/` at the repository root, or `TRACE_STORE_DIR`) and `--json`
@@ -467,7 +467,7 @@ const clear = Command.make("clear", { store: storeFlag }, ({ store }) =>
 ).pipe(Command.withDescription("Delete every stored trace"));
 
 const traceCli = Command.make("trace").pipe(
-  Command.withDescription("Local OTLP receiver and trace inspection for cf-slatedb"),
+  Command.withDescription("Local OTLP receiver and trace inspection for shaledb"),
   Command.withSubcommands([serve, pull, list, show, tail, grep, stats, diff, assert, clear]),
 );
 

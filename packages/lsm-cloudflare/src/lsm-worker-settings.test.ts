@@ -1,4 +1,4 @@
-import { DEFAULT_LSM_SETTINGS } from "@cf-slatedb/lsm-core";
+import { DEFAULT_LSM_SETTINGS } from "@shaledb/lsm-core";
 import { ConfigProvider, Effect, Option } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -55,12 +55,10 @@ describe("LsmWorkerSettings bindings", () => {
   });
 
   it("still reads the partial overrides that deploys before D55 bound", async () => {
-    const read = await readBack({ CF_SLATEDB_LSM_SETTINGS: '{"compactorPollInterval":2000}' });
+    const read = await readBack({ SHALEDB_LSM_SETTINGS: '{"compactorPollInterval":2000}' });
     expect(read.settings).toEqual({ ...DEFAULT_LSM_SETTINGS, compactorPollInterval: 2000 });
     // Deploys before D63 bound no sample rate: every trace is kept.
     expect(read.traceSampleRate).toBe(1);
-    expect((await readBack({ CF_SLATEDB_LSM_SETTINGS: "{}" })).settings).toEqual(
-      DEFAULT_LSM_SETTINGS,
-    );
+    expect((await readBack({ SHALEDB_LSM_SETTINGS: "{}" })).settings).toEqual(DEFAULT_LSM_SETTINGS);
   });
 });

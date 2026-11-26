@@ -1,6 +1,6 @@
 ---
 name: verify-seal-split
-description: "Model-check that sealing a cf-slatedb database stops every later write, and that splitting it (seal, one checkpoint, a range fork per successor) leaves every write acknowledged before the seal in exactly one successor. Use after any change to DbWriter.write/seal, the commit lock, DatabaseLifecycle.seal/createCheckpoint/forkRange, forkManifest, or the split order in lsm-sharding."
+description: "Model-check that sealing a shaledb database stops every later write, and that splitting it (seal, one checkpoint, a range fork per successor) leaves every write acknowledged before the seal in exactly one successor. Use after any change to DbWriter.write/seal, the commit lock, DatabaseLifecycle.seal/createCheckpoint/forkRange, forkManifest, or the split order in lsm-sharding."
 ---
 
 # Verify: seal and split

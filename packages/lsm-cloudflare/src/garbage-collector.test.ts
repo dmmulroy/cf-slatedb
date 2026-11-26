@@ -13,7 +13,7 @@ import {
   SortedRunId,
   SstId,
   Timestamp,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import { Effect, Layer, Option, Ref, Stream } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";

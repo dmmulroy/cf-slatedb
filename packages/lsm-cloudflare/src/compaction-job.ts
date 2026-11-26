@@ -4,7 +4,7 @@ import {
   DatabaseId,
   ManifestId,
   type SstHandle,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Effect, Option, Schema } from "effect";
 

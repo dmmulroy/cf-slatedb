@@ -8,7 +8,7 @@ import {
   SstId,
   Timestamp,
   WriterEpoch,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import type { HttpEffect } from "alchemy/Http";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Effect, Layer, Option } from "effect";

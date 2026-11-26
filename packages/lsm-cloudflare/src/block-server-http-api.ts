@@ -1,4 +1,4 @@
-import { DatabaseId, ManifestId, SstId } from "@cf-slatedb/lsm-core";
+import { DatabaseId, ManifestId, SstId } from "@shaledb/lsm-core";
 import { Schema } from "effect";
 import { HttpApi, HttpApiEndpoint, HttpApiGroup, HttpApiSchema } from "effect/http-api";
 

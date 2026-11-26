@@ -1,5 +1,5 @@
 {
-  "name": "@cf-slatedb/infra",
+  "name": "@shaledb/infra",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -12,13 +12,13 @@
   "devDependencies": {
     "@alchemy.run/cloudflare": "catalog:",
     "@alchemy.run/test": "catalog:",
-    "@cf-slatedb/lsm-cloudflare": "workspace:*",
-    "@cf-slatedb/lsm-core": "workspace:*",
-    "@cf-slatedb/sharding": "workspace:*",
     "@cloudflare/workers-types": "catalog:",
     "@distilled.cloud/cloudflare": "catalog:",
     "@effect/platform-node": "catalog:",
     "@effect/vitest": "catalog:",
+    "@shaledb/lsm-cloudflare": "workspace:*",
+    "@shaledb/lsm-core": "workspace:*",
+    "@shaledb/sharding": "workspace:*",
     "@types/node": "catalog:",
     "alchemy": "catalog:",
     "typescript": "catalog:",

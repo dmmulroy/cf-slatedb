@@ -5,7 +5,7 @@ import {
   SortedRunId,
   SstId,
   Timestamp,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import { Context, Effect, Layer, Option, Ref } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
@@ -444,7 +444,7 @@ describe("Compactor", () => {
       }),
     );
     expect(outcome.woken._tag).toBe("CompactorUnavailableError");
-    expect(outcome.woken.message).toContain("written by a newer cf-slatedb (format 2");
+    expect(outcome.woken.message).toContain("written by a newer shaledb (format 2");
     // Its alarm compacts nothing.
     expect([outcome.jobs, outcome.l0]).toEqual([0, 4]);
   });

@@ -16,11 +16,11 @@ const LOCAL_LSM_STAGE_PATTERN = /^(?:dev|test|local)(?:-[a-z0-9-]+)?$/;
  */
 export const isLocalLsmStage = (stage: string): boolean => LOCAL_LSM_STAGE_PATTERN.test(stage);
 
-/** Compatibility date of every cf-slatedb Worker. */
+/** Compatibility date of every shaledb Worker. */
 export const LSM_WORKER_COMPATIBILITY_DATE = "2026-10-15";
 
 /**
- * Compatibility settings of a cf-slatedb Worker on the current stage.
+ * Compatibility settings of a shaledb Worker on the current stage.
  *
  * **Details**
  *
@@ -28,7 +28,7 @@ export const LSM_WORKER_COMPATIBILITY_DATE = "2026-10-15";
  * another `workers.dev` URL of the same account, and without the flag Cloudflare refuses a Worker's
  * `fetch()` to a Worker on its own subdomain, so every span of a Worker's own events is lost (seen on
  * `preview-1`; Durable Object events were unaffected). Service bindings, which carry every call
- * between cf-slatedb's Workers, are not affected by the flag. Local stages leave it off: their spans
+ * between shaledb's Workers, are not affected by the flag. Local stages leave it off: their spans
  * go to a receiver on `127.0.0.1`, which a strictly public `fetch()` cannot reach.
  */
 export const lsmWorkerCompatibility = Effect.gen(function* () {

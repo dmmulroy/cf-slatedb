@@ -15,7 +15,7 @@ import {
   WriteReceipt,
   WriterEpoch,
   WriterFencedError,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import { Schema } from "effect";
 import { HttpApi, HttpApiEndpoint, HttpApiGroup, HttpApiSchema } from "effect/http-api";
 

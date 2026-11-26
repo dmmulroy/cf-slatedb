@@ -1,6 +1,6 @@
 ---
 name: verify-transactions
-description: "Model-check that cf-slatedb's SerializableSnapshot transactions admit only serializable histories: every committed transaction read exactly the values the database held when it committed. Use after any change to DbWriter.commitTransaction, MemTable.writtenAfter, DbClient.beginTransaction/getAt/scanAt/transaction, the reader's maxLastL0Seq check, or how flushes advance flushed_seq."
+description: "Model-check that shaledb's SerializableSnapshot transactions admit only serializable histories: every committed transaction read exactly the values the database held when it committed. Use after any change to DbWriter.commitTransaction, MemTable.writtenAfter, DbClient.beginTransaction/getAt/scanAt/transaction, the reader's maxLastL0Seq check, or how flushes advance flushed_seq."
 ---
 
 # Verify: transactions

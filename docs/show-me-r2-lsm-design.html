@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>cf-slatedb: a SlateDB-style LSM on R2, Durable Objects, Alchemy, and Effect</title>
+    <title>shaledb: a SlateDB-style LSM on R2, Durable Objects, Alchemy, and Effect</title>
     <style>
       :root {
         --bg: #faf8f4;
@@ -118,7 +118,7 @@
   </head>
   <body>
     <main>
-      <h1>cf-slatedb: SlateDB's LSM, rebuilt on R2 and Durable Objects</h1>
+      <h1>shaledb: SlateDB's LSM, rebuilt on R2 and Durable Objects</h1>
       <p class="lede">
         A design sketch, not an implementation. It keeps SlateDB's model: one writer, many readers,
         immutable SSTs, a CAS-versioned manifest, and size-tiered compaction. It swaps two pieces for Cloudflare-native ones. The writer is a
@@ -429,12 +429,12 @@ class Manifest extends Schema.Class&lt;Manifest&gt;("Manifest")({
           <tr><td><code>DatabaseLifecycle</code></td><td>create(id, options) · remove(id) · seal(id, successors) · forkRange(source, checkpoint, range, newId)</td><td>ManifestStore, WriterServer and CompactorServer namespaces, ObjectStore, Workers Cache purge</td><td>every step is a manifest CAS; <code>remove</code> purges <code>db:&lt;id&gt;</code></td></tr>
           <tr><td><code>GarbageCollector</code></td><td>collect(id)</td><td>ManifestStore, ObjectStore</td><td>reads only its own manifests and checkpoints; forks hold checkpoints on their sources, so shared SSTs stay alive (§12)</td></tr>
           <tr><td><code>CompactionBudget</code></td><td>acquire(budgetGroup) · release</td><td>none, or a global DO</td><td>fair share across groups; the group defaults to the <code>DatabaseId</code>, so callers can group databases by tenant</td></tr>
-          <tr><td colspan="4" class="note">The optional <code>@cf-slatedb/sharding</code> package (<code>ShardDirectory</code>, <code>ShardRouter</code>, <code>ShardSplit</code>) is in §12. It depends only on <code>DbClient</code> and <code>DatabaseLifecycle</code>.</td></tr>
+          <tr><td colspan="4" class="note">The optional <code>@shaledb/sharding</code> package (<code>ShardDirectory</code>, <code>ShardRouter</code>, <code>ShardSplit</code>) is in §12. It depends only on <code>DbClient</code> and <code>DatabaseLifecycle</code>.</td></tr>
         </table>
       </div>
       <pre style="margin-top: 12px"><code>// manifest-store.ts — the order the standards require
 export interface IManifestStore { readonly loadLatest: Effect.Effect&lt;VersionedManifest, ManifestStoreError, RuntimeContext&gt;; /* … */ }
-export class ManifestStore extends Context.Service&lt;ManifestStore, IManifestStore&gt;()("@cf-slatedb/ManifestStore") {}
+export class ManifestStore extends Context.Service&lt;ManifestStore, IManifestStore&gt;()("@shaledb/ManifestStore") {}
 export const makeManifestStore = Effect.gen(function* () { const objects = yield* ObjectStore; /* … */ return ManifestStore.of({ /* … */ }) })
 export const manifestStoreLayerWithoutDependencies = Layer.effect(ManifestStore, makeManifestStore)
 export const manifestStoreLayer     = manifestStoreLayerWithoutDependencies.pipe(Layer.provide(objectStoreLayer))
@@ -496,8 +496,8 @@ type ReadConsistency =
 
       <h2>10. Infrastructure (Alchemy)</h2>
       <div class="two">
-        <pre><code>// infra/cf-slatedb/alchemy.run.ts (sketch)
-Alchemy.Stack("CfSlatedb", { providers: Cloudflare.providers(), state: Cloudflare.state() },
+        <pre><code>// infra/shaledb/alchemy.run.ts (sketch)
+Alchemy.Stack("Shaledb", { providers: Cloudflare.providers(), state: Cloudflare.state() },
   Effect.gen(function* () {
     const bucket = yield* LsmBucket          // R2.Bucket, retain(production)
     const blocks = yield* BlockServerWorker  // Cloudflare.cache({ crossVersionCache: true }),
@@ -518,7 +518,7 @@ export const writerServerLayerWithoutDependencies = WriterServer.make(
       return { fetch, alarm: () => flusher.runAlarm() }
     })
   }))</code></pre>
-        <pre><code>cf-slatedb/
+        <pre><code>shaledb/
 ├── packages/lsm-core/          # pure; no Cloudflare imports
 │   └── src/
 │       ├── row.ts  manifest.ts  ids.ts
@@ -543,7 +543,7 @@ export const writerServerLayerWithoutDependencies = WriterServer.make(
 │       ├── shard-directory-server.ts    # range map + version, one DO per group
 │       ├── shard-router.ts              # retry on DatabaseSealedError
 │       └── shard-split.ts               # seal → forkRange ×2 → publish
-└── infra/cf-slatedb/           # deploys; alchemy.run.ts only</code></pre>
+└── infra/shaledb/           # deploys; alchemy.run.ts only</code></pre>
       </div>
 
       <h2>11. Trade-offs and open decisions</h2>
@@ -568,7 +568,7 @@ export const writerServerLayerWithoutDependencies = WriterServer.make(
       <div class="facts">
         <div class="fact"><b>1 · One database per tenant (default)</b><code>DatabaseId.make(`tenant-${id}`)</code>. Routing is a pure function of the id, with no directory. Isolation, deletion, and residency are per database. Idle cost is about zero: the DO hibernates, and small data stays in SQLite until <code>maxL0Age</code> flushes it.</div>
         <div class="fact"><b>2 · Pooled key prefixes (rarely right)</b>Many tiny tenants in one database under <code>tenantId/</code> keys. They share one writer's ~1k req/s and backpressure, deleting one is a range delete plus compaction, and there's no per-tenant residency. Option 1 is already cheap at scale.</div>
-        <div class="fact"><b>3 · Datasets beyond one writer</b>Use the optional <code>@cf-slatedb/sharding</code> package, or the same core primitives from your own code. Range-bounded databases split by forking without copying data.</div>
+        <div class="fact"><b>3 · Datasets beyond one writer</b>Use the optional <code>@shaledb/sharding</code> package, or the same core primitives from your own code. Range-bounded databases split by forking without copying data.</div>
       </div>
 
       <h3 style="margin-top: 20px">Ownership</h3>

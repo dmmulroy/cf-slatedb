@@ -4,8 +4,8 @@ Vite+ owns repository checks and workspace task execution. The root `vite.config
 
 ## Workspace boundaries
 
-- `packages/*` contains libraries (`@cf-slatedb/lsm-core`, `@cf-slatedb/lsm-cloudflare`,
-  `@cf-slatedb/sharding`). Each exposes `src/index.ts` through `exports`.
+- `packages/*` contains libraries (`@shaledb/lsm-core`, `@shaledb/lsm-cloudflare`,
+  `@shaledb/sharding`). Each exposes `src/index.ts` through `exports`.
 - `infra/*` contains independent composition roots, one Alchemy Stack each. They declare no
   `exports` and never depend on each other.
 - `tools/*` contains repository tooling that nothing imports: `tools/trace-cli`,
@@ -25,8 +25,8 @@ Cross-workspace infrastructure prerequisites belong in `dependsOn`. An exact `pa
 selector resolves without a `package.json` dependency on that package.
 
 Local first: `vp run dev` runs the Stack under Alchemy's local providers (stage `dev`, local R2,
-Durable Objects, and Workflows). `@cf-slatedb/infra#deploy:preview-<n>` deploys one of the three
-approved preview stages (use `tools/preview-cli`); `@cf-slatedb/infra#destroy:preview-<n>` is run
-only by Dillon; `@cf-slatedb/infra#state:read` reads the Cloudflare state store. Every other task
+Durable Objects, and Workflows). `@shaledb/infra#deploy:preview-<n>` deploys one of the three
+approved preview stages (use `tools/preview-cli`); `@shaledb/infra#destroy:preview-<n>` is run
+only by Dillon; `@shaledb/infra#state:read` reads the Cloudflare state store. Every other task
 that plans against or changes a live Cloudflare stage needs Dillon's approval before it runs, and
 none of them is reachable from `vp run ready`.

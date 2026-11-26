@@ -1,7 +1,7 @@
 import { defineConfig } from "vite-plus";
 
 /**
- * Vite+ configuration for `@cf-slatedb/lsm-cloudflare`.
+ * Vite+ configuration for `@shaledb/lsm-cloudflare`.
  *
  * **Details**
  *

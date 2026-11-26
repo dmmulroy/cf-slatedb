@@ -7,7 +7,7 @@ import {
   planCompactions,
   type SstHandle,
   type TransactionIsolation,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import { Arbitrary, Effect, Layer, Option, Schema } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";

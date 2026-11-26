@@ -1,12 +1,12 @@
 /**
- * Preview CLI: deploys cf-slatedb to the three reusable live preview stages and reports what is
+ * Preview CLI: deploys shaledb to the three reusable live preview stages and reports what is
  * deployed where, reading the Stack's outputs from the Cloudflare state store so it works from any
  * machine.
  *
  * Usage: `node tools/preview-cli/src/preview-cli.ts <command>`. Every command accepts `--json`.
  *
  * - `deploy <stage> [--dev-timings]` redeploys the Stack to `preview-1`, `preview-2`, or
- *   `preview-3` in place, through `vp run @cf-slatedb/infra#deploy:<stage>`.
+ *   `preview-3` in place, through `vp run @shaledb/infra#deploy:<stage>`.
  * - `status` lists each preview stage and its URLs.
  * - `url <stage>` prints one stage's URLs.
  * - `token <stage>` prints the stage's access token (its Workers answer `401` without it).
@@ -22,7 +22,7 @@ import { Console, Data, Effect, Option, Schema } from "effect";
 import { Argument, Command, Flag } from "effect/cli";
 
 import {
-  CF_SLATEDB_STACK_NAME,
+  SHALEDB_STACK_NAME,
   deployEnvironment,
   deployJurisdiction,
   deployTask,
@@ -67,15 +67,15 @@ const stageArgument = Argument.Literals("stage", PREVIEW_STAGES).pipe(
   Argument.withDescription("Preview stage: preview-1, preview-2, or preview-3"),
 );
 
-/** Reads every state record under `CfSlatedb[/<stage>]` through the read-only `state:read` task. */
+/** Reads every state record under `Shaledb[/<stage>]` through the read-only `state:read` task. */
 const readStateRecords = (stage: Option.Option<PreviewStage>) =>
   Effect.gen(function* () {
     const path = Option.match(stage, {
-      onNone: () => CF_SLATEDB_STACK_NAME,
-      onSome: (name) => `${CF_SLATEDB_STACK_NAME}/${name}`,
+      onNone: () => SHALEDB_STACK_NAME,
+      onSome: (name) => `${SHALEDB_STACK_NAME}/${name}`,
     });
     const result = yield* Effect.sync(() =>
-      spawnSync("vp", ["run", "@cf-slatedb/infra#state:read", "-r", path], {
+      spawnSync("vp", ["run", "@shaledb/infra#state:read", "-r", path], {
         cwd: REPO_ROOT,
         encoding: "utf8",
       }),
@@ -179,12 +179,12 @@ const deploy = Command.make(
         traceSampleRate,
       });
       yield* Console.error(
-        `Deploying ${CF_SLATEDB_STACK_NAME} to ${stage} with ${devTimings ? "dev" : "production"} timings, jurisdiction ${residency} (vp run ${deployTask(stage)})`,
+        `Deploying ${SHALEDB_STACK_NAME} to ${stage} with ${devTimings ? "dev" : "production"} timings, jurisdiction ${residency} (vp run ${deployTask(stage)})`,
       );
       // The Workers bind the stage's two Secrets Store token slots (D64): create any that are
       // missing first. Previews also keep their state-held token, which `token` prints.
       const tokens = yield* Effect.sync(() =>
-        spawnSync("vp", ["run", "@cf-slatedb/infra#tokens", "ensure", stage], {
+        spawnSync("vp", ["run", "@shaledb/infra#tokens", "ensure", stage], {
           cwd: REPO_ROOT,
           env,
           stdio: ["ignore", 2, 2],
@@ -354,7 +354,7 @@ const destroy = Command.make(
 );
 
 const previewCli = Command.make("preview").pipe(
-  Command.withDescription("Deploy and inspect cf-slatedb's live preview stages"),
+  Command.withDescription("Deploy and inspect shaledb's live preview stages"),
   Command.withSubcommands([deploy, status, url, token, collector, bindings, destroy]),
 );
 

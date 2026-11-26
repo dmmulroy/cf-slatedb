@@ -8,7 +8,7 @@ import {
   SeqNum,
   Timestamp,
   WriterEpoch,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import { Context, Data, Effect, Layer, Option, Schema, Stream } from "effect";
 
 import {
@@ -188,7 +188,7 @@ export interface IMemTable {
 }
 
 /** The contextual memtable. */
-export class MemTable extends Context.Service<MemTable, IMemTable>()("@cf-slatedb/MemTable") {}
+export class MemTable extends Context.Service<MemTable, IMemTable>()("@shaledb/MemTable") {}
 
 const StoredRow = Schema.Struct({
   key: Schema.Uint8Array,

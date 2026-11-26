@@ -1,4 +1,4 @@
-import type { DatabaseId, ManifestId, SeqNum, SstId } from "@cf-slatedb/lsm-core";
+import type { DatabaseId, ManifestId, SeqNum, SstId } from "@shaledb/lsm-core";
 
 /**
  * Object key layout in the shared bucket: everything a database owns is under `db/<id>/`.

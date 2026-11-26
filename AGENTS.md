@@ -2,7 +2,7 @@
 
 ## Project
 
-cf-slatedb is a SlateDB-style LSM key-value store on Cloudflare R2 and Durable Objects. It keeps
+shaledb is a SlateDB-style LSM key-value store on Cloudflare R2 and Durable Objects. It keeps
 SlateDB's model (one writer, many readers, immutable SSTs, a CAS-versioned manifest, size-tiered
 compaction) and swaps two pieces for Cloudflare-native ones: the writer is a Durable Object whose
 SQLite table is both the WAL and the memtable, and compaction runs in a Workflow. The design is
@@ -13,16 +13,16 @@ The unit is a **database**: one opaque `DatabaseId` with its own `WriterServer`,
 `CompactorServer`, manifest chain, R2 prefix `db/<id>/`, and cache tag `db:<id>`. The core has no
 tenant concept.
 
-- `packages/lsm-core` (`@cf-slatedb/lsm-core`) — pure: ids, rows, CRC32C, Bloom filter, varint,
+- `packages/lsm-core` (`@shaledb/lsm-core`) — pure: ids, rows, CRC32C, Bloom filter, varint,
   block and SST codecs, the k-way merge iterator, the manifest schema and its edits, and the
   size-tiered compaction scheduler. No Cloudflare imports.
-- `packages/lsm-cloudflare` (`@cf-slatedb/lsm-cloudflare`) — the engine: `ObjectStore` (R2),
+- `packages/lsm-cloudflare` (`@shaledb/lsm-cloudflare`) — the engine: `ObjectStore` (R2),
   `ManifestStore`, `ManifestCache`, `SstStore`, `BlockCache`, `BlockSource`, `BlockServer`,
   `MemTable`, `WriterServer`, `DbReader`, `DbClient`, `CompactorServer`, the compaction Workflow,
   `GarbageCollector`, and `DatabaseLifecycle`.
-- `packages/lsm-sharding` (`@cf-slatedb/sharding`) — optional range sharding (`ShardDirectory`,
+- `packages/lsm-sharding` (`@shaledb/sharding`) — optional range sharding (`ShardDirectory`,
   `ShardRouter`, `ShardSplit`) built only on the public APIs.
-- `infra/cf-slatedb` (`@cf-slatedb/infra`) — the Alchemy Stack: R2 bucket, Durable Objects, the
+- `infra/shaledb` (`@shaledb/infra`) — the Alchemy Stack: R2 bucket, Durable Objects, the
   `BlockServer` Worker, the API Worker, the compaction Workflow, and the GC cron Worker.
 - `tools/*` — the trace CLI, the scenario CLI, the preview CLI, formal verification, Traits, and
   the workspace boundary check.

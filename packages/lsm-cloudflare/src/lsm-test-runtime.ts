@@ -9,7 +9,7 @@ export const lsmTestRuntimeContextLayer = Layer.succeed(
   RuntimeContext,
   RuntimeContext.of({
     Type: "Test",
-    id: "cf-slatedb-test",
+    id: "shaledb-test",
     env: {},
     get: () => Effect.succeed(undefined),
     set: (id) => Effect.succeed(id),

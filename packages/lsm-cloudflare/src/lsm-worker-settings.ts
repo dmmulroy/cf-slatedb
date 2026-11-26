@@ -1,4 +1,4 @@
-import { LsmSettings } from "@cf-slatedb/lsm-core";
+import { LsmSettings } from "@shaledb/lsm-core";
 import * as Alchemy from "alchemy";
 import * as Output from "alchemy/Output";
 import { CurrentRuntimeContext } from "alchemy/RuntimeContext";
@@ -10,7 +10,7 @@ import { LSM_JURISDICTION_SETTING, type LsmJurisdiction } from "./lsm-jurisdicti
 import { LSM_TRACE_SAMPLE_RATE_SETTING } from "./lsm-trace-policy.ts";
 
 /**
- * Everything a deployment decides for the engine that every cf-slatedb Worker must agree on: the
+ * Everything a deployment decides for the engine that every shaledb Worker must agree on: the
  * complete engine settings and the Stack's jurisdiction.
  */
 export interface LsmWorkerSettings {
@@ -35,9 +35,9 @@ const encodeLsmSettingsJson = Schema.encodeSync(Schema.fromJsonString(LsmSetting
 
 /**
  * The bindings that carry `settings` to a Worker, by binding name: the complete settings as JSON
- * under `CF_SLATEDB_LSM_SETTINGS`, the jurisdiction (`eu`, `fedramp`, or `none`) under
- * `CF_SLATEDB_JURISDICTION`, the bucket's location hint (or `auto`) under
- * `CF_SLATEDB_BUCKET_LOCATION`, and the trace sample rate under `CF_SLATEDB_TRACE_SAMPLE_RATE`. None is ever absent, so a deploy can never leave an earlier value
+ * under `SHALEDB_LSM_SETTINGS`, the jurisdiction (`eu`, `fedramp`, or `none`) under
+ * `SHALEDB_JURISDICTION`, the bucket's location hint (or `auto`) under
+ * `SHALEDB_BUCKET_LOCATION`, and the trace sample rate under `SHALEDB_TRACE_SAMPLE_RATE`. None is ever absent, so a deploy can never leave an earlier value
  * bound (D55).
  */
 export const lsmWorkerSettingsBindings = (

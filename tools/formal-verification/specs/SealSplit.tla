@@ -1,6 +1,6 @@
 ------------------------------- MODULE SealSplit -------------------------------
 (***************************************************************************)
-(* Seal and split for one cf-slatedb database: after the seal no write     *)
+(* Seal and split for one shaledb database: after the seal no write     *)
 (* commits to the sealed database, and every write acknowledged before the *)
 (* seal is visible in exactly one successor (each a range fork of a        *)
 (* checkpoint of the sealed manifest).                                      *)

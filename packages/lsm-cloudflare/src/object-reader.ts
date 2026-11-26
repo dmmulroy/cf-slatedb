@@ -20,7 +20,7 @@ export interface IObjectReader {
 
 /** The contextual read-only object reader. */
 export class ObjectReader extends Context.Service<ObjectReader, IObjectReader>()(
-  "@cf-slatedb/ObjectReader",
+  "@shaledb/ObjectReader",
 ) {}
 
 const unavailable =

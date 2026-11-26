@@ -14,7 +14,7 @@ import { isLocalLsmStage } from "./lsm-stage.ts";
  * Name of the binding that carries a live stage's access token to its Workers (a `secret_text`
  * binding on Cloudflare).
  */
-export const LSM_ACCESS_TOKEN_BINDING = "CF_SLATEDB_ACCESS_TOKEN";
+export const LSM_ACCESS_TOKEN_BINDING = "SHALEDB_ACCESS_TOKEN";
 
 /**
  * The access token of the current stage: `None` on local stages, which are not gated; on every live
@@ -84,7 +84,7 @@ export type LsmRotatingToken = Effect.Effect<
  */
 export interface LsmAccessTokenSource<R = never> {
   /**
-   * A token fixed at deploy time, bound onto the Worker as the secret `CF_SLATEDB_ACCESS_TOKEN`
+   * A token fixed at deploy time, bound onto the Worker as the secret `SHALEDB_ACCESS_TOKEN`
    * (yielded at plan time), or `None`.
    */
   readonly fixed: Effect.Effect<Option.Option<Output.Output<Redacted.Redacted<string>>>, never, R>;
@@ -237,7 +237,7 @@ const unauthenticatedResponse = (requestId: string) =>
       status: 401,
       headers: {
         "cache-control": "no-store",
-        "www-authenticate": 'Bearer realm="cf-slatedb"',
+        "www-authenticate": 'Bearer realm="shaledb"',
         "x-request-id": requestId,
       },
     },

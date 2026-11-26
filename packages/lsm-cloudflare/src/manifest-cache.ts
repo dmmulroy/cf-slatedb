@@ -1,4 +1,4 @@
-import type { DatabaseId } from "@cf-slatedb/lsm-core";
+import type { DatabaseId } from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Clock, Context, Effect, Layer, Ref } from "effect";
 
@@ -33,7 +33,7 @@ export interface IManifestCache {
 
 /** The contextual manifest cache. */
 export class ManifestCache extends Context.Service<ManifestCache, IManifestCache>()(
-  "@cf-slatedb/ManifestCache",
+  "@shaledb/ManifestCache",
 ) {}
 
 interface CachedManifest {

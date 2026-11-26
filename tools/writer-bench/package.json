@@ -1,5 +1,5 @@
 {
-  "name": "@cf-slatedb/tools-writer-bench",
+  "name": "@shaledb/tools-writer-bench",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -7,8 +7,8 @@
     "test": "vp test run"
   },
   "dependencies": {
-    "@cf-slatedb/lsm-cloudflare": "workspace:*",
-    "@cf-slatedb/lsm-core": "workspace:*",
+    "@shaledb/lsm-cloudflare": "workspace:*",
+    "@shaledb/lsm-core": "workspace:*",
     "effect": "catalog:"
   },
   "devDependencies": {

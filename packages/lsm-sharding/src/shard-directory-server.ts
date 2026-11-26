@@ -1,12 +1,12 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
-import { DatabaseId } from "@cf-slatedb/lsm-core";
+import { DatabaseId } from "@shaledb/lsm-core";
 import {
   durableObjectCell,
   eventTelemetryFlushForStage,
   inLsmJurisdiction,
   lsmHttpServerLayer,
   lsmJurisdiction,
-} from "@cf-slatedb/lsm-cloudflare";
+} from "@shaledb/lsm-cloudflare";
 import type { HttpEffect } from "alchemy/Http";
 import { makeExecutionMemo } from "alchemy/Runtime/ExecutionMemo";
 import type { RuntimeContext } from "alchemy/RuntimeContext";

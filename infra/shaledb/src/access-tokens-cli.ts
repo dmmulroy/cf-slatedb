@@ -3,11 +3,11 @@
  *
  * Usage (through the `tokens` task, with the Alchemy profile's Cloudflare credentials):
  *
- * - `vp run @cf-slatedb/infra#tokens ensure <stage>`: create whichever of the stage's two token
+ * - `vp run @shaledb/infra#tokens ensure <stage>`: create whichever of the stage's two token
  *   secrets are missing, printing each new token once. The deploy tasks run it first.
- * - `vp run @cf-slatedb/infra#tokens check <stage>`: fail unless both slots exist (the production
+ * - `vp run @shaledb/infra#tokens check <stage>`: fail unless both slots exist (the production
  *   deploy task runs it first, so it never creates a token in a deploy's log).
- * - `vp run @cf-slatedb/infra#tokens rotate <stage> <A|B>`: replace one slot's token, printing
+ * - `vp run @shaledb/infra#tokens rotate <stage> <A|B>`: replace one slot's token, printing
  *   the new one. Move callers to the other slot's token before rotating a slot they use.
  *
  * Tokens are printed only here: the Secrets Store never returns them.
@@ -27,7 +27,7 @@ import {
   rotateAccessToken,
   type WrittenAccessToken,
 } from "./access-token-store.ts";
-import { CF_SLATEDB_ACCESS_TOKEN_SLOTS } from "./cf-slatedb-access-tokens.ts";
+import { SHALEDB_ACCESS_TOKEN_SLOTS } from "./shaledb-access-tokens.ts";
 
 const stageArgument = Argument.String("stage").pipe(
   Argument.withDescription("Live stage: production or preview-<n>"),
@@ -59,7 +59,7 @@ const check = Command.make("check", { stage: stageArgument }, ({ stage }) =>
     }
     return yield* new AccessTokenStoreError({
       reason: "StoreNotFound",
-      message: `${stage} has no access token in slot(s) ${missing.join(", ")}, so its Workers cannot deploy. Run \`vp run @cf-slatedb/infra#tokens ensure ${stage}\` first and store the tokens it prints.`,
+      message: `${stage} has no access token in slot(s) ${missing.join(", ")}, so its Workers cannot deploy. Run \`vp run @shaledb/infra#tokens ensure ${stage}\` first and store the tokens it prints.`,
     });
   }),
 ).pipe(Command.withDescription("Fail unless both of the stage's access-token secrets exist"));
@@ -68,7 +68,7 @@ const rotate = Command.make(
   "rotate",
   {
     stage: stageArgument,
-    slot: Argument.Literals("slot", CF_SLATEDB_ACCESS_TOKEN_SLOTS),
+    slot: Argument.Literals("slot", SHALEDB_ACCESS_TOKEN_SLOTS),
   },
   ({ stage, slot }) =>
     Effect.gen(function* () {

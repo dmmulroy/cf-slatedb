@@ -1,4 +1,4 @@
-import { type DatabaseId, ManifestId, type SstId } from "@cf-slatedb/lsm-core";
+import { type DatabaseId, ManifestId, type SstId } from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Context, Effect, Layer, Option, Ref, Schema } from "effect";
 import { HttpServerResponse } from "effect/http";
@@ -23,7 +23,7 @@ export interface IBlockCachePurge {
 
 /** The contextual Workers Cache purge of the `BlockServer`. */
 export class BlockCachePurge extends Context.Service<BlockCachePurge, IBlockCachePurge>()(
-  "@cf-slatedb/BlockCachePurge",
+  "@shaledb/BlockCachePurge",
 ) {}
 
 /** Provides a purge that records the purged databases; Workers Cache is not emulated locally. */

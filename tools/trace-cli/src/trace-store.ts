@@ -63,7 +63,7 @@ export interface ITraceStore {
 
 /** Provides the local trace store. */
 export class TraceStore extends Context.Service<TraceStore, ITraceStore>()(
-  "@cf-slatedb/tools-trace-cli/TraceStore",
+  "@shaledb/tools-trace-cli/TraceStore",
 ) {}
 
 const decodeCollectedSpanLine = Schema.decodeEffect(CollectedSpanJsonLine);

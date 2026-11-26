@@ -1,6 +1,6 @@
-# cf-slatedb implementation brief
+# shaledb implementation brief
 
-You are implementing **cf-slatedb**: a SlateDB-style LSM key-value store on Cloudflare R2 and Durable Objects,
+You are implementing **shaledb**: a SlateDB-style LSM key-value store on Cloudflare R2 and Durable Objects,
 written with Effect 4 and deployed with Alchemy v2. Implement the design exhaustively and end to end. The work is
 done when every part of the design is implemented, it runs locally, and the correctness tooling below proves it.
 
@@ -60,7 +60,7 @@ Work autonomously. Do not stop to ask for confirmation between phases. Ask Dillo
 
 ## Repository setup (Phase 0)
 
-The repo is `/Users/dmmulroy/Code/personal/cf-slatedb`. It has no commits yet. Already present:
+The repo is `/Users/dmmulroy/Code/personal/shaledb`. It has no commits yet. Already present:
 `docs/coding-standards.md`, `docs/errors.md`, `docs/vite-plus.md` (from iac), `docs/testing.md` (from R10/Overseer),
 the design page, and three pstack skills in `.agents/skills/`.
 
@@ -69,10 +69,10 @@ the design page, and three pstack skills in `.agents/skills/`.
   and tsconfig, `.node-version`, `.gitignore` (`node_modules`, `.alchemy`, `repos/`, trace stores), and
   `tools/workspace-boundaries` adapted to this layout.
 - Layout, following design §10: `packages/lsm-core` (pure; no Cloudflare imports), `packages/lsm-cloudflare`,
-  `packages/lsm-sharding` (optional; public API only), `infra/cf-slatedb` (the deployable Alchemy Stack; no
+  `packages/lsm-sharding` (optional; public API only), `infra/shaledb` (the deployable Alchemy Stack; no
   `exports`), `tools/*` (trace CLI, formal verification, load and scenario drivers).
 - Adapt the copied docs to this project. Replace iac, Overseer, and Account/Order/Invoice references with
-  cf-slatedb's own vocabulary only where they name a project. Keep the rules. Rewrite `docs/testing.md` so the
+  shaledb's own vocabulary only where they name a project. Keep the rules. Rewrite `docs/testing.md` so the
   default test strategy is **local**: unit and property tests, workerd integration through Alchemy's local dev
   providers, and scenario tests against a locally running Stack with trace assertions. Real-cloud end-to-end tests
   become an opt-in task that never runs without Dillon's approval.
@@ -123,7 +123,7 @@ Phases 2 and 3 can overlap. Do not start Phase 4 until the trace CLI works under
 
 ## Running locally
 
-- `infra/cf-slatedb/alchemy.run.ts` declares the full Stack: R2 bucket, `WriterServer`, `CompactorServer`,
+- `infra/shaledb/alchemy.run.ts` declares the full Stack: R2 bucket, `WriterServer`, `CompactorServer`,
   `ShardDirectory`, `BlockServer` Worker, API Worker, compaction Workflow, and the GC cron Worker. Production names
   and retention follow iac's stage rules, but **never deploy a live stage** without Dillon's approval.
 - Provide `vp run dev` (Alchemy local dev, stage `dev`, local R2 and Durable Objects) and a scenario driver CLI,

@@ -1,8 +1,8 @@
-# cf-slatedb
+# shaledb
 
 A SlateDB-style LSM key-value store on Cloudflare R2 and Durable Objects.
 
-cf-slatedb keeps SlateDB's model:
+shaledb keeps SlateDB's model:
 
 - one writer and many readers per database;
 - immutable SSTs in object storage;
@@ -50,7 +50,7 @@ local Stack, with trace assertions.
 
 ## The API
 
-The contract is [`docs/openapi/cf-slatedb-v1.json`](docs/openapi/cf-slatedb-v1.json), generated
+The contract is [`docs/openapi/shaledb-v1.json`](docs/openapi/shaledb-v1.json), generated
 from `DbHttpApi`, with examples of every request and response. It covers:
 
 - **Databases:** create, status, remove.
@@ -82,7 +82,7 @@ Live stages require `Authorization: Bearer <token>`. Each stage has two rotatabl
 | `packages/lsm-core`       | Pure LSM logic: ids, rows, codecs, Bloom filters, the merge iterator, the manifest and its edits, the compaction scheduler. No Cloudflare imports. |
 | `packages/lsm-cloudflare` | The engine on Workers: object store, manifest store, writer, reader, compactor, compaction Workflow, GC, lifecycle, the HTTP APIs.                 |
 | `packages/lsm-sharding`   | Optional range sharding over the public API.                                                                                                       |
-| `infra/cf-slatedb`        | The Alchemy Stack: buckets, Durable Objects, Workers, the Workflow, telemetry, access tokens.                                                      |
+| `infra/shaledb`           | The Alchemy Stack: buckets, Durable Objects, Workers, the Workflow, telemetry, access tokens.                                                      |
 | `tools/*`                 | Trace CLI, scenario and measurement CLI, preview CLI, writer benchmark, formal verification (TLA+).                                                |
 
 ## Documentation

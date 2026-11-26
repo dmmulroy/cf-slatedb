@@ -13,13 +13,13 @@ import {
   DatabaseId,
   DEFAULT_DATABASE_OPTIONS,
   WriteBatch,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import {
   DatabaseLifecycle,
   DbClient,
   dbServicesTestLayer,
   lsmTestRuntimeContextLayer,
-} from "@cf-slatedb/lsm-cloudflare";
+} from "@shaledb/lsm-cloudflare";
 import { Effect, Option, Schema } from "effect";
 
 const roundsArgument = process.argv.indexOf("--rounds");

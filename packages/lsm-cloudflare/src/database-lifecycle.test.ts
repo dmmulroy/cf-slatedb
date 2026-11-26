@@ -3,7 +3,7 @@ import {
   DEFAULT_DATABASE_OPTIONS,
   type KeyRange,
   manifestSstHandles,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import { Context, Effect, Layer, Option, Ref } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";

@@ -21,7 +21,7 @@ export interface IDbHttpRequest {
 
 /** Identifies the request being served, so error bodies carry its request id. */
 export class DbHttpRequest extends Context.Service<DbHttpRequest, IDbHttpRequest>()(
-  "@cf-slatedb/DbHttpRequest",
+  "@shaledb/DbHttpRequest",
 ) {}
 
 /** Reads the request identity from the `cf-ray` header (or generates one). */
@@ -112,11 +112,11 @@ export const dbHttpRequestMiddlewareLayer = HttpRouter.middleware<{
               );
             case "InternalError":
             case "ResponseError":
-              return internalFailure("cf-slatedb API router failed", error);
+              return internalFailure("shaledb API router failed", error);
           }
         }),
         Effect.catchCauseIf(Cause.hasDies, (cause) =>
-          internalFailure("cf-slatedb API request failed on a defect", Cause.pretty(cause)),
+          internalFailure("shaledb API request failed on a defect", Cause.pretty(cause)),
         ),
         Effect.annotateLogs({ requestId, path: pathname, method: request.method }),
       );

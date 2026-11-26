@@ -7,7 +7,7 @@ import {
   mergeRowStreams,
   type Row,
   sstHandleOwner,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import { Effect, Option, Result, Stream } from "effect";
 
 import { sstKey } from "./object-keys.ts";

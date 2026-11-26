@@ -1,4 +1,4 @@
-import type { LsmSettings } from "@cf-slatedb/lsm-core";
+import type { LsmSettings } from "@shaledb/lsm-core";
 import { Effect, Layer } from "effect";
 
 import { backgroundWorkTestLayer, workerBackgroundWorkLayer } from "./background-work.ts";
@@ -19,7 +19,7 @@ import { WriterServer } from "./writer-server.ts";
  * Provides `DbClient` and `DatabaseLifecycle` to any Worker in the Stack other than `DbApiWorker`
  * (which hosts the writers): it binds `WriterServer` from `DbApiWorker` and `CompactorServer` from
  * `CompactorWorker` (cross-script), the `BlockServer` service, and the bucket. This is how a
- * library such as `@cf-slatedb/sharding` uses the database from its own Worker.
+ * library such as `@shaledb/sharding` uses the database from its own Worker.
  */
 export const dbServicesLayer = Layer.mergeAll(
   dbClientLayerWithoutDependencies.pipe(Layer.provide(dbReaderLayer)),

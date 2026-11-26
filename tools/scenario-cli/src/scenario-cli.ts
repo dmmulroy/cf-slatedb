@@ -340,8 +340,14 @@ const soakCommand = Command.make(
       Flag.withDescription("Comma-separated minutes at which to split the sharded group"),
       Flag.withDefault("20,80"),
     ),
+    traceSampleRate: Flag.Finite("trace-sample-rate").pipe(
+      Flag.withDescription(
+        "The trace sample rate the stage was deployed with; the midway redeploy keeps it (soak at 0.1)",
+      ),
+      Flag.optional,
+    ),
   },
-  ({ stage, minutes, databases, keysPerDatabase, redeployAt, splitAt }) =>
+  ({ stage, minutes, databases, keysPerDatabase, redeployAt, splitAt, traceSampleRate }) =>
     runMeasurement(
       stage,
       soak({
@@ -350,6 +356,7 @@ const soakCommand = Command.make(
         keysPerDatabase,
         redeployAtMinute: redeployAt,
         splitAtMinutes: splitAt.split(",").map((minute) => Number(minute.trim())),
+        traceSampleRate,
       }),
     ),
 ).pipe(
@@ -367,7 +374,7 @@ const smokeCommand = Command.make(
     ),
     apiUrl: Flag.String("api-url").pipe(
       Flag.withDescription(
-        "The API's URL (production: its apiUrl output); the token is read from CF_SLATEDB_TOKEN",
+        "The API's URL (production: its apiUrl output); the token is read from SHALEDB_TOKEN",
       ),
       Flag.optional,
     ),
@@ -383,16 +390,16 @@ const smokeCommand = Command.make(
               Effect.fail(
                 new ScenarioCliError({
                   reason: "PreviewUnavailable",
-                  message: "Pass --stage <preview> or --api-url <url> (with CF_SLATEDB_TOKEN set).",
+                  message: "Pass --stage <preview> or --api-url <url> (with SHALEDB_TOKEN set).",
                 }),
               ),
             onSome: (url) => {
-              const token = process.env["CF_SLATEDB_TOKEN"];
+              const token = process.env["SHALEDB_TOKEN"];
               return token === undefined || token === ""
                 ? Effect.fail(
                     new ScenarioCliError({
                       reason: "PreviewUnavailable",
-                      message: "Set CF_SLATEDB_TOKEN to one of the stage's access tokens.",
+                      message: "Set SHALEDB_TOKEN to one of the stage's access tokens.",
                     }),
                   )
                 : Effect.succeed({ url, token });
@@ -471,7 +478,7 @@ const runScenarios = (names: ReadonlyArray<string>) =>
   });
 
 const scenarioCli = Command.make("scenario").pipe(
-  Command.withDescription("End-to-end scenarios for the local cf-slatedb Stack"),
+  Command.withDescription("End-to-end scenarios for the local shaledb Stack"),
   Command.withSubcommands([list, run, measure, soakCommand, smokeCommand]),
 );
 

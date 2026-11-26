@@ -82,7 +82,7 @@ export const telemetrySmokeWorkerLayer = TelemetrySmokeWorker.make(
     Effect.provide(
       lsmTelemetryLayer({
         baseUrl: `http://127.0.0.1:${TELEMETRY_SMOKE_COLLECTOR_PORT}`,
-        serviceName: "cf-slatedb-telemetry-smoke",
+        serviceName: "shaledb-telemetry-smoke",
       }),
     ),
   ),

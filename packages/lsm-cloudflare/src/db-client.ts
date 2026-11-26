@@ -18,7 +18,7 @@ import {
   type TransactionIsolation,
   type WriteBatch,
   type WriteReceipt,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import { Bytes, Context, Effect, Layer, Option, Schema, Stream } from "effect";
 
 import { backgroundWorkTestLayer } from "./background-work.ts";
@@ -280,7 +280,7 @@ export interface DbTransaction {
 export type DbTransactionError = DbClientReadError | TransactionConflictError;
 
 /** The contextual database client. */
-export class DbClient extends Context.Service<DbClient, IDbClient>()("@cf-slatedb/DbClient") {}
+export class DbClient extends Context.Service<DbClient, IDbClient>()("@shaledb/DbClient") {}
 
 const FLUSHED_VIEW: ReadView = {
   minLastL0Seq: SeqNum.make(0),

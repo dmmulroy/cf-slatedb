@@ -16,7 +16,7 @@ import {
   removeCheckpoint,
   type SstId,
   Timestamp,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Clock, Context, Effect, Layer, Option, Result, Schema, type Scope } from "effect";
 
@@ -213,7 +213,7 @@ export interface IDatabaseLifecycle {
 
 /** The contextual database lifecycle. */
 export class DatabaseLifecycle extends Context.Service<DatabaseLifecycle, IDatabaseLifecycle>()(
-  "@cf-slatedb/DatabaseLifecycle",
+  "@shaledb/DatabaseLifecycle",
 ) {}
 
 /**

@@ -4,7 +4,7 @@ import {
   FULL_KEY_RANGE,
   initialManifest,
   SeqNum,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import { Effect, Layer, Option } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";

@@ -1,6 +1,6 @@
 ---
 name: verify-gc-safety
-description: "Model-check that cf-slatedb garbage collection never deletes an SST that the newest manifest, a recently superseded manifest a reader may still hold, or a checkpoint (including a fork's hold on its source) references, and never deletes an uploaded SST whose commit can still succeed. Use after any change to GarbageCollector.collect, the GC planning functions, gcSstBoundary handling in commitL0Flush/commitCompaction, checkpoints, or how readers hold manifests."
+description: "Model-check that shaledb garbage collection never deletes an SST that the newest manifest, a recently superseded manifest a reader may still hold, or a checkpoint (including a fork's hold on its source) references, and never deletes an uploaded SST whose commit can still succeed. Use after any change to GarbageCollector.collect, the GC planning functions, gcSstBoundary handling in commitL0Flush/commitCompaction, checkpoints, or how readers hold manifests."
 ---
 
 # Verify: GC safety

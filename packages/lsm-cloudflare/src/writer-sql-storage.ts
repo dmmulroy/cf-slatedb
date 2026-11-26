@@ -41,7 +41,7 @@ export interface IWriterSqlStorage {
 
 /** The contextual writer SQLite storage. */
 export class WriterSqlStorage extends Context.Service<WriterSqlStorage, IWriterSqlStorage>()(
-  "@cf-slatedb/WriterSqlStorage",
+  "@shaledb/WriterSqlStorage",
 ) {}
 
 const sqlError = (cause: unknown) =>

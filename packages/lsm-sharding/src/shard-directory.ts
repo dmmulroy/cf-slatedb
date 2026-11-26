@@ -1,5 +1,5 @@
-import { DatabaseId, generateCompactionJobId } from "@cf-slatedb/lsm-core";
-import { type DurableObjectCell, inMemoryCell } from "@cf-slatedb/lsm-cloudflare";
+import { DatabaseId, generateCompactionJobId } from "@shaledb/lsm-core";
+import { type DurableObjectCell, inMemoryCell } from "@shaledb/lsm-cloudflare";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import {
   Context,
@@ -127,7 +127,7 @@ export interface IShardDirectory {
 
 /** The contextual shard directory. */
 export class ShardDirectory extends Context.Service<ShardDirectory, IShardDirectory>()(
-  "@cf-slatedb/ShardDirectory",
+  "@shaledb/ShardDirectory",
 ) {}
 
 /** A new database id for one half of a split: `s-` and a lowercase ULID. */

@@ -3,11 +3,11 @@ import { Data, Effect, Option, Redacted, Schedule, Stream } from "effect";
 
 import {
   accessTokenSecretName,
-  CF_SLATEDB_ACCESS_TOKEN_SLOTS,
-  CF_SLATEDB_SECRETS_STORE_NAME,
-  type CfSlatedbAccessTokenSlot,
-} from "./cf-slatedb-access-tokens.ts";
-import { CF_SLATEDB_CLOUDFLARE_ACCOUNT_ID } from "./cf-slatedb-stage.ts";
+  SHALEDB_ACCESS_TOKEN_SLOTS,
+  SHALEDB_SECRETS_STORE_NAME,
+  type ShaledbAccessTokenSlot,
+} from "./shaledb-access-tokens.ts";
+import { SHALEDB_CLOUDFLARE_ACCOUNT_ID } from "./shaledb-stage.ts";
 
 /**
  * An access-token operation could not complete.
@@ -28,7 +28,7 @@ export class AccessTokenStoreError extends Data.TaggedError("AccessTokenStoreErr
 /** A token this run wrote: which stage and slot, and its value (shown to the operator once). */
 export interface WrittenAccessToken {
   readonly stage: string;
-  readonly slot: CfSlatedbAccessTokenSlot;
+  readonly slot: ShaledbAccessTokenSlot;
   readonly secretName: string;
   readonly token: Redacted.Redacted<string>;
 }
@@ -47,31 +47,29 @@ const unavailable = (action: string) => (error: { readonly message?: string }) =
   });
 
 /** The account's Secrets Store that holds the access tokens. */
-const tokenStore = secretsStore.listStores
-  .items({ accountId: CF_SLATEDB_CLOUDFLARE_ACCOUNT_ID })
-  .pipe(
-    Stream.filter((store) => store.name === CF_SLATEDB_SECRETS_STORE_NAME),
-    Stream.runHead,
-    Effect.mapError(unavailable("list the account's Secrets Stores")),
-    Effect.flatMap(
-      Option.match({
-        onNone: () =>
-          Effect.fail(
-            new AccessTokenStoreError({
-              reason: "StoreNotFound",
-              message: `The account has no Secrets Store named ${CF_SLATEDB_SECRETS_STORE_NAME}. Create it in the Cloudflare dashboard (Secrets Store), then retry.`,
-            }),
-          ),
-        onSome: (store) => Effect.succeed(store.id),
-      }),
-    ),
-  );
+const tokenStore = secretsStore.listStores.items({ accountId: SHALEDB_CLOUDFLARE_ACCOUNT_ID }).pipe(
+  Stream.filter((store) => store.name === SHALEDB_SECRETS_STORE_NAME),
+  Stream.runHead,
+  Effect.mapError(unavailable("list the account's Secrets Stores")),
+  Effect.flatMap(
+    Option.match({
+      onNone: () =>
+        Effect.fail(
+          new AccessTokenStoreError({
+            reason: "StoreNotFound",
+            message: `The account has no Secrets Store named ${SHALEDB_SECRETS_STORE_NAME}. Create it in the Cloudflare dashboard (Secrets Store), then retry.`,
+          }),
+        ),
+      onSome: (store) => Effect.succeed(store.id),
+    }),
+  ),
+);
 
 /** The id of the secret named `name` in the store, if it exists. */
 const secretIdByName = (storeId: string, name: string) =>
   secretsStore.listStoreSecrets
     .items({
-      accountId: CF_SLATEDB_CLOUDFLARE_ACCOUNT_ID,
+      accountId: SHALEDB_CLOUDFLARE_ACCOUNT_ID,
       storeId,
       search: name,
       order: "name",
@@ -85,20 +83,18 @@ const secretIdByName = (storeId: string, name: string) =>
 
 /** Waits (bounded) until a written secret is active: Workers cannot bind a pending one. */
 const awaitActive = (storeId: string, secretId: string) =>
-  secretsStore
-    .getStoreSecret({ accountId: CF_SLATEDB_CLOUDFLARE_ACCOUNT_ID, storeId, secretId })
-    .pipe(
-      Effect.map((secret) => secret.status),
-      Effect.repeat({
-        schedule: Schedule.spaced("500 millis"),
-        until: (status) => status === "active",
-        times: 20,
-      }),
-      Effect.ignore,
-    );
+  secretsStore.getStoreSecret({ accountId: SHALEDB_CLOUDFLARE_ACCOUNT_ID, storeId, secretId }).pipe(
+    Effect.map((secret) => secret.status),
+    Effect.repeat({
+      schedule: Schedule.spaced("500 millis"),
+      until: (status) => status === "active",
+      times: 20,
+    }),
+    Effect.ignore,
+  );
 
 /** Writes a new token into `slot`, creating its secret when missing. */
-const writeSlot = (storeId: string, stage: string, slot: CfSlatedbAccessTokenSlot) =>
+const writeSlot = (storeId: string, stage: string, slot: ShaledbAccessTokenSlot) =>
   Effect.gen(function* () {
     const secretName = accessTokenSecretName(stage, slot);
     const token = newToken();
@@ -107,7 +103,7 @@ const writeSlot = (storeId: string, stage: string, slot: CfSlatedbAccessTokenSlo
       onSome: (id) =>
         secretsStore
           .patchStoreSecret({
-            accountId: CF_SLATEDB_CLOUDFLARE_ACCOUNT_ID,
+            accountId: SHALEDB_CLOUDFLARE_ACCOUNT_ID,
             storeId,
             secretId: id,
             value: Redacted.value(token),
@@ -116,14 +112,14 @@ const writeSlot = (storeId: string, stage: string, slot: CfSlatedbAccessTokenSlo
       onNone: () =>
         secretsStore
           .createStoreSecret({
-            accountId: CF_SLATEDB_CLOUDFLARE_ACCOUNT_ID,
+            accountId: SHALEDB_CLOUDFLARE_ACCOUNT_ID,
             storeId,
             body: [
               {
                 name: secretName,
                 value: Redacted.value(token),
                 scopes: ["workers"],
-                comment: `cf-slatedb access token, stage ${stage}, slot ${slot} (D64)`,
+                comment: `shaledb access token, stage ${stage}, slot ${slot} (D64)`,
               },
             ],
           })
@@ -147,7 +143,7 @@ export const ensureAccessTokens = (stage: string) =>
   Effect.gen(function* () {
     const storeId = yield* tokenStore;
     const created: Array<WrittenAccessToken> = [];
-    for (const slot of CF_SLATEDB_ACCESS_TOKEN_SLOTS) {
+    for (const slot of SHALEDB_ACCESS_TOKEN_SLOTS) {
       const existing = yield* secretIdByName(storeId, accessTokenSecretName(stage, slot));
       if (Option.isNone(existing)) created.push(yield* writeSlot(storeId, stage, slot));
     }
@@ -163,8 +159,8 @@ export const ensureAccessTokens = (stage: string) =>
 export const missingAccessTokens = (stage: string) =>
   Effect.gen(function* () {
     const storeId = yield* tokenStore;
-    const missing: Array<CfSlatedbAccessTokenSlot> = [];
-    for (const slot of CF_SLATEDB_ACCESS_TOKEN_SLOTS) {
+    const missing: Array<ShaledbAccessTokenSlot> = [];
+    for (const slot of SHALEDB_ACCESS_TOKEN_SLOTS) {
       const existing = yield* secretIdByName(storeId, accessTokenSecretName(stage, slot));
       if (Option.isNone(existing)) missing.push(slot);
     }
@@ -178,5 +174,5 @@ export const missingAccessTokens = (stage: string) =>
  *
  * @returns The new token, or `AccessTokenStoreError`.
  */
-export const rotateAccessToken = (stage: string, slot: CfSlatedbAccessTokenSlot) =>
+export const rotateAccessToken = (stage: string, slot: ShaledbAccessTokenSlot) =>
   Effect.flatMap(tokenStore, (storeId) => writeSlot(storeId, stage, slot));

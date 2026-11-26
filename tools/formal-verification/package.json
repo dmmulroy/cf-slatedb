@@ -1,5 +1,5 @@
 {
-  "name": "@cf-slatedb/tools-formal-verification",
+  "name": "@shaledb/tools-formal-verification",
   "version": "0.0.0",
   "private": true,
   "type": "module",

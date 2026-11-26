@@ -8,7 +8,7 @@ import {
   type SstId,
   type SstInfo,
   type SstKind,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Context, Effect, Layer, Metric, Option, Stream } from "effect";
 
@@ -62,7 +62,7 @@ export interface ISstStore {
 }
 
 /** The contextual SST store. */
-export class SstStore extends Context.Service<SstStore, ISstStore>()("@cf-slatedb/SstStore") {}
+export class SstStore extends Context.Service<SstStore, ISstStore>()("@shaledb/SstStore") {}
 
 /** Constructs the SST store over the contextual object store and settings. */
 export const makeSstStore = Effect.gen(function* () {

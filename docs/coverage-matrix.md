@@ -38,7 +38,7 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 ## §2 System
 
 - **Topology: API Worker, `WriterServer`, `BlockServer`, R2, `CompactorServer`, Workflow, GC cron** —
-  done (sharding's `ShardDirectory` comes in Phase 8). `infra/cf-slatedb/alchemy.run.ts`: `DbApiWorker`
+  done (sharding's `ShardDirectory` comes in Phase 8). `infra/shaledb/alchemy.run.ts`: `DbApiWorker`
   (hosts `WriterServer`, binds `CompactorServer` cross-script), `BlockServerWorker`, `CompactorWorker`
   (`CompactorServer`, `CompactionWorkflow`, `CompactionBudgetServer`), `GcWorker` (cron), the bucket,
   and the telemetry probe. `writer.workerd.ts` runs the same topology.
@@ -89,7 +89,7 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   for a block another Worker read first; off in a restricted Stack (D49).
 - **`BlockServer`: separate Worker, `crossVersionCache`, `workersDev: false`, `fetch()` not RPC**
   — done. `block-server-worker.ts`, `block-source.ts` (D31). Test: `writer.workerd.ts` reads through
-  the binding; trace shows `GET (client)` → `BlockServer.*` on the `cf-slatedb-blocks` service.
+  the binding; trace shows `GET (client)` → `BlockServer.*` on the `shaledb-blocks` service.
 - **`SstHandle.metaOffset`/`metaLength`** — done. One ranged request opens an SST
   (`BlockCache.meta` → `/meta/<offset>-<length>`); `sst-codec.test.ts` checks the bounds.
 
@@ -110,11 +110,11 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   create from the committer's own view; only a written commit trusted from it), used by
   `DbWriter.flushNow` and `DbWriter.seal`; `BackgroundWork` (`background-work.ts`: Worker,
   Durable Object, inline-for-Workflows, and forking test layers) carries the hint off the critical
-  path; `object.kind` on ObjectStore spans; `CF_SLATEDB_BUCKET_LOCATION` in the Stack config
+  path; `object.kind` on ObjectStore spans; `SHALEDB_BUCKET_LOCATION` in the Stack config
   (`LsmBucket` `locationHint`). Tests: `manifest-store.test.ts` (own view with one create and no
   load, from traces; stale view; collected next id; failure and no-op rechecked; hint), each
   mutation of the real code caught; `object-store.test.ts` (`objectKindOfKey`);
-  `cf-slatedb-stack-config.test.ts`, `lsm-worker-settings.test.ts` (bucket location). Trace: the
+  `shaledb-stack-config.test.ts`, `lsm-worker-settings.test.ts` (bucket location). Trace: the
   `flush` scenario (one `ManifestStore.update` from `OwnView` in one attempt, no
   `ManifestReader.loadLatest`), `create-race` (manifest creates by `object.kind`). Formal:
   `ManifestCasFencing` (three configs; `CommitOnce`, `LoadFindsHead`; `noBoundaryReread`,
@@ -229,20 +229,20 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 ## §10 Infrastructure
 
 - **Alchemy Stack with every Worker, DO, Workflow, and cron** — done for Phases 1–6
-  (`infra/cf-slatedb/alchemy.run.ts`); `ShardDirectory` joins in Phase 8.
-- **`state: Cloudflare.state()` for live stages** — done. `cfSlatedbStateLayer`
-  (`infra/cf-slatedb/src/cf-slatedb-stage.ts`): local state for `dev`/`test`/`local` stages,
+  (`infra/shaledb/alchemy.run.ts`); `ShardDirectory` joins in Phase 8.
+- **`state: Cloudflare.state()` for live stages** — done. `shaledbStateLayer`
+  (`infra/shaledb/src/shaledb-stage.ts`): local state for `dev`/`test`/`local` stages,
   the account's Cloudflare state store (pinned account) for previews and production. Test:
-  `infra/cf-slatedb/src/cf-slatedb-stage.test.ts`; `vp run dev` still runs offline. D43.
+  `infra/shaledb/src/shaledb-stage.test.ts`; `vp run dev` still runs offline. D43.
 - **Preview deployment tool** — done. `tools/preview-cli` (`deploy`, `status`, `url`, `token`,
   `destroy-command`; `--json`; `--dev-timings`), tasks `deploy:preview-<n>`, `destroy:preview-<n>`
-  (Dillon only), `state:read` (`infra/cf-slatedb/vite.config.ts`). Test:
+  (Dillon only), `state:read` (`infra/shaledb/vite.config.ts`). Test:
   `tools/preview-cli/src/preview-stage.test.ts` (state parsing, outputs, token, destroy command).
   Live: `preview-1` deployed and redeployed in place (no-op), `status`/`url`/`token` read the
   Cloudflare state store. D45.
-- **Traces from previews** — done. `infra/cf-slatedb/src/trace-collector-worker.ts`
+- **Traces from previews** — done. `infra/shaledb/src/trace-collector-worker.ts`
   (`TraceCollectorWorker`, `TraceBucket`, `TraceCollectorToken`; live stages only),
-  `cf-slatedb-telemetry.ts` (`cfSlatedbTelemetry`), `LsmWorkerTelemetry`/`lsmOtlpTelemetry`
+  `shaledb-telemetry.ts` (`shaledbTelemetry`), `LsmWorkerTelemetry`/`lsmOtlpTelemetry`
   (`lsm-telemetry.ts`), `lsmWorkerCompatibility` (`lsm-stage.ts`), `tools/trace-cli/src/
   preview-trace-pull.ts` (`pull --stage`, `tail --stage`), `preview-cli collector`. Tests:
   `preview-trace-pull.test.ts` (JSON and protobuf exports across pages, repeated pulls download
@@ -259,15 +259,15 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   (`LsmAccessToken`, `lsmAccessGateForStage`, replaced by `lsmAccessGateFrom` in D64), applied by `db-api-worker.ts`, `gc-worker.ts`,
   `shard-router-worker.ts`, and the telemetry probe. Test: `lsm-access-gate.test.ts`. Live:
   `preview-1` answers `401` without the token and serves the API with it. D44.
-- **The Stack owns its configuration (v1 workstream 1)** — done (D55). `CfSlatedbStackConfig`
-  (`infra/cf-slatedb/src/cf-slatedb-stack-config.ts`): stage, jurisdiction, complete `LsmSettings`,
+- **The Stack owns its configuration (v1 workstream 1)** — done (D55). `ShaledbStackConfig`
+  (`infra/shaledb/src/shaledb-stack-config.ts`): stage, jurisdiction, complete `LsmSettings`,
   telemetry, access mode, resolved once from the deploy's environment with complete defaults; the
   Stack resolves it before declaring anything and a refused variable fails the plan.
   `bindLsmWorkerSettings` / `lsmWorkerSettingsBindings` (`lsm-worker-settings.ts`) bind every Worker
   the complete settings and an explicit jurisdiction on every deploy (each Worker layer's `settings`
   option); `LsmSettings` refuses contradictory combinations (`lsm-settings.ts`). Both buckets are
   `forceDestroy` outside production. `preview-cli bindings <stage>` reads each Worker's bound values
-  from state. Tests: `cf-slatedb-stack-config.test.ts` (defaults by stage, each variable, each
+  from state. Tests: `shaledb-stack-config.test.ts` (defaults by stage, each variable, each
   refusal, bindings never absent), `lsm-worker-settings.test.ts` (bindings round-trip through the
   Workers' `Config` reads; pre-D55 partial values still read), `lsm-settings.test.ts`,
   `preview-stage.test.ts` (`deployEnvironment`, `previewWorkerBindings`), `writer.workerd.ts` (the
@@ -275,7 +275,7 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `--dev-timings`, then by a bare `vp run …#deploy:preview-1` with no variables set → every Worker
   bound the complete production settings and `none`; `preview-3` `eu` → `none` → every Worker `none`.
 - **Layout `packages/lsm-core`, `packages/lsm-cloudflare`, `packages/lsm-sharding`,
-  `infra/cf-slatedb`** — done. Enforced by `tools/workspace-boundaries` (D1, D2).
+  `infra/shaledb`** — done. Enforced by `tools/workspace-boundaries` (D1, D2).
 
 ## §11 Trade-offs
 
@@ -383,12 +383,12 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 - **Writer throughput and per-invocation limits (v1 workstream 6)** — done (D61). `DbWriter`'s
   in-memory `oldestUnflushed` (no memtable scan per write); `MEMTABLE_FLUSH_PAGE_QUERIES` (`+seq`
   bounds, cursor resume) in `mem-table.ts`; lsm-core `groupBlockReads` and
-  `COMPACTION_READ_CHUNK_BYTES` in `compaction-executor.ts`; `CfSlatedbStackConfig.limits` bound as
-  `limits.cpu_ms` (`cfSlatedbApiCpuLimit`, `cfSlatedbCompactorCpuLimit`); status `l0Count` from the
+  `COMPACTION_READ_CHUNK_BYTES` in `compaction-executor.ts`; `ShaledbStackConfig.limits` bound as
+  `limits.cpu_ms` (`shaledbApiCpuLimit`, `shaledbCompactorCpuLimit`); status `l0Count` from the
   newest manifest; `preview-cli deploy --settings`; `tools/writer-bench`; `scenario-cli measure
   writes|compaction-cpu|writer-memory|workflow-burst`. Tests: `mem-table.test.ts` (flush query plans
   use the primary key and no temp B-tree), `sst-codec.test.ts` (`groupBlockReads` property),
-  `cf-slatedb-stack-config.test.ts` (limits and refusals), `preview-stage.test.ts` (overrides over
+  `shaledb-stack-config.test.ts` (limits and refusals), `preview-stage.test.ts` (overrides over
   dev timings). Live: `docs/measurements.md` "Writer throughput and limits".
 - **Corruption: prevent, detect, repair (v1 workstream 7)** — done (D62). Upload integrity in
   `object-store.ts` (`sha256` on single-part puts; `uploadPartVerified` with native WebCrypto MD5,
@@ -408,8 +408,8 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
     `isExportedSpanAttribute`, and `traceIdSampled`. It is applied to every Worker's telemetry:
     the API, compactor, BlockServer, GC, shard router, and probe.
   - **Sample rate.** `LsmWorkerSettings.traceSampleRate` is bound as
-    `CF_SLATEDB_TRACE_SAMPLE_RATE` and read back by `lsmTraceSampleRate`.
-  - **Retention.** The TraceBucket expires `traces/` and `tails/` (`cfSlatedbTraceRetentionDays`).
+    `SHALEDB_TRACE_SAMPLE_RATE` and read back by `lsmTraceSampleRate`.
+  - **Retention.** The TraceBucket expires `traces/` and `tails/` (`shaledbTraceRetentionDays`).
     The LsmBucket aborts stale multipart uploads.
   - **Observability tooling.** `manifest.l0_ssts` on `Compactor.poll`;
     `scenario-cli measure health|sampling`; `trace-cli pull --since-minutes`;
@@ -419,19 +419,19 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
     `preview-stage.test.ts`, and the `redaction` scenario.
 - **Production readiness (v1 workstream 9)** — done (D64).
   - **Tokens.** `lsmAccessGateFrom`, `lsmAccessGateOver`, `LsmAccessTokenSource`, and
-    `lsmStageAccessTokens` (`lsm-access-gate.ts`). In infra: `cfSlatedbAccessTokens`
+    `lsmStageAccessTokens` (`lsm-access-gate.ts`). In infra: `shaledbAccessTokens`
     (Secrets Store slots by `Secret.lookup`, plus the state token on previews), and
     `access-token-store.ts` with `access-tokens-cli.ts` (the `tokens` task: `ensure`, `check`,
     `rotate`).
   - **Production tasks.** `plan:production` and `deploy:production`.
-  - **Contract.** `db-openapi.ts`, `generate-db-openapi.ts`, `docs/openapi/cf-slatedb-v1.json`
+  - **Contract.** `db-openapi.ts`, `generate-db-openapi.ts`, `docs/openapi/shaledb-v1.json`
     (`vp run generate:openapi`), and `docs/api-compatibility.md`.
   - **Format versions.** `MANIFEST_FORMAT_VERSION` with the `formatVersion` field, the check in
     `decodeStoredManifest`, and `COMPACTOR_STATE_FORMAT_VERSION`.
   - **Documentation.** `README.md` and `docs/operations.md`.
   - **Tests.** `lsm-access-gate.test.ts` (rotation, refresh, closed when unreadable),
-    `cf-slatedb-stack-config.test.ts` (production's configuration), and
-    `cf-slatedb-access-tokens.test.ts`. Also `db-openapi.test.ts` (checked in as generated,
+    `shaledb-stack-config.test.ts` (production's configuration), and
+    `shaledb-access-tokens.test.ts`. Also `db-openapi.test.ts` (checked in as generated,
     examples, scheme, headers), `manifest.test.ts` (the workstream 1 fixture),
     `manifest-store.test.ts` (newer format refused), and `compactor.test.ts` (newer state idle).
   - **Live.** Rotation on `preview-1`.

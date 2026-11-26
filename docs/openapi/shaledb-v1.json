@@ -1,7 +1,7 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "cf-slatedb",
+    "title": "shaledb",
     "version": "1.0.0",
     "description": "A SlateDB-style LSM key-value store on R2 and Durable Objects. Keys and values are base64 in JSON. Every response carries `x-request-id`; error bodies repeat it as `requestId`."
   },
@@ -46,7 +46,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -72,7 +72,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -102,7 +102,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -147,7 +147,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -207,7 +207,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -244,7 +244,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -283,7 +283,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           }
@@ -441,7 +441,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -481,7 +481,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -511,7 +511,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -556,7 +556,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -617,7 +617,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -654,7 +654,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -695,7 +695,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           }
@@ -869,7 +869,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -895,7 +895,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -925,7 +925,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -970,7 +970,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -1017,7 +1017,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -1054,7 +1054,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -1093,7 +1093,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           }
@@ -1234,7 +1234,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -1260,7 +1260,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -1290,7 +1290,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -1335,7 +1335,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -1382,7 +1382,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -1419,7 +1419,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -1458,7 +1458,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           }
@@ -1905,7 +1905,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -1931,7 +1931,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -1961,7 +1961,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -2006,7 +2006,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -2053,7 +2053,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -2090,7 +2090,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -2129,7 +2129,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           }
@@ -2329,7 +2329,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -2355,7 +2355,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -2385,7 +2385,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -2430,7 +2430,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -2492,7 +2492,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -2529,7 +2529,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -2568,7 +2568,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           }
@@ -2694,7 +2694,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -2720,7 +2720,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -2750,7 +2750,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -2795,7 +2795,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -2842,7 +2842,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -2879,7 +2879,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -2918,7 +2918,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           }
@@ -3073,7 +3073,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -3099,7 +3099,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -3129,7 +3129,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -3174,7 +3174,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -3221,7 +3221,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -3258,7 +3258,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -3297,7 +3297,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           }
@@ -3341,7 +3341,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -3367,7 +3367,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -3397,7 +3397,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -3442,7 +3442,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -3489,7 +3489,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -3526,7 +3526,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -3565,7 +3565,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           }
@@ -3620,7 +3620,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -3646,7 +3646,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -3676,7 +3676,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -3721,7 +3721,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -3768,7 +3768,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -3805,7 +3805,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -3844,7 +3844,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           }
@@ -3928,7 +3928,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -3954,7 +3954,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -3984,7 +3984,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -4029,7 +4029,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -4076,7 +4076,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -4113,7 +4113,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -4152,7 +4152,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           }
@@ -4241,7 +4241,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -4267,7 +4267,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -4297,7 +4297,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -4342,7 +4342,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -4389,7 +4389,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -4426,7 +4426,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -4465,7 +4465,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           }
@@ -4526,7 +4526,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -4552,7 +4552,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -4582,7 +4582,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -4627,7 +4627,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -4674,7 +4674,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -4711,7 +4711,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -4750,7 +4750,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           }
@@ -4904,7 +4904,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -4930,7 +4930,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -4960,7 +4960,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -5005,7 +5005,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -5052,7 +5052,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -5089,7 +5089,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -5128,7 +5128,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           }
@@ -5316,7 +5316,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -5342,7 +5342,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -5372,7 +5372,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -5417,7 +5417,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -5464,7 +5464,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -5501,7 +5501,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -5540,7 +5540,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           }
@@ -5665,7 +5665,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -5691,7 +5691,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -5721,7 +5721,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -5766,7 +5766,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -5827,7 +5827,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -5864,7 +5864,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -5903,7 +5903,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           }
@@ -6229,7 +6229,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -6255,7 +6255,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -6285,7 +6285,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -6330,7 +6330,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -6377,7 +6377,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -6414,7 +6414,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -6453,7 +6453,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           }
@@ -6715,7 +6715,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -6741,7 +6741,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -6771,7 +6771,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -6816,7 +6816,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -6863,7 +6863,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -6900,7 +6900,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -6939,7 +6939,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           }
@@ -7149,7 +7149,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -7175,7 +7175,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -7205,7 +7205,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -7250,7 +7250,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -7297,7 +7297,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -7334,7 +7334,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -7373,7 +7373,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           }
@@ -7462,7 +7462,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -7488,7 +7488,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -7518,7 +7518,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -7563,7 +7563,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -7610,7 +7610,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -7647,7 +7647,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -7686,7 +7686,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           }
@@ -7862,7 +7862,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -7888,7 +7888,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -7918,7 +7918,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -7963,7 +7963,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -8010,7 +8010,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -8047,7 +8047,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           },
@@ -8086,7 +8086,7 @@
                   "type": "string"
                 },
                 "required": true,
-                "description": "Identifies the request in cf-slatedb's traces and logs; error bodies repeat it as `requestId`."
+                "description": "Identifies the request in shaledb's traces and logs; error bodies repeat it as `requestId`."
               }
             }
           }
@@ -9235,7 +9235,7 @@
       "bearerToken": {
         "type": "http",
         "scheme": "bearer",
-        "description": "The stage's access token as `Authorization: Bearer <token>`. A live stage accepts either of its two rotatable tokens (`vp run @cf-slatedb/infra#tokens`); a preview also accepts the token `preview-cli token <stage>` prints. Local stages are not gated."
+        "description": "The stage's access token as `Authorization: Bearer <token>`. A live stage accepts either of its two rotatable tokens (`vp run @shaledb/infra#tokens`); a preview also accepts the token `preview-cli token <stage>` prints. Local stages are not gated."
       }
     }
   },

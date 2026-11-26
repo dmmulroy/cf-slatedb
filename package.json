@@ -1,12 +1,12 @@
 {
-  "name": "cf-slatedb",
+  "name": "shaledb",
   "version": "0.0.0",
   "private": true,
   "type": "module",
   "scripts": {
     "ready": "vp check && vp run -r test",
-    "dev": "vp run @cf-slatedb/infra#dev",
-    "verify": "vp run @cf-slatedb/tools-formal-verification#verify",
+    "dev": "vp run @shaledb/infra#dev",
+    "verify": "vp run @shaledb/tools-formal-verification#verify",
     "trace": "node tools/trace-cli/src/trace-cli.ts",
     "scenario": "node tools/scenario-cli/src/scenario-cli.ts",
     "preview": "node tools/preview-cli/src/preview-cli.ts",

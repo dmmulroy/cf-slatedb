@@ -25,7 +25,7 @@ node tools/scenario-cli/src/scenario-cli.ts measure split-pause --stage preview-
 
 A Worker cannot measure its own CPU time: its clock advances only across I/O, which is why many
 spans show `0.00ms`. Live stages therefore attach a Tail Worker (`CpuTailWorker`,
-`infra/cf-slatedb/src/cpu-tail-worker.ts`, D48) to the API Worker (which hosts the writer Durable
+`infra/shaledb/src/cpu-tail-worker.ts`, D48) to the API Worker (which hosts the writer Durable
 Objects) and the compactor Worker. Cloudflare hands it every finished invocation with `cpuTime` and
 `wallTime`; it stores one record per invocation (script, Durable Object id, event kind, method, URL
 path, status, outcome, times) under `tails/` in the stage's trace bucket, and the measurement
@@ -182,7 +182,7 @@ ENAM; `sam` landed in IAD too), and a read ~80 ms. Each region farther away adds
 trip: ~510 ms from the US west coast, ~550–590 ms from Europe, ~900–1,000 ms from Asia-Pacific and
 Oceania. `preview-1`'s writers run near its bucket (an own-view commit is one ~285 ms create plus a
 ~76 ms read), so placement could not speed it up. An installation whose writers sit elsewhere should
-create its bucket there: `CF_SLATEDB_BUCKET_LOCATION` (fixed at creation; unrestricted Stacks only).
+create its bucket there: `SHALEDB_BUCKET_LOCATION` (fixed at creation; unrestricted Stacks only).
 
 ## Split write pause after D57 (v1 workstream 3)
 

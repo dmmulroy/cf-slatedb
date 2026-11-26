@@ -1,6 +1,6 @@
 ---------------------------- MODULE NoAckedWriteLost ----------------------------
 (***************************************************************************)
-(* No acknowledged write is lost or hidden, for one cf-slatedb database.   *)
+(* No acknowledged write is lost or hidden, for one shaledb database.   *)
 (*                                                                         *)
 (* Code this models (packages/lsm-cloudflare/src/):                        *)
 (*  - db-writer.ts write: commit rows + last_seq in one SQLite transaction *)

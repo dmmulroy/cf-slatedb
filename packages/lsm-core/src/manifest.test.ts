@@ -101,7 +101,7 @@ describe("Manifest JSON", () => {
   });
 
   it("decodes a manifest older code wrote, as format 1 with no dropped SSTs (D64)", () => {
-    // Written by cf-slatedb at v1 workstream 1 (before format versions and droppedSsts), read back
+    // Written by shaledb at v1 workstream 1 (before format versions and droppedSsts), read back
     // from preview-1's bucket.
     const written = readFileSync(
       new URL("./fixtures/manifest-written-by-workstream-1.json", import.meta.url),

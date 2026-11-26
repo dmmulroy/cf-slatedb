@@ -1,6 +1,6 @@
 import { Schema } from "effect";
 
-/** Largest sequence number, timestamp, or counter cf-slatedb stores: 2^53 - 1. */
+/** Largest sequence number, timestamp, or counter shaledb stores: 2^53 - 1. */
 export const MAX_SAFE_COUNTER = Number.MAX_SAFE_INTEGER;
 
 const NonNegativeSafeInt = Schema.Int.check(

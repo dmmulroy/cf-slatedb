@@ -1,5 +1,5 @@
 {
-  "name": "@cf-slatedb/tools-preview-cli",
+  "name": "@shaledb/tools-preview-cli",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -7,8 +7,8 @@
     "test": "vp test run"
   },
   "dependencies": {
-    "@cf-slatedb/lsm-core": "workspace:*",
     "@effect/platform-node": "catalog:",
+    "@shaledb/lsm-core": "workspace:*",
     "effect": "catalog:"
   },
   "devDependencies": {

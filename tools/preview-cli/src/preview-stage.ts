@@ -1,4 +1,4 @@
-import { DEFAULT_LSM_SETTINGS } from "@cf-slatedb/lsm-core";
+import { DEFAULT_LSM_SETTINGS } from "@shaledb/lsm-core";
 import { Data, Effect, Option, Schema } from "effect";
 
 /** Schema for one of the three reusable live preview stages. */
@@ -10,8 +10,8 @@ export type PreviewStage = typeof PreviewStage.Type;
 /** Every preview stage, in order. */
 export const PREVIEW_STAGES: ReadonlyArray<PreviewStage> = PreviewStage.literals;
 
-/** Name of the Alchemy Stack every preview deploys (`infra/cf-slatedb/alchemy.run.ts`). */
-export const CF_SLATEDB_STACK_NAME = "CfSlatedb";
+/** Name of the Alchemy Stack every preview deploys (`infra/shaledb/alchemy.run.ts`). */
+export const SHALEDB_STACK_NAME = "Shaledb";
 
 /**
  * Engine settings for `deploy --dev-timings`: the same short GC and compactor timings as `vp run
@@ -45,7 +45,7 @@ export const deployJurisdiction = (
     ),
   );
 
-/** Schema for a deployed preview's Stack outputs (`CfSlatedb/<stage>/output` in Alchemy state). */
+/** Schema for a deployed preview's Stack outputs (`Shaledb/<stage>/output` in Alchemy state). */
 export const PreviewOutputs = Schema.Struct({
   /** Public database API (`/v1`). */
   apiUrl: Schema.String,
@@ -76,7 +76,7 @@ export interface PreviewStatus {
   readonly outputs: Option.Option<PreviewOutputs>;
 }
 
-/** Records of the Alchemy state store, keyed by path (`CfSlatedb/<stage>/<resource>`). */
+/** Records of the Alchemy state store, keyed by path (`Shaledb/<stage>/<resource>`). */
 export type StateRecords = ReadonlyMap<string, unknown>;
 
 /**
@@ -86,7 +86,7 @@ export type StateRecords = ReadonlyMap<string, unknown>;
  */
 export class PreviewStateError extends Data.TaggedError("PreviewStateError")<{
   readonly reason: "StateUnreadable" | "StateRecordInvalid";
-  /** The state path read (`CfSlatedb[/<stage>[/<record>]]`). */
+  /** The state path read (`Shaledb[/<stage>[/<record>]]`). */
   readonly path: string;
   readonly message: string;
 }> {}
@@ -136,7 +136,7 @@ export const previewOutputs = Effect.fn("PreviewStage.previewOutputs")(function*
   records: StateRecords,
   stage: PreviewStage,
 ) {
-  const path = `${CF_SLATEDB_STACK_NAME}/${stage}/output`;
+  const path = `${SHALEDB_STACK_NAME}/${stage}/output`;
   const output = records.get(path);
   if (output === undefined) return Option.none<PreviewOutputs>();
   return Option.some(
@@ -170,7 +170,7 @@ export const previewSecret = Effect.fn("PreviewStage.previewSecret")(function* (
   stage: PreviewStage,
   secret: PreviewSecret,
 ) {
-  const path = `${CF_SLATEDB_STACK_NAME}/${stage}/${secret}`;
+  const path = `${SHALEDB_STACK_NAME}/${stage}/${secret}`;
   const record = records.get(path);
   if (record === undefined) return Option.none<string>();
   const decoded = yield* decodeRedactedText(record).pipe(
@@ -188,16 +188,16 @@ export const previewSecret = Effect.fn("PreviewStage.previewSecret")(function* (
 
 /**
  * Deploy variables the preview CLI decides from its flags. The Stack resolves the rest of its
- * configuration from them (`CfSlatedbStackConfig`, D55); values left in the shell must not change a
+ * configuration from them (`ShaledbStackConfig`, D55); values left in the shell must not change a
  * preview, so a variable a flag does not set is removed rather than inherited.
  */
 const PREVIEW_DECIDED_VARIABLES = [
-  "CF_SLATEDB_LSM_SETTINGS",
-  "CF_SLATEDB_JURISDICTION",
+  "SHALEDB_LSM_SETTINGS",
+  "SHALEDB_JURISDICTION",
   // Previews let R2 place their bucket: a hint left in the shell would replace it.
-  "CF_SLATEDB_BUCKET_LOCATION",
-  "CF_SLATEDB_TRACE_SAMPLE_RATE",
-  "CF_SLATEDB_TRACE_RETENTION_DAYS",
+  "SHALEDB_BUCKET_LOCATION",
+  "SHALEDB_TRACE_SAMPLE_RATE",
+  "SHALEDB_TRACE_RETENTION_DAYS",
 ] as const;
 
 /**
@@ -227,11 +227,11 @@ export const deployEnvironment = (
     ...Option.getOrElse(options.settings, () => ({})),
   };
   if (Object.keys(overrides).length > 0) {
-    environment["CF_SLATEDB_LSM_SETTINGS"] = JSON.stringify(overrides);
+    environment["SHALEDB_LSM_SETTINGS"] = JSON.stringify(overrides);
   }
-  environment["CF_SLATEDB_JURISDICTION"] = options.jurisdiction;
+  environment["SHALEDB_JURISDICTION"] = options.jurisdiction;
   if (Option.isSome(options.traceSampleRate)) {
-    environment["CF_SLATEDB_TRACE_SAMPLE_RATE"] = String(options.traceSampleRate.value);
+    environment["SHALEDB_TRACE_SAMPLE_RATE"] = String(options.traceSampleRate.value);
   }
   return environment;
 };
@@ -280,7 +280,7 @@ export const previewWorkerBindings = (
   records: StateRecords,
   stage: PreviewStage,
 ): ReadonlyArray<PreviewWorkerBindings> => {
-  const prefix = `${CF_SLATEDB_STACK_NAME}/${stage}/`;
+  const prefix = `${SHALEDB_STACK_NAME}/${stage}/`;
   const bindings: Array<PreviewWorkerBindings> = [];
   for (const [path, record] of records) {
     if (!path.startsWith(prefix)) continue;
@@ -291,8 +291,8 @@ export const previewWorkerBindings = (
       () => ({}),
     );
     const bound = (name: string) => Option.flatMap(Option.fromUndefinedOr(env[name]), boundText);
-    const lsmSettings = bound("CF_SLATEDB_LSM_SETTINGS");
-    const jurisdiction = bound("CF_SLATEDB_JURISDICTION");
+    const lsmSettings = bound("SHALEDB_LSM_SETTINGS");
+    const jurisdiction = bound("SHALEDB_JURISDICTION");
     if (Option.isNone(lsmSettings) && Option.isNone(jurisdiction)) continue;
     bindings.push({ worker: path.slice(prefix.length), lsmSettings, jurisdiction });
   }
@@ -323,10 +323,10 @@ export const describeBoundLsmSettings = (json: string): string => {
 };
 
 /** The `vp run` task that deploys a stage in place. */
-export const deployTask = (stage: PreviewStage) => `@cf-slatedb/infra#deploy:${stage}`;
+export const deployTask = (stage: PreviewStage) => `@shaledb/infra#deploy:${stage}`;
 
 /**
  * The command Dillon runs to tear a preview down. Agents never run it: the deployment guard blocks
  * `alchemy destroy`, and previews are reused by redeploying them.
  */
-export const destroyCommand = (stage: PreviewStage) => `vp run @cf-slatedb/infra#destroy:${stage}`;
+export const destroyCommand = (stage: PreviewStage) => `vp run @shaledb/infra#destroy:${stage}`;

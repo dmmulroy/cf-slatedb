@@ -4,7 +4,7 @@ import {
   EMPTY_COMPACTION_BUDGET_LEDGER,
   releaseCompactionLease,
   Timestamp,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Clock, Context, Effect, Layer, Option, Schema, Semaphore } from "effect";
 
@@ -44,7 +44,7 @@ export interface ICompactionBudget {
 
 /** The contextual compaction budget. */
 export class CompactionBudget extends Context.Service<CompactionBudget, ICompactionBudget>()(
-  "@cf-slatedb/CompactionBudget",
+  "@shaledb/CompactionBudget",
 ) {}
 
 /** No shared budget: every compaction may run (the design's "none"). */

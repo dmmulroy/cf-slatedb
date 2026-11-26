@@ -1,9 +1,9 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { DatabaseId, SeqNum } from "@cf-slatedb/lsm-core";
-import { DbHttpApi, GcHttpApi } from "@cf-slatedb/lsm-cloudflare";
-import { ShardedHttpApi, ShardGroup } from "@cf-slatedb/sharding";
+import { DatabaseId, SeqNum } from "@shaledb/lsm-core";
+import { DbHttpApi, GcHttpApi } from "@shaledb/lsm-cloudflare";
+import { ShardedHttpApi, ShardGroup } from "@shaledb/sharding";
 import { Clock, Effect, Option, Schema } from "effect";
 import { HttpClient, HttpClientRequest } from "effect/http";
 import { HttpApiClient } from "effect/http-api";
@@ -23,6 +23,12 @@ export interface SoakOptions {
   readonly splitAtMinutes: ReadonlyArray<number>;
   /** Keys per database the writers overwrite. */
   readonly keysPerDatabase: number;
+  /**
+   * The trace sample rate the stage was deployed with (`preview-cli deploy --trace-sample-rate`),
+   * which the midway redeploy keeps. Soak at production's rate (0.1): at 100% a busy stage exports
+   * faster than its spans can be read back.
+   */
+  readonly traceSampleRate: Option.Option<number>;
 }
 
 const text = new TextDecoder();
@@ -200,7 +206,7 @@ const untilSuccess = <A, E, R>(
   });
 
 /** Redeploys the stage with production settings without blocking the soak's fibers. */
-const redeploy = (stage: string) =>
+const redeploy = (stage: string, traceSampleRate: Option.Option<number>) =>
   Effect.callback<number>((resume) => {
     const child = spawn(
       process.execPath,
@@ -208,6 +214,10 @@ const redeploy = (stage: string) =>
         fileURLToPath(new URL("../../preview-cli/src/preview-cli.ts", import.meta.url)),
         "deploy",
         stage,
+        ...Option.match(traceSampleRate, {
+          onNone: () => [],
+          onSome: (rate) => ["--trace-sample-rate", String(rate)],
+        }),
       ],
       { cwd: REPO_ROOT, stdio: ["ignore", "ignore", "ignore"] },
     );
@@ -697,7 +707,10 @@ export const soak = (options: SoakOptions) =>
       onSome: (minute) =>
         Effect.gen(function* () {
           yield* Effect.sleep(`${minute * 60_000} millis`);
-          const code = yield* redeploy(stack.previewStage.pipe(Option.getOrElse(() => "local")));
+          const code = yield* redeploy(
+            stack.previewStage.pipe(Option.getOrElse(() => "local")),
+            options.traceSampleRate,
+          );
           ledger.checked("redeploy");
           if (code !== 0) ledger.failures.push(`redeploy exited ${code}`);
         }),

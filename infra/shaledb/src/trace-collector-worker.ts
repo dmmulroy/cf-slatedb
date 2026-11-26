@@ -5,7 +5,7 @@ import {
   bindLsmWorkerSettings,
   lsmHttpServerLayer,
   lsmJurisdiction,
-} from "@cf-slatedb/lsm-cloudflare";
+} from "@shaledb/lsm-cloudflare";
 import * as Alchemy from "alchemy";
 import type { HttpEffect } from "alchemy/Http";
 import { makeExecutionMemo } from "alchemy/Runtime/ExecutionMemo";
@@ -14,12 +14,12 @@ import { Context, Effect, Layer, Option, Schedule, Schema } from "effect";
 import { Base64 } from "effect/encoding";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 
-import { CF_SLATEDB_PRODUCTION_STAGE } from "./cf-slatedb-stage.ts";
-import { cfSlatedbTraceRetentionDays } from "./cf-slatedb-stack-config.ts";
-import { cfSlatedbWorkerSettings } from "./cf-slatedb-stack-config.ts";
+import { SHALEDB_PRODUCTION_STAGE } from "./shaledb-stage.ts";
+import { shaledbTraceRetentionDays } from "./shaledb-stack-config.ts";
+import { shaledbWorkerSettings } from "./shaledb-stack-config.ts";
 
 /** Name of the secret binding that carries a stage's trace collector token. */
-export const TRACE_COLLECTOR_TOKEN_BINDING = "CF_SLATEDB_TRACE_COLLECTOR_TOKEN";
+export const TRACE_COLLECTOR_TOKEN_BINDING = "SHALEDB_TRACE_COLLECTOR_TOKEN";
 
 /** Key prefix of every stored OTLP export in the trace bucket. */
 export const TRACE_COLLECTOR_PREFIX = "traces/";
@@ -27,8 +27,12 @@ export const TRACE_COLLECTOR_PREFIX = "traces/";
 /** Key prefix of the Tail Worker's invocation records in the trace bucket (`cpu-tail-worker.ts`). */
 export const TAIL_RECORDS_PREFIX = "tails/";
 
-/** Most exports one `GET /v1/traces/batches` returns. */
-const MAX_BATCHES_PER_PAGE = 100;
+/**
+ * Most exports one `GET /v1/traces/batches` returns. A busy preview at 100% sampling stores about 40
+ * exports a second; pages of 500 read 50 at a time keep a pull ahead of that, within the R2
+ * binding's limit of about 1,000 operations per invocation (one list and 500 reads).
+ */
+const MAX_BATCHES_PER_PAGE = 500;
 
 /**
  * The bearer secret a live stage's Workers send their spans with, and that `trace-cli pull` reads
@@ -47,7 +51,7 @@ export const TraceBucket = Cloudflare.R2.Bucket(
   Effect.gen(function* () {
     const stage = yield* Alchemy.Stage;
     const jurisdiction = yield* lsmJurisdiction;
-    const retentionSeconds = (yield* cfSlatedbTraceRetentionDays) * 24 * 60 * 60;
+    const retentionSeconds = (yield* shaledbTraceRetentionDays) * 24 * 60 * 60;
     return {
       ...(Option.isSome(jurisdiction) ? { jurisdiction: jurisdiction.value } : {}),
       // Traces and tail records expire after the configured days (P4, D63).
@@ -58,7 +62,7 @@ export const TraceBucket = Cloudflare.R2.Bucket(
       })),
       // Traces are disposable. Outside production, replacing the bucket (a jurisdiction change) or
       // destroying the stage empties it first instead of failing on its contents.
-      forceDestroy: stage !== CF_SLATEDB_PRODUCTION_STAGE,
+      forceDestroy: stage !== SHALEDB_PRODUCTION_STAGE,
     };
   }),
 );
@@ -66,7 +70,7 @@ export const TraceBucket = Cloudflare.R2.Bucket(
 class TraceBucketClient extends Context.Service<
   TraceBucketClient,
   Cloudflare.R2.ReadWriteBucketClient
->()("@cf-slatedb/infra/TraceBucketClient") {}
+>()("@shaledb/infra/TraceBucketClient") {}
 
 const traceBucketClientLayer = Layer.effect(
   TraceBucketClient,
@@ -190,7 +194,7 @@ const readBatchesUnder = (prefix: string) =>
             body: Base64.encode(bytes),
           });
         }),
-      { concurrency: 32 },
+      { concurrency: 50 },
     );
     const found = batches.flatMap((batch) => (Option.isSome(batch) ? [batch.value] : []));
     return HttpServerResponse.jsonUnsafe(
@@ -260,7 +264,7 @@ export const traceCollectorWorkerLayer = TraceCollectorWorker.make(
     );
     const router = yield* makeExecutionMemo(HttpRouter.toHttpEffect(traceCollectorRoutesLayer));
     // Its bucket is in the Stack's jurisdiction, read through the same binding as the engine's.
-    yield* bindLsmWorkerSettings(cfSlatedbWorkerSettings);
+    yield* bindLsmWorkerSettings(shaledbWorkerSettings);
     return {
       fetch: withToken(
         Effect.flatten(router).pipe(Effect.provideService(TraceBucketClient, bucket)),

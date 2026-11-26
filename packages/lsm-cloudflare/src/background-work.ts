@@ -25,7 +25,7 @@ export interface IBackgroundWork {
 
 /** The contextual background work runner of the current Worker, Durable Object, or Workflow. */
 export class BackgroundWork extends Context.Service<BackgroundWork, IBackgroundWork>()(
-  "@cf-slatedb/BackgroundWork",
+  "@shaledb/BackgroundWork",
 ) {}
 
 /** `work` under its span, with any failure or defect logged instead of raised. */

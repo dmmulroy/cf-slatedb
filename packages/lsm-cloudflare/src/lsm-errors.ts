@@ -1,4 +1,4 @@
-import { DatabaseId } from "@cf-slatedb/lsm-core";
+import { DatabaseId } from "@shaledb/lsm-core";
 import { Schema } from "effect";
 
 /**

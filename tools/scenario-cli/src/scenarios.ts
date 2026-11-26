@@ -1,6 +1,6 @@
-import { DatabaseId, SeqNum } from "@cf-slatedb/lsm-core";
-import { DbHttpApi, GcHttpApi, sstKey } from "@cf-slatedb/lsm-cloudflare";
-import { ShardedHttpApi, ShardGroup } from "@cf-slatedb/sharding";
+import { DatabaseId, SeqNum } from "@shaledb/lsm-core";
+import { DbHttpApi, GcHttpApi, sstKey } from "@shaledb/lsm-cloudflare";
+import { ShardedHttpApi, ShardGroup } from "@shaledb/sharding";
 import { Effect, Option } from "effect";
 import { HttpClient, HttpClientRequest } from "effect/http";
 import { HttpApiClient } from "effect/http-api";
@@ -771,7 +771,7 @@ const redaction: Scenario = {
       http.execute(
         HttpClientRequest.get(`${apiUrl}/v1/databases/${databaseId}/status`).pipe(
           HttpClientRequest.setUrlParams({ probe: "redaction-secret" }),
-          HttpClientRequest.setHeader("user-agent", "cf-slatedb-scenario/redaction"),
+          HttpClientRequest.setHeader("user-agent", "shaledb-scenario/redaction"),
         ),
       ),
     );

@@ -4,7 +4,7 @@ import {
   initialManifest,
   ManifestId,
   SstId,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import { Effect, Layer, Option } from "effect";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { describe, expect, it } from "vite-plus/test";

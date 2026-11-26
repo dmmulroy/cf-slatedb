@@ -1,5 +1,5 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
-import { DatabaseId, DEFAULT_DATABASE_OPTIONS, KeyRange, SeqNum } from "@cf-slatedb/lsm-core";
+import { DatabaseId, DEFAULT_DATABASE_OPTIONS, KeyRange, SeqNum } from "@shaledb/lsm-core";
 import {
   bindLsmWorkerSettings,
   DatabaseLifecycle,
@@ -13,7 +13,7 @@ import {
   type LsmWorkerSettingsSource,
   type LsmWorkerTelemetry,
   withLsmTracePolicy,
-} from "@cf-slatedb/lsm-cloudflare";
+} from "@shaledb/lsm-cloudflare";
 import type { HttpEffect } from "alchemy/Http";
 import { makeExecutionMemo } from "alchemy/Runtime/ExecutionMemo";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
@@ -326,6 +326,6 @@ export const shardRouterWorkerLayer = <R = never>(options: ShardRouterWorkerOpti
         ).pipe(Layer.provideMerge(shardDirectoryLayer), Layer.provideMerge(dbServicesLayer)),
       ),
       Effect.provide(shardDirectoryServerLayer),
-      Effect.provide(withLsmTracePolicy(options.telemetry("cf-slatedb-shards"))),
+      Effect.provide(withLsmTracePolicy(options.telemetry("shaledb-shards"))),
     ),
   );

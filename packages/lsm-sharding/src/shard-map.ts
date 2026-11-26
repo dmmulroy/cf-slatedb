@@ -1,4 +1,4 @@
-import { DatabaseId, FULL_KEY_RANGE, KeyRange, keyRangeContains } from "@cf-slatedb/lsm-core";
+import { DatabaseId, FULL_KEY_RANGE, KeyRange, keyRangeContains } from "@shaledb/lsm-core";
 import { Bytes, Option, Result, Schema } from "effect";
 
 /** Schema for a shard group's name: one directory, one range map. */

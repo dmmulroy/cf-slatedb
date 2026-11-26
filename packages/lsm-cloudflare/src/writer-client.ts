@@ -11,7 +11,7 @@ import type {
   WriteBatchInvalidError,
   WriteReceipt,
   WriterFencedError,
-} from "@cf-slatedb/lsm-core";
+} from "@shaledb/lsm-core";
 import { makeExecutionMemo } from "alchemy/Runtime/ExecutionMemo";
 import { RuntimeContext } from "alchemy/RuntimeContext";
 import { Cache, Context, Effect, Layer, type Option, Schedule, Scope } from "effect";
@@ -128,7 +128,7 @@ export interface IWriterClient {
 
 /** The contextual writer client. */
 export class WriterClient extends Context.Service<WriterClient, IWriterClient>()(
-  "@cf-slatedb/WriterClient",
+  "@shaledb/WriterClient",
 ) {}
 
 /**
