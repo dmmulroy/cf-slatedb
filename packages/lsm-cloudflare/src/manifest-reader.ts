@@ -78,7 +78,7 @@ export interface IManifestReader {
    * stored (the writer's last flush, from its probe, or the manifest the caller loaded before):
    * GC's manifest boundary, the `LATEST` hint, that manifest, and the id after it are read
    * together, so when it is still the newest this is one round trip instead of `loadLatest`'s two
-   * or more (D67).
+   * or more (D67, D72).
    *
    * **Details**
    *

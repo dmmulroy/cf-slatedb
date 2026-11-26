@@ -299,7 +299,7 @@ describe("DbClient against a Map oracle", () => {
     expect(outcome.retried).toEqual(Result.succeed(Option.none()));
   });
 
-  it("sizes a scan's first read-ahead from its limit and the SST's rows per block (D67)", () => {
+  it("sizes a scan's first read-ahead from its limit and the SST's rows per block (D72)", () => {
     const sst = (rowCount: number, blockCount: number) => ({ rowCount, blockCount });
     // No limit: everything is wanted, so read ahead fully.
     expect(scanFirstReadAheadBlocks(Option.none(), sst(10_000, 100))).toBe(SCAN_READ_AHEAD_BLOCKS);
@@ -316,7 +316,7 @@ describe("DbClient against a Map oracle", () => {
     expect(scanFirstReadAheadBlocks(Option.some(100), sst(0, 0))).toBe(SCAN_READ_AHEAD_BLOCKS);
   });
 
-  it("a short scan reads only the blocks its limit needs, and reads on when rows turn out hidden (D67)", async () => {
+  it("a short scan reads only the blocks its limit needs, and reads on when rows turn out hidden (D72)", async () => {
     const outcome = await run(
       Effect.gen(function* () {
         yield* createDatabase;

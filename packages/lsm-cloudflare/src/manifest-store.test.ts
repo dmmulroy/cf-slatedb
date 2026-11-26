@@ -374,7 +374,7 @@ describe("ManifestStore", () => {
   const manifestReads = (names: ReadonlyArray<string>) =>
     names.filter((name) => name === "ManifestReader.load").length;
 
-  it("from a known manifest far behind, continues from the LATEST hint instead of one id at a time (D67)", async () => {
+  it("from a known manifest far behind, continues from the LATEST hint instead of one id at a time (D72)", async () => {
     const outcome = await runWithCache(
       Effect.gen(function* () {
         yield* initialize;
@@ -402,7 +402,7 @@ describe("ManifestStore", () => {
     expect(outcome).toEqual({ ids: [9, 9, 9], reads: [5, 3, 11] });
   });
 
-  it("the cache refreshes from the manifest it holds: one round of reads while nothing was committed since (D67)", async () => {
+  it("the cache refreshes from the manifest it holds: one round of reads while nothing was committed since (D72)", async () => {
     const outcome = await runWithCache(
       Effect.gen(function* () {
         yield* initialize;
