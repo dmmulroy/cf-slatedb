@@ -796,14 +796,17 @@ export const makeDbWriter = Effect.gen(function* () {
           const added = writes.reduce((sum, item) => sum + memTableWriteBytes(item), 0);
           // A refresh scanning while this commit runs must not install its figures (see
           // `refreshUnflushedCounters`): mark the commit before its rows reach SQLite, and add
-          // them in the same step that ends it.
-          yield* Ref.update(unflushed, (current) => ({
-            ...current,
-            generation: current.generation + 1,
-            committing: true,
-          }));
-          const seq = yield* memTable.commit(writes, createTs).pipe(
-            Effect.onExit((exit) =>
+          // them in the same step that ends it. The mark and its removal are one resource, so an
+          // interruption between them cannot leave the mark set, which would keep every later
+          // refresh from installing.
+          const seq = yield* Effect.acquireUseRelease(
+            Ref.update(unflushed, (current) => ({
+              ...current,
+              generation: current.generation + 1,
+              committing: true,
+            })),
+            () => memTable.commit(writes, createTs),
+            (_, exit) =>
               Ref.update(unflushed, (current) => {
                 const ended = {
                   ...current,
@@ -822,9 +825,7 @@ export const makeDbWriter = Effect.gen(function* () {
                     }
                   : ended;
               }),
-            ),
-            Effect.mapError(unavailable(databaseId, "write")),
-          );
+          ).pipe(Effect.mapError(unavailable(databaseId, "write")));
           return { seq, createTs };
         }),
       );
