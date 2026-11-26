@@ -140,7 +140,10 @@ describe("watchers", () => {
       Effect.onInterrupt(() => Effect.sync(() => (watcherStopped = true))),
     );
     const exit = await Effect.runPromiseExit(
-      whileWorkloadRuns(Effect.andThen(Effect.sleep("20 millis"), Effect.fail("workload failed")), watcher),
+      whileWorkloadRuns(
+        Effect.andThen(Effect.sleep("20 millis"), Effect.fail("workload failed")),
+        watcher,
+      ),
     );
     expect(exit._tag).toBe("Failure");
     expect(watcherStopped).toBe(true);

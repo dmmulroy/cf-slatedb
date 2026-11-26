@@ -45,7 +45,9 @@ describe("the report file", () => {
             return fs.writeFileString(target, data, options);
           },
           rename: (from, to) => {
-            calls.push(`rename ${from === path ? "report" : "temporary"} to ${to === path ? "report" : "other"}`);
+            calls.push(
+              `rename ${from === path ? "report" : "temporary"} to ${to === path ? "report" : "other"}`,
+            );
             expect(JSON.parse(readFileSync(from, "utf8"))).toEqual({ phase: "workload" });
             return fs.rename(from, to);
           },
