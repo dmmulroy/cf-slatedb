@@ -367,8 +367,30 @@ const soakCommand = Command.make(
       ),
       Flag.optional,
     ),
+    reportFile: Flag.String("report-file").pipe(
+      Flag.withDescription(
+        "Keep the report in this file while the soak runs: replaced atomically every minute and after each phase",
+      ),
+      Flag.optional,
+    ),
+    telemetryBudgetMinutes: Flag.Int("telemetry-budget-minutes").pipe(
+      Flag.withDescription(
+        "Minutes each final telemetry read may take before it is cut off and recorded as a failure",
+      ),
+      Flag.withDefault(10),
+    ),
   },
-  ({ stage, minutes, databases, keysPerDatabase, redeployAt, splitAt, traceSampleRate }) =>
+  ({
+    stage,
+    minutes,
+    databases,
+    keysPerDatabase,
+    redeployAt,
+    splitAt,
+    traceSampleRate,
+    reportFile,
+    telemetryBudgetMinutes,
+  }) =>
     runMeasurement(
       stage,
       soak({
@@ -378,6 +400,8 @@ const soakCommand = Command.make(
         redeployAtMinute: redeployAt,
         splitAtMinutes: splitAt.split(",").map((minute) => Number(minute.trim())),
         traceSampleRate,
+        reportFile,
+        telemetryBudgetMinutes,
       }),
     ),
 ).pipe(

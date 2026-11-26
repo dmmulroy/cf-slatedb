@@ -4,20 +4,27 @@ import { fileURLToPath } from "node:url";
 import { DatabaseId, SeqNum } from "@shaledb/lsm-core";
 import { DbHttpApi, GcHttpApi } from "@shaledb/lsm-cloudflare";
 import { ShardedHttpApi, ShardGroup } from "@shaledb/sharding";
-import { Clock, Effect, Option, Schema } from "effect";
+import { Clock, Duration, Effect, Option, Schema } from "effect";
 import { HttpClient, HttpClientRequest } from "effect/http";
 import { HttpApiClient } from "effect/http-api";
 
 import {
   exceptionType,
   forEachInvocationRecord,
-  invocationsRepresentedBy,
   measureHealth,
   pullMeasurementSpans,
   spansSince,
-  tailCursorAt,
 } from "./measurements.ts";
 import { ScenarioStack, uniqueId } from "./scenario.ts";
+import { soakPassed, type SoakPhase, writeReportFile } from "./soak-report.ts";
+import {
+  catchUpTails,
+  every,
+  readTailsWithin,
+  readWithin,
+  TailTally,
+  whileWorkloadRuns,
+} from "./soak-telemetry.ts";
 
 const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
 
@@ -37,7 +44,20 @@ export interface SoakOptions {
    * faster than its spans can be read back.
    */
   readonly traceSampleRate: Option.Option<number>;
+  /**
+   * Where the report is kept up to date while the soak runs (`--report-file`): replaced atomically
+   * at least every minute during the workload and after each phase, so a stopped run leaves it.
+   */
+  readonly reportFile: Option.Option<string>;
+  /**
+   * The time each final telemetry read (the tail-record catch-up, the health report, the span pull,
+   * each span search) may take before it is cut off and recorded as a failure.
+   */
+  readonly telemetryBudgetMinutes: number;
 }
+
+/** How long one read of tail records or spans may take while the workload runs. */
+const WATCHER_READ_BUDGET = "5 minutes";
 
 const text = new TextDecoder();
 const bytesOf = (value: string) => new TextEncoder().encode(value);
@@ -699,63 +719,35 @@ export const soak = (options: SoakOptions) =>
       }
     });
 
-    // Every invocation's outcome, from the unsampled tail records, folded into counts each minute:
-    // a 2-hour soak makes millions of them, too many to read in one go at the end.
-    const invocationOutcomes = new Map<string, number>();
-    const limitHits: Array<string> = [];
-    let tailCursor = tailCursorAt(startedAt);
-    let invocationsSeen = 0;
-    /** Folds the tail records since the last read into the counts; false when the read failed. */
-    const readTails = Effect.gen(function* () {
-      tailCursor = yield* forEachInvocationRecord(tailCursor, (records) => {
-        for (const record of records) {
-          invocationsSeen += 1;
-          const worker =
-            Option.getOrElse(record.scriptName, () => "unknown").split("-")[1] ?? "unknown";
-          const key = `${worker} ${record.outcome}`;
-          // A kept `ok` record stands for `1 / sampleRate` invocations (D71).
-          invocationOutcomes.set(
-            key,
-            (invocationOutcomes.get(key) ?? 0) + invocationsRepresentedBy(record),
-          );
-          if (
-            ["exceededCpu", "exceededMemory", "exception"].includes(record.outcome) &&
-            limitHits.length < 50
-          ) {
-            limitHits.push(
-              `${worker} ${record.eventKind} ${Option.getOrElse(record.path, () => "")} ended ${record.outcome} (${record.cpuTimeMs} ms CPU)`,
-            );
-          }
-        }
-      });
-      return true;
-    }).pipe(
-      Effect.catchTags({
-        // The cursor only moves past records that were read, so the next read picks these up.
-        MeasurementError: (error) =>
-          Effect.sync(() => {
-            ledger.note("tail read", error.message.slice(0, 200));
-            return false;
-          }),
+    // Every invocation's outcome, from the tail records, folded into counts each minute: a 2-hour
+    // soak makes too many to read in one go at the end. Each read has a budget, and the watcher is
+    // interrupted when the workload ends, wherever it is.
+    const tails = new TailTally(startedAt);
+    const tailWatcher = every(
+      "60 seconds",
+      Effect.gen(function* () {
+        const read = yield* readTailsWithin(tails, WATCHER_READ_BUDGET, forEachInvocationRecord);
+        // The cursor only moves past pages that were read, so the next read picks up the rest.
+        if (read._tag === "Failed") ledger.note("tail read", read.message.slice(0, 200));
+        if (read._tag === "OutOfTime")
+          ledger.note("tail read", `cut off after ${WATCHER_READ_BUDGET} (${tails.progress()})`);
       }),
     );
-    const tailWatcher = Effect.gen(function* () {
-      while (yield* running) {
-        yield* pause(60_000);
-        yield* readTails;
-      }
-    });
 
     // Pull the stage's spans as they arrive, so the final pull is short: a busy stage exports
-    // faster than one pull at the end could read.
-    const tracePuller = Effect.gen(function* () {
-      while (yield* running) {
-        yield* pause(60_000);
-        const pulled = yield* Effect.result(pullMeasurementSpans(options.minutes + 10));
+    // faster than one pull at the end could read. A pull cut off resumes where it stopped.
+    const tracePuller = every(
+      "60 seconds",
+      Effect.gen(function* () {
+        const pulled = yield* Effect.result(
+          readWithin(WATCHER_READ_BUDGET, pullMeasurementSpans(options.minutes + 10)),
+        );
         if (pulled._tag === "Failure")
           ledger.note("trace pull", pulled.failure.message.slice(0, 200));
-      }
-    });
+        else if (pulled.success._tag === "OutOfTime")
+          ledger.note("trace pull", `cut off after ${WATCHER_READ_BUDGET}`);
+      }),
+    );
 
     const redeployer = Option.match(options.redeployAtMinute, {
       onNone: () => Effect.void,
@@ -771,23 +763,114 @@ export const soak = (options: SoakOptions) =>
         }),
     });
 
-    yield* Effect.all(
-      [
-        ...models.flatMap((model) => [
-          writer(model),
-          reader(model),
-          scanner(model),
-          transactor(model),
-          snapshotter(model),
-        ]),
-        remover,
-        groupWriter,
-        splitter,
-        redeployer,
-        tracePuller,
-        tailWatcher,
-      ],
-      { concurrency: "unbounded", discard: true },
+    // The report as known so far: written to `--report-file` during the run, printed at the end.
+    let phase: SoakPhase = "workload";
+    let endedAt = Option.none<number>();
+    const storage: Array<{
+      readonly databaseId: DatabaseId;
+      readonly liveSsts: number;
+      readonly liveRunBytes: number;
+      readonly stored: { objects: number; bytes: number; older: number; olderBytes: number };
+    }> = [];
+    let spansChecked = 0;
+    const errorsByException = new Map<string, number>();
+    let health = Option.none<Effect.Success<ReturnType<typeof measureHealth>>>();
+    const report = Effect.gen(function* () {
+      const now = yield* Clock.currentTimeMillis;
+      const unexpectedErrors = [...errorsByException].filter(
+        ([type]) => !EXPECTED_EXCEPTIONS.has(type),
+      );
+      return {
+        passed: soakPassed({
+          phase,
+          mismatches: ledger.mismatches,
+          failures: ledger.failures,
+          unexpectedErrors,
+          healthIssues: Option.map(health, (found) => found.issues),
+        }),
+        phase,
+        updatedAt: new Date(now).toISOString(),
+        minutes: (Option.getOrElse(endedAt, () => now) - startedAt) / 60_000,
+        databases: models.map((model) => model.databaseId),
+        group,
+        mismatches: ledger.mismatches,
+        failures: ledger.failures,
+        checks: Object.fromEntries(ledger.checks),
+        retried: Object.fromEntries(ledger.retried),
+        events: ledger.events,
+        counters: models.map((model) => ({
+          databaseId: model.databaseId,
+          committed: model.counterCommitted,
+          uncertain: model.counterUncertain,
+        })),
+        latencies: Object.fromEntries(
+          [...ledger.latencies].map(([kind, values]) => [
+            kind,
+            {
+              count: values.length,
+              p50: percentile(values, 0.5),
+              p99: percentile(values, 0.99),
+              max: Math.max(...values),
+            },
+          ]),
+        ),
+        storage,
+        spansChecked,
+        invocationsChecked: tails.recordsRead,
+        newestTailRecordAt: Option.getOrNull(
+          Option.map(tails.newestRecordAt, (at) => new Date(at).toISOString()),
+        ),
+        invocationOutcomes: Object.fromEntries(
+          [...tails.invocationOutcomes].map(([outcome, count]) => [outcome, Math.round(count)]),
+        ),
+        errorsByException: Object.fromEntries(errorsByException),
+        unexpectedErrors: Object.fromEntries(unexpectedErrors),
+        health: Option.getOrNull(health),
+      };
+    });
+    let reportFileFailed = false;
+    /** Replaces the report file with the report as known now; a failed write is a soak failure. */
+    const saveReport = Option.match(options.reportFile, {
+      onNone: () => Effect.void,
+      onSome: (path) =>
+        Effect.gen(function* () {
+          const written = yield* Effect.result(writeReportFile(path, yield* report));
+          if (written._tag === "Failure" && !reportFileFailed) {
+            reportFileFailed = true;
+            ledger.failures.push(`report file ${path}: ${written.failure.message.slice(0, 200)}`);
+          }
+        }),
+    });
+    /** Moves to `next` and records it in the report file. */
+    const enter = (next: SoakPhase) =>
+      Effect.gen(function* () {
+        phase = next;
+        yield* saveReport;
+      });
+
+    yield* saveReport;
+    // The watchers run beside the workload and are interrupted when it ends (D65).
+    yield* whileWorkloadRuns(
+      Effect.all(
+        [
+          ...models.flatMap((model) => [
+            writer(model),
+            reader(model),
+            scanner(model),
+            transactor(model),
+            snapshotter(model),
+          ]),
+          remover,
+          groupWriter,
+          splitter,
+          redeployer,
+        ],
+        { concurrency: "unbounded", discard: true },
+      ),
+      Effect.all([tracePuller, tailWatcher, every("60 seconds", saveReport)], {
+        concurrency: "unbounded",
+        discard: true,
+      }),
     );
 
     // Final checks: every key at Latest, then (after a flush) at Flushed; counters; the group.
@@ -873,10 +956,12 @@ export const soak = (options: SoakOptions) =>
       );
       ledger.checked("final.group");
     });
+    // The data checks come first: telemetry is read only after them, so it can never hold them up.
+    yield* enter("final-reads");
     yield* finalChecks;
 
     // Storage: after collecting, no SST older than GC's age limit is stored unless the manifest uses it.
-    const storage = [];
+    yield* enter("storage");
     const oldMs = 3_600_000 + 300_000 + 600_000;
     for (const model of models) {
       yield* untilSuccess(
@@ -933,99 +1018,70 @@ export const soak = (options: SoakOptions) =>
       }
     }
 
-    const endedAt = yield* Clock.currentTimeMillis;
+    endedAt = Option.some(yield* Clock.currentTimeMillis);
+    yield* enter("telemetry");
+    // Telemetry last, each read within its budget: one that runs out is a failure saying how far
+    // it got, and the next check still runs.
+    const budget = Duration.minutes(options.telemetryBudgetMinutes);
+    const budgetText = `${options.telemetryBudgetMinutes} min`;
     // The last tail records, then the health report over the soak's last minutes (its tail-record
-    // part over the whole soak is `invocationOutcomes` above).
+    // part over the whole soak is `invocationOutcomes`).
     yield* Effect.sleep("20 seconds");
-    let tailsRead = yield* readTails;
-    for (let attempt = 0; !tailsRead && attempt < 3; attempt++) {
-      yield* Effect.sleep("10 seconds");
-      tailsRead = yield* readTails;
-    }
-    if (!tailsRead) {
-      ledger.failures.push(
-        "the soak's last tail records could not be read, so some were not checked",
-      );
-    }
-    if (invocationsSeen === 0) {
+    const tailsLeft = yield* catchUpTails(tails, budget, forEachInvocationRecord);
+    if (Option.isSome(tailsLeft)) ledger.failures.push(tailsLeft.value);
+    if (tails.recordsRead === 0) {
       ledger.failures.push("no tail records from the soak's window were read");
     }
-    for (const hit of limitHits) ledger.failures.push(`invocation: ${hit}`);
-    const healthResult = yield* Effect.result(measureHealth(15));
-    if (healthResult._tag === "Failure") {
-      ledger.failures.push(`health report: ${healthResult.failure.message}`);
+    for (const hit of tails.limitHits) ledger.failures.push(`invocation: ${hit}`);
+    yield* saveReport;
+    const healthRead = yield* Effect.result(readWithin(budget, measureHealth(15)));
+    if (healthRead._tag === "Failure") {
+      ledger.failures.push(`health report: ${healthRead.failure.message}`);
+    } else if (healthRead.success._tag === "OutOfTime") {
+      ledger.failures.push(`health report: not finished within ${budgetText}`);
+    } else {
+      health = Option.some(healthRead.success.value);
     }
-    const health =
-      healthResult._tag === "Success" ? Option.some(healthResult.success) : Option.none();
-    const pulledStore = yield* Effect.result(
-      pullMeasurementSpans(Math.ceil((endedAt - startedAt) / 60_000) + 5),
+    yield* saveReport;
+    const soakMinutes = Math.ceil(
+      (Option.getOrElse(endedAt, () => startedAt) - startedAt) / 60_000,
     );
-    if (pulledStore._tag === "Failure")
-      ledger.failures.push(`trace pull: ${pulledStore.failure.message}`);
-    const store = pulledStore._tag === "Success" ? pulledStore.success : "";
-    const errorSpans =
-      store === ""
-        ? []
-        : yield* spansSince(store, startedAt, ["--error"]).pipe(
-            Effect.tapError((error) =>
-              Effect.sync(() => ledger.failures.push(`trace grep: ${error.message}`)),
-            ),
-            Effect.orElseSucceed(() => []),
-          );
-    // A soak whose spans were not read cannot claim no unexpected errors.
-    const spansChecked = yield* spansSince(store, startedAt, ["--name", "DbWriter.write"]).pipe(
-      Effect.map((spans) => spans.length),
-      Effect.orElseSucceed(() => 0),
-    );
-    if (spansChecked === 0) ledger.failures.push("no spans from the soak's window were read");
-    const errorsByException = new Map<string, number>();
-    for (const span of errorSpans) {
+    const pulled = yield* Effect.result(readWithin(budget, pullMeasurementSpans(soakMinutes + 5)));
+    const store =
+      pulled._tag === "Success" && pulled.success._tag === "Finished"
+        ? Option.some(pulled.success.value)
+        : Option.none<string>();
+    if (pulled._tag === "Failure") ledger.failures.push(`trace pull: ${pulled.failure.message}`);
+    else if (pulled.success._tag === "OutOfTime")
+      ledger.failures.push(`trace pull: not finished within ${budgetText}`);
+    /** The spans matching `args` in the store, or `None` (recorded as a failure) when unreadable. */
+    const searchSpans = (args: ReadonlyArray<string>) =>
+      Effect.gen(function* () {
+        if (Option.isNone(store))
+          return Option.none<Effect.Success<ReturnType<typeof spansSince>>>();
+        const found = yield* Effect.result(
+          readWithin(budget, spansSince(store.value, startedAt, args)),
+        );
+        if (found._tag === "Failure") {
+          ledger.failures.push(`trace grep: ${found.failure.message}`);
+          return Option.none();
+        }
+        if (found.success._tag === "OutOfTime") {
+          ledger.failures.push(`trace grep ${args.join(" ")}: not finished within ${budgetText}`);
+          return Option.none();
+        }
+        return Option.some(found.success.value);
+      });
+    for (const span of Option.getOrElse(yield* searchSpans(["--error"]), () => [])) {
       const type = exceptionType(span);
       errorsByException.set(type, (errorsByException.get(type) ?? 0) + 1);
     }
-    const unexpectedErrors = [...errorsByException].filter(
-      ([type]) => !EXPECTED_EXCEPTIONS.has(type),
-    );
-    const latencies = Object.fromEntries(
-      [...ledger.latencies].map(([kind, values]) => [
-        kind,
-        {
-          count: values.length,
-          p50: percentile(values, 0.5),
-          p99: percentile(values, 0.99),
-          max: Math.max(...values),
-        },
-      ]),
-    );
-    const passed =
-      ledger.mismatches.length === 0 &&
-      ledger.failures.length === 0 &&
-      unexpectedErrors.length === 0 &&
-      Option.exists(health, (report) => report.issues.length === 0);
-    return {
-      passed,
-      minutes: (endedAt - startedAt) / 60_000,
-      databases: models.map((model) => model.databaseId),
-      group,
-      mismatches: ledger.mismatches,
-      failures: ledger.failures,
-      checks: Object.fromEntries(ledger.checks),
-      retried: Object.fromEntries(ledger.retried),
-      events: ledger.events,
-      counters: models.map((model) => ({
-        databaseId: model.databaseId,
-        committed: model.counterCommitted,
-        uncertain: model.counterUncertain,
-      })),
-      latencies,
-      storage,
-      spansChecked,
-      invocationsChecked: invocationsSeen,
-      invocationOutcomes: Object.fromEntries(
-        [...invocationOutcomes].map(([outcome, count]) => [outcome, Math.round(count)]),
-      ),
-      errorsByException: Object.fromEntries(errorsByException),
-      unexpectedErrors: Object.fromEntries(unexpectedErrors),
-      health: Option.getOrNull(health),
-    };
+    // A soak whose spans were not read cannot claim no unexpected errors.
+    spansChecked = Option.match(yield* searchSpans(["--name", "DbWriter.write"]), {
+      onNone: () => 0,
+      onSome: (spans) => spans.length,
+    });
+    if (spansChecked === 0) ledger.failures.push("no spans from the soak's window were read");
+    yield* enter("done");
+    return yield* report;
   });

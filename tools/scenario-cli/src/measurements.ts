@@ -11,7 +11,7 @@ import { HttpApiClient } from "effect/http-api";
 
 import {
   pullStageSpansSinceStart,
-  runTraceCli,
+  runTraceCliCaptured,
   runTraceCliAsync,
   ScenarioStack,
   uniqueId,
@@ -248,14 +248,16 @@ export const tailCursorAt = (sinceMs: number) =>
 
 /**
  * Reads the Tail Worker's invocation records after `after` (a tail key, see {@link tailCursorAt}),
- * a page at a time, passing each page to `onRecords`. Each page is retried a few times, so one
- * failed request does not lose a long read.
+ * a page at a time, passing each page's records and the key to continue from after it to
+ * `onPage`. Each page is retried a few times, so one failed request does not lose a long read.
+ * `onPage` runs synchronously once per page, so a read interrupted between pages has handed over
+ * every record before the last key it handed over, and none after it.
  *
  * @returns The key to continue from next time, or `MeasurementError`.
  */
 export const forEachInvocationRecord = (
   after: string,
-  onRecords: (records: ReadonlyArray<InvocationRecord>) => void,
+  onPage: (records: ReadonlyArray<InvocationRecord>, cursor: string) => void,
 ) =>
   Effect.gen(function* () {
     const collector = yield* MeasurementCollector;
@@ -278,16 +280,18 @@ export const forEachInvocationRecord = (
           Effect.retry({ times: 4, schedule: Schedule.exponential("500 millis") }),
           Effect.mapError(failed("read tail records")),
         );
+      const records: Array<InvocationRecord> = [];
       for (const batch of page.batches) {
         const body = Base64.decode(batch.body);
         if (body._tag === "Failure") continue;
-        onRecords(
-          yield* decodeRecords(new TextDecoder().decode(body.success)).pipe(
+        records.push(
+          ...(yield* decodeRecords(new TextDecoder().decode(body.success)).pipe(
             Effect.mapError(failed("decode tail records")),
-          ),
+          )),
         );
       }
       if (page.next !== null) cursor = page.next;
+      onPage(records, cursor);
       if (!page.more || page.batches.length === 0) break;
     }
     return cursor;
@@ -1035,7 +1039,8 @@ export const pullMeasurementSpans = (minutes: number) =>
 /** Spans `trace-cli grep` finds in `store` with `args` that started at or after `sinceMs`. */
 export const spansSince = (store: string, sinceMs: number, args: ReadonlyArray<string>) =>
   Effect.gen(function* () {
-    const result = yield* runTraceCli(["grep", "--json", "--store", store, ...args]);
+    // In its own process without blocking this one, so a time budget around it can cut it off.
+    const result = yield* runTraceCliCaptured(["grep", "--json", "--store", store, ...args]);
     const step = `trace-cli grep ${args.join(" ")}`;
     if (result.status !== 0) {
       return yield* new MeasurementError({
