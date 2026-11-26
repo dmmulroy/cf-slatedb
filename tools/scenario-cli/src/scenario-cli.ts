@@ -28,6 +28,7 @@ import {
   measureR2Placement,
   measureTransactionAborts,
   measureHealth,
+  measureLatency,
   measureSampling,
   measureWorkflowBurst,
   measureWriterMemory,
@@ -315,6 +316,16 @@ const measureHealthCommand = Command.make(
   ),
 );
 
+const measureLatencyCommand = Command.make(
+  "latency",
+  { stage: measureStage, minutes: Flag.Int("minutes").pipe(Flag.withDefault(15)) },
+  ({ stage, minutes }) => runMeasurement(stage, measureLatency(minutes)),
+).pipe(
+  Command.withDescription(
+    "Server-side latency and block reads per operation over the last minutes, from a live stage's spans (D67)",
+  ),
+);
+
 const measureSamplingCommand = Command.make(
   "sampling",
   { stage: measureStage, requests: Flag.Int("requests").pipe(Flag.withDefault(200)) },
@@ -438,6 +449,7 @@ const measure = Command.make("measure").pipe(
     measureWriterMemoryCommand,
     measureWorkflowBurstCommand,
     measureHealthCommand,
+    measureLatencyCommand,
     measureSamplingCommand,
   ]),
 );

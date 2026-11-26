@@ -1,7 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { Context, Data, Effect, Option, Schedule } from "effect";
+import { Clock, Context, Data, Effect, Option, Schedule } from "effect";
 import type { HttpClient } from "effect/http";
 
 /**
@@ -140,6 +140,12 @@ const PREVIEW_SPAN_SETTLE = "5 seconds";
 /** Pulls and asserts again this many times, a few seconds apart, before a preview check fails. */
 const PREVIEW_ASSERT_ATTEMPTS = 6;
 
+/**
+ * When this process started. A preview check pulls only spans exported since then: a stage that
+ * ran a soak holds hours of exports nobody pulled, and reading them first would stall the check.
+ */
+const PROCESS_STARTED_AT = Date.now();
+
 /** Runs the trace CLI in its own process; returns its exit status and output. */
 /**
  * Runs the trace CLI in its own process without blocking this one (a long `pull` must not stall a
@@ -168,6 +174,17 @@ export const runTraceCli = (args: ReadonlyArray<string>, input?: string) =>
   );
 
 /**
+ * Pulls into the default trace store the spans `stage` exported since this process started (see
+ * {@link PROCESS_STARTED_AT}); returns the trace CLI's exit status and output.
+ */
+export const pullStageSpansSinceStart = (stage: string) =>
+  Effect.gen(function* () {
+    const sinceMinutes =
+      Math.ceil(((yield* Clock.currentTimeMillis) - PROCESS_STARTED_AT) / 60_000) + 1;
+    return yield* runTraceCli(["pull", "--stage", stage, "--since-minutes", String(sinceMinutes)]);
+  });
+
+/**
  * Runs a trace assertion (the trace CLI's `assert`, in its own process) against the local trace
  * store. Locally, the Workers flush spans before responding, so a scenario's traces are stored by
  * the time its requests return. On a preview stage they are exported after each response to the
@@ -189,7 +206,7 @@ export const assertTraces = (name: string, assertion: unknown) =>
     let last = "";
     for (let attempt = 1; attempt <= PREVIEW_ASSERT_ATTEMPTS; attempt++) {
       yield* Effect.sleep(attempt === 1 ? PREVIEW_SPAN_SETTLE : "3 seconds");
-      const pulled = yield* runTraceCli(["pull", "--stage", previewStage.value]);
+      const pulled = yield* pullStageSpansSinceStart(previewStage.value);
       if (pulled.status !== 0) {
         last = `pulling ${previewStage.value}'s spans failed:\n${pulled.stdout}${pulled.stderr}`;
         continue;

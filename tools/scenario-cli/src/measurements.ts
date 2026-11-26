@@ -9,7 +9,13 @@ import { Base64 } from "effect/encoding";
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 import { HttpApiClient } from "effect/http-api";
 
-import { runTraceCli, runTraceCliAsync, ScenarioStack, uniqueId } from "./scenario.ts";
+import {
+  pullStageSpansSinceStart,
+  runTraceCli,
+  runTraceCliAsync,
+  ScenarioStack,
+  uniqueId,
+} from "./scenario.ts";
 
 /**
  * A measurement could not run or its data could not be read: `step` names what it was doing and
@@ -301,9 +307,7 @@ const decodeFlushSpans = Schema.decodeUnknownEffect(Schema.fromJsonString(FlushS
 const pulledSpans = (name: string, databaseId: string) =>
   Effect.gen(function* () {
     const { stage } = yield* MeasurementCollector;
-    yield* Effect.sync(() =>
-      spawnSync(process.execPath, [TRACE_CLI, "pull", "--stage", stage], { encoding: "utf8" }),
-    );
+    yield* pullStageSpansSinceStart(stage);
     const result = yield* Effect.sync(() =>
       spawnSync(
         process.execPath,
@@ -625,9 +629,7 @@ export const measureGcScale = (load: GcScaleLoad) =>
     // Spans and tail records arrive after each invocation.
     yield* Effect.sleep("20 seconds");
     const { stage } = yield* MeasurementCollector;
-    yield* Effect.sync(() =>
-      spawnSync(process.execPath, [TRACE_CLI, "pull", "--stage", stage], { encoding: "utf8" }),
-    );
+    yield* pullStageSpansSinceStart(stage);
     const grepped = yield* Effect.sync(() =>
       spawnSync(
         process.execPath,
@@ -1033,6 +1035,66 @@ const tally = (values: ReadonlyArray<string>) =>
       ),
     ].sort((left, right) => right[1] - left[1]),
   );
+
+/** The operations {@link measureLatency} reports, each a span the API Worker records per request. */
+const LATENCY_OPERATIONS: ReadonlyArray<{
+  readonly operation: string;
+  readonly spanName: string;
+  readonly consistency?: "Latest" | "AtLeast" | "Flushed";
+}> = [
+  { operation: "get Latest", spanName: "DbClient.getRow", consistency: "Latest" },
+  { operation: "get AtLeast", spanName: "DbClient.getRow", consistency: "AtLeast" },
+  { operation: "get Flushed", spanName: "DbClient.getRow", consistency: "Flushed" },
+  { operation: "scan", spanName: "DbClient.scan" },
+  { operation: "write batch", spanName: "WriterClient.write" },
+  { operation: "transaction commit", spanName: "WriterClient.commitTransaction" },
+];
+
+/**
+ * Server-side latency of a live stage's reads, scans, writes, and transaction commits over the
+ * last `minutes`, from its sampled spans: the span each operation records in the API Worker, so
+ * the caller's network and the trace export after the response are not in it (D67).
+ *
+ * **Details**
+ *
+ * `blockReads` counts the `BlockSource.block` and `BlockSource.meta` spans in the operation's
+ * trace: the blocks and SST metadata it fetched from the `BlockServer` because the isolate's cache
+ * did not hold them. Run it after a workload (a soak, for example), with `minutes` covering it.
+ *
+ * @returns Per operation: how many were sampled, their latency percentiles in milliseconds, and
+ *   their block-read percentiles; or `MeasurementError` when the spans cannot be pulled or read.
+ */
+export const measureLatency = (minutes: number) =>
+  Effect.gen(function* () {
+    const sinceMs = (yield* Clock.currentTimeMillis) - minutes * 60_000;
+    const store = yield* pullMeasurementSpans(minutes);
+    const blockReadsByTrace = new Map<string, number>();
+    for (const name of ["BlockSource.block", "BlockSource.meta"]) {
+      for (const span of yield* spansSince(store, sinceMs, ["--name", name])) {
+        blockReadsByTrace.set(span.traceId, (blockReadsByTrace.get(span.traceId) ?? 0) + 1);
+      }
+    }
+    const spansByName = new Map<string, ReadonlyArray<typeof GreppedSpan.Type>>();
+    for (const spanName of new Set(LATENCY_OPERATIONS.map((operation) => operation.spanName))) {
+      spansByName.set(spanName, yield* spansSince(store, sinceMs, ["--name", spanName]));
+    }
+    return {
+      minutes,
+      operations: LATENCY_OPERATIONS.map(({ operation, spanName, consistency }) => {
+        const spans = (spansByName.get(spanName) ?? []).filter(
+          (span) =>
+            consistency === undefined || span.attributes["read.consistency"] === consistency,
+        );
+        const blockReads = spans.map((span) => blockReadsByTrace.get(span.traceId) ?? 0);
+        return {
+          operation,
+          sampled: spans.length,
+          latencyMs: summarize(spans.map((span) => span.durationMs)),
+          blockReads: { p50: percentile(blockReads, 0.5), p90: percentile(blockReads, 0.9) },
+        };
+      }),
+    };
+  });
 
 /**
  * Head sampling on a live stage (D63): sends `requests` writes, each its own trace, to one new
