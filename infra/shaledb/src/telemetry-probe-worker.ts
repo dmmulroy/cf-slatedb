@@ -12,6 +12,7 @@ import {
   objectStoreLayer,
   withLsmTracePolicy,
 } from "@shaledb/lsm-cloudflare";
+import type { DurableObjectStorage } from "@cloudflare/workers-types";
 import type { HttpEffect } from "alchemy/Http";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Clock, Effect, Option, Schema } from "effect";
@@ -242,6 +243,102 @@ const PlainSqliteGet = Schema.Struct({ key: Schema.Uint8ArrayFromBase64 });
 const decodePlainSqliteGet = Schema.decodeUnknownEffect(Schema.fromJsonString(PlainSqliteGet));
 const encodeBase64 = Schema.encodeSync(Schema.Uint8ArrayFromBase64);
 
+/**
+ * The statements of the writer's memtable (`packages/lsm-cloudflare/src/mem-table.ts`), copied
+ * for {@link rowCostOf}: its table and index, a row's insert, a point read, the flush's ordered
+ * read, and the trim's delete. Keep them the statements the writer runs, or the measurement
+ * describes something else.
+ */
+const MEMTABLE_STATEMENTS = {
+  schema: [
+    `CREATE TABLE IF NOT EXISTS memtable_rows (
+       key BLOB NOT NULL,
+       seq INTEGER NOT NULL,
+       kind INTEGER NOT NULL,
+       payload BLOB NOT NULL,
+       create_ts INTEGER,
+       expire_ts INTEGER,
+       PRIMARY KEY (key, seq DESC)
+     ) WITHOUT ROWID`,
+    "CREATE INDEX IF NOT EXISTS memtable_rows_by_seq ON memtable_rows (seq)",
+  ],
+  insert:
+    "INSERT INTO memtable_rows (key, seq, kind, payload, create_ts, expire_ts) VALUES (?, ?, ?, ?, ?, ?)",
+  probe:
+    "SELECT key, seq, kind, payload, create_ts, expire_ts FROM memtable_rows WHERE key = ? AND +seq <= ? AND +seq > ? ORDER BY seq DESC",
+  flushRead:
+    "SELECT key, seq, kind, payload, create_ts, expire_ts FROM memtable_rows WHERE +seq > ? AND +seq <= ? ORDER BY key ASC, seq DESC LIMIT ?",
+  trim: "DELETE FROM memtable_rows WHERE seq <= ?",
+} as const;
+
+/**
+ * What Durable Object SQLite counts, in the `rowsWritten` and `rowsRead` it bills by, for `rows`
+ * rows of `valueBytes` going through the writer's memtable statements, and through the plain
+ * table's (`POST /rowcost?rows=<n>&valueBytes=<n>`). Each count is the cursor's own.
+ */
+const rowCostOf = (storage: DurableObjectStorage, rows: number, valueBytes: number) => {
+  const counted = (query: string, ...bindings: ReadonlyArray<ArrayBuffer | number | null>) => {
+    const cursor = storage.sql.exec(query, ...bindings);
+    const returned = cursor.toArray().length;
+    return { rowsWritten: cursor.rowsWritten, rowsRead: cursor.rowsRead, returned };
+  };
+  const sum = (
+    total: { rowsWritten: number; rowsRead: number },
+    one: { rowsWritten: number; rowsRead: number },
+  ) => ({
+    rowsWritten: total.rowsWritten + one.rowsWritten,
+    rowsRead: total.rowsRead + one.rowsRead,
+  });
+  const none = { rowsWritten: 0, rowsRead: 0 };
+  const key = (index: number) =>
+    new TextEncoder().encode(`rowcost-${index.toString().padStart(9, "0")}`).slice().buffer;
+  const value = new Uint8Array(valueBytes).fill(7).buffer;
+  storage.sql.exec("DROP TABLE IF EXISTS memtable_rows");
+  storage.sql.exec("DROP TABLE IF EXISTS rowcost_kv");
+  for (const statement of MEMTABLE_STATEMENTS.schema) storage.sql.exec(statement);
+  storage.sql.exec(
+    "CREATE TABLE rowcost_kv (key BLOB PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID",
+  );
+  let memtableInsert = none;
+  let plainInsert = none;
+  storage.transactionSync(() => {
+    for (let index = 0; index < rows; index++) {
+      memtableInsert = sum(
+        memtableInsert,
+        counted(MEMTABLE_STATEMENTS.insert, key(index), index + 1, 0, value, 1, null),
+      );
+    }
+  });
+  storage.transactionSync(() => {
+    for (let index = 0; index < rows; index++) {
+      plainInsert = sum(
+        plainInsert,
+        counted("INSERT INTO rowcost_kv (key, value) VALUES (?, ?)", key(index), value),
+      );
+    }
+  });
+  const memtableProbe = counted(MEMTABLE_STATEMENTS.probe, key(0), rows, 0);
+  const plainGet = counted("SELECT value FROM rowcost_kv WHERE key = ?", key(0));
+  const memtableFlushRead = counted(MEMTABLE_STATEMENTS.flushRead, 0, rows, rows);
+  const memtableTrim = counted(MEMTABLE_STATEMENTS.trim, rows);
+  const plainDelete = counted("DELETE FROM rowcost_kv");
+  const databaseBytesAfter = storage.sql.databaseSize;
+  storage.sql.exec("DROP TABLE memtable_rows");
+  storage.sql.exec("DROP TABLE rowcost_kv");
+  return {
+    rows,
+    valueBytes,
+    memtable: {
+      insert: memtableInsert,
+      probe: memtableProbe,
+      flushRead: memtableFlushRead,
+      trim: memtableTrim,
+    },
+    plain: { insert: plainInsert, get: plainGet, deleteAll: plainDelete },
+    databaseBytesAfter,
+  };
+};
+
 const plainSqliteServerLayer = PlainSqliteServer.make(
   Effect.gen(function* () {
     const state = yield* Cloudflare.DurableObjectState;
@@ -254,8 +351,20 @@ const plainSqliteServerLayer = PlainSqliteServer.make(
       return {
         fetch: Effect.gen(function* () {
           const request = yield* HttpServerRequest.HttpServerRequest;
+          const url = new URL(request.url, "http://probe");
+          if (url.pathname.endsWith("/rowcost")) {
+            const rows = Math.min(
+              20_000,
+              Math.max(1, Number(url.searchParams.get("rows")) || 1000),
+            );
+            const size = Math.min(
+              100_000,
+              Math.max(1, Number(url.searchParams.get("valueBytes")) || 100),
+            );
+            return yield* HttpServerResponse.json(rowCostOf(storage, rows, size));
+          }
           const body = yield* request.text;
-          if (request.url.endsWith("/batches")) {
+          if (url.pathname.endsWith("/batches")) {
             const batch = yield* decodePlainSqliteBatch(body);
             storage.transactionSync(() => {
               for (const { key, value } of batch.operations) {
@@ -325,7 +434,7 @@ export class TelemetryProbeWorker extends Cloudflare.Worker<
 >()("TelemetryProbeWorker") {}
 
 /** `/v1/probe/sqlite/<name>/batches` or `/get`: a {@link PlainSqliteServer} and what to ask it. */
-const PLAIN_SQLITE_PATH = /\/sqlite\/([A-Za-z0-9_-]{1,64})\/(batches|get)$/;
+const PLAIN_SQLITE_PATH = /\/sqlite\/([A-Za-z0-9_-]{1,64})\/(batches|get|rowcost)$/;
 
 /** Worker Layer for {@link TelemetryProbeWorker}. */
 export const telemetryProbeWorkerLayer = TelemetryProbeWorker.make(
@@ -359,7 +468,7 @@ export const telemetryProbeWorkerLayer = TelemetryProbeWorker.make(
               inLsmJurisdiction(plainSqlite, jurisdiction).getByName(name),
             );
             const answered = yield* store.execute(
-              HttpClientRequest.post(`http://probe/${operation}`).pipe(
+              HttpClientRequest.post(`http://probe/${operation}${url.search}`).pipe(
                 HttpClientRequest.bodyText(yield* request.text, "application/json"),
               ),
             );
