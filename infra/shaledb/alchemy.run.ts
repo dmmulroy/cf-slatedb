@@ -105,13 +105,17 @@ const ShaledbStack = Alchemy.Stack(
     const traces = isLocalLsmStage(stage)
       ? Option.none()
       : Option.some(yield* Cloudflare.Worker.ref(TraceCollectorWorker));
-    // Live stages also record every API and compactor invocation's CPU time (D48).
+    // Live stages also record API, compactor, and GC invocations' outcome and CPU time (D48),
+    // sampled like traces except for the ones that did not end `ok` (D71).
     if (!isLocalLsmStage(stage)) {
       yield* Cloudflare.Worker(CPU_TAIL_WORKER_ID, {
         main: join(import.meta.dirname, "src", "cpu-tail-worker.ts"),
         workersDev: false,
         compatibility: { date: LSM_WORKER_COMPATIBILITY_DATE },
-        env: { TRACE_BUCKET: yield* TraceBucket },
+        env: {
+          TRACE_BUCKET: yield* TraceBucket,
+          TAIL_SAMPLE_RATE: String(config.telemetry.traceSampleRate),
+        },
       });
     }
     return {
