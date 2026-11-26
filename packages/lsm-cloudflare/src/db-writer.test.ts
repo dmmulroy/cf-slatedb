@@ -8,22 +8,36 @@ import {
   type WriteBatch,
 } from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
-import { Context, Effect, Layer, Option, Ref } from "effect";
+import { Context, Deferred, Effect, Fiber, Layer, Option, Ref, Tracer } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
 import { backgroundWorkTestLayer } from "./background-work.ts";
 import { CompactionTrigger, compactionTriggerTestLayer } from "./compaction-trigger.ts";
-import { DbWriter, dbWriterLayerWithoutDependencies, dbWriterTestLayer } from "./db-writer.ts";
+import {
+  DbWriter,
+  dbWriterLayerWithoutDependencies,
+  dbWriterTestLayer,
+  type IDbWriter,
+} from "./db-writer.ts";
 import { lsmConfigurationTestLayer } from "./lsm-configuration.ts";
 import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
 import { manifestRows } from "./lsm-test-support.ts";
-import { MemTable, memTableLayerWithoutDependencies } from "./mem-table.ts";
+import {
+  type IMemTable,
+  MemTable,
+  MemTableError,
+  memTableLayerWithoutDependencies,
+} from "./mem-table.ts";
 import { ManifestReader } from "./manifest-reader.ts";
 import { ManifestStore, manifestStoreTestLayer } from "./manifest-store.ts";
 import { ObjectStore } from "./object-store.ts";
 import { sstStoreLayerWithoutDependencies } from "./sst-store.ts";
-import { DurableObjectAlarm, durableObjectAlarmTestLayer } from "./durable-object-alarm.ts";
+import {
+  DurableObjectAlarm,
+  durableObjectAlarmTestLayer,
+  type IDurableObjectAlarm,
+} from "./durable-object-alarm.ts";
 import { WriterSqlStorage, writerSqlStorageTestLayer } from "./writer-sql-storage.ts";
 
 const DB = DatabaseId.make("orders");
@@ -80,6 +94,84 @@ const run = <A, E>(
 ) =>
   effect.pipe(
     Effect.provide(dbWriterTestLayer(overrides)),
+    Effect.provide(lsmTestRuntimeContextLayer),
+    Effect.provide(TestClock.layer()),
+    Effect.runPromise,
+  );
+
+/** What a test of the counter refresh holds: the writer, its memtable, its alarm, and the hooks. */
+interface HookedStatsWriter {
+  readonly writer: IDbWriter;
+  readonly memTable: IMemTable;
+  readonly alarm: IDurableObjectAlarm;
+  /**
+   * Effects run, one per call and in order, right after `MemTable.stats` has scanned and before
+   * the writer sees the result. A failing one replaces the scan's result with its failure.
+   */
+  readonly afterScan: Array<Effect.Effect<void, MemTableError>>;
+  /** Effects run, one per call and in order, right after `MemTable.commit` wrote its rows. */
+  readonly afterCommit: Array<Effect.Effect<void>>;
+  /** Queues a hook that commits `batch` through the writer, as a concurrent request would. */
+  readonly commitAfterScan: (batch: WriteBatch) => void;
+}
+
+/**
+ * Runs `body` against a started writer whose `MemTable.stats` runs the queued `afterScan` hooks:
+ * a commit can then land between the scan and the install, which the scheduler otherwise allows
+ * only at an unpredictable yield.
+ */
+const runWithHookedStats = <A, E>(
+  body: (
+    writer: HookedStatsWriter,
+  ) => Effect.Effect<A, E, DbWriter | MemTable | DurableObjectAlarm | RuntimeContext>,
+) =>
+  Effect.gen(function* () {
+    yield* createDatabase();
+    const afterScan: Array<Effect.Effect<void, MemTableError>> = [];
+    const afterCommit: Array<Effect.Effect<void>> = [];
+    const hookedMemTable = Layer.effect(
+      MemTable,
+      Effect.map(MemTable, (memTable) =>
+        MemTable.of({
+          ...memTable,
+          stats: Effect.tap(memTable.stats, () => afterScan.shift() ?? Effect.void),
+          commit: (writes, createTs) =>
+            Effect.tap(memTable.commit(writes, createTs), () => afterCommit.shift() ?? Effect.void),
+        }),
+      ),
+    ).pipe(
+      Layer.provide(
+        memTableLayerWithoutDependencies.pipe(Layer.provide(writerSqlStorageTestLayer)),
+      ),
+    );
+    const shared = yield* Effect.context<ManifestStore | ManifestReader | ObjectStore>();
+    const context = yield* Layer.build(
+      Layer.provideMerge(
+        dbWriterLayerWithoutDependencies.pipe(Layer.provide(sstStoreLayerWithoutDependencies)),
+        Layer.mergeAll(
+          hookedMemTable,
+          durableObjectAlarmTestLayer,
+          compactionTriggerTestLayer,
+          backgroundWorkTestLayer,
+          lsmConfigurationTestLayer(),
+        ),
+      ).pipe(Layer.provide(Layer.succeedContext(shared))),
+    );
+    const writer = Context.get(context, DbWriter);
+    const memTable = Context.get(context, MemTable);
+    const alarm = Context.get(context, DurableObjectAlarm);
+    const runtime = yield* Effect.context<RuntimeContext>();
+    const commitAfterScan = (batch: WriteBatch) => {
+      afterScan.push(
+        writer.write(DB, batch).pipe(Effect.asVoid, Effect.orDie, Effect.provide(runtime)),
+      );
+    };
+    return yield* body({ writer, memTable, alarm, afterScan, afterCommit, commitAfterScan }).pipe(
+      Effect.provide(context),
+    );
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(manifestStoreTestLayer),
     Effect.provide(lsmTestRuntimeContextLayer),
     Effect.provide(TestClock.layer()),
     Effect.runPromise,
@@ -333,6 +425,159 @@ describe("DbWriter", () => {
       Effect.runPromise,
     );
     expect(outcome).toEqual({ atStart: 1, whileIdle: 0, afterFlush: 2, rows: 2 });
+  });
+
+  it("a commit that lands while a flush scans for fresh counters is kept in them, and its alarm flushes it (D74)", async () => {
+    const outcome = await runWithHookedStats(
+      ({ writer, memTable, alarm, afterScan, commitAfterScan }) =>
+        Effect.gen(function* () {
+          yield* TestClock.setTime(10_000);
+          yield* writer.write(DB, put("a", "1"));
+          // The end of this flush scans SQLite for its counters; the write of `b` commits right
+          // after that scan and before its figures are installed.
+          commitAfterScan(put("b", "2"));
+          const flushedSeq = yield* writer.flush(DB);
+          const status = yield* writer.status(DB);
+          const scanned = yield* memTable.stats;
+          // The Durable Object clears an alarm when it fires; then `b` reaches its age limit.
+          yield* alarm.cancel;
+          yield* TestClock.setTime(10_000 + 60_000);
+          yield* writer.runAlarm;
+          return {
+            flushedSeq,
+            counted: [status.unflushedBytes, status.unflushedRows],
+            scanned: [scanned.unflushedBytes, scanned.rowCount],
+            afterAlarm: (yield* writer.status(DB)).flushedSeq,
+            hooksLeft: afterScan.length,
+          };
+        }),
+    );
+    expect(outcome.hooksLeft).toBe(0);
+    expect(outcome.flushedSeq).toBe(1);
+    expect(outcome.scanned).toEqual([1 + 1 + 32, 1]);
+    expect(outcome.counted).toEqual(outcome.scanned);
+    expect(outcome.afterAlarm).toBe(2);
+  });
+
+  it("a commit that started before a flush's counter scan and ends after it is counted once (D74)", async () => {
+    const outcome = await runWithHookedStats(({ writer, memTable, afterScan, afterCommit }) =>
+      Effect.gen(function* () {
+        yield* writer.write(DB, put("a", "1"));
+        // The write of `b` puts its row in SQLite and then waits, so it has started and not ended
+        // while the flush that follows writes that row and scans. The write may end only during
+        // the flush's second scan: a refresh must not install the first scan meanwhile, or the
+        // write's row, already flushed, is counted again when it ends.
+        const inserted = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        afterCommit.push(
+          Deferred.succeed(inserted, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        );
+        afterScan.push(Effect.void, Effect.asVoid(Deferred.succeed(release, undefined)));
+        const write = yield* Effect.forkChild(writer.write(DB, put("b", "2")));
+        yield* Deferred.await(inserted);
+        const flushedSeq = yield* writer.flush(DB);
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(write);
+        const status = yield* writer.status(DB);
+        const scanned = yield* memTable.stats;
+        return {
+          flushedSeq,
+          counted: [status.unflushedBytes, status.unflushedRows],
+          scanned: [scanned.unflushedBytes, scanned.rowCount],
+        };
+      }),
+    );
+    expect(outcome).toEqual({ flushedSeq: 2, counted: [0, 0], scanned: [0, 0] });
+  });
+
+  it("counters a refresh could not settle stay above SQLite until the next flush, which flushes every row (D74)", async () => {
+    const outcome = await runWithHookedStats(({ writer, memTable, alarm, commitAfterScan }) =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(10_000);
+        yield* writer.write(DB, put("a", "1"));
+        // Every scan the flush makes is overtaken by a commit, so the refresh gives up.
+        for (const key of ["b", "c", "d"]) {
+          commitAfterScan(put(key, "2"));
+        }
+        yield* writer.flush(DB);
+        const status = yield* writer.status(DB);
+        const scanned = yield* memTable.stats;
+        yield* alarm.cancel;
+        yield* TestClock.setTime(10_000 + 60_000);
+        yield* writer.runAlarm;
+        const afterAlarm = yield* writer.status(DB);
+        const scannedAfter = yield* memTable.stats;
+        return {
+          counted: status.unflushedRows,
+          scanned: scanned.rowCount,
+          afterAlarm: [afterAlarm.flushedSeq, afterAlarm.unflushedRows, scannedAfter.rowCount],
+          scheduled: yield* alarm.scheduled,
+        };
+      }),
+    );
+    // Above SQLite (they still hold `a`), never below it.
+    expect([outcome.counted, outcome.scanned]).toEqual([4, 3]);
+    expect(outcome.afterAlarm).toEqual([4, 0, 0]);
+    expect(outcome.scheduled).toEqual(Option.none());
+  });
+
+  it("an alarm that finds nothing to flush settles stale counters instead of setting itself again (D74)", async () => {
+    const outcome = await runWithHookedStats(({ writer, alarm, afterScan }) =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(10_000);
+        yield* writer.write(DB, put("a", "1"));
+        // The flush commits and records `a` flushed, then its counter scan fails.
+        afterScan.push(
+          Effect.fail(
+            new MemTableError({
+              operation: "stats",
+              reason: "StorageUnavailable",
+              message: "Test: the counter scan failed.",
+            }),
+          ),
+        );
+        const failedFlush = yield* Effect.result(writer.flush(DB));
+        yield* alarm.cancel;
+        yield* TestClock.setTime(10_000 + 60_000);
+        yield* writer.runAlarm;
+        const status = yield* writer.status(DB);
+        return {
+          failedFlush: failedFlush._tag,
+          flushedSeq: status.flushedSeq,
+          rows: status.unflushedRows,
+          scheduled: yield* alarm.scheduled,
+        };
+      }),
+    );
+    expect(outcome).toEqual({
+      failedFlush: "Failure",
+      flushedSeq: 1,
+      rows: 0,
+      scheduled: Option.none(),
+    });
+  });
+
+  it("a ready writer answers requests without starting again (D69)", async () => {
+    const started: Array<string> = [];
+    const recordingTracer = Tracer.make({
+      span: (options) => {
+        if (options.name === "DbWriter.start") started.push(options.name);
+        return new Tracer.NativeSpan(options);
+      },
+    });
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createDatabase();
+        const writer = yield* DbWriter;
+        yield* writer.write(DB, put("a", "1"));
+        const afterFirst = started.length;
+        yield* writer.write(DB, put("b", "2"));
+        yield* writer.probe(DB, bytes("a"));
+        yield* writer.status(DB);
+        return { afterFirst, afterMore: started.length };
+      }).pipe(Effect.withTracer(recordingTracer)),
+    );
+    expect(outcome).toEqual({ afterFirst: 1, afterMore: 1 });
   });
 
   it("seals: flushes every acknowledged write, then refuses writes with the successors", async () => {

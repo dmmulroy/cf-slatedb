@@ -1625,7 +1625,8 @@ in `M` holds, for each key, its newest version at or below `S`, whatever flushes
 dropped. `ReadView.maxLastL0Seq` already enforced this for transactions; every view built from a
 writer's answer now sets it to the snapshot (`DbClient.pointView`, `scanView`).
 
-- **A cached manifest always fits**: it was loaded before the writer was asked.
+- **A cached manifest usually fits**: it was loaded before the writer was asked, or by a
+  concurrent read in the same isolate, which the check catches.
 - **A manifest loaded after the answer may not.** The reader then fails with `SnapshotExpired`,
   and `DbClient.getRow` and `scan` ask the writer again, up to three times
   (`LATEST_READ_ATTEMPTS`). Each further time needs another flush to commit in that same short
@@ -1857,9 +1858,25 @@ of CPU. No soak could show it: their memtables hold a few hundred rows.
 **The fix.**
 
 - **One formula.** `memTableWriteBytes` (key, payload, 32 bytes) is what SQLite sums and what a
-  commit adds to the counter, so the counter equals what a scan would report.
-- **Three counters**: unflushed bytes, unflushed rows, and the oldest unflushed commit time. They
-  are read from SQLite when the writer starts and when a flush ends, and advanced by each commit.
+  commit adds to the counter, so the counter equals what a scan would report, as long as no commit
+  runs during a scan (next item).
+- **Three counters**, in one value: unflushed bytes, unflushed rows, and the oldest unflushed
+  commit time. They are read from SQLite when the writer starts and when a flush ends, and advanced
+  by each commit.
+- **A scan is installed only if no commit ran during it.** A flush holds only the flush lock, so a
+  commit can land between its scan and the moment it sets the counters; setting them anyway lost
+  that commit's row from them, and with the oldest commit time gone no alarm was set for it (found
+  in review). Each commit now advances a generation number when it starts and again, in the same
+  step that adds its row, when it ends, and marks itself running in between. The refresh installs
+  its scan only if the generation is unchanged and no commit is running, and otherwise scans again,
+  three times at most. If every scan is overtaken it keeps the counters it has: they still hold the
+  rows the flush wrote, so they are above SQLite, never below it, and only bring the next flush
+  forward; that flush refreshes them. The flush cannot take the commit lock instead: a seal takes
+  the commit lock and then the flush lock.
+- **A flush with nothing to write settles stale counters.** Counters left above SQLite (a refresh
+  that gave up, or one that failed after the flush was recorded) kept the alarm due, and an alarm
+  that found nothing to flush set itself for now again. A flush that writes nothing now rescans
+  when the counters still show unflushed rows (none: counters showing nothing are never wrong).
 - **The alarm decides from the counters** `scheduleFlush` set it from, so the two cannot
   disagree, and an alarm costs no scan.
 - **`status` reports the counters**: no scan on a transaction's begin or on a status request.
@@ -1880,6 +1897,12 @@ flush). Both are once per flush.
   aggregate statement; the writer's start runs one and a flush two.
 - Six mutations caught: another formula, a row counter not advanced, `status` scanning, the alarm
   scanning, a flush not refreshing, an alarm that flushes whenever anything is unflushed.
+- A memtable whose `stats` lets a commit run between the scan and the install: the counters then
+  equal a scan, and the alarm at the row's age limit flushes it (on the code before, the counters
+  showed nothing and the alarm did not flush). A commit that started before the scan and ends after
+  it is counted once (fails without the "no commit running" check). Every scan overtaken: the
+  counters stay above SQLite and the next alarm flushes every row. A counter scan that fails after
+  a flush: the next alarm settles the counters and does not set itself again.
 
 **Model.** `NoAckedWriteLost` and `SealSplit` are indifferent to when a flush is scheduled; no
 step changed (the skills record it).

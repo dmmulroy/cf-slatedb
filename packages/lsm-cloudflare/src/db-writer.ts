@@ -256,6 +256,46 @@ export const writeStalls = Metric.counter("lsm_write_stalls", {
 /** How long to wait before retrying a failed flush. */
 const FLUSH_RETRY_MILLIS = 1_000;
 
+/**
+ * How many times the end of a flush scans the memtable for fresh counters before it gives up and
+ * keeps the counters it has. Each further scan needs a commit to land during the one before.
+ */
+const COUNTER_REFRESH_ATTEMPTS = 3;
+
+/**
+ * The writer's figures for its unflushed rows (D74), in one value so that a commit changes all of
+ * them in one indivisible step.
+ *
+ * **Details**
+ *
+ * The counters are never below what SQLite holds: a commit adds exactly its rows, and only a scan
+ * installs lower figures, and only when no commit ran while it scanned (`generation`). A counter
+ * above SQLite (a refresh that gave up, or a failed flush) is corrected by the next flush, and makes
+ * that flush come sooner, never later, so no row is left unflushed past `maxL0Age`.
+ */
+interface UnflushedCounters {
+  /** Bytes of the unflushed rows, as `memTableWriteBytes` counts them. */
+  readonly bytes: number;
+  readonly rows: number;
+  /** Commit time of the oldest unflushed row; some whenever a row is unflushed. */
+  readonly oldest: Option.Option<Timestamp>;
+  /**
+   * Advanced when a commit starts and again when it ends. A scan whose generation changed before
+   * it is installed may have missed, or counted, a commit's rows.
+   */
+  readonly generation: number;
+  /** A commit has started and not ended: its rows may or may not be in a scan. */
+  readonly committing: boolean;
+}
+
+const NO_UNFLUSHED_ROWS: UnflushedCounters = {
+  bytes: 0,
+  rows: 0,
+  oldest: Option.none(),
+  generation: 0,
+  committing: false,
+};
+
 type WriterPhase =
   | { readonly _tag: "Uninitialized" }
   | {
@@ -290,11 +330,9 @@ export const makeDbWriter = Effect.gen(function* () {
   // The unflushed rows' bytes and count, and the commit time of the oldest: everything the flush
   // scheduler, the alarm, backpressure, and `status` need. Kept in memory so that none of them
   // scans the memtable: read from SQLite at start and after each flush, and advanced by each
-  // commit with the same per-row figure SQLite sums (`memTableWriteBytes`), so the counters
-  // always equal what a scan would report (D74).
-  const unflushedBytes = yield* Ref.make(0);
-  const unflushedRows = yield* Ref.make(0);
-  const oldestUnflushed = yield* Ref.make(Option.none<Timestamp>());
+  // commit with the same per-row figure SQLite sums (`memTableWriteBytes`). A scan is installed
+  // only if no commit ran during it, so the counters equal what a scan would report (D74).
+  const unflushed = yield* Ref.make(NO_UNFLUSHED_ROWS);
   const initLock = yield* Semaphore.make(1);
   const commitLock = yield* Semaphore.make(1);
   const flushLock = yield* Semaphore.make(1);
@@ -335,18 +373,62 @@ export const makeDbWriter = Effect.gen(function* () {
       ),
   });
 
-  /** Recomputes the in-memory byte counter and oldest unflushed time from SQLite (one scan). */
-  const refreshUnflushedBytes = (databaseId: DatabaseId) =>
-    memTable.stats.pipe(
-      Effect.tap((stats) =>
-        Effect.all([
-          Ref.set(unflushedBytes, stats.unflushedBytes),
-          Ref.set(unflushedRows, stats.rowCount),
-          Ref.set(oldestUnflushed, stats.oldestCreateTs),
-        ]),
-      ),
-      Effect.mapError(unavailable(databaseId, "stats")),
-    );
+  /**
+   * Replaces the counters with a scan of SQLite, unless a commit ran during the scan: then it scans
+   * again, up to {@link COUNTER_REFRESH_ATTEMPTS} times.
+   *
+   * **Details**
+   *
+   * Commits take the commit lock, which a flush must not take inside its own (a seal takes them in
+   * the other order), so a commit can land between the scan and the install. Installing anyway
+   * could drop that commit's row from the counters, leaving no alarm for it. When every attempt is
+   * overtaken, the counters are kept: they are then above SQLite (they still hold the rows this
+   * flush wrote), which only brings the next flush forward, and that flush refreshes them.
+   */
+  const refreshUnflushedCounters = (databaseId: DatabaseId) =>
+    Effect.gen(function* () {
+      for (let attempt = 1; attempt <= COUNTER_REFRESH_ATTEMPTS; attempt++) {
+        const before = yield* Ref.get(unflushed);
+        const stats = yield* memTable.stats.pipe(Effect.mapError(unavailable(databaseId, "stats")));
+        const installed = yield* Ref.modify(
+          unflushed,
+          (current): readonly [boolean, UnflushedCounters] =>
+            current.generation === before.generation && !current.committing
+              ? [
+                  true,
+                  {
+                    ...current,
+                    bytes: stats.unflushedBytes,
+                    rows: stats.rowCount,
+                    oldest: stats.oldestCreateTs,
+                  },
+                ]
+              : [false, current],
+        );
+        if (installed) return;
+        // Let the commit that overtook the scan finish before scanning again.
+        yield* Effect.yieldNow;
+      }
+      yield* Effect.annotateCurrentSpan({ "writer.counters_refresh_overtaken": true });
+    });
+
+  /**
+   * For a flush that found no row to write: refreshes counters that still show unflushed rows.
+   *
+   * **Details**
+   *
+   * Counters left above SQLite (a refresh that gave up, or a flush that failed after recording its
+   * rows flushed) would otherwise keep the alarm due: it would fire, find nothing to flush, and be
+   * set for now again, the loop D74 removed. Counters showing nothing need no scan, since they are
+   * never below SQLite.
+   */
+  const settleCountersWithNothingToFlush = (databaseId: DatabaseId) =>
+    Effect.gen(function* () {
+      const counters = yield* Ref.get(unflushed);
+      if (counters.rows > 0 || Option.isSome(counters.oldest)) {
+        yield* refreshUnflushedCounters(databaseId);
+      }
+    });
 
   /**
    * Schedules the flush alarm for when the oldest unflushed row reaches `maxL0Age`, or now once
@@ -355,13 +437,11 @@ export const makeDbWriter = Effect.gen(function* () {
    */
   const scheduleFlush = (_databaseId: DatabaseId) =>
     Effect.gen(function* () {
-      const oldest = yield* Ref.get(oldestUnflushed);
-      if (Option.isNone(oldest)) return;
+      const counters = yield* Ref.get(unflushed);
+      if (Option.isNone(counters.oldest)) return;
       const now = yield* Clock.currentTimeMillis;
       const due =
-        (yield* Ref.get(unflushedBytes)) >= settings.l0SstSize
-          ? now
-          : oldest.value + settings.maxL0Age;
+        counters.bytes >= settings.l0SstSize ? now : counters.oldest.value + settings.maxL0Age;
       const scheduled = yield* alarm.scheduled;
       if (Option.isNone(scheduled) || scheduled.value > due) yield* alarm.scheduleAt(due);
     });
@@ -435,7 +515,7 @@ export const makeDbWriter = Effect.gen(function* () {
               yield* Clock.currentTimeMillis,
             )
             .pipe(Effect.mapError(unavailable(databaseId, "start")));
-          yield* refreshUnflushedBytes(databaseId);
+          yield* refreshUnflushedCounters(databaseId);
           const ready: WriterPhase = {
             _tag: "Ready",
             databaseId,
@@ -506,8 +586,10 @@ export const makeDbWriter = Effect.gen(function* () {
           const cut = meta.lastSeq;
           yield* Effect.annotateCurrentSpan({ "database.id": databaseId, seq: cut });
           const nothingCommitted = Option.none<VersionedManifest>();
-          if (cut <= meta.flushedSeq)
+          if (cut <= meta.flushedSeq) {
+            yield* settleCountersWithNothingToFlush(databaseId);
             return { flushedSeq: meta.flushedSeq, committed: nothingCommitted };
+          }
           const options = ready.manifest.manifest.options;
           const written = yield* ssts
             .write({
@@ -532,6 +614,7 @@ export const makeDbWriter = Effect.gen(function* () {
             yield* memTable
               .markFlushed(cut, Option.none(), yield* Clock.currentTimeMillis)
               .pipe(Effect.mapError(unavailable(databaseId, "flush")));
+            yield* settleCountersWithNothingToFlush(databaseId);
             return { flushedSeq: cut, committed: nothingCommitted };
           }
           const changelog = Option.isSome(options.changelog)
@@ -584,7 +667,7 @@ export const makeDbWriter = Effect.gen(function* () {
           yield* Ref.update(phase, (current) =>
             current._tag === "Ready" ? { ...current, manifest: committed } : current,
           );
-          yield* refreshUnflushedBytes(databaseId);
+          yield* refreshUnflushedCounters(databaseId);
           yield* Metric.update(flushBytes, written.value.info.sizeBytes);
           // Enough L0 SSTs to compact: wake the compactor (an idle database has no compactor alarm).
           if (committed.manifest.l0.length >= settings.minCompactionSources) {
@@ -660,7 +743,7 @@ export const makeDbWriter = Effect.gen(function* () {
       const receipt = yield* commitLock.withPermits(1)(
         Effect.gen(function* () {
           let ready = yield* writableReady(databaseId);
-          const bytes = yield* Ref.get(unflushedBytes);
+          const { bytes } = yield* Ref.get(unflushed);
           if (bytes >= settings.maxUnflushedBytes) {
             yield* Metric.update(writeStalls, 1);
             yield* scheduleFlush(databaseId);
@@ -710,14 +793,37 @@ export const makeDbWriter = Effect.gen(function* () {
           // Monotonic clock: never behind the newest tick already handed out or flushed.
           const now = yield* Clock.currentTimeMillis;
           const createTs = Timestamp.make(Math.max(now, meta.clockTick));
-          const seq = yield* memTable
-            .commit(writes, createTs)
-            .pipe(Effect.mapError(unavailable(databaseId, "write")));
           const added = writes.reduce((sum, item) => sum + memTableWriteBytes(item), 0);
-          yield* Ref.update(unflushedBytes, (current) => current + added);
-          yield* Ref.update(unflushedRows, (current) => current + writes.length);
-          yield* Ref.update(oldestUnflushed, (current) =>
-            Option.isSome(current) ? current : Option.some(createTs),
+          // A refresh scanning while this commit runs must not install its figures (see
+          // `refreshUnflushedCounters`): mark the commit before its rows reach SQLite, and add
+          // them in the same step that ends it.
+          yield* Ref.update(unflushed, (current) => ({
+            ...current,
+            generation: current.generation + 1,
+            committing: true,
+          }));
+          const seq = yield* memTable.commit(writes, createTs).pipe(
+            Effect.onExit((exit) =>
+              Ref.update(unflushed, (current) => {
+                const ended = {
+                  ...current,
+                  generation: current.generation + 1,
+                  committing: false,
+                };
+                // A failed commit rolled back: none of its rows is in SQLite.
+                return exit._tag === "Success"
+                  ? {
+                      ...ended,
+                      bytes: current.bytes + added,
+                      rows: current.rows + writes.length,
+                      oldest: Option.isSome(current.oldest)
+                        ? current.oldest
+                        : Option.some(createTs),
+                    }
+                  : ended;
+              }),
+            ),
+            Effect.mapError(unavailable(databaseId, "write")),
           );
           return { seq, createTs };
         }),
@@ -918,6 +1024,7 @@ export const makeDbWriter = Effect.gen(function* () {
     const ready = yield* ensureReady(databaseId);
     const meta = yield* memTable.meta.pipe(Effect.mapError(unavailable(databaseId, "status")));
     // From the counters, not a scan: a transaction begins with this call.
+    const counters = yield* Ref.get(unflushed);
     return {
       databaseId,
       writerEpoch: ready.writerEpoch,
@@ -925,8 +1032,8 @@ export const makeDbWriter = Effect.gen(function* () {
       flushedSeq: meta.flushedSeq,
       retainedFromSeq: meta.retainedFromSeq,
       flushedManifestId: meta.flushedManifestId,
-      unflushedBytes: yield* Ref.get(unflushedBytes),
-      unflushedRows: yield* Ref.get(unflushedRows),
+      unflushedBytes: counters.bytes,
+      unflushedRows: counters.rows,
       l0Count: ready.manifest.manifest.l0.length,
       sealed: Option.isSome(ready.sealed),
     };
@@ -1027,9 +1134,11 @@ export const makeDbWriter = Effect.gen(function* () {
           }
           yield* memTable.clear.pipe(Effect.mapError(unavailable(databaseId, "destroy")));
           yield* alarm.cancel;
-          yield* Ref.set(unflushedBytes, 0);
-          yield* Ref.set(unflushedRows, 0);
-          yield* Ref.set(oldestUnflushed, Option.none());
+          // Both locks are held, so no commit or refresh is running.
+          yield* Ref.update(unflushed, (current) => ({
+            ...NO_UNFLUSHED_ROWS,
+            generation: current.generation + 1,
+          }));
           yield* Ref.set(phase, { _tag: "Uninitialized" });
         }),
       ),
@@ -1046,12 +1155,11 @@ export const makeDbWriter = Effect.gen(function* () {
       // The same counters `scheduleFlush` set this alarm from, so the two always agree on
       // whether a flush is due. Deciding here from a scan of the memtable, with a figure the
       // scheduler did not share, made the alarm fire, scan, and be set again without flushing.
-      const oldest = yield* Ref.get(oldestUnflushed);
+      const counters = yield* Ref.get(unflushed);
       const now = yield* Clock.currentTimeMillis;
       const due =
-        Option.isSome(oldest) &&
-        ((yield* Ref.get(unflushedBytes)) >= settings.l0SstSize ||
-          oldest.value + settings.maxL0Age <= now);
+        Option.isSome(counters.oldest) &&
+        (counters.bytes >= settings.l0SstSize || counters.oldest.value + settings.maxL0Age <= now);
       if (due) yield* flushNow(id);
       yield* scheduleFlush(id);
     }).pipe(Effect.exit);
