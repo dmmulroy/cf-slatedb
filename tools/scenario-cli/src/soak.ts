@@ -683,6 +683,8 @@ export const soak = (options: SoakOptions) =>
     });
     const splitter = Effect.gen(function* () {
       for (const minute of options.splitAtMinutes) {
+        // A split planned after the workload's end is skipped: it must not hold the workload open.
+        if (minute >= options.minutes) continue;
         const wait = startedAt + minute * 60_000 - (yield* Clock.currentTimeMillis);
         if (wait > 0) yield* Effect.sleep(`${wait} millis`);
         const map = yield* untilSuccess(
@@ -753,6 +755,8 @@ export const soak = (options: SoakOptions) =>
       onNone: () => Effect.void,
       onSome: (minute) =>
         Effect.gen(function* () {
+          // A redeploy planned after the workload's end is skipped, like a late split.
+          if (minute >= options.minutes) return;
           yield* Effect.sleep(`${minute * 60_000} millis`);
           const code = yield* redeploy(
             stack.previewStage.pipe(Option.getOrElse(() => "local")),

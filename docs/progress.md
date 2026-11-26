@@ -242,7 +242,8 @@ hand-off is below.
     every telemetry read has a budget whose overrun is a failure saying how far it got, the data
     checks run before telemetry, and `--report-file` keeps the report, atomically replaced, every
     minute and after each phase. Tests: `soak-telemetry.test.ts`, `soak-report.test.ts`,
-    `scenario.test.ts` in `tools/scenario-cli`. Not yet run live.
+    `scenario.test.ts` in `tools/scenario-cli`. A split or redeploy planned after `--minutes` is
+    skipped instead of holding the workload open (no test). Not yet run live.
   - **Lessons for running in parallel.** TLC on every core starves a client-driven measurement
     on the same laptop (transport errors, one failed run): run it niced and apart from timed
     runs. A tool started while a deploy has the checkout on another ref loads a mix of two
