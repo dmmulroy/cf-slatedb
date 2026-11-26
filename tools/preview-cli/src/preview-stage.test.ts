@@ -7,6 +7,7 @@ import {
   deployJurisdiction,
   describeBoundLsmSettings,
   destroyCommand,
+  PREVIEW_DEV_TIMINGS,
   parseStateRead,
   previewOutputs,
   previewSecret,
@@ -113,15 +114,45 @@ describe("deployEnvironment", () => {
       CF_SLATEDB_TRACE_SAMPLE_RATE: "0.5",
       CF_SLATEDB_BUCKET_LOCATION: "weur",
     };
-    expect(deployEnvironment(shell, { devTimings: false, jurisdiction: "none" })).toEqual({
+    expect(
+      deployEnvironment(shell, {
+        devTimings: false,
+        jurisdiction: "none",
+        settings: Option.none(),
+      }),
+    ).toEqual({
       PATH: "/bin",
       CF_SLATEDB_JURISDICTION: "none",
     });
-    expect(deployEnvironment(shell, { devTimings: true, jurisdiction: "fedramp" })).toEqual({
+    expect(
+      deployEnvironment(shell, {
+        devTimings: true,
+        jurisdiction: "fedramp",
+        settings: Option.none(),
+      }),
+    ).toEqual({
       PATH: "/bin",
       CF_SLATEDB_LSM_SETTINGS:
         '{"gcMinAge":10000,"compactorPollInterval":1000,"transactionRetentionMs":5000}',
       CF_SLATEDB_JURISDICTION: "fedramp",
+    });
+  });
+});
+
+describe("deployEnvironment settings", () => {
+  it("applies measurement overrides over the dev timings", () => {
+    const environment = deployEnvironment(
+      {},
+      {
+        devTimings: true,
+        jurisdiction: "none",
+        settings: Option.some({ l0SstSize: 268_435_456, gcMinAge: 20_000 }),
+      },
+    );
+    expect(JSON.parse(environment["CF_SLATEDB_LSM_SETTINGS"] ?? "{}")).toEqual({
+      ...PREVIEW_DEV_TIMINGS,
+      l0SstSize: 268_435_456,
+      gcMinAge: 20_000,
     });
   });
 });

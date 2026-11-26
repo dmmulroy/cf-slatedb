@@ -434,3 +434,54 @@ export const blocksOverlappingRange = (meta: SstMeta, range: KeyRange): Readonly
   }
   return result;
 };
+
+/** One byte-range read that covers consecutive data blocks of an SST. */
+export interface BlockRead {
+  /** Offset of the first block's bytes. */
+  readonly offset: number;
+  /** Bytes from the first block's start to the last block's end. */
+  readonly length: number;
+  /** The blocks the read covers, in order. */
+  readonly blocks: ReadonlyArray<number>;
+}
+
+/**
+ * Groups `blocks` (positions in `index`, an SST's block index, in order) into byte-range reads of at most `maxBytes`
+ * each, merging only blocks that sit next to each other in the file. A block larger than `maxBytes`
+ * is read alone. A compaction step reads its inputs this way so a 64 MiB input costs tens of
+ * requests rather than one per 4 KiB block (a Worker invocation may make only so many, D61).
+ */
+export const groupBlockReads = (
+  index: ReadonlyArray<SstIndexEntry>,
+  blocks: ReadonlyArray<number>,
+  maxBytes: number,
+): ReadonlyArray<BlockRead> => {
+  const reads: Array<BlockRead> = [];
+  let current: { offset: number; end: number; blocks: Array<number> } | undefined;
+  for (const block of blocks) {
+    const entry = index[block];
+    if (entry === undefined) continue;
+    const end = entry.offset + entry.length;
+    if (current !== undefined && entry.offset === current.end && end - current.offset <= maxBytes) {
+      current.end = end;
+      current.blocks.push(block);
+      continue;
+    }
+    if (current !== undefined) {
+      reads.push({
+        offset: current.offset,
+        length: current.end - current.offset,
+        blocks: current.blocks,
+      });
+    }
+    current = { offset: entry.offset, end, blocks: [block] };
+  }
+  if (current !== undefined) {
+    reads.push({
+      offset: current.offset,
+      length: current.end - current.offset,
+      blocks: current.blocks,
+    });
+  }
+  return reads;
+};

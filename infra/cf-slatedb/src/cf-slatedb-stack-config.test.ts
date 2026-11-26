@@ -29,6 +29,7 @@ describe("CfSlatedbStackConfig", () => {
       lsmSettings: DEFAULT_LSM_SETTINGS,
       telemetry: { traceSampleRate: 1, traceRetentionDays: 14 },
       access: { mode: "BearerToken" },
+      limits: { apiCpuMs: 30_000, compactorCpuMs: 60_000 },
     });
     expect((await resolve("dev", {})).access.mode).toBe("Open");
     expect((await resolve("production", {})).telemetry.traceSampleRate).toBe(0.1);
@@ -57,6 +58,9 @@ describe("CfSlatedbStackConfig", () => {
       transactionRetentionMs: 5_000,
     });
     expect(config.telemetry).toEqual({ traceSampleRate: 0.25, traceRetentionDays: 7 });
+    expect((await resolve("preview-1", { CF_SLATEDB_API_CPU_MS: "45000" })).limits.apiCpuMs).toBe(
+      45_000,
+    );
   });
 
   it("refuses an invalid variable or combination, naming the variable", async () => {
@@ -83,6 +87,9 @@ describe("CfSlatedbStackConfig", () => {
         CF_SLATEDB_BUCKET_LOCATION: "weur",
       }),
     ).toBe("CF_SLATEDB_BUCKET_LOCATION");
+    expect(await refusedVariable("preview-1", { CF_SLATEDB_COMPACTOR_CPU_MS: "900000" })).toBe(
+      "CF_SLATEDB_COMPACTOR_CPU_MS",
+    );
     expect(await refusedVariable("preview-1", { CF_SLATEDB_TRACE_SAMPLE_RATE: "2" })).toBe(
       "CF_SLATEDB_TRACE_SAMPLE_RATE",
     );

@@ -265,6 +265,10 @@ export const makeDbWriter = Effect.gen(function* () {
 
   const phase = yield* Ref.make<WriterPhase>({ _tag: "Uninitialized" });
   const unflushedBytes = yield* Ref.make(0);
+  // Commit time of the oldest unflushed row: with the byte counter, all the flush scheduler needs,
+  // kept in memory so a write never scans the memtable (refreshed from SQLite at start and after
+  // each flush).
+  const oldestUnflushed = yield* Ref.make(Option.none<Timestamp>());
   const initLock = yield* Semaphore.make(1);
   const commitLock = yield* Semaphore.make(1);
   const flushLock = yield* Semaphore.make(1);
@@ -305,28 +309,32 @@ export const makeDbWriter = Effect.gen(function* () {
       ),
   });
 
-  /** Recomputes the in-memory byte counter from SQLite. */
+  /** Recomputes the in-memory byte counter and oldest unflushed time from SQLite (one scan). */
   const refreshUnflushedBytes = (databaseId: DatabaseId) =>
     memTable.stats.pipe(
-      Effect.tap((stats) => Ref.set(unflushedBytes, stats.unflushedBytes)),
+      Effect.tap((stats) =>
+        Effect.all([
+          Ref.set(unflushedBytes, stats.unflushedBytes),
+          Ref.set(oldestUnflushed, stats.oldestCreateTs),
+        ]),
+      ),
       Effect.mapError(unavailable(databaseId, "stats")),
     );
 
-  /** Schedules the flush alarm for when the oldest unflushed row reaches `maxL0Age`, or now. */
-  const scheduleFlush = (databaseId: DatabaseId) =>
+  /**
+   * Schedules the flush alarm for when the oldest unflushed row reaches `maxL0Age`, or now once
+   * `l0SstSize` bytes are unflushed. Reads only the in-memory counters: no memtable scan per write
+   * (D61).
+   */
+  const scheduleFlush = (_databaseId: DatabaseId) =>
     Effect.gen(function* () {
-      const stats = yield* memTable.stats.pipe(
-        Effect.mapError(unavailable(databaseId, "scheduleFlush")),
-      );
-      if (stats.rowCount === 0) return;
+      const oldest = yield* Ref.get(oldestUnflushed);
+      if (Option.isNone(oldest)) return;
       const now = yield* Clock.currentTimeMillis;
       const due =
-        stats.unflushedBytes >= settings.l0SstSize
+        (yield* Ref.get(unflushedBytes)) >= settings.l0SstSize
           ? now
-          : Option.match(stats.oldestCreateTs, {
-              onNone: () => now,
-              onSome: (ts) => ts + settings.maxL0Age,
-            });
+          : oldest.value + settings.maxL0Age;
       const scheduled = yield* alarm.scheduled;
       if (Option.isNone(scheduled) || scheduled.value > due) yield* alarm.scheduleAt(due);
     });
@@ -676,12 +684,13 @@ export const makeDbWriter = Effect.gen(function* () {
             0,
           );
           yield* Ref.update(unflushedBytes, (current) => current + added);
+          yield* Ref.update(oldestUnflushed, (current) =>
+            Option.isSome(current) ? current : Option.some(createTs),
+          );
           return { seq, createTs };
         }),
       );
-      yield* scheduleFlush(databaseId).pipe(
-        Effect.catchTags({ WriterUnavailableError: () => Effect.void }),
-      );
+      yield* scheduleFlush(databaseId);
       yield* Effect.annotateCurrentSpan({ seq: receipt.seq });
       return receipt;
     });

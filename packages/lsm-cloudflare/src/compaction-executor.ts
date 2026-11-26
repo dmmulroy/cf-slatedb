@@ -1,5 +1,6 @@
 import {
   blocksOverlappingRange,
+  groupBlockReads,
   CompactionInputsChangedError,
   CompactionJob,
   CompactorEpoch,
@@ -103,6 +104,13 @@ export type CompactionError =
   | CompactionUnavailableError
   | SstCorruptedError;
 
+/**
+ * Most bytes one input read covers (D61). A Worker invocation may make only about 1,000 requests, so
+ * a compaction step reads its inputs in chunks of consecutive blocks: a 64 MiB input is 32 reads,
+ * and with two chunks in flight per input even eight inputs hold about 32 MiB.
+ */
+export const COMPACTION_READ_CHUNK_BYTES = 2 * 1024 * 1024;
+
 /** Compactions committed, by kind of input (SlateDB RFC-0021 parity). */
 export const compactionsCommitted = Metric.counter("lsm_compactions_committed", {
   description: "Compactions whose output was committed to the manifest",
@@ -168,7 +176,10 @@ export const makeCompactionExecutor = Effect.gen(function* () {
       message: `Input SST ${handle.id} of a compaction of database ${databaseId} no longer exists. The compaction is discarded and planned again from the current manifest.`,
     });
 
-  /** One input SST's rows at or after `start` (inside its view), streamed one block at a time. */
+  /**
+   * One input SST's rows at or after `start` (inside its view), streamed in chunks of consecutive
+   * blocks of up to {@link COMPACTION_READ_CHUNK_BYTES} (one request each).
+   */
   const sstRows = (databaseId: DatabaseId, handle: SstHandle, start: Option.Option<Uint8Array>) =>
     Stream.unwrap(
       Effect.gen(function* () {
@@ -190,21 +201,34 @@ export const makeCompactionExecutor = Effect.gen(function* () {
         if (Option.isNone(metaBytes)) return yield* inputMissing(databaseId, handle);
         const meta = yield* Effect.fromResult(decodeSstMeta(handle.id, metaBytes.value));
         const visible = range.value;
-        return Stream.fromIterable(blocksOverlappingRange(meta, visible)).pipe(
-          // Fetch the next block while this one is merged: two blocks per input in memory.
+        const reads = groupBlockReads(
+          meta.index,
+          blocksOverlappingRange(meta, visible),
+          COMPACTION_READ_CHUNK_BYTES,
+        );
+        return Stream.fromIterable(reads).pipe(
+          // Fetch the next chunk while this one is merged: two chunks per input in memory.
           Stream.mapEffect(
-            (index) =>
+            (read) =>
               Effect.gen(function* () {
-                const entry = meta.index[index];
-                if (entry === undefined) return [];
                 const bytes = yield* objects
-                  .getRange(key, { offset: entry.offset, length: entry.length })
+                  .getRange(key, { offset: read.offset, length: read.length })
                   .pipe(Effect.mapError(unavailable(databaseId)));
                 if (Option.isNone(bytes)) return yield* inputMissing(databaseId, handle);
-                const block = yield* Effect.fromResult(
-                  decodeDataBlock(bytes.value, { sstId: handle.id, offset: entry.offset }),
-                );
-                return [...block.rows()];
+                const rows: Array<Row> = [];
+                for (const index of read.blocks) {
+                  const entry = meta.index[index];
+                  if (entry === undefined) continue;
+                  const start = entry.offset - read.offset;
+                  const block = yield* Effect.fromResult(
+                    decodeDataBlock(bytes.value.subarray(start, start + entry.length), {
+                      sstId: handle.id,
+                      offset: entry.offset,
+                    }),
+                  );
+                  rows.push(...block.rows());
+                }
+                return rows;
               }),
             { concurrency: 2 },
           ),

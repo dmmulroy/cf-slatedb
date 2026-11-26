@@ -22,10 +22,13 @@ import {
   MeasurementCollector,
   measureFlushCpu,
   measureSplitPause,
+  measureCompactionCpu,
   measureGcScale,
   measureManifestCas,
   measureR2Placement,
   measureTransactionAborts,
+  measureWorkflowBurst,
+  measureWriterMemory,
   measureWrites,
 } from "./measurements.ts";
 import { ScenarioStack, type ScenarioFailure } from "./scenario.ts";
@@ -275,6 +278,29 @@ const measureGcScaleCommand = Command.make(
   ),
 );
 
+const measureCompactionCpuCommand = Command.make(
+  "compaction-cpu",
+  {
+    stage: measureStage,
+    megabytesPerFlush: Flag.Int("megabytes-per-flush").pipe(Flag.withDefault(60)),
+  },
+  ({ stage, megabytesPerFlush }) => runMeasurement(stage, measureCompactionCpu(megabytesPerFlush)),
+).pipe(Command.withDescription("CPU per flush and per compaction step at production sizes (D61)"));
+
+const measureWriterMemoryCommand = Command.make(
+  "writer-memory",
+  { stage: measureStage, megabytes: Flag.Int("megabytes").pipe(Flag.withDefault(250)) },
+  ({ stage, megabytes }) => runMeasurement(stage, measureWriterMemory(megabytes)),
+).pipe(
+  Command.withDescription("A writer holding and flushing ~256 MiB unflushed: memory and CPU (D61)"),
+);
+
+const measureWorkflowBurstCommand = Command.make(
+  "workflow-burst",
+  { stage: measureStage, databases: Flag.Int("databases").pipe(Flag.withDefault(200)) },
+  ({ stage, databases }) => runMeasurement(stage, measureWorkflowBurst(databases)),
+).pipe(Command.withDescription("Many compaction Workflows started at once (D61)"));
+
 const measure = Command.make("measure").pipe(
   Command.withDescription("Measurements against a live preview stage; JSON results"),
   Command.withSubcommands([
@@ -285,6 +311,9 @@ const measure = Command.make("measure").pipe(
     measureManifestCasCommand,
     measureR2PlacementCommand,
     measureGcScaleCommand,
+    measureCompactionCpuCommand,
+    measureWriterMemoryCommand,
+    measureWorkflowBurstCommand,
   ]),
 );
 

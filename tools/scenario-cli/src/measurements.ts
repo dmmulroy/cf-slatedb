@@ -167,6 +167,15 @@ export const measureWrites = (load: WriteLoad) =>
     const status = yield* client.databases
       .status({ params: { databaseId } })
       .pipe(Effect.mapError(failed("status after the load")));
+    // CPU per batch from the Tail Worker: the API Worker's request and the writer's (D61).
+    yield* Effect.sleep("15 seconds");
+    const records = (yield* readInvocationRecords(started)).filter((record) =>
+      Option.exists(record.path, (path) => path.includes(`/databases/${databaseId}/batches`)),
+    );
+    const writerRecords = records.filter((record) => Option.isSome(record.durableObjectId));
+    const apiRecords = records.filter((record) => Option.isNone(record.durableObjectId));
+    const writerCpuSeconds =
+      writerRecords.reduce((sum, record) => sum + record.cpuTimeMs, 0) / 1000;
     return {
       databaseId,
       load,
@@ -178,6 +187,10 @@ export const measureWrites = (load: WriteLoad) =>
       latencyMs: summarize(latencies),
       failures: Object.fromEntries(failures),
       after: { l0Count: status.l0Count, unflushedBytes: status.unflushedBytes },
+      writerCpuMsPerBatch: summarize(writerRecords.map((record) => record.cpuTimeMs)),
+      apiCpuMsPerBatch: summarize(apiRecords.map((record) => record.cpuTimeMs)),
+      writerCpuSeconds,
+      writerBusyFraction: writerCpuSeconds / elapsedSeconds,
     };
   });
 
@@ -637,6 +650,265 @@ export const measureGcScale = (load: GcScaleLoad) =>
           )
           .map((record) => record.cpuTimeMs),
       ),
+    };
+  });
+
+/**
+ * Writes `megabytesPerFlush` of 1 KB rows and flushes it, four times, so the writer wakes the
+ * compactor and four L0 SSTs of production size compact; reports the CPU of every flush and of
+ * every compactor invocation (its alarms, and the compaction Workflow's steps), to size the Workers'
+ * CPU limits (D61).
+ *
+ * @returns The report, or `MeasurementError` when a write, flush, or reading tail records fails.
+ */
+export const measureCompactionCpu = (megabytesPerFlush: number) =>
+  Effect.gen(function* () {
+    const databaseId = DatabaseId.make(uniqueId("ms-compact"));
+    yield* createDatabase(databaseId);
+    const client = yield* dbApi;
+    const batchRows = 2000;
+    const rowValueBytes = 1000;
+    const batches = Math.ceil((megabytesPerFlush * 1_048_576) / (batchRows * rowValueBytes));
+    const value = valueBytes(rowValueBytes, 13);
+    const since = yield* Clock.currentTimeMillis;
+    for (let flush = 0; flush < 4; flush++) {
+      yield* Effect.forEach(
+        Array.from({ length: batches }, (_, index) => index),
+        (sequence) =>
+          client.databases
+            .write({
+              params: { databaseId },
+              payload: {
+                operations: Array.from({ length: batchRows }, (_, row) => ({
+                  _tag: "Put" as const,
+                  key: keyBytes(flush, sequence, row),
+                  value,
+                  ttlMillis: Option.none(),
+                })),
+              },
+            })
+            .pipe(Effect.mapError(failed("write"))),
+        { concurrency: 4, discard: true },
+      );
+      yield* client.databases
+        .flush({ params: { databaseId } })
+        .pipe(Effect.mapError(failed("flush")));
+    }
+    // Wait for the compaction to finish, polling the manifest's L0 (the writer's status shows its own,
+    // possibly older, view of the manifest).
+    let compacted = false;
+    for (let attempt = 0; attempt < 120 && !compacted; attempt++) {
+      yield* Effect.sleep("5 seconds");
+      const compaction = yield* client.databases
+        .compaction({ params: { databaseId } })
+        .pipe(Effect.mapError(failed("compaction status")));
+      compacted = compaction.l0Ssts === 0 && compaction.sortedRuns.length > 0;
+    }
+    const compactedAfterSeconds = ((yield* Clock.currentTimeMillis) - since) / 1000;
+    yield* Effect.sleep("20 seconds");
+    const records = yield* readInvocationRecords(since);
+    const isCompactor = (record: InvocationRecord) =>
+      Option.exists(record.scriptName, (name) => name.includes("compactorworker"));
+    const writerFlushes = records.filter(
+      (record) =>
+        Option.isSome(record.durableObjectId) &&
+        !isCompactor(record) &&
+        (record.eventKind === "alarm" ||
+          Option.exists(record.path, (path) => path.endsWith(`/databases/${databaseId}/flush`))),
+    );
+    const compactor = records.filter(isCompactor);
+    const byKind = new Map<string, Array<number>>();
+    for (const record of compactor) {
+      const kind = record.eventKind;
+      byKind.set(kind, [...(byKind.get(kind) ?? []), record.cpuTimeMs]);
+    }
+    return {
+      databaseId,
+      megabytesPerFlush,
+      compacted,
+      compactedAfterSeconds,
+      flushCpuMs: summarize(writerFlushes.map((record) => record.cpuTimeMs)),
+      flushWallMs: summarize(writerFlushes.map((record) => record.wallTimeMs)),
+      compactorCpuMsByEventKind: Object.fromEntries(
+        [...byKind.entries()].map(([kind, values]) => [kind, summarize(values)]),
+      ),
+      compactorOutcomes: [...new Set(compactor.map((record) => record.outcome))],
+      writerOutcomes: [...new Set(writerFlushes.map((record) => record.outcome))],
+    };
+  });
+
+/**
+ * Fills one writer with `megabytes` of 1 KB rows without flushing (deploy with `l0SstSize` at least
+ * that large), then flushes it, and reports every writer invocation's CPU and outcome: whether a
+ * Durable Object holding that much in SQLite, and flushing it, stays within its memory and CPU
+ * limits (design §12, D61).
+ *
+ * @returns The report, or `MeasurementError` when the database cannot be created or tail records
+ *   cannot be read (refused writes are counted, not raised).
+ */
+export const measureWriterMemory = (megabytes: number) =>
+  Effect.gen(function* () {
+    const databaseId = DatabaseId.make(uniqueId("ms-mem"));
+    yield* createDatabase(databaseId);
+    const client = yield* dbApi;
+    const batchRows = 2000;
+    const value = valueBytes(1000, 17);
+    const batches = Math.ceil((megabytes * 1_048_576) / (batchRows * 1000));
+    const since = yield* Clock.currentTimeMillis;
+    const refused = new Map<string, number>();
+    yield* Effect.forEach(
+      Array.from({ length: batches }, (_, index) => index),
+      (sequence) =>
+        client.databases
+          .write({
+            params: { databaseId },
+            payload: {
+              operations: Array.from({ length: batchRows }, (_, row) => ({
+                _tag: "Put" as const,
+                key: keyBytes(0, sequence, row),
+                value,
+                ttlMillis: Option.none(),
+              })),
+            },
+          })
+          .pipe(
+            Effect.catchCause((cause) =>
+              Effect.sync(() => {
+                const tag = String(cause).slice(0, 60);
+                refused.set(tag, (refused.get(tag) ?? 0) + 1);
+              }),
+            ),
+          ),
+      { concurrency: 4, discard: true },
+    );
+    const before = yield* client.databases
+      .status({ params: { databaseId } })
+      .pipe(Effect.mapError(failed("status before the flush")));
+    const flushStarted = yield* Clock.currentTimeMillis;
+    const flushed = yield* Effect.result(client.databases.flush({ params: { databaseId } }));
+    const flushClientMs = (yield* Clock.currentTimeMillis) - flushStarted;
+    yield* Effect.sleep("20 seconds");
+    const records = (yield* readInvocationRecords(since)).filter((record) =>
+      Option.isSome(record.durableObjectId),
+    );
+    const outcomes = new Map<string, number>();
+    for (const record of records)
+      outcomes.set(record.outcome, (outcomes.get(record.outcome) ?? 0) + 1);
+    const flushes = records.filter(
+      (record) =>
+        record.eventKind === "alarm" ||
+        Option.exists(record.path, (path) => path.endsWith(`/databases/${databaseId}/flush`)),
+    );
+    return {
+      databaseId,
+      megabytes,
+      unflushedBytesBeforeFlush: before.unflushedBytes,
+      refusedWrites: Object.fromEntries(refused),
+      flushSucceeded: flushed._tag === "Success",
+      flushClientMs,
+      writerOutcomes: Object.fromEntries(outcomes),
+      flushCpuMs: summarize(flushes.map((record) => record.cpuTimeMs)),
+      flushWallMs: summarize(flushes.map((record) => record.wallTimeMs)),
+      writeCpuMs: summarize(
+        records
+          .filter((record) => Option.exists(record.path, (path) => path.includes("/batches")))
+          .map((record) => record.cpuTimeMs),
+      ),
+    };
+  });
+
+/**
+ * Starts `databases` compactions at once: brings each database to three L0 SSTs, then writes and
+ * flushes the fourth on every database concurrently, so every writer wakes its compactor and each
+ * launches a compaction Workflow together (deploy with a `compactionBudgetCapacity` above
+ * `databases`). Reports how many finished, how long the last took, and whether any start failed
+ * (design §12: the Workflows concurrent-instance limit, D61).
+ *
+ * @returns The report, or `MeasurementError` when a database cannot be created or written.
+ */
+export const measureWorkflowBurst = (databases: number) =>
+  Effect.gen(function* () {
+    const group = uniqueId("ms-wf");
+    const ids = Array.from({ length: databases }, (_, index) =>
+      DatabaseId.make(`${group}-${index.toString().padStart(4, "0")}`),
+    );
+    const client = yield* dbApi;
+    const value = valueBytes(100, 9);
+    const writeAndFlush = (databaseId: DatabaseId, round: number) =>
+      Effect.gen(function* () {
+        yield* client.databases
+          .write({
+            params: { databaseId },
+            payload: {
+              operations: [
+                {
+                  _tag: "Put" as const,
+                  key: keyBytes(0, round, 0),
+                  value,
+                  ttlMillis: Option.none(),
+                },
+              ],
+            },
+          })
+          .pipe(Effect.mapError(failed("write")));
+        yield* client.databases
+          .flush({ params: { databaseId } })
+          .pipe(Effect.mapError(failed("flush")));
+      });
+    yield* Effect.forEach(
+      ids,
+      (databaseId) =>
+        Effect.gen(function* () {
+          yield* createDatabase(databaseId);
+          for (let round = 0; round < 3; round++) yield* writeAndFlush(databaseId, round);
+        }),
+      { concurrency: 16, discard: true },
+    );
+    const since = yield* Clock.currentTimeMillis;
+    // The fourth flush everywhere at once: every compactor launches its Workflow together.
+    yield* Effect.forEach(ids, (databaseId) => writeAndFlush(databaseId, 3), {
+      concurrency: "unbounded",
+      discard: true,
+    });
+    const burstSeconds = ((yield* Clock.currentTimeMillis) - since) / 1000;
+    const pending = new Set(ids);
+    let maxRunning = 0;
+    for (let attempt = 0; attempt < 120 && pending.size > 0; attempt++) {
+      yield* Effect.sleep("5 seconds");
+      let running = 0;
+      yield* Effect.forEach(
+        [...pending],
+        (databaseId) =>
+          Effect.gen(function* () {
+            const status = yield* client.databases
+              .compaction({ params: { databaseId } })
+              .pipe(Effect.option);
+            if (Option.isNone(status)) return;
+            if (status.value.l0Ssts === 0 && status.value.sortedRuns.length > 0)
+              pending.delete(databaseId);
+            else if (Option.exists(status.value.compactor, (state) => state.running.length > 0))
+              running++;
+          }),
+        { concurrency: 32, discard: true },
+      );
+      maxRunning = Math.max(maxRunning, running);
+    }
+    const allDoneSeconds = ((yield* Clock.currentTimeMillis) - since) / 1000;
+    yield* Effect.sleep("15 seconds");
+    const records = (yield* readInvocationRecords(since)).filter((record) =>
+      Option.exists(record.scriptName, (name) => name.includes("compactorworker")),
+    );
+    const outcomes = new Map<string, number>();
+    for (const record of records)
+      outcomes.set(record.outcome, (outcomes.get(record.outcome) ?? 0) + 1);
+    return {
+      databases,
+      burstSeconds,
+      compacted: databases - pending.size,
+      notCompacted: pending.size,
+      allDoneSeconds,
+      maxRunningObserved: maxRunning,
+      compactorOutcomes: Object.fromEntries(outcomes),
     };
   });
 

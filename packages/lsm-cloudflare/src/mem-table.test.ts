@@ -8,10 +8,17 @@ import {
   SeqNum,
   Timestamp,
 } from "@cf-slatedb/lsm-core";
-import { Arbitrary, Effect, Option, Schema, Stream } from "effect";
+import { Arbitrary, Effect, Layer, Option, Schema, Stream } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 
-import { MemTable, memTableTestLayer, type MemTableCursor } from "./mem-table.ts";
+import {
+  MEMTABLE_FLUSH_PAGE_QUERIES,
+  MemTable,
+  memTableLayerWithoutDependencies,
+  memTableTestLayer,
+  type MemTableCursor,
+} from "./mem-table.ts";
+import { WriterSqlStorage, writerSqlStorageTestLayer } from "./writer-sql-storage.ts";
 
 const smallInt = (minimum: number, maximum: number) =>
   Arbitrary.schema(Schema.Int.check(Schema.isBetween({ minimum, maximum })));
@@ -231,5 +238,27 @@ describe("MemTable on SQLite", () => {
       return { failure: failure.reason, lastSeq: meta.lastSeq, rows: stats.rowCount };
     }).pipe(Effect.provide(memTableTestLayer), Effect.runPromise);
     expect(outcome).toEqual({ failure: "StorageUnavailable", lastSeq: 1, rows: 1 });
+  });
+
+  it("streams a flush by primary key, never by sorting every row on each page (D61)", async () => {
+    const plans = await Effect.gen(function* () {
+      yield* MemTable;
+      const sql = yield* WriterSqlStorage;
+      const explain = (query: string, bindings: ReadonlyArray<number>) =>
+        Effect.map(sql.exec(`EXPLAIN QUERY PLAN ${query}`, ...bindings), (rows) =>
+          rows.map((row) => String(row["detail"])).join(" ; "),
+        );
+      return {
+        first: yield* explain(MEMTABLE_FLUSH_PAGE_QUERIES.first, [0, 10, 1000]),
+        next: yield* explain(MEMTABLE_FLUSH_PAGE_QUERIES.next, [0, 0, 5, 0, 10, 1000]),
+      };
+    }).pipe(
+      Effect.provide(
+        memTableLayerWithoutDependencies.pipe(Layer.provideMerge(writerSqlStorageTestLayer)),
+      ),
+      Effect.runPromise,
+    );
+    for (const plan of [plans.first, plans.next]) expect(plan).not.toContain("TEMP B-TREE");
+    expect(plans.next).toContain("PRIMARY KEY");
   });
 });

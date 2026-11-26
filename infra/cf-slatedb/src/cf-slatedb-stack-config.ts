@@ -8,6 +8,7 @@ import {
   type LsmWorkerSettings,
   type LsmWorkerSettingsSource,
 } from "@cf-slatedb/lsm-cloudflare";
+import * as Alchemy from "alchemy";
 import { Stage } from "alchemy/Stage";
 import { Data, Effect, Option, Schema } from "effect";
 
@@ -25,6 +26,25 @@ export const CF_SLATEDB_TRACE_SAMPLE_RATE_VARIABLE = "CF_SLATEDB_TRACE_SAMPLE_RA
  */
 export const CF_SLATEDB_TRACE_RETENTION_DAYS_VARIABLE = "CF_SLATEDB_TRACE_RETENTION_DAYS";
 
+/** Name of the deploy variable that sets the API Worker's CPU limit per invocation, in ms. */
+export const CF_SLATEDB_API_CPU_MS_VARIABLE = "CF_SLATEDB_API_CPU_MS";
+
+/** Name of the deploy variable that sets the compactor Worker's CPU limit per invocation, in ms. */
+export const CF_SLATEDB_COMPACTOR_CPU_MS_VARIABLE = "CF_SLATEDB_COMPACTOR_CPU_MS";
+
+/**
+ * Default CPU limit of the API Worker and the writers it hosts (P5, D61): a 60 MiB flush peaked at
+ * 3.5 s of CPU on `preview-1`, so twice that is well inside Workers Paid's 30 s default, kept
+ * explicit.
+ */
+export const DEFAULT_API_CPU_MS = 30_000;
+
+/**
+ * Default CPU limit of the compactor Worker (P5, D61): a compaction step writing a 64 MiB output
+ * peaked at 17.7 s of CPU on `preview-1`; twice that exceeds the 30 s default, so it is raised.
+ */
+export const DEFAULT_COMPACTOR_CPU_MS = 60_000;
+
 /** Default fraction of production requests whose traces are kept (P4). */
 export const PRODUCTION_TRACE_SAMPLE_RATE = 0.1;
 
@@ -33,6 +53,9 @@ export const DEFAULT_TRACE_RETENTION_DAYS = 14;
 
 /** Schema for the fraction of requests whose traces are kept: 0 (none) to 1 (every request). */
 const TraceSampleRate = Schema.Number.check(Schema.isBetween({ minimum: 0, maximum: 1 }));
+
+/** Schema for a Worker's CPU limit per invocation: 10 ms to Workers Paid's 5-minute maximum. */
+const CpuLimitMs = Schema.Int.check(Schema.isBetween({ minimum: 10, maximum: 300_000 }));
 
 /** Schema for how many whole days a live stage keeps traces and tail records. */
 const TraceRetentionDays = Schema.Int.check(Schema.isGreaterThan(0));
@@ -75,6 +98,7 @@ export type CfSlatedbAccessMode = typeof CfSlatedbAccessMode.Type;
  * - `telemetry.traceSampleRate`: fraction of requests whose traces are kept.
  * - `telemetry.traceRetentionDays`: days a live stage keeps traces and tail records.
  * - `access.mode`: how callers authenticate to the public Workers.
+ * - `limits`: CPU per invocation of the API Worker (and its writers) and the compactor Worker.
  */
 export const CfSlatedbStackConfig = Schema.Struct({
   stage: Schema.String,
@@ -86,6 +110,7 @@ export const CfSlatedbStackConfig = Schema.Struct({
     traceRetentionDays: TraceRetentionDays,
   }),
   access: Schema.Struct({ mode: CfSlatedbAccessMode }),
+  limits: Schema.Struct({ apiCpuMs: CpuLimitMs, compactorCpuMs: CpuLimitMs }),
 });
 
 /** The complete configuration of one cf-slatedb installation. */
@@ -116,6 +141,9 @@ const decodeLsmSettings = Schema.decodeUnknownEffect(LsmSettings, { onExcessProp
 const decodeTraceSampleRate = Schema.decodeEffect(
   Schema.NumberFromString.pipe(Schema.decodeTo(TraceSampleRate)),
 );
+const decodeCpuLimitMs = Schema.decodeEffect(
+  Schema.NumberFromString.pipe(Schema.decodeTo(CpuLimitMs)),
+);
 const decodeTraceRetentionDays = Schema.decodeEffect(
   Schema.NumberFromString.pipe(Schema.decodeTo(TraceRetentionDays)),
 );
@@ -144,6 +172,8 @@ const refused = (name: string, reason: string) =>
  *   Unknown names and contradictory combinations are refused.
  * - `CF_SLATEDB_TRACE_SAMPLE_RATE`: 0 to 1 (default 1; 0.1 in production).
  * - `CF_SLATEDB_TRACE_RETENTION_DAYS`: whole days (default 14).
+ * - `CF_SLATEDB_API_CPU_MS`, `CF_SLATEDB_COMPACTOR_CPU_MS`: CPU limits per invocation (defaults
+ *   30 s and 60 s, from measurements).
  *
  * @returns The configuration, or `CfSlatedbStackConfigError` naming the refused variable.
  */
@@ -218,6 +248,21 @@ export const resolveCfSlatedbStackConfig = Effect.fn("CfSlatedbStackConfig.resol
         ),
     },
   );
+  const cpuLimit = (name: string, fallback: number) =>
+    Option.match(variable(environment, name), {
+      onNone: () => Effect.succeed(fallback),
+      onSome: (text) =>
+        decodeCpuLimitMs(text.trim()).pipe(
+          Effect.mapError(() =>
+            refused(name, `"${text}" is not a whole number of milliseconds from 10 to 300000`),
+          ),
+        ),
+    });
+  const apiCpuMs = yield* cpuLimit(CF_SLATEDB_API_CPU_MS_VARIABLE, DEFAULT_API_CPU_MS);
+  const compactorCpuMs = yield* cpuLimit(
+    CF_SLATEDB_COMPACTOR_CPU_MS_VARIABLE,
+    DEFAULT_COMPACTOR_CPU_MS,
+  );
   const accessMode: CfSlatedbAccessMode = isLocalLsmStage(stage) ? "Open" : "BearerToken";
   // Every part was decoded by its own schema above.
   return {
@@ -227,6 +272,7 @@ export const resolveCfSlatedbStackConfig = Effect.fn("CfSlatedbStackConfig.resol
     lsmSettings,
     telemetry: { traceSampleRate, traceRetentionDays },
     access: { mode: accessMode },
+    limits: { apiCpuMs, compactorCpuMs },
   } satisfies CfSlatedbStackConfig;
 });
 
@@ -256,4 +302,30 @@ export const cfSlatedbWorkerSettingsOf = (config: CfSlatedbStackConfig): LsmWork
 export const cfSlatedbWorkerSettings: LsmWorkerSettingsSource<Stage> = cfSlatedbStackConfig.pipe(
   Effect.map(cfSlatedbWorkerSettingsOf),
   Effect.orDie,
+);
+
+/**
+ * A value of the Stack configuration for a Worker's props. Props Effects also run inside the deployed
+ * Worker, where there is no deploy environment to resolve (its `process.env` holds packed bindings),
+ * so outside planning this yields `atRuntime`, which nothing reads there.
+ */
+const atPlanTime = <A>(
+  select: (config: CfSlatedbStackConfig) => A,
+  atRuntime: A,
+): Effect.Effect<A, never, Stage> =>
+  Effect.gen(function* () {
+    if ((yield* Alchemy.ALCHEMY_PHASE) !== "plan") return atRuntime;
+    return select(yield* cfSlatedbStackConfig.pipe(Effect.orDie));
+  });
+
+/** The CPU limit (ms per invocation) the Stack configuration gives the API Worker. */
+export const cfSlatedbApiCpuLimit: Effect.Effect<number, never, Stage> = atPlanTime(
+  (config) => config.limits.apiCpuMs,
+  DEFAULT_API_CPU_MS,
+);
+
+/** The CPU limit (ms per invocation) the Stack configuration gives the compactor Worker. */
+export const cfSlatedbCompactorCpuLimit: Effect.Effect<number, never, Stage> = atPlanTime(
+  (config) => config.limits.compactorCpuMs,
+  DEFAULT_COMPACTOR_CPU_MS,
 );

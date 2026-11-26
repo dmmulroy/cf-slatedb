@@ -19,6 +19,7 @@ const writerTestApiLayer = dbApiWorkerLayer({
   main: import.meta.url,
   telemetry: lsmOtlpTelemetry(INTEGRATION_OTLP_BASE_URL),
   settings: INTEGRATION_WORKER_SETTINGS,
+  cpuLimitMs: Effect.succeed(30_000),
   tailConsumers: noLsmTailConsumers,
   devPort: INTEGRATION_PORTS.api,
 });

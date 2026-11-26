@@ -74,6 +74,14 @@ them. The `nonAtomicProbe` variant reproduces it.
 
 ## Maintenance notes
 
+- Checked against the v1 workstream 6 commit (D61). `DbWriter.write` no longer scans the memtable
+  to schedule the flush alarm: it reads in-memory counters (oldest unflushed commit time, unflushed
+  bytes), refreshed from SQLite at start and after each flush. That only decides *when* a flush
+  runs; a flush still reads every row above `flushed_seq`. The flush page queries now resume from a
+  `(key, seq)` cursor (`resumeAfterCursor`, shared with `MemTable.scan`) with `+seq` bounds; the
+  paged-scan property test in `mem-table.test.ts` (pages of 3 rows, the same cursor condition) shows
+  every version is read exactly once, in order. No model step changed.
+
 - D58 (v1 workstream 4): a flush no longer deletes rows. `MemTable.markFlushed` records
   `flushed_seq` after the manifest commit (the model's `FlushTruncate`), and a separate `Trim`
   deletes flushed rows up to a horizon at or below `flushed_seq` at any time. The `Latest` probe

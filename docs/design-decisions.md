@@ -1007,3 +1007,77 @@ the sweep paged in runs of at most 50 databases at ~160 ms CPU each. Of 15,535 i
 15,517 had outcome `ok`; 18 were `canceled` (Durable Object alarms and Workflow RPC calls, at most
 213 ms wall and 11 ms CPU, ended by the runtime rather than by a limit). None was `exceededCpu` or
 `exceededMemory`.
+
+## D61. Writer throughput and per-invocation limits: measured, then fixed where it was spent
+
+v1 workstream 6 measured first, then fixed what the measurements showed.
+
+**What the writer spent its CPU on.** Before D61, every write ran `scheduleFlush`, which ran
+`MemTable.stats`. That is a scan of the whole unflushed memtable, so its cost grew with the
+memtable. `DbWriter` now keeps the commit time of the oldest unflushed row in memory, beside the byte
+counter it already kept. A commit sets it if none is set. Start-up and every flush refresh it from
+SQLite with one scan. `scheduleFlush` reads only the two counters. On `preview-1` with production
+settings:
+
+| Batch rows | Before (rows/s) | After (rows/s) | Client latency p50 before / after |
+| ---------: | --------------: | -------------: | --------------------------------- |
+|        100 |           2,454 |          6,547 | 305 / 105 ms                      |
+|      1,000 |           7,678 |         15,257 | 2,057 / 961 ms                    |
+
+After the fix the writer was busy 47–48% of the time, so these rates are bounded by the client and
+the round trip, not by the writer.
+
+**No binary batch body (design §11 settled).** `tools/writer-bench` splits the writer's in-process
+write path into its parts. JSON decoding of the batch is 14% of it at both 100 and 1,000 rows. Live
+writer CPU per 100-row batch is now 6 ms p50. A binary internal body would save at most about 14%
+of a component that is not the bottleneck. It would also add a second batch codec to keep in step.
+The workstream's target, doubling the 100-row rate, was met without it (2.7×). The public body stays
+base64 JSON, and the internal `WriterHttpApi` body stays the same schema. An additive
+`application/x-cf-slatedb-batch` body remains possible later if callers need it.
+
+**Flush paging no longer builds a temp B-tree per page.** D58's flush queries bounded `seq` with
+`seq > ? AND seq <= ?`. On a 60 MiB memtable SQLite chose the `seq` index and sorted each page in a
+temporary B-tree, so one flush exceeded the 30 s CPU limit (`exceededCpu`). The flush queries
+(`MEMTABLE_FLUSH_PAGE_QUERIES`) now write the bound as `+seq`, which stops SQLite from using that
+index. Pages resume from the last `(key, seq)` with `key >= ? AND (key > ? OR seq < ?)`, which walks
+the primary key in order. A query-plan test asserts that the flush queries use the primary key and
+no `TEMP B-TREE`; reverting the fix fails it. 60 MiB flushes then cost 1.2 s CPU at p50 and 4.3 s
+at most.
+
+**Compaction reads inputs in 2 MiB chunks.** Compaction read one `getRange` per 4 KiB block, so a
+64 MiB step made thousands of requests and failed with "Too many API requests by single Worker
+invocation". lsm-core's `groupBlockReads(index, blocks, maxBytes)` groups consecutive blocks into
+reads of at most `COMPACTION_READ_CHUNK_BYTES` (2 MiB; a single larger block is read alone).
+`CompactionExecutor` decodes each chunk's blocks in memory. A 64 MiB input is now 32 reads. A
+property test checks that the reads cover exactly the requested blocks, in order, each contiguous
+and within the bound; dropping either the contiguity or the size check fails it. Four 60 MiB L0
+SSTs then compacted in four steps (9.0 s CPU for the step measured after the fix; 17.7 s at most
+across a run) with every outcome `ok`.
+
+**CPU limits come from the Stack configuration (P5).** `CfSlatedbStackConfig.limits` sets
+`apiCpuMs` (default 30,000) and `compactorCpuMs` (default 60,000). Both are bound as `limits.cpu_ms`
+on the API Worker, whose writers run under it, and on the compactor Worker.
+`CF_SLATEDB_API_CPU_MS` and `CF_SLATEDB_COMPACTOR_CPU_MS` override them, from 10 to 300,000 ms;
+other values are refused. The defaults are the largest measured invocation times two:
+
+- **Writer:** a 256 MiB flush peaked at 9.8 s, so 2× is 19.7 s and fits the 30 s default.
+- **Compaction:** a step peaked at 17.7 s, so 2× is 35.4 s, which is above 30 s. The limit is raised
+  to 60 s.
+
+These values are read only while planning (`Alchemy.ALCHEMY_PHASE`). A Worker's props Effect also
+runs inside the deployed Worker, where resolving the deploy environment threw (error 1101 on every
+request) the first time this was deployed.
+
+**Design §12's two open questions, measured** on `preview-3` with production settings plus
+measurement overrides (`preview-cli deploy --settings`):
+
+- **Memory.** One writer held 266,954,000 bytes unflushed (`l0SstSize` 256 MiB) and then flushed
+  it. All 174 writer invocations were `ok`, with no `exceededMemory`. Five writes at the cap were
+  refused with `WriteStalled`, which is the intended backpressure. So Durable Object SQLite at
+  `maxUnflushedBytes` fits, whether or not its page cache counts against 128 MB.
+- **Workflows.** 200 databases started compactions at once (`compactionBudgetCapacity` 1,000). All
+  200 finished within 16.4 s, and 1,848 compactor invocations were `ok`. 200 simultaneous instances
+  are within the plan's limit; production's budget (32) keeps far fewer running.
+
+**Also:** `GET /databases/:id/status` now reports `l0Count` from the newest manifest. The writer's
+own view lags a compaction, so a poller waiting for L0 to drain never saw it drain.

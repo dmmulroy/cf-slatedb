@@ -5,18 +5,18 @@
 **v1 for production** ([`docs/handoff-v1.md`](handoff-v1.md)): ten workstreams, then the release
 checklist and Dillon's go-ahead (P6). The decisions asked of Dillon are under "Open questions".
 
-| Workstream                                | Status      | Commit      |
-| ----------------------------------------- | ----------- | ----------- |
-| 1. The Stack owns its configuration       | done        | this commit |
-| 2. Fast manifest commits                  | next        |             |
-| 3. Splits pause briefly, never fail       | not started |             |
-| 4. Transactions exact across flushes      | not started |             |
-| 5. GC and maintenance that scale          | not started |             |
-| 6. Writer throughput and limits           | not started |             |
-| 7. Corruption: prevent, detect, repair    | not started |             |
-| 8. Production telemetry                   | not started |             |
-| 9. Production readiness                   | not started |             |
-| 10. Soak, release checklist, the go-ahead | not started |             |
+| Workstream                                | Status      | Commit               |
+| ----------------------------------------- | ----------- | -------------------- |
+| 1. The Stack owns its configuration       | done        | `012bdb5`            |
+| 2. Fast manifest commits                  | done        | `774ed7b`            |
+| 3. Splits pause briefly, never fail       | done        | `393758c`            |
+| 4. Transactions exact across flushes      | done        | `5f2850b`, `5df4099` |
+| 5. GC and maintenance that scale          | done        | `e06f3eb`            |
+| 6. Writer throughput and limits           | done        | this commit          |
+| 7. Corruption: prevent, detect, repair    | next        |                      |
+| 8. Production telemetry                   | not started |                      |
+| 9. Production readiness                   | not started |                      |
+| 10. Soak, release checklist, the go-ahead | not started |                      |
 
 The previous round (all ten build phases and `docs/handoff.md`'s seven items) is complete; its
 hand-off is below.
@@ -89,6 +89,30 @@ hand-off is below.
   `ok`, 18 runtime-`canceled` alarms and Workflow calls, none over a limit. Also fixed: the local
   cleanup never matched `alchemy dev`'s process, so stacks piled up between runs (environment only).
   11/11 scenarios locally and on `preview-1`.
+- **6. Writer throughput and limits (D61).** Each write ran a memtable stats scan to schedule the
+  flush. It now reads in-memory counters. 100-row batches went from 2,454 to 6,547 rows/s, and
+  1,000-row batches from 7,678 to 15,257; the writer is busy about half the time. The binary batch
+  body is declined, because decoding is 14% of the write path (`tools/writer-bench`). Measuring at
+  production sizes found two real failures, both fixed:
+  - **A 60 MiB flush exceeded 30 s of CPU.** D58's seq-bounded queries made SQLite build a temp
+    B-tree per page. The fix is `+seq` bounds and a cursor resume, with a query-plan test.
+  - **Compaction hit the per-invocation request limit.** It made one `getRange` per 4 KiB block.
+    `groupBlockReads` now reads 2 MiB chunks, with a property test.
+
+  The CPU limits come from the Stack config (P5): the API at 30 s, which is 2 × the 9.8 s peak for a
+  256 MiB flush, and the compactor at 60 s, which is 2 × the 17.7 s peak per compaction step. A
+  first deploy resolved the config inside the Worker and failed every request with 1101. Limits are
+  now resolved only at plan time.
+
+  Design §12's two open questions were answered on `preview-3`:
+  - **Memory:** 256 MiB unflushed, then flushed, gave no `exceededMemory`.
+  - **Workflows:** 200 compactions started at once all finished within 16 s.
+
+  New tooling: `preview-cli deploy --settings` and `measure writer-memory|workflow-burst`. Status
+  `l0Count` now comes from the newest manifest.
+
+  Results: 11/11 scenarios passed locally and on `preview-1` (`--dev-timings`). Both previews were
+  then redeployed with production settings.
 
 ## Remaining-work log
 

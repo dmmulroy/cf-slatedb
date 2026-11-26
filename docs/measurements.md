@@ -47,7 +47,8 @@ during the runs (each stayed under 64 MiB and 60 s).
 Large values (from the flush runs: 2,000 rows × 1,000-byte values ≈ 2 MB per batch, 4 in flight):
 writer CPU per batch p50 107 ms, p90 298 ms.
 
-**Reading.** The writer is **CPU-bound**: it spent 19–26 s of CPU in each 30 s run, so these rates
+**Reading (before D61; see "Writer throughput and limits" below: the fixed cost was a per-write
+memtable scan, now gone).** The writer is **CPU-bound**: it spent 19–26 s of CPU in each 30 s run, so these rates
 are close to one writer's ceiling. A batch costs roughly a fixed ~15–20 ms (HTTP and schema
 decoding of the base64 JSON body, the SQLite transaction) plus ~0.05–0.07 ms per 100-byte row. One
 writer sustains **about 12–15k small rows/s with 1,000-row batches** (~1.4 MiB/s), and about
@@ -252,6 +253,50 @@ with the number of databases. With 10,000 databases a full sweep cycle takes 200
 only a backstop. The 18 `canceled` outcomes were Durable Object alarms and Workflow RPC calls ended
 by the runtime (at most 213 ms wall, 11 ms CPU), not limits.
 
+## Writer throughput and limits (v1 workstream 6, D61)
+
+`preview-1`, production settings; `measure writes` with 16-byte keys and 100-byte values for 30 s.
+Writer and API CPU come from the tail records.
+
+| Batch rows | In flight | Rows/s before | Rows/s after | Latency p50 / p90 / p99 after (ms) | Writer CPU per batch p50 / p90 (ms) | API CPU per batch p50 / p90 (ms) | Writer busy |
+| ---------: | --------: | ------------: | -----------: | ---------------------------------- | ----------------------------------- | -------------------------------- | ----------: |
+|        100 |         8 |         2,454 |        6,547 | 105 / 136 / 427                    | 6 / 12                              | 10 / 18                          |         48% |
+|      1,000 |        16 |         7,678 |       15,257 | 961 / 1,706 / 2,400                | 12 / 176                            | 23 / 41                          |         47% |
+
+`tools/writer-bench` (node:sqlite standing in for Durable Object SQLite; shares, not absolute
+numbers):
+
+| Batch rows | Body bytes | JSON decode (µs) | Collapse (µs) | Write path (µs) | Decode share |
+| ---------: | ---------: | ---------------: | ------------: | --------------: | -----------: |
+|        100 |     21,216 |              241 |           249 |           1,707 |        14.1% |
+|      1,000 |    212,016 |            1,693 |         1,223 |          11,814 |        14.3% |
+
+**Reading.** The per-write memtable scan was the writer's fixed cost. Without it, a writer is idle
+half the time at these loads, and decoding is about a seventh of what remains, so the binary body is
+not adopted (D61).
+
+**Flush and compaction at production sizes** (`measure compaction-cpu --megabytes-per-flush 60`:
+four 60 MiB flushes, then the compaction of the four L0 SSTs):
+
+| Run                               | Flush CPU p50 / max (ms) | Flush wall p50 / max (s) |   Compaction step CPU (ms) | Compacted                       | Outcomes            |
+| --------------------------------- | -----------------------: | -----------------------: | -------------------------: | ------------------------------- | ------------------- |
+| D58 flush queries                 |                        — |                        — |                          — | no                              | flush `exceededCpu` |
+| flush fixed, one read per block   |              649 / 2,990 |                        — |                          — | no (`Too many API requests`)    | flush `ok`          |
+| reads in 2 MiB chunks             |              771 / 3,471 |              11.0 / 11.9 | 10,735 p50, 17,668 max (5) | yes (4 steps, one commit)       | all `ok`            |
+| same, after the CPU limits (60 s) |            1,150 / 4,345 |              12.7 / 14.4 |                      9,046 | yes, 112 s after the last flush | all `ok`            |
+
+**One writer at `maxUnflushedBytes`** (`measure writer-memory --megabytes 250` on `preview-3`
+deployed with `--settings '{"l0SstSize":268435456,"maxL0Age":3600000}'`): 266,954,000 bytes held
+unflushed, then one flush of all of it. 174 writer invocations, all `ok`; 5 writes refused with
+`WriteStalled` at the cap. Flush CPU p50 1,482 ms, max 9,842 ms; the client's flush call took 82 s.
+Write CPU per 2,000 × 1 KB batch p50 77 ms, max 617 ms.
+
+**Compactions started at once** (`measure workflow-burst --databases 200`, `compactionBudgetCapacity`
+1,000): the fourth flush on 200 databases in 3.0 s; all 200 compacted within 16.4 s of the burst
+(at most 38 seen running at one poll); 1,848 compactor invocations, all `ok`.
+
+**Limits set (P5):** API Worker and its writers 30 s (2 × 9.8 s), compactor 60 s (2 × 17.7 s).
+
 ## Live checks
 
 | Check                                       | Result                         | How                                                                                                                                                                                                                                                                                                                                                                                             |
@@ -262,8 +307,8 @@ by the runtime (at most 213 ms wall, 11 ms CPU), not limits.
 
 ## Not measured
 
-- Whether Durable Object SQLite's page cache counts against the 128 MB isolate limit: no load here
-  came near it (the largest memtable was ~60 MB of rows), and no API reports a Durable Object's
-  memory.
-- The Workflows concurrent-instance limit on the plan: the measurements ran one compaction at a
-  time (`maxConcurrentCompactions: 1`).
+- Whether Durable Object SQLite's page cache counts against the 128 MB isolate limit, as such: no
+  API reports a Durable Object's memory. What matters was measured instead: a writer holding
+  `maxUnflushedBytes` (256 MiB) unflushed, then flushing it, never reported `exceededMemory` (D61).
+- The Workflows concurrent-instance limit itself: 200 compactions started at once all ran (D61);
+  production's compaction budget (32) stays far below that.

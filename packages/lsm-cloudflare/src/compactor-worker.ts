@@ -38,6 +38,11 @@ export interface CompactorWorkerOptions<R = never> {
   readonly settings: LsmWorkerSettingsSource<R>;
   /** Tail Workers attached to the Worker (`noLsmTailConsumers` locally). */
   readonly tailConsumers: LsmWorkerTailConsumers<R>;
+  /**
+   * CPU limit per invocation, in ms (Workers Paid; the Stack configuration's measured value). Its
+   * Durable Objects run under the same limit.
+   */
+  readonly cpuLimitMs: Effect.Effect<number, never, R>;
   readonly devPort: number;
 }
 
@@ -61,6 +66,7 @@ export const compactorWorkerLayer = <R = never>(options: CompactorWorkerOptions<
         workersDev: false,
         compatibility: yield* lsmWorkerCompatibility,
         tailConsumers: yield* options.tailConsumers,
+        limits: { cpuMs: yield* options.cpuLimitMs },
         dev: { host: "127.0.0.1", port: options.devPort },
       };
     }),

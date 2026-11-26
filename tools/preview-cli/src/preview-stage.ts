@@ -207,7 +207,12 @@ const PREVIEW_DECIDED_VARIABLES = [
  */
 export const deployEnvironment = (
   inherited: Readonly<Record<string, string | undefined>>,
-  options: { readonly devTimings: boolean; readonly jurisdiction: PreviewJurisdiction },
+  options: {
+    readonly devTimings: boolean;
+    readonly jurisdiction: PreviewJurisdiction;
+    /** Extra setting overrides for a measurement deploy (`--settings`), applied over dev timings. */
+    readonly settings: Option.Option<Readonly<Record<string, number>>>;
+  },
 ): Record<string, string> => {
   const environment: Record<string, string> = {};
   for (const [name, value] of Object.entries(inherited)) {
@@ -215,8 +220,13 @@ export const deployEnvironment = (
       environment[name] = value;
     }
   }
-  if (options.devTimings)
-    environment["CF_SLATEDB_LSM_SETTINGS"] = JSON.stringify(PREVIEW_DEV_TIMINGS);
+  const overrides = {
+    ...(options.devTimings ? PREVIEW_DEV_TIMINGS : {}),
+    ...Option.getOrElse(options.settings, () => ({})),
+  };
+  if (Object.keys(overrides).length > 0) {
+    environment["CF_SLATEDB_LSM_SETTINGS"] = JSON.stringify(overrides);
+  }
   environment["CF_SLATEDB_JURISDICTION"] = options.jurisdiction;
   return environment;
 };

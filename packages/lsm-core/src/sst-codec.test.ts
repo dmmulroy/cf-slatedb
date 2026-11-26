@@ -1,4 +1,4 @@
-import { Arbitrary, Bytes, Option, Result, Schema } from "effect";
+import { Arbitrary, Bytes, Effect, Option, Result, Schema } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 
 import { bloomFilterMayContain } from "./bloom-filter.ts";
@@ -23,6 +23,7 @@ import {
   blocksOverlappingRange,
   decodeSstMeta,
   firstBlockForKey,
+  groupBlockReads,
   SstBuilder,
   type SstMeta,
   sstMayContainKey,
@@ -238,5 +239,70 @@ describe("SST codec and read path", () => {
     expect(Result.isFailure(versionFailure) && versionFailure.failure.reason).toBe(
       "UnsupportedVersion",
     );
+  });
+});
+
+const smallSize = Arbitrary.schema(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 64 })));
+
+describe("groupBlockReads", () => {
+  it("covers exactly the given blocks in order with contiguous reads within the size bound", () => {
+    const result = Effect.runSync(
+      Arbitrary.checkEffect(
+        Arbitrary.all({
+          sizes: Arbitrary.array(smallSize, { minLength: 1, maxLength: 60 }),
+          // Up to several blocks per read, so merging across a gap would be generated.
+          maxBytes: Arbitrary.schema(
+            Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 512 })),
+          ),
+          gapAt: Arbitrary.schema(Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 60 }))),
+        }),
+        ({ sizes, maxBytes, gapAt }) => {
+          // Blocks laid out end to end, except one gap (as an SST's blocks are, minus what a view skips).
+          let offset = 0;
+          const index = sizes.map((length, position) => {
+            if (position === gapAt) offset += 7;
+            const entry = {
+              offset,
+              length,
+              firstKey: Uint8Array.of(position),
+              lastKey: Uint8Array.of(position),
+            };
+            offset += length;
+            return entry;
+          });
+          const wanted = index
+            .map((_, position) => position)
+            .filter((position) => position % 5 !== 3);
+          const reads = groupBlockReads(index, wanted, maxBytes);
+          const covered = reads.flatMap((read) => read.blocks);
+          const contiguous = reads.every((read) =>
+            read.blocks.every((block, position) => {
+              const entry = index[block];
+              if (entry === undefined) return false;
+              const previous = position === 0 ? undefined : index[read.blocks[position - 1] ?? -1];
+              return previous === undefined || previous.offset + previous.length === entry.offset;
+            }),
+          );
+          const bounded = reads.every(
+            (read) => read.blocks.length === 1 || read.length <= maxBytes,
+          );
+          const spans = reads.every((read) => {
+            const first = index[read.blocks[0] ?? -1];
+            const last = index[read.blocks[read.blocks.length - 1] ?? -1];
+            return (
+              first !== undefined &&
+              last !== undefined &&
+              read.offset === first.offset &&
+              read.length === last.offset + last.length - first.offset
+            );
+          });
+          return Effect.succeed(
+            covered.join(",") === wanted.join(",") && contiguous && bounded && spans,
+          );
+        },
+      ),
+    );
+    const failure = Arbitrary.formatCheckFailure(result);
+    if (failure !== undefined) throw new Error(failure);
   });
 });

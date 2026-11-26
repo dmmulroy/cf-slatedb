@@ -224,6 +224,23 @@ const MIGRATIONS = [
 
 const ROW_COLUMNS = "key, seq, kind, payload, create_ts, expire_ts";
 
+/**
+ * Query shape for key-ordered reads (D61): sequence bounds are written `+seq`, so SQLite cannot pick
+ * the `seq` index for them (it would then sort every matching row, payloads included, on every page;
+ * a 60 MiB flush exceeded the 30 s CPU limit that way), and a page resumes with `key >= ?` so the
+ * primary key `(key, seq DESC)` seeks to it instead of scanning from the first key.
+ */
+const resumeAfterCursor = "key >= ? AND (key > ? OR seq < ?)";
+
+/**
+ * The flush's page queries (internal; exported for the query-plan test): the first page of rows in
+ * `(afterSeq, cut]` in key order, and the next page after a cursor.
+ */
+export const MEMTABLE_FLUSH_PAGE_QUERIES = {
+  first: `SELECT ${ROW_COLUMNS} FROM memtable_rows WHERE +seq > ? AND +seq <= ? ORDER BY key ASC, seq DESC LIMIT ?`,
+  next: `SELECT ${ROW_COLUMNS} FROM memtable_rows WHERE ${resumeAfterCursor} AND +seq > ? AND +seq <= ? ORDER BY key ASC, seq DESC LIMIT ?`,
+} as const;
+
 const toRow = (stored: typeof StoredRow.Type): Row => ({
   key: stored.key,
   seq: stored.seq,
@@ -422,20 +439,20 @@ export const makeMemTable = Effect.gen(function* () {
     versions: (key, snapshotSeq, afterSeq) =>
       selectRows(
         "versions",
-        `SELECT ${ROW_COLUMNS} FROM memtable_rows WHERE key = ? AND seq <= ? AND seq > ? ORDER BY seq DESC`,
+        `SELECT ${ROW_COLUMNS} FROM memtable_rows WHERE key = ? AND +seq <= ? AND +seq > ? ORDER BY seq DESC`,
         key,
         snapshotSeq,
         afterSeq,
       ),
     scan: (range, snapshotSeq, afterSeq, cursor, limit) => {
-      const conditions = ["key >= ?", "seq <= ?", "seq > ?"];
+      const conditions = ["key >= ?", "+seq <= ?", "+seq > ?"];
       const bindings: Array<SqlValue> = [range.start, snapshotSeq, afterSeq];
       if (Option.isSome(range.end)) {
         conditions.push("key < ?");
         bindings.push(range.end.value);
       }
       if (Option.isSome(cursor)) {
-        conditions.push("(key > ? OR (key = ? AND seq < ?))");
+        conditions.push(resumeAfterCursor);
         bindings.push(cursor.value.key, cursor.value.key, cursor.value.seq);
       }
       return selectRows(
@@ -451,19 +468,19 @@ export const makeMemTable = Effect.gen(function* () {
           const page = Option.isNone(cursor)
             ? yield* selectRows(
                 "rowsUpTo",
-                `SELECT ${ROW_COLUMNS} FROM memtable_rows WHERE seq > ? AND seq <= ? ORDER BY key ASC, seq DESC LIMIT ?`,
+                MEMTABLE_FLUSH_PAGE_QUERIES.first,
                 afterSeq,
                 cut,
                 FLUSH_PAGE_ROWS,
               )
             : yield* selectRows(
                 "rowsUpTo",
-                `SELECT ${ROW_COLUMNS} FROM memtable_rows WHERE seq > ? AND seq <= ? AND (key > ? OR (key = ? AND seq < ?)) ORDER BY key ASC, seq DESC LIMIT ?`,
-                afterSeq,
-                cut,
+                MEMTABLE_FLUSH_PAGE_QUERIES.next,
                 cursor.value.key,
                 cursor.value.key,
                 cursor.value.seq,
+                afterSeq,
+                cut,
                 FLUSH_PAGE_ROWS,
               );
           const last = page[page.length - 1];

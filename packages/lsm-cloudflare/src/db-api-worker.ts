@@ -53,6 +53,11 @@ export interface DbApiWorkerOptions<R = never> {
   readonly settings: LsmWorkerSettingsSource<R>;
   /** Tail Workers attached to the Worker (`noLsmTailConsumers` locally). */
   readonly tailConsumers: LsmWorkerTailConsumers<R>;
+  /**
+   * CPU limit per invocation, in ms (Workers Paid; the Stack configuration's measured value). Its
+   * Durable Objects run under the same limit.
+   */
+  readonly cpuLimitMs: Effect.Effect<number, never, R>;
   /** Local dev port. */
   readonly devPort: number;
 }
@@ -81,6 +86,7 @@ export const dbApiWorkerLayer = <R = never>(options: DbApiWorkerOptions<R>) =>
         main: options.main,
         compatibility: yield* lsmWorkerCompatibility,
         tailConsumers: yield* options.tailConsumers,
+        limits: { cpuMs: yield* options.cpuLimitMs },
         dev: { host: "127.0.0.1", port: options.devPort },
       };
     }),

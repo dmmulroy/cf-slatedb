@@ -380,6 +380,16 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   compactor), the `gc` scenario (the compactor's alarm collected 4 SSTs). Formal: `GcSafety` (one
   collection per database, now enforced by the compactor). Live (`preview-1`, dev timings): 500
   databases all collected by their compactors; no invocation exceeded a limit.
+- **Writer throughput and per-invocation limits (v1 workstream 6)** — done (D61). `DbWriter`'s
+  in-memory `oldestUnflushed` (no memtable scan per write); `MEMTABLE_FLUSH_PAGE_QUERIES` (`+seq`
+  bounds, cursor resume) in `mem-table.ts`; lsm-core `groupBlockReads` and
+  `COMPACTION_READ_CHUNK_BYTES` in `compaction-executor.ts`; `CfSlatedbStackConfig.limits` bound as
+  `limits.cpu_ms` (`cfSlatedbApiCpuLimit`, `cfSlatedbCompactorCpuLimit`); status `l0Count` from the
+  newest manifest; `preview-cli deploy --settings`; `tools/writer-bench`; `scenario-cli measure
+  writes|compaction-cpu|writer-memory|workflow-burst`. Tests: `mem-table.test.ts` (flush query plans
+  use the primary key and no temp B-tree), `sst-codec.test.ts` (`groupBlockReads` property),
+  `cf-slatedb-stack-config.test.ts` (limits and refusals), `preview-stage.test.ts` (overrides over
+  dev timings). Live: `docs/measurements.md` "Writer throughput and limits".
 - **Routed reads see writes across a split (stale maps)** — done (D59). `DbWriter.probe`/`scan`
   report `sealedSuccessors`; `ReadOptions.refuseSealed` (`db-client.ts`); `ShardRouter` gets route
   through `withRouting` and scans resume shard by shard (`scanFrom`). Test: `sharding.test.ts` (a

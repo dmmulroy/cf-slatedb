@@ -18,7 +18,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
-import { Console, Data, Effect, Option } from "effect";
+import { Console, Data, Effect, Option, Schema } from "effect";
 import { Argument, Command, Flag } from "effect/cli";
 
 import {
@@ -54,6 +54,10 @@ class PreviewCliError extends Data.TaggedError("PreviewCliError")<{
 }> {}
 
 const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
+
+const decodeSettingsOverrides = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(Schema.Record(Schema.String, Schema.Number)),
+);
 
 const jsonFlag = Flag.Boolean("json").pipe(
   Flag.withDescription("Print machine-readable JSON"),
@@ -128,9 +132,15 @@ const deploy = Command.make(
       ),
       Flag.withDefault(false),
     ),
+    settings: Flag.String("settings").pipe(
+      Flag.withDescription(
+        "Engine setting overrides as JSON (e.g. '{\"l0SstSize\":268435456}'), for a measurement deploy; applied over --dev-timings",
+      ),
+      Flag.optional,
+    ),
     json: jsonFlag,
   },
-  ({ stage, jurisdiction, devTimings, json }) =>
+  ({ stage, jurisdiction, devTimings, settings, json }) =>
     Effect.gen(function* () {
       const current = yield* previewOutputs(yield* readStateRecords(Option.some(stage)), stage);
       const residency = deployJurisdiction(jurisdiction, current);
@@ -141,7 +151,26 @@ const deploy = Command.make(
         );
       }
       // Settings come only from the flags: values left in the shell must not change a preview.
-      const env = deployEnvironment(process.env, { devTimings, jurisdiction: residency });
+      const overrides = yield* Option.match(settings, {
+        onNone: () => Effect.succeed(Option.none<Readonly<Record<string, number>>>()),
+        onSome: (text) =>
+          decodeSettingsOverrides(text).pipe(
+            Effect.map(Option.some),
+            Effect.mapError(
+              () =>
+                new PreviewCliError({
+                  stage,
+                  reason: "DeployFailed",
+                  message: `--settings must be a JSON object of numeric settings, such as '{"l0SstSize":268435456}'.`,
+                }),
+            ),
+          ),
+      });
+      const env = deployEnvironment(process.env, {
+        devTimings,
+        jurisdiction: residency,
+        settings: overrides,
+      });
       yield* Console.error(
         `Deploying ${CF_SLATEDB_STACK_NAME} to ${stage} with ${devTimings ? "dev" : "production"} timings, jurisdiction ${residency} (vp run ${deployTask(stage)})`,
       );

@@ -3,6 +3,7 @@ import { Chunk, Stream } from "effect";
 import { Effect, Layer, Option } from "effect";
 import { HttpApiBuilder } from "effect/http-api";
 
+import { ReaderUnavailableError } from "./db-reader.ts";
 import { DatabaseLifecycle } from "./database-lifecycle.ts";
 import { DbHttpApi } from "./db-http-api.ts";
 import { DbHttpRequest, dbHttpRequestMiddlewareLayer } from "./db-http-request.ts";
@@ -64,7 +65,27 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
         ),
       )
       .handle("status", ({ params }) =>
-        writer.status(params.databaseId).pipe(publicFailures("status")),
+        Effect.gen(function* () {
+          const status = yield* writer.status(params.databaseId);
+          // The writer's manifest is the one it last committed or loaded; after a compaction the
+          // newest manifest has fewer L0 SSTs, so report that (D61).
+          const latest = yield* manifests.loadLatest(params.databaseId).pipe(
+            Effect.catchTags({
+              ManifestReadError: (error) =>
+                Effect.fail(
+                  new ReaderUnavailableError({
+                    databaseId: params.databaseId,
+                    reason:
+                      error.reason === "StoredManifestInvalid"
+                        ? "StoredManifestInvalid"
+                        : "StorageUnavailable",
+                    message: error.message,
+                  }),
+                ),
+            }),
+          );
+          return { ...status, l0Count: latest.manifest.l0.length };
+        }).pipe(publicFailures("status")),
       )
       .handle("createCheckpoint", ({ params, payload }) =>
         lifecycle.createCheckpoint(params.databaseId, payload).pipe(publicFailures("checkpoint")),
