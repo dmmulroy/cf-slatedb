@@ -5,15 +5,11 @@ import {
   DatabaseId,
   DroppedSst,
   dropSstFromManifest,
-  externalOwners,
   fenceCompactor,
   generateCompactionJobId,
   type Manifest,
   ManifestId,
   planCompactionsAround,
-  releasableExternalRefs,
-  removeCheckpoint,
-  removeExternalRef,
   SstId,
   SstNotInManifestError,
   Timestamp,
@@ -372,35 +368,6 @@ export const makeCompactor = Effect.gen(function* () {
     });
 
   /**
-   * A fork releases the checkpoints it holds on sources it no longer reads: once compaction has
-   * rewritten every SST the newest manifest and the manifests its own checkpoints pin take from an
-   * owner (`releasableExternalRefs`), it removes its checkpoint from the owner's manifest, then its
-   * reference from its own. Each step is an idempotent CAS, so a crash between them is retried.
-   */
-  const releaseExternalRefs = (databaseId: DatabaseId, latest: Manifest) =>
-    Effect.gen(function* () {
-      if (latest.externalRefs.length === 0) return;
-      const owners = externalOwners(latest);
-      // Cheap check first: the newest manifest still reads every owner.
-      if (latest.externalRefs.every((ref) => owners.has(ref.owner))) return;
-      const pinned: Array<Manifest> = [];
-      for (const checkpoint of latest.checkpoints) {
-        pinned.push(...Option.toArray(yield* reader.load(databaseId, checkpoint.manifestId)));
-      }
-      for (const ref of releasableExternalRefs(latest, pinned)) {
-        yield* manifests
-          .update(ref.owner, (manifest) =>
-            Result.succeed(removeCheckpoint(manifest, ref.checkpointId)),
-          )
-          .pipe(Effect.catchTags({ DatabaseNotFoundError: () => Effect.void }));
-        yield* manifests.update(databaseId, (manifest) =>
-          Result.succeed(removeExternalRef(manifest, ref)),
-        );
-        yield* Effect.annotateCurrentSpan({ "fork.released_owner": ref.owner });
-      }
-    });
-
-  /**
    * One poll: drop finished jobs, renew the rest, plan and start more.
    *
    * @returns Whether to poll again (jobs running or waiting for budget).
@@ -515,7 +482,6 @@ export const makeCompactor = Effect.gen(function* () {
           )
         : state.collectionDueAt;
       yield* cell.set({ ...state, running, corruptSsts, collectionDueAt });
-      if (running.length === 0) yield* releaseExternalRefs(databaseId, latest.manifest);
       yield* Effect.annotateCurrentSpan({
         "database.id": databaseId,
         "manifest.id": latest.id,
@@ -616,11 +582,8 @@ export const makeCompactor = Effect.gen(function* () {
       )
       .pipe(
         Effect.catchTags({ DatabaseNotFoundError: () => Effect.succeed(false) }),
-        // Manifest unreadable or contended now: poll again later.
-        Effect.catchTags({
-          ManifestReadError: () => Effect.succeed(true),
-          ManifestWriteError: () => Effect.succeed(true),
-        }),
+        // Manifest unreadable now: poll again later.
+        Effect.catchTags({ ManifestReadError: () => Effect.succeed(true) }),
       );
     if (again) yield* pollBy((yield* Clock.currentTimeMillis) + settings.compactorPollInterval);
     // A collection still due keeps the alarm set even when compaction is idle.

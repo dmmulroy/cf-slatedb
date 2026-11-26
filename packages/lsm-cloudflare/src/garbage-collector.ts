@@ -7,6 +7,9 @@ import {
   planManifestCollection,
   planSstCollection,
   prepareGarbageCollection,
+  releasableExternalRefs,
+  removeCheckpoint,
+  removeExternalRef,
   SstId,
   type StoredManifest,
   type StoredSst,
@@ -213,12 +216,41 @@ export const makeGarbageCollector = Effect.gen(function* () {
       minAge: settings.gcMinAge,
     });
     const retained: Array<Manifest> = [committed.manifest];
+    let everyRetainedLoaded = true;
     for (const id of plan.retained) {
       if (id === committed.id) continue;
       const manifest = yield* reader
         .load(databaseId, id)
         .pipe(Effect.catchTags({ ManifestReadError: unavailable(databaseId) }));
+      if (Option.isNone(manifest)) everyRetainedLoaded = false;
       retained.push(...Option.toArray(manifest));
+    }
+    // A fork releases its hold on its source once no manifest kept here names another database's
+    // SST (D77). Each step is an idempotent CAS: first the owner's checkpoint, then the reference,
+    // so a crash between them leaves the reference, and the next collection releases again.
+    const released = everyRetainedLoaded
+      ? releasableExternalRefs(committed.manifest, retained)
+      : [];
+    for (const ref of released) {
+      yield* manifests
+        .update(ref.owner, (manifest) =>
+          Result.succeed(removeCheckpoint(manifest, ref.checkpointId)),
+        )
+        .pipe(
+          Effect.catchTags({
+            DatabaseNotFoundError: () => Effect.void,
+            ManifestReadError: unavailable(databaseId),
+            ManifestWriteError: unavailable(databaseId),
+          }),
+        );
+      yield* manifests
+        .update(databaseId, (manifest) => Result.succeed(removeExternalRef(manifest, ref)))
+        .pipe(
+          Effect.catchTags({
+            ManifestReadError: unavailable(databaseId),
+            ManifestWriteError: unavailable(databaseId),
+          }),
+        );
     }
     const sstBoundary =
       committed.manifest.gcSstBoundary < cutoff ? committed.manifest.gcSstBoundary : cutoff;
@@ -245,6 +277,7 @@ export const makeGarbageCollector = Effect.gen(function* () {
       "gc.boundary_advanced": advanceBoundary,
       "gc.deleted_ssts": deletedSsts.length,
       "gc.deleted_manifests": plan.deletable.length,
+      "fork.released_owner": released.map((ref) => ref.owner).join(","),
     });
     const nextCollectionAt = nextCollectionTime({
       latestId: committed.id,
