@@ -28,8 +28,15 @@ export class MeasurementError extends Data.TaggedError("MeasurementError")<{
   readonly message: string;
 }> {}
 
-/** Where a preview stage's tail records and spans can be read (`preview-cli collector`). */
+/**
+ * Where a live stage's tail records and spans can be read: a preview's from `preview-cli
+ * collector`, or any live stage's from `--collector-url` and `SHALEDB_TRACE_TOKEN`.
+ */
 export interface IMeasurementCollector {
+  /**
+   * The preview stage, or the collector URL's host when it was named by URL; names the stage's
+   * measurement store, so the two forms never share one.
+   */
   readonly stage: string;
   readonly url: string;
   readonly token: string;
@@ -1003,33 +1010,33 @@ const measurementStore = (stage: string) =>
 
 /**
  * Pulls the stage's spans from the last `minutes` into its measurement store (resuming where the
- * last pull stopped).
+ * last pull stopped). It names the collector by URL whichever form resolved it, with the token in
+ * the trace CLI's environment, never on its command line.
  */
 export const pullMeasurementSpans = (minutes: number) =>
   Effect.gen(function* () {
-    const { previewStage } = yield* ScenarioStack;
-    const stage = Option.getOrElse(previewStage, () => "local");
-    if (Option.isSome(previewStage)) {
-      const pulled = yield* runTraceCliAsync([
+    const collector = yield* MeasurementCollector;
+    const store = measurementStore(collector.stage);
+    const pulled = yield* runTraceCliAsync(
+      [
         "pull",
-        "--stage",
-        stage,
+        "--collector-url",
+        collector.url,
         "--store",
-        measurementStore(stage),
+        store,
         "--since-minutes",
         String(minutes),
-      ]);
-      if (pulled.status !== 0) {
-        return yield* new MeasurementError({
-          step: "trace-cli pull",
-          reason: "TraceCliFailed",
-          message: `Pulling ${stage}'s spans failed: ${pulled.stderr.slice(-500)}. Run the measurement again.`,
-        });
-      }
+      ],
+      { SHALEDB_TRACE_TOKEN: collector.token },
+    );
+    if (pulled.status !== 0) {
+      return yield* new MeasurementError({
+        step: "trace-cli pull",
+        reason: "TraceCliFailed",
+        message: `Pulling ${collector.stage}'s spans failed: ${pulled.stderr.slice(-500)}. Run the measurement again.`,
+      });
     }
-    return Option.isSome(previewStage)
-      ? measurementStore(stage)
-      : fileURLToPath(new URL("../../../.traces", import.meta.url));
+    return store;
   });
 
 /** Spans `trace-cli grep` finds in `store` with `args` that started at or after `sinceMs`. */

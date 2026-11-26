@@ -149,11 +149,16 @@ const PROCESS_STARTED_AT = Date.now();
 /** Runs the trace CLI in its own process; returns its exit status and output. */
 /**
  * Runs the trace CLI in its own process without blocking this one (a long `pull` must not stall a
- * soak's other fibers); returns its exit status and error output.
+ * soak's other fibers); returns its exit status and error output. `environment` is added to this
+ * process's environment for the child (a token, which must not go in `args`).
  */
-export const runTraceCliAsync = (args: ReadonlyArray<string>) =>
+export const runTraceCliAsync = (
+  args: ReadonlyArray<string>,
+  environment: Readonly<Record<string, string>> = {},
+) =>
   Effect.callback<{ readonly status: number; readonly stderr: string }>((resume) => {
     const child = spawn(process.execPath, [TRACE_CLI, ...args], {
+      env: { ...process.env, ...environment },
       stdio: ["ignore", "ignore", "pipe"],
     });
     let stderr = "";
