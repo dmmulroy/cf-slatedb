@@ -6,69 +6,105 @@ being produced.
 
 ## What changed in workstream 10
 
-- **The release tools (D65).** `scenario-cli soak` is the release gate: several databases, mixed
-  writes, reads at every consistency, scans, transactions, pinned snapshots, removals, a sharded
-  group split twice, and a redeploy midway. A model of every acknowledged write is checked at
-  `Latest` and `Flushed` at the end, with storage bounded after GC. `scenario-cli smoke` is the
-  production smoke test, on databases it names and removes itself.
-- **Defects the soaks and models found, all fixed:**
-  - D66: the block cache shared reads in flight across requests, which caused 5-minute hangs and a
-    500 during a redeploy.
-  - D69: a request the schemas refuse returned 500; it is now `InvalidRequest` (400).
-  - D70: a `Latest` read could return "not found" for a key that always had a value, by using a
-    manifest flushed and compacted past its snapshot. Present since Phase 5, found by the model,
+- **The release tools (D65).**
+  - **`scenario-cli soak` is the release gate.** It runs several databases with mixed writes,
+    reads at every consistency, scans, transactions, pinned snapshots, removals, a sharded group
+    split twice, and a redeploy midway. At the end, a model of every acknowledged write is checked
+    at `Latest` and `Flushed`, and storage must be bounded after GC.
+  - **It was rebuilt so it cannot lose its results.** It runs in phases: data checks before
+    telemetry, and every telemetry read bounded by a budget whose overrun is a failure.
+    `--report-file` is replaced atomically every minute (`docs/release-v1.md` §5).
+  - **`scenario-cli smoke` is the production smoke test.** It runs on databases it names and
+    removes itself.
+- **Defects found and fixed:**
+  - **D66.** The block cache shared reads in flight across requests. That caused 5-minute hangs
+    and a 500 during a redeploy.
+  - **D69.** A request the schemas refuse returned 500. It is now `InvalidRequest` (400).
+  - **D70.** A `Latest` read could return "not found" for a key that always had a value, by using a
+    manifest flushed and compacted past its snapshot. Present since Phase 5. Found by the model,
     never seen live.
-  - D74: the writer's alarm looped without flushing, and every transaction begin scanned the whole
-    memtable.
+  - **D74.** The writer's alarm looped without flushing, and every transaction begin scanned the
+    whole memtable.
+  - **D74, corrected.** A commit racing the counter refresh could leave its row counted nowhere, so
+    unflushed until a later write. Found by review.
+  - **D76.** On a database read but not flushed for over an hour after a compaction, every
+    transaction read failed with `SnapshotTooOld`, and so did every retry. Unpinned snapshots lived
+    half the documented hour. Found by checking `docs/invariants.md` against the code.
+  - **D77 (in progress, `proto/fork-hold`).** A fork released its hold on its source while readers
+    of its recent manifests still needed the source's SSTs. Found by the interaction audit.
+  - **D78 (in progress, `proto/compactor-fence`).** Two overlapping first wakes fenced a compactor
+    against itself for good, so writes to that database were refused permanently. Found by
+    `measure manifest-cas` on `preview-3`.
+  - `docs/release-v1.md` §8 says what these five imply.
 - **Read path (D67, D72).**
   - A read reuses any cached manifest holding the writer's flushed rows, and a refresh takes one
     round trip from the manifest held.
-  - SSTs are opened together. A slow block read is hedged from the bucket. Scans read ahead, stop
-    at their limit, and use 16 KiB blocks.
+  - SSTs are opened together. A slow block read is hedged from the bucket, except in a restricted
+    Stack. Scans read ahead, stop at their limit, and use 16 KiB blocks.
   - On `preview-3`, a `Flushed` get went from 81 / 162 / 515 ms to 5 / 113 / 243 ms (p50 / p90 /
-    p99). A 100-row scan went from 76 / 555 / 2,146 ms to 60 / 257 / 983 ms.
+    p99). A 100-row scan went from 76 / 555 / 2,146 ms to 60 / 257 / 983 ms
+    (`docs/measurements.md`, "Read latency").
 - **Flush path (D70, D73).**
   - A flush writes only the versions a read can reach: 0.44 MB stored instead of 4.4 MB for the
     soak's workload.
   - A flush no longer waits for the compactor it wakes, and rows are encoded a chunk at a time.
-- **Telemetry (D71).** Tail records are sampled like traces, except those that did not end `ok`.
+- **Telemetry (D71, and production reads).**
+  - Tail records are sampled like traces, except those that did not end `ok`.
+  - `trace-cli pull`/`tail` and `scenario-cli measure health`/`latency` read any live stage,
+    production included, by `--collector-url` with `SHALEDB_TRACE_TOKEN`.
+    `preview-cli trace-token <stage>` writes that token only into a pipe.
+- **The baseline (D75).** A plain Durable Object SQLite baseline in the probe Worker and
+  `measure baseline`. PENDING(baseline): its result.
+- **The invariants guide.** `docs/invariants.md` ties each invariant (acknowledged, flushed, what
+  each read may see, when GC may reclaim an SST) to the code that enforces it and the test or model
+  that checks it.
 - **The rename (D68).** cf-slatedb became shaledb. The previews were redeployed as new
   `Shaledb/preview-<n>` stacks, and the old `CfSlatedb/preview-<n>` stacks remain (below).
 - **The release checklist** is `docs/release-v1.md`.
 
 ## What was verified
 
-- `vp run ready` exit 0 and `vp run verify` exit 0, 28/28 TLC runs, on the D70–D74 code
-  (`docs/progress.md`).
-- 13/13 scenarios under `vp run dev` and on `preview-3` (`--dev-timings`).
-- 5-minute soaks passing on `preview-2` and `preview-3` for each arm of the D70–D74 experiments.
-- Thirty-five mutations of the D70–D74 code, each caught by a test.
+- **The gates on the D70–D74 code:** `vp run ready` exit 0 and `vp run verify` exit 0, 28/28 TLC
+  runs (`docs/progress.md`). Also 13/13 scenarios under `vp run dev` and on `preview-3`
+  (`--dev-timings`), and 5-minute soaks passing on `preview-2` and `preview-3` for each arm of the
+  D70–D74 experiments.
+- **Mutations:** thirty-five mutations of the D70–D74 code, each caught by a test. The later fixes
+  (D76, the counter race, hedging, the soak tool, the telemetry reads) each list their mutation
+  checks in their reports.
+- **On `f3b2ad2`, before D76–D78 and the counter fix:** the 20-minute `eu` soak on `preview-2`
+  passed. It found no mismatch and no failure, and every invocation ended `ok`
+  (`docs/release-v1.md` §5). This is evidence about `f3b2ad2`, not the release gate.
+
+PENDING(soak-preview-1-f3b2ad2): the outcome of the 130-minute soak on `f3b2ad2` on `preview-1`.
 
 PENDING(final-commit): the release commit, with `vp run ready` and `vp run verify` observed at
-exit 0 on it.
+exit 0 on it, and the number of TLC runs.
 
-PENDING(soak-preview-1): the 130-minute soak on the final code on `preview-1`: pass or fail on each
-criterion, p50/p99 per operation, the health summary.
+PENDING(soak-preview-1): the 130-minute soak on the release commit on `preview-1`: pass or fail on
+each criterion, p50/p99 per operation, the health summary.
 
-PENDING(soak-preview-2): the 20-minute `eu` soak on the final code on `preview-2`: the same.
+PENDING(soak-preview-2): the 20-minute `eu` soak on the release commit on `preview-2`: the same.
 
 PENDING(step4): writes, split pause, compaction CPU, flush CPU, and read latency re-measured on the
 final code, each against its target.
 
-PENDING(baseline): the comparison with plain Durable Object SQLite.
+PENDING(d77): D77 merged, with its tests and model runs.
+
+PENDING(d78): D78 merged, with its tests, and `ms-cas-mwy5ujbj` on `preview-3` revived live.
 
 ## What is left
 
 - **P6.** Dillon decides with `docs/release-v1.md`. If he says go, the production deploy, its smoke
-  test, and the production URL are recorded here.
-- **Production health tooling.** `measure health` and `trace-cli pull --stage` read only
-  `preview-1..3`. Nothing in the repository reads production's collector yet
-  (`docs/release-v1.md` §8).
+  test, and the production URLs (`apiUrl`, `traceCollectorUrl`) are recorded here.
+- **D77 and D78** are merged and verified, then the release soaks run on the release commit.
 - **The deployment guard.** Its allowlist names only the pre-rename project path, which the guard
-  skips. `scripts/allowlist-shaledb-deploys.sh` must be rerun, and its stage list does not keep
-  agents off `production` (`docs/release-v1.md` §9 step 2).
+  skips. `scripts/allowlist-shaledb-deploys.sh` must be rerun from the main checkout, and its stage
+  list does not keep agents off `production` (`docs/release-v1.md` §10 step 2).
+- **No metrics are collected.** The trace collector discards OTLP metrics, so the three
+  `lsm_*` counters `docs/operations.md` names are readable nowhere (`docs/release-v1.md` §9). Either
+  collect them or take them out of `docs/operations.md`.
 - `docs/progress.md`'s workstream table still says "this commit" for workstream 9. It is `8a96667`.
-- Everything in `docs/release-v1.md` §8 ("Known limitations").
+- Everything in `docs/release-v1.md` §9 ("Known limitations").
 
 ## Destroying what is left on Cloudflare (Dillon runs these; agents never do)
 
@@ -111,6 +147,13 @@ Each destroy removes everything the stage's state holds:
 It does **not** remove the stage's two token secrets. See step 3.
 
 Wait until the release soaks and any measurements on a stage are finished before destroying it.
+
+**Keep `preview-3` until D78's recovery is proven.** Database `ms-cas-mwy5ujbj` on `preview-3` is
+the live fixture for D78. Its compactor has been fenced against itself since 2026-11-26 23:05 UTC,
+with 16 L0 SSTs, every write refused, and `"fenced": true` against the manifest's compactor epoch 2.
+It is kept on purpose: after D78 is deployed, a wake must make it compact again and accept writes.
+Destroying `preview-3` deletes it. Destroy `preview-3` only after that result is recorded
+(PENDING(d78)).
 
 ### 2. The orphaned stacks from before the rename: `CfSlatedb/preview-1`, `-2`, `-3`
 
@@ -226,3 +269,68 @@ curl -X DELETE "$API/stores/$STORE_ID/secrets/<secret id>" -H "Authorization: Be
 
 Check each listed `name` before deleting. `search` also matches comments. Cloudflare's how-to page
 warns to delete a secret only once nothing deployed uses it, which steps 1 and 2 ensure.
+
+## Local worktrees and branches to remove after the merge
+
+The parallel round left 21 git worktrees under `/tmp/shale-work/wt/`, each on its own `proto/*`
+branch of the main repository (`git worktree list` at `fec2698`). They are on this laptop only and
+were never pushed. Once the release is merged into `main`, every branch below except the last two
+is contained in `main`, and its worktree can go.
+
+| Worktree (`/tmp/shale-work/wt/…`) | Branch                      | In `proto/integration-2` at `fec2698`                            |
+| --------------------------------- | --------------------------- | ---------------------------------------------------------------- |
+| `integ2`                          | `proto/integration-2`       | is it                                                            |
+| `candidate`                       | `proto/candidate`           | yes                                                              |
+| `docs`                            | `proto/docs`                | yes                                                              |
+| `baseline`                        | `proto/baseline`            | yes                                                              |
+| `prod-health`                     | `proto/prod-health`         | yes                                                              |
+| `review`                          | `proto/review`              | yes                                                              |
+| `txn-fix`                         | `proto/txn-fix`             | yes                                                              |
+| `soak-tool`                       | `proto/soak-tool`           | yes                                                              |
+| `writer-counters`                 | `proto/writer-counters`     | yes                                                              |
+| `tools`                           | `proto/tools`               | yes                                                              |
+| `newest-flush`                    | `proto/newest-flush`        | yes                                                              |
+| `flush-cpu`                       | `proto/flush-cpu`           | yes                                                              |
+| `background-wake`                 | `proto/background-wake`     | yes                                                              |
+| `hedged-reads`                    | `proto/hedged-reads`        | yes                                                              |
+| `limit-read-ahead`                | `proto/limit-read-ahead`    | yes                                                              |
+| `refresh-from-cached`             | `proto/refresh-from-cached` | yes                                                              |
+| `release-doc`                     | `proto/release-doc`         | this branch; merged at integration                               |
+| `fork-hold`                       | `proto/fork-hold`           | no: D77, in progress                                             |
+| `compactor-fence`                 | `proto/compactor-fence`     | no: D78, in progress                                             |
+| `parallel-parts`                  | `proto/parallel-parts`      | no: the declined concurrent part uploads (D73 names this branch) |
+| `integration`                     | `proto/integration`         | no: an earlier integration that merged `proto/parallel-parts`    |
+
+From the main checkout, on `main`, after the merge:
+
+```sh
+cd /Users/dmmulroy/Code/personal/cf-slatedb
+for name in integ2 candidate docs baseline prod-health review txn-fix soak-tool writer-counters \
+  tools newest-flush flush-cpu background-wake hedged-reads limit-read-ahead refresh-from-cached \
+  release-doc fork-hold compactor-fence; do
+  git worktree remove "/tmp/shale-work/wt/$name"
+done
+git branch -d proto/integration-2 proto/candidate proto/docs proto/baseline proto/prod-health \
+  proto/review proto/txn-fix proto/soak-tool proto/writer-counters proto/tools proto/newest-flush \
+  proto/flush-cpu proto/background-wake proto/hedged-reads proto/limit-read-ahead \
+  proto/refresh-from-cached proto/release-doc proto/fork-hold proto/compactor-fence
+git worktree prune
+```
+
+- **The removal is safe by default.** `git worktree remove` refuses a worktree with uncommitted
+  changes, and `git branch -d` refuses a branch that is not merged into `main`. A refusal means
+  something was not merged: look before forcing.
+- **`proto/parallel-parts` holds the only copy of a declined prototype** (`d9c145e`, concurrent
+  multipart uploads), and D73 names the branch. `proto/integration` exists only to merge it. Keep
+  both, or tag the prototype before removing them:
+
+  ```sh
+  git tag parallel-parts-prototype d9c145e
+  git worktree remove /tmp/shale-work/wt/parallel-parts && git worktree remove /tmp/shale-work/wt/integration
+  git branch -D proto/parallel-parts proto/integration
+  ```
+
+- **What else lives in `/tmp/shale-work`.** Besides the worktrees, the agents' directories
+  (`agents/`), the release outputs (`release/`, including `soak-p2.json`), and the measurement
+  scripts (`scripts/`) are the evidence several documents cite by path. Copy what you want to keep
+  before `/tmp` is cleared.
