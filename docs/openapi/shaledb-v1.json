@@ -88,7 +88,7 @@
                       "code": "Unauthenticated",
                       "details": {},
                       "operation": "routeRequest",
-                      "message": "The request was not authenticated. Send the stage's token as `Authorization: Bearer <token>`; `preview-cli token <stage>` prints it.",
+                      "message": "The request was not authenticated. Send one of the stage's access tokens (docs/operations.md, \"Access tokens\") as `Authorization: Bearer <token>`.",
                       "requestId": "8f3a1c2b9d7e6f50-IAD",
                       "retryable": false
                     }
@@ -497,7 +497,7 @@
                       "code": "Unauthenticated",
                       "details": {},
                       "operation": "routeRequest",
-                      "message": "The request was not authenticated. Send the stage's token as `Authorization: Bearer <token>`; `preview-cli token <stage>` prints it.",
+                      "message": "The request was not authenticated. Send one of the stage's access tokens (docs/operations.md, \"Access tokens\") as `Authorization: Bearer <token>`.",
                       "requestId": "8f3a1c2b9d7e6f50-IAD",
                       "retryable": false
                     }
@@ -911,7 +911,7 @@
                       "code": "Unauthenticated",
                       "details": {},
                       "operation": "routeRequest",
-                      "message": "The request was not authenticated. Send the stage's token as `Authorization: Bearer <token>`; `preview-cli token <stage>` prints it.",
+                      "message": "The request was not authenticated. Send one of the stage's access tokens (docs/operations.md, \"Access tokens\") as `Authorization: Bearer <token>`.",
                       "requestId": "8f3a1c2b9d7e6f50-IAD",
                       "retryable": false
                     }
@@ -1276,7 +1276,7 @@
                       "code": "Unauthenticated",
                       "details": {},
                       "operation": "routeRequest",
-                      "message": "The request was not authenticated. Send the stage's token as `Authorization: Bearer <token>`; `preview-cli token <stage>` prints it.",
+                      "message": "The request was not authenticated. Send one of the stage's access tokens (docs/operations.md, \"Access tokens\") as `Authorization: Bearer <token>`.",
                       "requestId": "8f3a1c2b9d7e6f50-IAD",
                       "retryable": false
                     }
@@ -1947,7 +1947,7 @@
                       "code": "Unauthenticated",
                       "details": {},
                       "operation": "routeRequest",
-                      "message": "The request was not authenticated. Send the stage's token as `Authorization: Bearer <token>`; `preview-cli token <stage>` prints it.",
+                      "message": "The request was not authenticated. Send one of the stage's access tokens (docs/operations.md, \"Access tokens\") as `Authorization: Bearer <token>`.",
                       "requestId": "8f3a1c2b9d7e6f50-IAD",
                       "retryable": false
                     }
@@ -2371,7 +2371,7 @@
                       "code": "Unauthenticated",
                       "details": {},
                       "operation": "routeRequest",
-                      "message": "The request was not authenticated. Send the stage's token as `Authorization: Bearer <token>`; `preview-cli token <stage>` prints it.",
+                      "message": "The request was not authenticated. Send one of the stage's access tokens (docs/operations.md, \"Access tokens\") as `Authorization: Bearer <token>`.",
                       "requestId": "8f3a1c2b9d7e6f50-IAD",
                       "retryable": false
                     }
@@ -2736,7 +2736,7 @@
                       "code": "Unauthenticated",
                       "details": {},
                       "operation": "routeRequest",
-                      "message": "The request was not authenticated. Send the stage's token as `Authorization: Bearer <token>`; `preview-cli token <stage>` prints it.",
+                      "message": "The request was not authenticated. Send one of the stage's access tokens (docs/operations.md, \"Access tokens\") as `Authorization: Bearer <token>`.",
                       "requestId": "8f3a1c2b9d7e6f50-IAD",
                       "retryable": false
                     }
@@ -3115,7 +3115,7 @@
                       "code": "Unauthenticated",
                       "details": {},
                       "operation": "routeRequest",
-                      "message": "The request was not authenticated. Send the stage's token as `Authorization: Bearer <token>`; `preview-cli token <stage>` prints it.",
+                      "message": "The request was not authenticated. Send one of the stage's access tokens (docs/operations.md, \"Access tokens\") as `Authorization: Bearer <token>`.",
                       "requestId": "8f3a1c2b9d7e6f50-IAD",
                       "retryable": false
                     }
@@ -3383,7 +3383,7 @@
                       "code": "Unauthenticated",
                       "details": {},
                       "operation": "routeRequest",
-                      "message": "The request was not authenticated. Send the stage's token as `Authorization: Bearer <token>`; `preview-cli token <stage>` prints it.",
+                      "message": "The request was not authenticated. Send one of the stage's access tokens (docs/operations.md, \"Access tokens\") as `Authorization: Bearer <token>`.",
                       "requestId": "8f3a1c2b9d7e6f50-IAD",
                       "retryable": false
                     }
@@ -3662,7 +3662,7 @@
                       "code": "Unauthenticated",
                       "details": {},
                       "operation": "routeRequest",
-                      "message": "The request was not authenticated. Send the stage's token as `Authorization: Bearer <token>`; `preview-cli token <stage>` prints it.",
+                      "message": "The request was not authenticated. Send one of the stage's access tokens (docs/operations.md, \"Access tokens\") as `Authorization: Bearer <token>`.",
                       "requestId": "8f3a1c2b9d7e6f50-IAD",
                       "retryable": false
                     }
@@ -3970,7 +3970,7 @@
                       "code": "Unauthenticated",
                       "details": {},
                       "operation": "routeRequest",
-                      "message": "The request was not authenticated. Send the stage's token as `Authorization: Bearer <token>`; `preview-cli token <stage>` prints it.",
+                      "message": "The request was not authenticated. Send one of the stage's access tokens (docs/operations.md, \"Access tokens\") as `Authorization: Bearer <token>`.",
                       "requestId": "8f3a1c2b9d7e6f50-IAD",
                       "retryable": false
                     }
@@ -4283,7 +4283,7 @@
                       "code": "Unauthenticated",
                       "details": {},
                       "operation": "routeRequest",
-                      "message": "The request was not authenticated. Send the stage's token as `Authorization: Bearer <token>`; `preview-cli token <stage>` prints it.",
+                      "message": "The request was not authenticated. Send one of the stage's access tokens (docs/operations.md, \"Access tokens\") as `Authorization: Bearer <token>`.",
                       "requestId": "8f3a1c2b9d7e6f50-IAD",
                       "retryable": false
                     }
@@ -4568,7 +4568,7 @@
                       "code": "Unauthenticated",
                       "details": {},
                       "operation": "routeRequest",
-                      "message": "The request was not authenticated. Send the stage's token as `Authorization: Bearer <token>`; `preview-cli token <stage>` prints it.",
+                      "message": "The request was not authenticated. Send one of the stage's access tokens (docs/operations.md, \"Access tokens\") as `Authorization: Bearer <token>`.",
                       "requestId": "8f3a1c2b9d7e6f50-IAD",
                       "retryable": false
                     }
@@ -4946,7 +4946,7 @@
                       "code": "Unauthenticated",
                       "details": {},
                       "operation": "routeRequest",
-                      "message": "The request was not authenticated. Send the stage's token as `Authorization: Bearer <token>`; `preview-cli token <stage>` prints it.",
+                      "message": "The request was not authenticated. Send one of the stage's access tokens (docs/operations.md, \"Access tokens\") as `Authorization: Bearer <token>`.",
                       "requestId": "8f3a1c2b9d7e6f50-IAD",
                       "retryable": false
                     }
@@ -5358,7 +5358,7 @@
                       "code": "Unauthenticated",
                       "details": {},
                       "operation": "routeRequest",
-                      "message": "The request was not authenticated. Send the stage's token as `Authorization: Bearer <token>`; `preview-cli token <stage>` prints it.",
+                      "message": "The request was not authenticated. Send one of the stage's access tokens (docs/operations.md, \"Access tokens\") as `Authorization: Bearer <token>`.",
                       "requestId": "8f3a1c2b9d7e6f50-IAD",
                       "retryable": false
                     }
@@ -5707,7 +5707,7 @@
                       "code": "Unauthenticated",
                       "details": {},
                       "operation": "routeRequest",
-                      "message": "The request was not authenticated. Send the stage's token as `Authorization: Bearer <token>`; `preview-cli token <stage>` prints it.",
+                      "message": "The request was not authenticated. Send one of the stage's access tokens (docs/operations.md, \"Access tokens\") as `Authorization: Bearer <token>`.",
                       "requestId": "8f3a1c2b9d7e6f50-IAD",
                       "retryable": false
                     }
@@ -6271,7 +6271,7 @@
                       "code": "Unauthenticated",
                       "details": {},
                       "operation": "routeRequest",
-                      "message": "The request was not authenticated. Send the stage's token as `Authorization: Bearer <token>`; `preview-cli token <stage>` prints it.",
+                      "message": "The request was not authenticated. Send one of the stage's access tokens (docs/operations.md, \"Access tokens\") as `Authorization: Bearer <token>`.",
                       "requestId": "8f3a1c2b9d7e6f50-IAD",
                       "retryable": false
                     }
@@ -6757,7 +6757,7 @@
                       "code": "Unauthenticated",
                       "details": {},
                       "operation": "routeRequest",
-                      "message": "The request was not authenticated. Send the stage's token as `Authorization: Bearer <token>`; `preview-cli token <stage>` prints it.",
+                      "message": "The request was not authenticated. Send one of the stage's access tokens (docs/operations.md, \"Access tokens\") as `Authorization: Bearer <token>`.",
                       "requestId": "8f3a1c2b9d7e6f50-IAD",
                       "retryable": false
                     }
@@ -7191,7 +7191,7 @@
                       "code": "Unauthenticated",
                       "details": {},
                       "operation": "routeRequest",
-                      "message": "The request was not authenticated. Send the stage's token as `Authorization: Bearer <token>`; `preview-cli token <stage>` prints it.",
+                      "message": "The request was not authenticated. Send one of the stage's access tokens (docs/operations.md, \"Access tokens\") as `Authorization: Bearer <token>`.",
                       "requestId": "8f3a1c2b9d7e6f50-IAD",
                       "retryable": false
                     }
@@ -7504,7 +7504,7 @@
                       "code": "Unauthenticated",
                       "details": {},
                       "operation": "routeRequest",
-                      "message": "The request was not authenticated. Send the stage's token as `Authorization: Bearer <token>`; `preview-cli token <stage>` prints it.",
+                      "message": "The request was not authenticated. Send one of the stage's access tokens (docs/operations.md, \"Access tokens\") as `Authorization: Bearer <token>`.",
                       "requestId": "8f3a1c2b9d7e6f50-IAD",
                       "retryable": false
                     }
@@ -7904,7 +7904,7 @@
                       "code": "Unauthenticated",
                       "details": {},
                       "operation": "routeRequest",
-                      "message": "The request was not authenticated. Send the stage's token as `Authorization: Bearer <token>`; `preview-cli token <stage>` prints it.",
+                      "message": "The request was not authenticated. Send one of the stage's access tokens (docs/operations.md, \"Access tokens\") as `Authorization: Bearer <token>`.",
                       "requestId": "8f3a1c2b9d7e6f50-IAD",
                       "retryable": false
                     }
