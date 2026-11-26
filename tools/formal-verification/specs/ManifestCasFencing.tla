@@ -16,6 +16,10 @@
 (*    read the hint and GC's manifest boundary, probe forward from         *)
 (*    max(hint, boundary + 1) to the first missing id; a missing start     *)
 (*    falls back to listing (the newest id).                               *)
+(*    ManifestReader.loadLatestFrom(k), for a manifest k whose commit was  *)
+(*    reported (the writer's last flush, which a reader learns from the    *)
+(*    writer's probe, D67): probe forward from k when it is stored and     *)
+(*    above the boundary, otherwise loadLatest.                            *)
 (*  - lsm-core/src/manifest.ts fenceWriter, fenceCompactor, commitL0Flush  *)
 (*    (writer epoch check, idempotent retry), commitCompaction (compactor  *)
 (*    epoch check, inputs-present check).                                  *)
@@ -41,13 +45,15 @@
 (*   "blindCreate"        create overwrites instead of If-None-Match: *    *)
 (*   "noBoundaryReread"   create trusts putIfAbsent alone (WithGc)         *)
 (*   "hintOnlyProbe"      loadLatest probes from the hint alone (WithGc)   *)
+(*   "knownIgnoresBoundary" loadLatestFrom probes from any stored known    *)
+(*                        manifest, even at or below the boundary (WithGc) *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets, TLC
 
 CONSTANTS Writers, Compactors, JobsPerCompactor, MaxId, MaxFlushes, WithGc, Broken
 
 ASSUME Broken \in {"none", "noWriterEpochCheck", "noInputsCheck", "blindCreate",
-                   "noBoundaryReread", "hintOnlyProbe"}
+                   "noBoundaryReread", "hintOnlyProbe", "knownIgnoresBoundary"}
 ASSUME WithGc \in BOOLEAN
 
 Ids == 1 .. MaxId
@@ -94,6 +100,14 @@ ProbeFrom(s) == CHOOSE i \in s .. MaxId :
                   /\ \A k \in s .. i : Exists(k)
                   /\ (i = MaxId \/ ~Exists(i + 1))
 LoadLatest == IF Exists(Start) THEN ProbeFrom(Start) ELSE Head
+
+\* ManifestReader.loadLatestFrom(k): the boundary, k, and k + 1 are read together. Above the
+\* boundary nothing is deleted and ids are contiguous up to the newest, so a stored k there is a
+\* sound place to probe from; at or below it a missing k + 1 may be a gap GC left beside a
+\* manifest a checkpoint keeps, so the reader starts over with loadLatest.
+LoadLatestFrom(k) ==
+  IF Exists(k) /\ (k > boundary \/ Broken = "knownIgnoresBoundary")
+  THEN ProbeFrom(k) ELSE LoadLatest
 
 Init ==
   /\ store = [i \in Ids |-> IF i = 1 THEN Empty ELSE NoManifest]
@@ -388,6 +402,10 @@ AckedDataVisible == acked \subseteq Data(store[Head])
 
 \* loadLatest finds the newest manifest, however far the hint lags or which manifests GC deleted.
 LoadFindsHead == LoadLatest = Head
+
+\* loadLatestFrom finds the newest manifest from any manifest a committer was told it committed,
+\* however long ago, whatever was committed after it and whichever manifests GC deleted.
+LoadFromKnownFindsHead == \A k \in reported : LoadLatestFrom(k) = Head
 
 \* Compactions never duplicate data into both L0 and the sorted run (inputs are replaced exactly).
 NoDoubleReference == \A s \in store[Head].l0 : sstData[s] \cap UNION {sstData[r] : r \in store[Head].runs} = {}

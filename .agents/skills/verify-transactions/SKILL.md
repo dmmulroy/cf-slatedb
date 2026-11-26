@@ -83,6 +83,12 @@ deletes rows. `writer.workerd.ts` refuses write skew through the public API.
 
 ## Maintenance notes
 
+- D67 (v1 workstream 10): `ReadView` gained `freshness` and `manifestHint`. `DbClient.getAt` and
+  `scanAt` set `freshness: "Recent"` with no hint on every path (pinned and unpinned), so
+  transaction reads find their manifest exactly as before: the pinned begin manifest, or for old
+  callers the refresh-interval manifest with the `maxLastL0Seq` check. `commitTransaction` and
+  `writtenAfter` are unchanged. No model step changed; reran, all broken variants still fail.
+
 - D58 (v1 workstream 4): the model now has the retained horizon, trims, and reads from the begin
   manifest plus rows above the horizon; `noFlushCheck` became `trimWithoutAbort`, and
   `noReadHorizonCheck` is new. Supersedes the D50 notes below.
@@ -93,7 +99,7 @@ deletes rows. `writer.workerd.ts` refuses write skew through the public API.
 
 ## Keeping it in step with the code
 
-Sync commit: the v1 workstream 4 commit (`transactions exact across flushes`, D58). When a covered function changes after it, update the model
+Sync commit: the D67 commit (`perf(read)`: the covering manifest cache, `loadLatestFrom`, read-ahead, 16 KiB blocks). When a covered function changes after it, update the model
 so each action is still one awaited effect in the code, rerun, and show each invariant still fails on
 a broken variant before moving the sync commit. For drift that skipped this skill, use
 `.agents/skills/maintain-formal-verification-skill/SKILL.md`.

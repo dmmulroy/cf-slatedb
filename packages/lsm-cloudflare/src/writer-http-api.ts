@@ -38,6 +38,7 @@ export const ProbeResponse = Schema.Struct({
   versions: Schema.Array(RowSchema),
   snapshotSeq: SeqNum,
   flushedSeq: SeqNum,
+  flushedManifestId: Schema.OptionFromOptionalKey(ManifestId),
   sealedSuccessors: Schema.OptionFromNullOr(Schema.Array(DatabaseId)),
 });
 
@@ -68,6 +69,7 @@ export const MemTableScanResponse = Schema.Struct({
   snapshotSeq: SeqNum,
   flushedSeq: SeqNum,
   retainedFromSeq: SeqNum,
+  flushedManifestId: Schema.OptionFromOptionalKey(ManifestId),
   sealedSuccessors: Schema.OptionFromNullOr(Schema.Array(DatabaseId)),
   nextCursor: Schema.OptionFromNullOr(MemTableCursorSchema),
 });

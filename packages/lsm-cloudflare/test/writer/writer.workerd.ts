@@ -3,7 +3,7 @@ import { DatabaseId, FULL_KEY_RANGE, type ReadConsistency } from "@shaledb/lsm-c
 import * as Test from "@alchemy.run/test/Vitest";
 import { expect } from "@effect/vitest";
 import { Effect, Option, Schedule } from "effect";
-import { HttpClient } from "effect/http";
+import { HttpClient, HttpClientRequest } from "effect/http";
 import { HttpApiClient } from "effect/http-api";
 
 import { DbHttpApi } from "../../src/db-http-api.ts";
@@ -117,6 +117,44 @@ test.provider(
         client.databases.write({ params: { databaseId }, payload: { operations: [] } }),
       );
       expect(invalid._tag === "BatchInvalidPublicError" && invalid.details.reason).toBe("Empty");
+
+      // A request the endpoint's schemas refuse is the caller's mistake: `InvalidRequest` (400) in
+      // the public error envelope, naming the malformed part, never an internal failure.
+      const http = yield* HttpClient.HttpClient;
+      const refused = (body: string, contentType: string) =>
+        http
+          .execute(
+            HttpClientRequest.post(`${workerUrl(deployed.url)}/v1/databases`).pipe(
+              HttpClientRequest.bodyText(body, contentType),
+            ),
+          )
+          .pipe(
+            Effect.flatMap((response) =>
+              Effect.map(response.json, (json) => ({
+                status: response.status,
+                requestId: response.headers["x-request-id"],
+                json,
+              })),
+            ),
+          );
+      for (const [body, contentType, expectedInMessage] of [
+        ["{", "application/json", "body"],
+        ['{"keyRange":null}', "application/json", "databaseId"],
+        ['{"databaseId":"not a valid id!"}', "application/json", "body"],
+        ["", "application/json", "body"],
+        ["databaseId=orders", "text/plain", "content type"],
+      ] as const) {
+        const answer = yield* refused(body, contentType);
+        expect(answer.status, body).toBe(400);
+        expect(answer.json, body).toMatchObject({
+          _tag: "InvalidRequestPublicError",
+          code: "InvalidRequest",
+          details: { method: "POST", path: "/v1/databases" },
+          requestId: answer.requestId,
+          retryable: false,
+        });
+        expect(JSON.stringify(answer.json), body).toContain(expectedInMessage);
+      }
 
       // Reads run in the API Worker and fetch blocks from the BlockServer over its binding.
       const read = (key: string, consistency: ReadConsistency) =>

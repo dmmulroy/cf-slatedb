@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { DatabaseId } from "@shaledb/lsm-core";
 import { DbHttpApi, GcHttpApi } from "@shaledb/lsm-cloudflare";
 import { ShardedHttpApi, ShardGroup } from "@shaledb/sharding";
-import { Clock, Context, Data, Effect, Option, Schema } from "effect";
+import { Clock, Context, Data, Effect, Option, Schedule, Schema } from "effect";
 import { Base64 } from "effect/encoding";
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 import { HttpApiClient } from "effect/http-api";
@@ -207,7 +207,7 @@ const InvocationRecord = Schema.Struct({
   cpuTimeMs: Schema.Number,
   wallTimeMs: Schema.Number,
 });
-type InvocationRecord = typeof InvocationRecord.Type;
+export type InvocationRecord = typeof InvocationRecord.Type;
 
 const TailPage = Schema.Struct({
   batches: Schema.Array(Schema.Struct({ key: Schema.String, body: Schema.String })),
@@ -225,17 +225,29 @@ const decodeRecords = Schema.decodeUnknownEffect(
  * @returns The records, or `MeasurementError` when the collector cannot be read or a stored record
  *   does not decode.
  */
-export const readInvocationRecords = (sinceMs: number) =>
+/** Where a tail-record listing starts so that it covers `sinceMs` (keys start with arrival time). */
+export const tailCursorAt = (sinceMs: number) =>
+  `tails/${(sinceMs - 1).toString().padStart(15, "0")}`;
+
+/**
+ * Reads the Tail Worker's invocation records after `after` (a tail key, see {@link tailCursorAt}),
+ * a page at a time, passing each page to `onRecords`. Each page is retried a few times, so one
+ * failed request does not lose a long read.
+ *
+ * @returns The key to continue from next time, or `MeasurementError`.
+ */
+export const forEachInvocationRecord = (
+  after: string,
+  onRecords: (records: ReadonlyArray<InvocationRecord>) => void,
+) =>
   Effect.gen(function* () {
     const collector = yield* MeasurementCollector;
     const client = yield* HttpClient.HttpClient;
-    // Keys start with the arrival time, so the listing can start just before `sinceMs`.
-    let after = Option.some(`tails/${(sinceMs - 1).toString().padStart(15, "0")}`);
-    const records: Array<InvocationRecord> = [];
+    let cursor = after;
     while (true) {
       const url = new URL("/v1/tails/batches", collector.url);
-      url.searchParams.set("limit", "100");
-      if (Option.isSome(after)) url.searchParams.set("after", after.value);
+      url.searchParams.set("limit", "500");
+      url.searchParams.set("after", cursor);
       const page = yield* client
         .execute(
           HttpClientRequest.get(url.toString()).pipe(
@@ -245,23 +257,35 @@ export const readInvocationRecords = (sinceMs: number) =>
         .pipe(
           Effect.flatMap((response) => response.json),
           Effect.flatMap(decodeTailPage),
+          Effect.timeout("60 seconds"),
+          Effect.retry({ times: 4, schedule: Schedule.exponential("500 millis") }),
           Effect.mapError(failed("read tail records")),
         );
       for (const batch of page.batches) {
         const body = Base64.decode(batch.body);
         if (body._tag === "Failure") continue;
-        records.push(
-          ...(yield* decodeRecords(new TextDecoder().decode(body.success)).pipe(
+        onRecords(
+          yield* decodeRecords(new TextDecoder().decode(body.success)).pipe(
             Effect.mapError(failed("decode tail records")),
-          )),
+          ),
         );
       }
-      if (page.next !== null) after = Option.some(page.next);
+      if (page.next !== null) cursor = page.next;
       if (!page.more || page.batches.length === 0) break;
     }
-    return records;
+    return cursor;
     // Its own client: the stage's HTTP client carries the access token, not the collector's.
   }).pipe(Effect.provide(FetchHttpClient.layer));
+
+/** Every invocation record since `sinceMs` (see {@link forEachInvocationRecord}). */
+export const readInvocationRecords = (sinceMs: number) =>
+  Effect.gen(function* () {
+    const records: Array<InvocationRecord> = [];
+    yield* forEachInvocationRecord(tailCursorAt(sinceMs), (page) => {
+      records.push(...page);
+    });
+    return records;
+  });
 
 const TRACE_CLI = fileURLToPath(new URL("../../trace-cli/src/trace-cli.ts", import.meta.url));
 

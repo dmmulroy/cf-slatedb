@@ -1451,6 +1451,116 @@ Durable Object, where requests share one context.
 block, which must complete within a second. It fails on the previous code and passes now. The old
 test that asserted joining was replaced by one asserting that a block, once read, is kept.
 
+## D67. A read the writer answered uses any manifest holding its flushed rows; scans read ahead; 16 KiB blocks
+
+**What the soak's spans showed** (`preview-3`, 100% sampling, a 5-minute soak): 82% of gets
+reloaded the manifest, two R2 round trips of about 90 ms together, because a reader's cached
+manifest was only good for `manifestRefreshInterval` (1 s) and most isolates see a database less
+often than that. A get took 124 ms at p50. Scans waited on one block read at a time.
+
+**A read that asked the writer needs no fresh manifest.** A `Latest` read's probe returns the
+writer's `flushedSeq`. Any manifest with `lastL0Seq >= flushedSeq` holds every flushed row; later
+manifests differ only by compactions, collections, and checkpoints, which change no row a read
+resolves. So such a read (`ReadView.freshness: "Covering"`) takes the cached manifest whenever it
+covers `flushedSeq`, however long ago it was refreshed (`ManifestCache.covering`). The cache
+follows the writer's flushes: the first read after one finds the cached manifest too old and
+loads.
+
+- **How long a manifest is held.** A cached manifest was the newest when its load began, and is
+  read for at most half of `gcMinAge` after that (30 minutes in production). GC keeps the SSTs of a
+  manifest for `gcMinAge` after it is superseded (D29), so everything it names is still stored, with
+  the other half of `gcMinAge` to spare for the read itself. This is inside `GcSafety.tla`'s
+  `MayBeHeld`.
+- **A hit vouches for the manifest.** The writer has just said the cached manifest holds every
+  flushed row, so the cache records that (`confirmedAt`), and `Flushed` reads in the same isolate
+  use it for another `manifestRefreshInterval` without loading.
+- **`AtLeast` keeps its bound.** An `AtLeast` read skips the writer only when the manifest a
+  `Flushed` read would use right now, without loading one, already covers its sequence number
+  (`ManifestCache.recent`). Otherwise it asks the writer, as a `Latest` read does. Before, it
+  loaded a manifest to find out (about 90 ms on most reads); a probe costs about 10 ms and returns
+  the newest data. Served without the writer, it is exactly as old as a `Flushed` read may be, as
+  design §4 says.
+- **`Flushed` reads, snapshots, and transaction reads are unchanged** (`freshness: "Recent"`, or
+  a pinned manifest).
+- **A missing SST drops the cached manifest.** A reader that finds an SST of its manifest gone
+  forgets the manifest (`ManifestCache.forget`) before failing with the retryable
+  `StorageUnavailable`, so the retry loads the newest. Nothing above should let this happen; it
+  makes the error's "retry the read" true if something does.
+
+**The writer says where to look.** The probe and the memtable scan return `flushedManifestId`,
+the manifest the writer's last flush committed (an optional field on the internal writer API, so
+an older writer decodes as none). On a miss the reader calls `ManifestReader.loadLatestFrom`: it
+reads GC's manifest boundary, that manifest, and the id after it together, and probes forward
+while a next id exists. When the flush's manifest is still the newest, that is one round trip
+instead of `loadLatest`'s two or three. At or below the boundary, or no longer stored, it falls
+back to `loadLatest`.
+
+**Found in review, before this was committed.** The first version loaded the hinted manifest
+itself and cached it for half of `gcMinAge`, and let an `AtLeast` read use any cached manifest
+that young. Both were wrong, and the soak could not have shown either: it writes constantly, and
+its `AtLeast` reads carry a receipt just issued.
+
+- **The hinted manifest is usually not the newest.** A compaction supersedes a flush's manifest
+  within seconds. A database written, compacted, and then idle would hand a new isolate that
+  manifest up to an hour after it was superseded, and the isolate would keep reading it for
+  another 30 minutes while GC deleted its SSTs: retryable failures that no retry fixes. The
+  safety argument needs "newest when loaded", so the hint is only where the search starts.
+- **`AtLeast` could be 30 minutes stale.** A receipt from long ago is covered by any cached
+  manifest, so the read would have skipped both the writer and every flush since.
+
+**Reads open their SSTs together.**
+
+- **Point reads** fetch the metadata (index and Bloom filter) of every SST that may hold the key
+  at once, before checking any filter. A cold isolate otherwise waited on one metadata read per
+  SST in turn.
+- **Scans** fetch the metadata of every overlapping SST at once, and the merge pulls every
+  input's first chunk concurrently (`mergeRowStreams`). The heap still breaks ties by input
+  position, so the output is the same.
+- **Scans read ahead** `SCAN_READ_AHEAD_BLOCKS` (8) blocks per SST while the merge consumes it.
+  The merge pulls one source at a time, so without read-ahead a scan waited on one block at a
+  time. A short scan wastes at most that many reads per SST.
+
+**Blocks are 16 KiB** (`blockSize` default, from 4 KiB). Each block a scan or a compaction reads
+is one request, and a point read fetches one block whatever its size. Larger blocks cut a scan's
+block reads about threefold (p50 16 → 6 on the same workload) at no cost to gets. Readers follow
+each SST's own index, so SSTs written with another block size stay readable; nothing is rewritten.
+
+**The trace collector serves pages of 500 exports** (from 100), and the measurement tools read
+tail records in pages of 500 with retries, so a busy stage's telemetry can be read back as fast
+as it arrives.
+
+**Model.**
+
+- `NoAckedWriteLost.tla` already lets a `Latest` read use any manifest with `lastL0Seq >=
+  flushedSeq` (`ReadManifest`); `LatestSeesAcked` covers the covering cache as it is.
+- `GcSafety.tla`'s `MayBeHeld` (the newest manifest, or one superseded less than `gcMinAge` ago)
+  covers the hold. No step changed.
+- `ManifestCasFencing.tla` gained `LoadLatestFrom(k)` and the invariant `LoadFromKnownFindsHead`:
+  from any manifest a commit was reported at, the reader finds the newest, whatever was committed
+  since and whichever manifests GC deleted. The new broken variant `knownIgnoresBoundary` (probe
+  from the known manifest even at or below the boundary) fails it: a checkpoint keeps the known
+  manifest while GC deletes its successor. `vp run verify` is now 27 runs.
+- `Transactions.tla`: transaction reads keep `Recent` or a pinned manifest. No step changed.
+
+**Tests** (`manifest-store.test.ts`, `db-client.test.ts`; each mutation below fails one):
+
+- A covering read is served from the cache past the refresh interval, never from a manifest
+  missing flushed rows, and never past half of `gcMinAge`.
+- From the writer's last flush the newest manifest is loaded, never that flush's superseded
+  manifest; a stale `LATEST` hint is not read; a collected, pinned-below-the-boundary, or
+  never-written known manifest still finds the newest.
+- A covering hit lets `Flushed` reads use the manifest for one more refresh interval, not longer,
+  and not past the hold.
+- An `AtLeast` read skips the writer within the refresh interval and asks it afterwards.
+- A read that finds an SST missing fails once, and its retry succeeds.
+- Mutations caught: returning the known manifest without probing forward; ignoring the boundary;
+  ignoring `flushedSeq`; ignoring the hold in `covering` or in `recent`; holding for all of
+  `gcMinAge`; `recent` ignoring the refresh interval; a hit that does not vouch; no `forget`;
+  `AtLeast` never or always skipping the writer. One is not caught, by design: removing the
+  reader's own check that the manifest covers the view, which `covering` already guarantees.
+
+**Measured** on `preview-3`, server-side spans: see `docs/measurements.md` ("Read latency").
+
 ## D68. The project is named shaledb
 
 Dillon renamed the project from cf-slatedb to **shaledb**.
@@ -1468,3 +1578,26 @@ Alchemy keys state by Stack name, so the next deploy of each preview created a n
 stack with new resources. The old `CfSlatedb/<stage>` previews and their Secrets Store secrets
 remain until Dillon destroys them from a checkout before the rename (`docs/progress.md`). Nothing
 was deployed to production under either name.
+
+## D69. A request the endpoint's schemas refuse is `InvalidRequest` (400)
+
+A body that was not JSON, lacked a required field, or held an id the schema refuses came back as
+`InternalFailure` (500). Effect's `HttpApiBuilder` raises a request that fails its endpoint's
+schemas as a defect (`HttpApiSchemaError`), and the request middleware turned every defect into a 500. A content type no endpoint accepts was answered by the builder itself, in plain text with
+415, outside the error envelope.
+
+- **Request decoding failures** (`Params`, `Headers`, `Query`, `Payload`) are now
+  `InvalidRequest` (400), already declared for every endpoint. The message names the part and
+  repeats the schema's issue on one line, capped at 300 characters ("Missing key at
+  ["databaseId"]"). The issue describes the caller's own request and goes only to the caller; it
+  is neither logged nor put on a span.
+- **Response encoding failures** (`Body`, `ResponseHeaders`) are our fault and stay
+  `InternalFailure`, logged.
+- **An unaccepted content type** is `InvalidRequest` too, telling the caller to send JSON.
+
+Test: `writer.workerd.ts` sends five malformed creates through the real Worker and expects the
+envelope with status 400, the request id of the `x-request-id` header, and the part named.
+
+**Also.** `DbWriter.ensureReady` answers from memory once the writer is ready, so a
+`DbWriter.start` span now means an actual start (a fence-in), not every request. The scenario
+runner reports what caused a failed request (the `cause` chain of a transport error).

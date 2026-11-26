@@ -90,7 +90,10 @@ const lsmSettingsCombinationIssues = (settings: LsmSettingsFields) =>
  *
  * **Details**
  *
- * - `blockSize`: target data block size.
+ * - `blockSize`: target data block size. 16 KiB: each block a scan or compaction reads is one
+ *   request, and a point read fetches one block whatever its size, so larger blocks cut a scan's
+ *   requests fourfold against 4 KiB at no cost to gets (D67). Readers follow each SST's own index,
+ *   so SSTs written with another size stay readable.
  * - `filterBitsPerKey`, `minFilterKeys`: Bloom filter sizing; SSTs with fewer distinct keys get none.
  * - `l0SstSize`: flush once the memtable holds this many bytes (8–16 MiB for hot databases).
  * - `maxL0Age`: flush once the oldest unflushed write is this old; bounds how long data lives only
@@ -131,7 +134,7 @@ const MiB = 1024 * 1024;
 
 /** Default settings (design §11: 64 MiB L0, 256 MiB backpressure; SlateDB's compaction defaults). */
 export const DEFAULT_LSM_SETTINGS: LsmSettings = {
-  blockSize: 4096,
+  blockSize: 16_384,
   filterBitsPerKey: 10,
   minFilterKeys: 0,
   l0SstSize: 64 * MiB,

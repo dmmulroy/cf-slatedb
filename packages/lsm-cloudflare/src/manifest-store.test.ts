@@ -265,6 +265,143 @@ describe("ManifestStore", () => {
     expect(ids).toEqual([1, 1, 2]);
   });
 
+  /** Runs against a cache with a 1 s refresh interval and a 60 s `gcMinAge` (held for 30 s). */
+  const runWithCache = <A, E>(
+    effect: Effect.Effect<
+      A,
+      E,
+      ManifestCache | ManifestStore | ManifestReader | ObjectStore | RuntimeContext
+    >,
+  ) =>
+    effect.pipe(
+      Effect.provide(
+        manifestCacheLayerWithoutDependencies.pipe(
+          Layer.provideMerge(manifestStoreTestLayer),
+          Layer.provide(
+            lsmConfigurationTestLayer({ manifestRefreshInterval: 1000, gcMinAge: 60_000 }),
+          ),
+        ),
+      ),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.provide(TestClock.layer()),
+      Effect.runPromise,
+    );
+
+  it("serves a covering manifest from cache past the refresh interval, never one missing flushed rows, and never past half of gcMinAge (D67)", async () => {
+    const outcome = await runWithCache(
+      Effect.gen(function* () {
+        yield* initialize;
+        const cache = yield* ManifestCache;
+        const store = yield* ManifestStore;
+        const first = yield* cache.current(DB);
+        yield* TestClock.adjust("5 seconds");
+        // A commit that flushes nothing (a compaction): the cached manifest still holds every
+        // flushed row, so a read the writer told `flushedSeq` 0 needs no load.
+        yield* store.update(DB, fenceWriter);
+        const covered = yield* cache.covering(DB, 0, Option.none());
+        // A flush commits manifest 3 with lastL0Seq 1: a read needing it must not get manifest 1.
+        yield* store.update(DB, flushEdit(1, WriterEpoch.make(1)));
+        const needsFlush = yield* cache.covering(DB, 1, Option.none());
+        // Another commit, 29 s later: still served from the cache.
+        yield* store.update(DB, fenceWriter);
+        yield* TestClock.adjust("29 seconds");
+        const stillHeld = yield* cache.covering(DB, 1, Option.none());
+        // Half of gcMinAge after its load, the manifest's SSTs may be collected: load again,
+        // however recently the writer vouched for it.
+        yield* TestClock.adjust("1 second");
+        const tooOld = yield* cache.covering(DB, 1, Option.none());
+        return [first.id, covered.id, needsFlush.id, stillHeld.id, tooOld.id];
+      }),
+    );
+    expect(outcome).toEqual([1, 1, 3, 3, 4]);
+  });
+
+  it("loads the newest manifest from the writer's last flush, never that flush's superseded manifest (D67)", async () => {
+    const outcome = await runWithCache(
+      Effect.gen(function* () {
+        yield* initialize;
+        const cache = yield* ManifestCache;
+        const store = yield* ManifestStore;
+        const reader = yield* ManifestReader;
+        const objects = yield* ObjectStore;
+        // The writer's last flush committed manifest 2; it is still the newest.
+        yield* store.update(DB, flushEdit(1, WriterEpoch.make(0)));
+        const newest = yield* cache.covering(DB, 1, Option.some(ManifestId.make(2)));
+        // A stale LATEST hint is never read when the known manifest is usable.
+        yield* objects.put(latestManifestKey(DB), new TextEncoder().encode("1"));
+        // Two compactions supersede it. A reader must hold only a manifest that was the newest
+        // when it loaded it (GC keeps its SSTs for gcMinAge after that), so manifest 2, though it
+        // holds every flushed row, is not the answer.
+        yield* store.update(DB, fenceWriter);
+        yield* store.update(DB, fenceWriter);
+        yield* TestClock.adjust("31 seconds");
+        const superseded = yield* cache.covering(DB, 1, Option.some(ManifestId.make(2)));
+        // GC collected the flush's manifest and its successor: found from the boundary instead.
+        yield* store.advanceManifestBoundary(DB, ManifestId.make(3));
+        yield* objects.delete([
+          manifestKey(DB, ManifestId.make(2)),
+          manifestKey(DB, ManifestId.make(3)),
+        ]);
+        const collected = yield* reader.loadLatestFrom(DB, ManifestId.make(2));
+        // A checkpoint kept the flush's manifest while GC deleted its successor: the missing
+        // successor is a gap, not the end.
+        yield* objects.put(
+          manifestKey(DB, ManifestId.make(2)),
+          Option.getOrThrow(yield* objects.get(manifestKey(DB, ManifestId.make(4)))),
+        );
+        const pinnedBelowBoundary = yield* reader.loadLatestFrom(DB, ManifestId.make(2));
+        // A manifest id that was never written (a writer on another database's state).
+        const unknown = yield* reader.loadLatestFrom(DB, ManifestId.make(9));
+        return [newest.id, superseded.id, collected.id, pinnedBelowBoundary.id, unknown.id];
+      }),
+    );
+    expect(outcome).toEqual([2, 4, 4, 4, 4]);
+  });
+
+  it("a covering hit vouches for the cached manifest: Flushed reads use it for another refresh interval, not longer (D67)", async () => {
+    const outcome = await runWithCache(
+      Effect.gen(function* () {
+        yield* initialize;
+        const cache = yield* ManifestCache;
+        const store = yield* ManifestStore;
+        const first = yield* cache.current(DB);
+        yield* TestClock.adjust("5 seconds");
+        // Past the refresh interval nothing vouches for it.
+        const unconfirmed = yield* cache.recent(DB);
+        // The writer says nothing was flushed past what it holds.
+        yield* cache.covering(DB, first.manifest.lastL0Seq, Option.none());
+        const confirmed = yield* cache.recent(DB);
+        // A flush the cache has not seen: within the interval `current` may predate it...
+        yield* store.update(DB, flushEdit(1, WriterEpoch.make(0)));
+        const within = yield* cache.current(DB);
+        // ...and after it, with no newer word from the writer, it loads.
+        yield* TestClock.adjust("1 second");
+        const lapsed = yield* cache.recent(DB);
+        const after = yield* cache.current(DB);
+        // A manifest held to half of gcMinAge is not served however recently it was vouched for.
+        yield* TestClock.adjust("29500 millis");
+        yield* cache.covering(DB, 1, Option.none());
+        const vouched = yield* cache.recent(DB);
+        yield* TestClock.adjust("500 millis");
+        const pastHold = yield* cache.recent(DB);
+        // Forgetting drops it at once.
+        yield* cache.refresh(DB);
+        yield* cache.forget(DB);
+        const forgotten = yield* cache.recent(DB);
+        return {
+          ids: [first.id, within.id, after.id],
+          cached: [unconfirmed, confirmed, lapsed, vouched, pastHold, forgotten].map((manifest) =>
+            Option.getOrElse(
+              Option.map(manifest, (versioned): number => versioned.id),
+              () => 0,
+            ),
+          ),
+        };
+      }),
+    );
+    expect(outcome).toEqual({ ids: [1, 1, 2], cached: [0, 1, 0, 2, 0, 0] });
+  });
+
   it("refuses to read, or write over, a manifest a newer format wrote (D64)", async () => {
     const outcome = await run(
       Effect.gen(function* () {

@@ -288,6 +288,8 @@ const FLUSHED_VIEW: ReadView = {
   memtable: [],
   manifestId: Option.none(),
   maxLastL0Seq: Option.none(),
+  freshness: "Recent",
+  manifestHint: Option.none(),
 };
 
 /** Constructs the client over the contextual writer client and reader. */
@@ -301,14 +303,24 @@ export const makeDbClient = Effect.gen(function* () {
     memtable: [],
     manifestId: Option.some(snapshot.manifestId),
     maxLastL0Seq: Option.none(),
+    freshness: "Recent",
+    manifestHint: Option.none(),
   });
 
-  /** Whether an `AtLeast` read can skip the writer: the cached manifest already covers `seq`. */
+  /**
+   * Whether a read can skip the writer: a `Flushed` read always; an `AtLeast` read when the
+   * manifest a `Flushed` read would use right now, without loading one, already covers its `seq`.
+   *
+   * **Details**
+   *
+   * Otherwise the `AtLeast` read asks the writer, as a `Latest` read does. That costs one probe
+   * (about 10 ms) and returns the newest data, where loading a manifest only to find out whether
+   * it covers `seq` cost two R2 round trips on most reads (D67).
+   */
   const coveredByManifest = (databaseId: DatabaseId, consistency: ReadConsistency) =>
     consistency._tag === "AtLeast"
-      ? Effect.map(
-          reader.currentManifest(databaseId),
-          (current) => current.manifest.lastL0Seq >= consistency.seq,
+      ? Effect.map(reader.recentManifest(databaseId), (recent) =>
+          Option.exists(recent, (current) => current.manifest.lastL0Seq >= consistency.seq),
         )
       : Effect.succeed(consistency._tag === "Flushed");
 
@@ -344,6 +356,9 @@ export const makeDbClient = Effect.gen(function* () {
         memtable: probe.versions,
         manifestId: Option.none(),
         maxLastL0Seq: Option.none(),
+        // The writer said which rows are flushed: any cached manifest holding them will do (D67).
+        freshness: "Covering",
+        manifestHint: probe.flushedManifestId,
       } satisfies ReadView;
     });
 
@@ -360,6 +375,7 @@ export const makeDbClient = Effect.gen(function* () {
       let cursor = Option.none<MemTableCursor>();
       let snapshotSeq = Option.none<SeqNum>();
       let flushedSeq = SeqNum.make(0);
+      let manifestHint = Option.none<ManifestId>();
       for (;;) {
         const page = yield* writer.scan(databaseId, {
           range,
@@ -371,7 +387,10 @@ export const makeDbClient = Effect.gen(function* () {
         yield* refuseIfSealed(databaseId, options, page.sealedSuccessors);
         rows.push(...page.rows);
         snapshotSeq = Option.some(page.snapshotSeq);
-        if (page.flushedSeq > flushedSeq) flushedSeq = page.flushedSeq;
+        if (page.flushedSeq > flushedSeq) {
+          flushedSeq = page.flushedSeq;
+          manifestHint = page.flushedManifestId;
+        }
         if (Option.isNone(page.nextCursor)) break;
         cursor = page.nextCursor;
       }
@@ -381,6 +400,9 @@ export const makeDbClient = Effect.gen(function* () {
         memtable: rows,
         manifestId: Option.none(),
         maxLastL0Seq: Option.none(),
+        // The writer said which rows are flushed: any cached manifest holding them will do (D67).
+        freshness: "Covering",
+        manifestHint,
       } satisfies ReadView;
     });
 
@@ -458,6 +480,8 @@ export const makeDbClient = Effect.gen(function* () {
           memtable: kept.versions,
           manifestId,
           maxLastL0Seq: Option.some(readSeq),
+          freshness: "Recent",
+          manifestHint: Option.none(),
         })
         .pipe(Effect.catchTags(expiredIsTooOld(databaseId, readSeq)));
     }
@@ -469,6 +493,8 @@ export const makeDbClient = Effect.gen(function* () {
       memtable: probe.versions.filter((row) => row.seq <= readSeq),
       manifestId: Option.none(),
       maxLastL0Seq: Option.some(readSeq),
+      freshness: "Recent",
+      manifestHint: Option.none(),
     };
     return yield* reader
       .getRow(databaseId, key, view)
@@ -511,6 +537,8 @@ export const makeDbClient = Effect.gen(function* () {
       memtable: rows,
       manifestId,
       maxLastL0Seq: Option.some(readSeq),
+      freshness: "Recent",
+      manifestHint: Option.none(),
     };
     return yield* Stream.runCollect(
       reader.scan(databaseId, range, view, { limit: Option.some(limit) }),

@@ -83,6 +83,18 @@ moment ago counted as old and its SSTs could be deleted under a reader. `ownUplo
 
 ## Maintenance notes
 
+- D67 (v1 workstream 10): a reader now holds a cached manifest for up to half of `gcMinAge`
+  after loading it (`ManifestCache.covering`), where it used to hold one for
+  `manifestRefreshInterval`. The manifest was the newest when its load began
+  (`loadLatest`/`loadLatestFrom` always return the newest; `verify-manifest-cas-fencing` checks
+  both), so it is read less than `gcMinAge` after it was superseded: inside `MayBeHeld`. `collect`
+  and the planning functions are unchanged, so no model step changed. Two things keep the bound
+  true in the code, each with a test that fails without it (`manifest-store.test.ts`): the hold is
+  measured from the load's start and capped at half of `gcMinAge`, and a manifest the writer
+  merely names (its last flush) is never cached unless it is still the newest. Reads longer than
+  half of `gcMinAge`, and clock skew of that size between an isolate and the compactor, are
+  outside the model, as before. Reran; all broken variants still fail.
+
 - D62 (v1 workstream 7): an operator's repair, `dropSstFromManifest`, is a commit that removes one
   SST reference and adds none. Added as `DropSst(s)`, with the broken variant `dropDeletesObject`
   (the drop also deletes the object at once, as a naive repair would), which fails
@@ -108,7 +120,7 @@ moment ago counted as old and its SSTs could be deleted under a reader. `ownUplo
 
 ## Keeping it in step with the code
 
-Sync commit: the v1 workstream 2 commit (`fast manifest commits`, D56). When a covered function changes after it, update the model
+Sync commit: the D67 commit (`perf(read)`: the covering manifest cache, `loadLatestFrom`, read-ahead, 16 KiB blocks). When a covered function changes after it, update the model
 so each action is still one awaited effect in the code, rerun, and show each invariant still fails on
 a broken variant before moving the sync commit. For drift that skipped this skill, use
 `.agents/skills/maintain-formal-verification-skill/SKILL.md`.

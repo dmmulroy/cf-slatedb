@@ -449,7 +449,7 @@ export interface BlockRead {
  * Groups `blocks` (positions in `index`, an SST's block index, in order) into byte-range reads of at most `maxBytes`
  * each, merging only blocks that sit next to each other in the file. A block larger than `maxBytes`
  * is read alone. A compaction step reads its inputs this way so a 64 MiB input costs tens of
- * requests rather than one per 4 KiB block (a Worker invocation may make only so many, D61).
+ * requests rather than one per block (a Worker invocation may make only so many, D61).
  */
 export const groupBlockReads = (
   index: ReadonlyArray<SstIndexEntry>,

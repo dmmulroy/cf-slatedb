@@ -1,19 +1,24 @@
 import {
   DatabaseId,
   DEFAULT_DATABASE_OPTIONS,
+  dropSstFromManifest,
   FULL_KEY_RANGE,
   initialManifest,
   type ReadConsistency,
   SeqNum,
+  Timestamp,
 } from "@shaledb/lsm-core";
-import { Arbitrary, Effect, Option, Schema, Stream } from "effect";
+import { Arbitrary, Effect, Option, Result, Schema, Stream } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
 import { DbClient, dbClientTestLayer } from "./db-client.ts";
 import type { DbReaderServices } from "./db-reader.ts";
 import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
+import { ManifestReader } from "./manifest-reader.ts";
 import { ManifestStore } from "./manifest-store.ts";
+import { sstKey } from "./object-keys.ts";
+import { ObjectStore } from "./object-store.ts";
 
 const DB = DatabaseId.make("orders");
 const hex = (bytes: Uint8Array) =>
@@ -57,7 +62,13 @@ const applyToOracle = (oracle: Map<number, Uint8Array>, step: Step) => {
   }
 };
 
-const run = <A, E>(program: Effect.Effect<A, E, DbClient | ManifestStore | DbReaderServices>) =>
+const run = <A, E>(
+  program: Effect.Effect<
+    A,
+    E,
+    DbClient | ManifestStore | ManifestReader | ObjectStore | DbReaderServices
+  >,
+) =>
   program.pipe(
     Effect.scoped,
     Effect.provide(dbClientTestLayer({ blockSize: 64 })),
@@ -197,6 +208,81 @@ describe("DbClient against a Map oracle", () => {
     // AtLeast(seq) from the receipt always sees the write.
     expect(outcome.atLeast).toEqual(Option.some(Uint8Array.of(9)));
     expect(outcome.fresh).toEqual(Option.some(Uint8Array.of(9)));
+  });
+
+  it("an AtLeast read skips the writer only while a Flushed read would use the same manifest (D67)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createDatabase;
+        const client = yield* DbClient;
+        const read = (consistency: ReadConsistency) =>
+          client.get(DB, keyBytes(1), {
+            consistency,
+            snapshot: Option.none(),
+            refuseSealed: false,
+          });
+        const first = yield* client.put(DB, keyBytes(1), Uint8Array.of(1));
+        yield* client.flush(DB);
+        // A Latest read leaves the manifest holding the flush in this reader's cache.
+        yield* read({ _tag: "Latest" });
+        yield* client.put(DB, keyBytes(1), Uint8Array.of(2));
+        yield* client.flush(DB);
+        // Within the refresh interval the cached manifest covers the receipt: no writer call, so
+        // the read is as old as a Flushed read may be.
+        const within = yield* read({ _tag: "AtLeast", seq: first.seq });
+        // After it nothing vouches for the cached manifest, though it still covers the receipt
+        // and is held far longer for Latest reads: the read asks the writer.
+        yield* TestClock.adjust("2 seconds");
+        const after = yield* read({ _tag: "AtLeast", seq: first.seq });
+        return { within, after };
+      }),
+    );
+    expect(outcome.within).toEqual(Option.some(Uint8Array.of(1)));
+    expect(outcome.after).toEqual(Option.some(Uint8Array.of(2)));
+  });
+
+  it("a read that finds an SST of its cached manifest missing drops the manifest, so the retry succeeds (D67)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createDatabase;
+        const client = yield* DbClient;
+        const latest = (key: number) =>
+          client
+            .get(DB, keyBytes(key), {
+              consistency: { _tag: "Latest" },
+              snapshot: Option.none(),
+              refuseSealed: false,
+            })
+            .pipe(Effect.result);
+        // Enough rows for several 64-byte blocks, so the first read leaves most blocks unread.
+        for (let key = 1; key <= 40; key++) {
+          yield* client.put(DB, keyBytes(key), Uint8Array.of(key));
+        }
+        yield* client.flush(DB);
+        const cachedRead = yield* latest(1);
+        // The SST leaves the manifest and is deleted, as after a compaction and a collection the
+        // reader's cached manifest outlived.
+        const { manifest } = yield* (yield* ManifestReader).loadLatest(DB);
+        const [sst] = manifest.l0;
+        if (sst === undefined) return yield* Effect.die("the flush wrote no L0 SST");
+        yield* (yield* ManifestStore).update(DB, (current) =>
+          dropSstFromManifest(current, {
+            sstId: sst.id,
+            reason: "Forced",
+            droppedAt: Timestamp.make(0),
+          }),
+        );
+        yield* (yield* ObjectStore).delete([sstKey(DB, sst.id)]);
+        const missing = yield* latest(40);
+        const retried = yield* latest(40);
+        return { cachedRead, missing, retried };
+      }),
+    );
+    expect(outcome.cachedRead).toEqual(Result.succeed(Option.some(Uint8Array.of(1))));
+    expect(Result.isFailure(outcome.missing) && outcome.missing.failure._tag).toBe(
+      "ReaderUnavailableError",
+    );
+    expect(outcome.retried).toEqual(Result.succeed(Option.none()));
   });
 
   it("reads a snapshot pinned to a manifest, unaffected by later writes and flushes", async () => {

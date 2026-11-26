@@ -73,13 +73,35 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `flushedSeq`/`seq`). Tests: `db-client.test.ts` (Map-oracle property at every consistency;
   staleness bound, shown failing without the refresh), `writer.workerd.ts`. Formal:
   `NoAckedWriteLost` (`LatestSeesAcked`) (D29).
+- **A read the writer answered needs no fresh manifest (v1 workstream 10)** — done (D67).
+  - **Code.** `ManifestCache.covering` (any cached manifest holding the probe's `flushedSeq`,
+    held at most half of `gcMinAge` from its load), `recent` and `forget` (`manifest-cache.ts`);
+    `ReadView.freshness` and `manifestHint` (`db-reader.ts`); `flushedManifestId` on the writer's
+    probe and scan (`db-writer.ts`, `writer-http-api.ts`); `ManifestReader.loadLatestFrom`
+    (`manifest-reader.ts`); `DbClient.coveredByManifest` (an `AtLeast` read skips the writer only
+    while a `Flushed` read would use the same manifest).
+  - **Tests.** `manifest-store.test.ts` (served past the refresh interval, never missing flushed
+    rows, never past the hold; the newest manifest from the writer's last flush, never the
+    superseded one; a hit vouches for one refresh interval) and `db-client.test.ts` (`AtLeast`
+    within and after the interval; a missing SST drops the cached manifest and the retry
+    succeeds). Eleven mutations caught.
+  - **Formal.** `NoAckedWriteLost` (`ReadManifest` is any covering manifest), `GcSafety`
+    (`MayBeHeld`), and `ManifestCasFencing` (`LoadFromKnownFindsHead`; `knownIgnoresBoundary`
+    fails).
+  - **Live.** `docs/measurements.md` ("Read latency").
 - **SST skip by range and Bloom filter; index search; block seek** — done. `DbReader.getRow`/
   `sstVersions` (range and view skip, Bloom skip, `firstBlockForKey`, seek continuing across blocks,
-  stop at the first settled level), `DbReader.scan` (`blocksOverlappingRange`, prefetch of the next
-  block). Tests: `sst-codec.test.ts`, `db-client.test.ts`.
-- **L1 `BlockCache` (separate data and metadata caches)** — done. `block-cache.ts` (joined
-  misses, failures not cached, `cache.hit` span attribute, `lsm_block_cache_requests` metric;
-  bounded by bytes per `budgetGroup`, D51).
+  stop at the first settled level), `DbReader.scan` (`blocksOverlappingRange`). Since D67 a point
+  read fetches every candidate SST's metadata at once, a scan fetches every overlapping SST's
+  metadata at once and reads ahead `SCAN_READ_AHEAD_BLOCKS` (8) blocks per SST, and
+  `mergeRowStreams` pulls every input's first chunk concurrently. Blocks default to 16 KiB
+  (`DEFAULT_LSM_SETTINGS.blockSize`); readers follow each SST's own index. Tests:
+  `sst-codec.test.ts`, `merge-iterator.test.ts` (the merge properties), `db-client.test.ts`.
+- **L1 `BlockCache` (separate data and metadata caches)** — done. `block-cache.ts` (completed
+  values shared across requests, reads in flight never shared (D66), failures not cached,
+  `cache.hit` span attribute, `lsm_block_cache_requests` metric; bounded by bytes per
+  `budgetGroup`, D51). Test: `block-cache.test.ts` (a read that never finishes does not hold up a
+  second read of the same block).
   Trace: the repeat-read assertion (both caches hit, no `BlockServer` span).
 - **L2 Workers Cache in front of `BlockServer`; block/meta/manifest URLs; immutable headers;
   `Cache-Tag`** — done, confirmed live. `block-server-http-api.ts`,
@@ -105,7 +127,8 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   collected hinted manifest, a hint lagging below manifests GC deleted, the background hint never
   moving back). Trace: the `write-read` scenario and the Phase 5 dev check assert no
   `ObjectStore.list` on a `Flushed` read. Formal: `ManifestCasFencingGc.cfg` (`LoadFindsHead`;
-  `hintOnlyProbe` fails).
+  `hintOnlyProbe` fails). `loadLatestFrom` starts from the writer's last flush instead of the hint
+  (D67; `LoadFromKnownFindsHead`; `knownIgnoresBoundary` fails).
 - **Fast manifest commits (v1 workstream 2)** — done (D56). `ManifestStore.updateFrom` (an optimistic
   create from the committer's own view; only a written commit trusted from it), used by
   `DbWriter.flushNow` and `DbWriter.seal`; `BackgroundWork` (`background-work.ts`: Worker,
@@ -189,8 +212,10 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `ManifestReadError`, `ObjectStoreUnavailableError`, `ReaderUnavailableError`,
   `ChangelogUnavailableError`, `CheckpointNotFoundError`, compaction, GC, and budget errors. Public
   envelope: `db-public-error.ts` + the exhaustive `db-public-error-translation.ts` (D25): every
-  internal error maps to a code, message, request id, and `retryable`. Tests:
-  `writer-client.test.ts`, `writer.workerd.ts` (public errors over HTTP), each module's tests.
+  internal error maps to a code, message, request id, and `retryable`. A request its endpoint's
+  schemas refuse, or with a content type no endpoint accepts, is `InvalidRequest` (400) naming the
+  malformed part (`db-http-request.ts`, D69). Tests: `writer-client.test.ts`, `writer.workerd.ts`
+  (public errors over HTTP, five malformed requests), each module's tests.
 - **Merge operators and TTL during reads and compaction** — done. `lsm-core/src/row-resolution.ts`
   (D10, D11) and `compaction-merge.ts` (`compactRowStreams`). Tests: `row-resolution.test.ts`
   (oracle at any snapshot and time; earliest expiry; `U64Add`; `MergeOperatorMissingError`; raw
@@ -435,6 +460,12 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
     examples, scheme, headers), `manifest.test.ts` (the workstream 1 fixture),
     `manifest-store.test.ts` (newer format refused), and `compactor.test.ts` (newer state idle).
   - **Live.** Rotation on `preview-1`.
+- **Soak and production smoke test (v1 workstream 10)** — done (D65). `scenario-cli soak`
+  (`tools/scenario-cli/src/soak.ts`: writers, readers at every consistency, scanners, transactors,
+  snapshotters, a remover, a sharded group split twice, a midway redeploy; a model of every
+  acknowledged write; final reads of every key; storage, tail-record, health, and span checks) and
+  `scenario-cli smoke` (`smoke.ts`: only operations safe on a live installation, on databases it
+  removes). Live: `docs/measurements.md` ("Release soaks").
 - **Routed reads see writes across a split (stale maps)** — done (D59). `DbWriter.probe`/`scan`
   report `sealedSuccessors`; `ReadOptions.refuseSealed` (`db-client.ts`); `ShardRouter` gets route
   through `withRouting` and scans resume shard by shard (`scanFrom`). Test: `sharding.test.ts` (a

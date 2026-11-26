@@ -89,7 +89,8 @@ class CursorHeap {
  * A k-way merge over each input's `Pull` with a private binary heap. Rows with the same key and
  * sequence number are emitted once (from the earliest input): a crash between an L0 upload and the
  * memtable truncation replays such duplicates. Inputs are pulled lazily, one chunk at a time, so a
- * merge never buffers more than one chunk per input.
+ * merge never buffers more than one chunk per input; the first chunk of every input is pulled
+ * concurrently.
  *
  * @param sources - Inputs ordered newest first (memtable, then L0 newest to oldest, then sorted runs
  *   by id descending); on an exact duplicate the earliest input wins.
@@ -119,7 +120,13 @@ export const mergeRowStreams = <E, R>(
           function* () {
             if (!started) {
               started = true;
-              for (let source = 0; source < pulls.length; source++) yield* refill(source);
+              // Every input's first chunk at once: each may wait on a read, and the heap orders
+              // ties by input position, not by arrival, so the merge's output is unchanged.
+              yield* Effect.forEach(
+                pulls.map((_, source) => source),
+                refill,
+                { concurrency: "unbounded", discard: true },
+              );
             }
             const batch: Array<Row> = [];
             while (batch.length < MERGED_BATCH_SIZE) {

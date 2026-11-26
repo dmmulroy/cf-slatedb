@@ -74,6 +74,23 @@ export interface IManifestReader {
     databaseId: DatabaseId,
   ) => Effect.Effect<VersionedManifest, DatabaseNotFoundError | ManifestReadError, RuntimeContext>;
   /**
+   * Finds and reads the newest manifest starting from `knownId`, a manifest the caller knows was
+   * committed (the writer's last flush, from its probe): GC's manifest boundary, that manifest, and
+   * the id after it are read together, so when it is still the newest this is one round trip
+   * instead of `loadLatest`'s two or more (D67).
+   *
+   * **Details**
+   *
+   * Always returns the newest manifest, never just `knownId`: a compaction usually supersedes a
+   * flush's manifest within seconds, and a reader may only keep a manifest that was the newest
+   * when it loaded it (D29). When `knownId` is at or below the boundary, or no longer stored, this
+   * is `loadLatest`.
+   */
+  readonly loadLatestFrom: (
+    databaseId: DatabaseId,
+    knownId: ManifestId,
+  ) => Effect.Effect<VersionedManifest, DatabaseNotFoundError | ManifestReadError, RuntimeContext>;
+  /**
    * Reads one manifest by id, as for a checkpoint.
    *
    * @returns The manifest, none when it does not exist (never written, or collected), or
@@ -228,6 +245,28 @@ export const makeManifestReader = Effect.gen(function* () {
       message: `Database ${databaseId} does not exist. Create it before reading or writing it.`,
     });
 
+  /**
+   * The newest manifest at or after `start`, which must be stored and above GC's manifest boundary:
+   * probes one id at a time until one is missing. `next` is the already-read manifest after `start`.
+   */
+  const probeForward = Effect.fnUntraced(function* (
+    databaseId: DatabaseId,
+    start: VersionedManifest,
+    next: Option.Option<Manifest>,
+    probesSoFar: number,
+  ) {
+    let newest = start;
+    let after = next;
+    let probes = probesSoFar;
+    while (Option.isSome(after)) {
+      newest = { id: ManifestId.make(newest.id + 1), manifest: after.value };
+      after = yield* load(databaseId, ManifestId.make(newest.id + 1));
+      probes++;
+    }
+    yield* Effect.annotateCurrentSpan({ "manifest.id": newest.id, "manifest.probes": probes });
+    return newest;
+  });
+
   const loadLatest = Effect.fn("ManifestReader.loadLatest")(function* (databaseId: DatabaseId) {
     yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
     const { hintBody, boundary } = yield* Effect.all(
@@ -269,13 +308,6 @@ export const makeManifestReader = Effect.gen(function* () {
       next = yield* load(databaseId, ManifestId.make(id + 1));
       probes++;
     }
-    while (Option.isSome(next)) {
-      id = ManifestId.make(id + 1);
-      manifest = next;
-      next = yield* load(databaseId, ManifestId.make(id + 1));
-      probes++;
-    }
-    yield* Effect.annotateCurrentSpan({ "manifest.id": id, "manifest.probes": probes });
     if (Option.isNone(manifest)) {
       return yield* new ManifestReadError({
         databaseId,
@@ -284,10 +316,32 @@ export const makeManifestReader = Effect.gen(function* () {
         message: `Manifest ${id} of database ${databaseId} disappeared while it was being read. Retry the read.`,
       });
     }
-    return { id, manifest: manifest.value };
+    return yield* probeForward(databaseId, { id, manifest: manifest.value }, next, probes);
   });
 
-  return ManifestReader.of({ load, loadLatest, loadManifestBoundary });
+  const loadLatestFrom = Effect.fn("ManifestReader.loadLatestFrom")(function* (
+    databaseId: DatabaseId,
+    knownId: ManifestId,
+  ) {
+    yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
+    const { boundary, known, after } = yield* Effect.all(
+      {
+        boundary: loadManifestBoundary(databaseId),
+        known: load(databaseId, knownId),
+        after: load(databaseId, ManifestId.make(knownId + 1)),
+      },
+      { concurrency: 3 },
+    );
+    // Only ids above the boundary are contiguous up to the newest (D56): below it a missing
+    // successor may be a gap GC left, so start over from the hint and the boundary.
+    if (knownId <= boundary.id || Option.isNone(known)) {
+      yield* Effect.annotateCurrentSpan({ "manifest.known_usable": false });
+      return yield* loadLatest(databaseId);
+    }
+    return yield* probeForward(databaseId, { id: knownId, manifest: known.value }, after, 1);
+  });
+
+  return ManifestReader.of({ load, loadLatest, loadLatestFrom, loadManifestBoundary });
 });
 
 /** Provides the manifest reader, leaving the object store requirement visible. */

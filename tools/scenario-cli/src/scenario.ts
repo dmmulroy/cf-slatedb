@@ -66,8 +66,27 @@ function binaryAware(_key: string, value: unknown): unknown {
 }
 
 /**
+ * What caused `error`, innermost last: a failed request's `HttpClientError` says only "Transport
+ * error", and the reason (connection refused, reset, timed out) is in its `cause` chain.
+ */
+const describeCauses = (error: unknown): string => {
+  const causes: Array<string> = [];
+  let current: unknown = error;
+  for (let depth = 0; depth < 4; depth++) {
+    if (typeof current !== "object" || current === null || !("cause" in current)) break;
+    current = current.cause;
+    if (current instanceof Error) {
+      const code =
+        "code" in current && typeof current.code === "string" ? ` [${current.code}]` : "";
+      causes.push(`${current.name}: ${current.message}${code}`);
+    }
+  }
+  return causes.length === 0 ? "" : ` (caused by ${causes.join(" ← ")})`;
+};
+
+/**
  * Runs an effect that calls the Stack, turning any failure into a `ScenarioFailure` for `step` (a
- * typed API error becomes its tag and message).
+ * typed API error becomes its tag and message, followed by what caused it).
  */
 export const step = <A, E extends { readonly _tag: string }, R>(
   name: string,
@@ -78,7 +97,7 @@ export const step = <A, E extends { readonly _tag: string }, R>(
       (error) =>
         new ScenarioFailure({
           step: name,
-          message: `${error._tag}${"message" in error && typeof error.message === "string" ? `: ${error.message}` : ""}`,
+          message: `${error._tag}${"message" in error && typeof error.message === "string" ? `: ${error.message}` : ""}${describeCauses(error)}`,
         }),
     ),
   );

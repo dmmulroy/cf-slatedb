@@ -74,6 +74,18 @@ them. The `nonAtomicProbe` variant reproduces it.
 
 ## Maintenance notes
 
+- D67 (v1 workstream 10): the `Latest` read path now uses the reader's cached manifest whenever
+  its `lastL0Seq` is at least the probe's `flushedSeq`, however long ago it was refreshed
+  (`ManifestCache.covering`, `ReadView.freshness: "Covering"`), instead of only within
+  `manifestRefreshInterval`. That is exactly `ReadManifest`, which always chose *any* manifest with
+  `lastL0Seq >= rFs`, so no model step changed. The probe and the memtable scan also return
+  `flushedManifestId`, read in the same `consistently` block as `flushed_seq`; it only tells the
+  reader where to start looking for the newest manifest (`loadLatestFrom`, covered by
+  `verify-manifest-cas-fencing`). `AtLeast` reads that skip the writer keep the refresh-interval
+  bound and are not `Latest` reads. `DbWriter.ensureReady` answers from memory once ready (the
+  same phase it returned under the lock). Mutation caught by `manifest-store.test.ts`: a covering
+  read ignoring `flushedSeq`. Reran; all broken variants still fail.
+
 - D62 (v1 workstream 7): `Compactor.dropSst` removes one SST from the manifest at an operator's
   explicit, confirmed request, after a compaction reported it corrupted (or with `force`). Its rows
   are lost by design and the manifest records the loss (`droppedSsts`), like removal (D39); the
@@ -114,7 +126,7 @@ them. The `nonAtomicProbe` variant reproduces it.
 
 ## Keeping it in step with the code
 
-Sync commit: the v1 workstream 4 commit (`transactions exact across flushes`, D58). When a covered function changes after it, update the model so
+Sync commit: the D67 commit (`perf(read)`: the covering manifest cache, `loadLatestFrom`, read-ahead, 16 KiB blocks). When a covered function changes after it, update the model so
 each action is still one awaited effect in the code, rerun, and show each invariant still fails on a
 broken variant before moving the sync commit. For drift that skipped this skill, use
 `.agents/skills/maintain-formal-verification-skill/SKILL.md`.

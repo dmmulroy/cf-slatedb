@@ -74,6 +74,12 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
         expect: "LoadFindsHead",
         timeLimitSeconds: 60,
       },
+      {
+        config: "ManifestCasFencingGc.cfg",
+        broken: "knownIgnoresBoundary",
+        expect: "LoadFromKnownFindsHead",
+        timeLimitSeconds: 60,
+      },
     ],
   },
   {

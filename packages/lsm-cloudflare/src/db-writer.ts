@@ -72,6 +72,11 @@ export interface MemTableProbe {
    * gone from the memtable, so the reader needs a manifest with `lastL0Seq >= flushedSeq`.
    */
   readonly flushedSeq: SeqNum;
+  /**
+   * The manifest the writer's last flush committed, which covers `flushedSeq`: a reader whose cache
+   * is behind loads it directly instead of searching for the newest (D67). None before any flush.
+   */
+  readonly flushedManifestId: Option.Option<ManifestId>;
   /** The database's successors when it is sealed, so a router can tell its map is stale. */
   readonly sealedSuccessors: Option.Option<ReadonlyArray<DatabaseId>>;
 }
@@ -94,6 +99,8 @@ export interface MemTableScanPage {
   readonly flushedSeq: SeqNum;
   /** Rows at or below it are gone from SQLite (see `WriterMeta.retainedFromSeq`). */
   readonly retainedFromSeq: SeqNum;
+  /** The manifest the last flush committed (see `MemTableProbe.flushedManifestId`). */
+  readonly flushedManifestId: Option.Option<ManifestId>;
   /** The database's successors when it is sealed (see `MemTableProbe.sealedSuccessors`). */
   readonly sealedSuccessors: Option.Option<ReadonlyArray<DatabaseId>>;
   /** Where the next page starts, or none on the last page. */
@@ -343,8 +350,20 @@ export const makeDbWriter = Effect.gen(function* () {
    * Starts the writer for `databaseId` once per instance: fences in with a new writer epoch, seeds
    * the sequence oracle and clock from the manifest, and drops rows a crash left behind after their
    * flush committed.
+   *
+   * **Details**
+   *
+   * Every request calls this first. Once the writer is ready for `databaseId` it answers from
+   * memory, with no lock and no span: only an actual start is a `DbWriter.start` span.
    */
   const ensureReady = (databaseId: DatabaseId) =>
+    Effect.flatMap(Ref.get(phase), (current) =>
+      current._tag === "Ready" && current.databaseId === databaseId
+        ? Effect.succeed(current)
+        : startWriter(databaseId),
+    );
+
+  const startWriter = (databaseId: DatabaseId) =>
     initLock
       .withPermits(1)(
         Effect.gen(function* () {
@@ -771,6 +790,7 @@ export const makeDbWriter = Effect.gen(function* () {
       versions,
       snapshotSeq: meta.lastSeq,
       flushedSeq: meta.flushedSeq,
+      flushedManifestId: meta.flushedManifestId,
       sealedSuccessors: ready.sealed,
     };
   });
@@ -836,6 +856,7 @@ export const makeDbWriter = Effect.gen(function* () {
       snapshotSeq,
       flushedSeq: meta.flushedSeq,
       retainedFromSeq: meta.retainedFromSeq,
+      flushedManifestId: meta.flushedManifestId,
       sealedSuccessors: ready.sealed,
       nextCursor:
         rows.length === limit && last !== undefined

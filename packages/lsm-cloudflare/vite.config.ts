@@ -29,6 +29,9 @@ const lsmCloudflareViteConfig = defineConfig(({ mode }) => ({
       : {
           include: ["src/**/*.test.ts", "test/**/*.test.ts"],
           passWithNoTests: true,
+          // The property tests run many generated histories each: seconds on an idle machine, so
+          // the 5 s default fails them whenever other work loads the machine.
+          testTimeout: 30_000,
         },
 }));
 

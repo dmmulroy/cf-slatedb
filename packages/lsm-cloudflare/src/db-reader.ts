@@ -60,6 +60,18 @@ export interface ReadView {
    * `SnapshotExpired` instead. None: any.
    */
   readonly maxLastL0Seq: Option.Option<SeqNum>;
+  /**
+   * Which newest manifest the read accepts (D67):
+   *
+   * - `Recent`: one known to have held every flushed row within `manifestRefreshInterval`. For
+   *   reads that did not ask the writer (`Flushed`, and `AtLeast` served without it).
+   * - `Covering`: any cached one with `lastL0Seq >= minLastL0Seq`. Only for a read whose
+   *   `minLastL0Seq` is the writer's `flushedSeq`, just read from it: the writer has then said
+   *   exactly which flushed rows exist.
+   */
+  readonly freshness: "Recent" | "Covering";
+  /** The manifest the writer's last flush committed: where a `Covering` load starts looking. */
+  readonly manifestHint: Option.Option<ManifestId>;
 }
 
 /**
@@ -122,7 +134,8 @@ export interface IDbReader {
   ) => Stream.Stream<Row, DbReadError, DbReaderServices>;
   /**
    * Up to `limit` changelog rows with sequence numbers in (`afterSeq`, `upToSeq`], in sequence
-   * order, from a manifest that covers `upToSeq` (the change feed's flushed part).
+   * order, from a manifest that covers `upToSeq` (the change feed's flushed part). `upToSeq` must
+   * be the writer's `flushedSeq`, just read from it: the manifest is found as for a `Covering` view.
    */
   readonly changelogRows: (
     databaseId: DatabaseId,
@@ -130,7 +143,15 @@ export interface IDbReader {
     upToSeq: SeqNum,
     limit: number,
   ) => Effect.Effect<ReadonlyArray<Row>, DbReadError | ChangelogUnavailableError, DbReaderServices>;
-  /** The manifest a `Flushed` read at this moment would use (for snapshots and `AtLeast`). */
+  /**
+   * The manifest a `Flushed` read at this moment would use without loading one, if any; no I/O.
+   * Lets an `AtLeast` read skip the writer when that manifest already covers its sequence number,
+   * and ask the writer (cheaper than loading a manifest to find out) when it does not (D67).
+   */
+  readonly recentManifest: (
+    databaseId: DatabaseId,
+  ) => Effect.Effect<Option.Option<VersionedManifest>>;
+  /** The manifest a `Flushed` read at this moment would use (for snapshots). */
   readonly currentManifest: (
     databaseId: DatabaseId,
   ) => Effect.Effect<
@@ -212,9 +233,11 @@ export const makeDbReader = Effect.gen(function* () {
         }
         return { id: view.manifestId.value, manifest: pinned.value };
       }
-      let current = yield* manifests
-        .current(databaseId)
-        .pipe(Effect.catchTags(manifestUnavailable(databaseId)));
+      let current = yield* (
+        view.freshness === "Covering"
+          ? manifests.covering(databaseId, view.minLastL0Seq, view.manifestHint)
+          : manifests.current(databaseId)
+      ).pipe(Effect.catchTags(manifestUnavailable(databaseId)));
       if (current.manifest.lastL0Seq < view.minLastL0Seq) {
         // The writer flushed rows the cached manifest predates; its commit happened first.
         current = yield* manifests
@@ -244,13 +267,17 @@ export const makeDbReader = Effect.gen(function* () {
     });
 
   const blockFailures = (databaseId: DatabaseId) => ({
+    // The cached manifest named an SST that is gone, so it must not serve the retry (D67).
     SstMissingError: (error: { readonly message: string }) =>
-      Effect.fail(
-        new ReaderUnavailableError({
-          databaseId,
-          reason: "StorageUnavailable",
-          message: `An SST of database ${databaseId} was missing (the manifest changed during the read): ${error.message} Retry the read.`,
-        }),
+      Effect.andThen(
+        manifests.forget(databaseId),
+        Effect.fail(
+          new ReaderUnavailableError({
+            databaseId,
+            reason: "StorageUnavailable",
+            message: `An SST of database ${databaseId} was missing (the manifest changed during the read): ${error.message} Retry the read.`,
+          }),
+        ),
       ),
     BlockSourceUnavailableError: (error: { readonly message: string }) =>
       Effect.fail(
@@ -312,22 +339,32 @@ export const makeDbReader = Effect.gen(function* () {
     const snapshotSeq = Option.getOrElse(view.snapshotSeq, () => manifest.lastL0Seq);
     let sstsRead = 0;
     if (!settled(versions)) {
-      for (const level of levels(manifest)) {
+      // The one SST per level that may hold the key, newest level first.
+      const candidates = levels(manifest).flatMap((level) => {
         const handle = level.find(
           (candidate) =>
             keyRangeContains(sstHandleVisibleRange(candidate), key) &&
             Bytes.Order(key, candidate.firstKey) >= 0 &&
             Bytes.Order(key, candidate.lastKey) <= 0,
         );
-        if (handle === undefined) continue;
-        sstsRead++;
-        const found = yield* sstVersions(
-          databaseId,
-          handle,
-          key,
-          snapshotSeq,
-          readerBudgetGroup(databaseId, manifest),
+        return handle === undefined ? [] : [handle];
+      });
+      // Their metadata (index and Bloom filter) all at once: an isolate with a cold cache would
+      // otherwise wait on one metadata read per SST in turn before checking any filter (D67). The
+      // loop below then reads them from memory.
+      const budgetGroup = readerBudgetGroup(databaseId, manifest);
+      if (candidates.length > 1) {
+        yield* Effect.forEach(
+          candidates,
+          (handle) => blocks.meta(sstHandleOwner(handle, databaseId), handle, budgetGroup),
+          { concurrency: "unbounded", discard: true },
         ).pipe(Effect.catchTags(blockFailures(databaseId)));
+      }
+      for (const handle of candidates) {
+        sstsRead++;
+        const found = yield* sstVersions(databaseId, handle, key, snapshotSeq, budgetGroup).pipe(
+          Effect.catchTags(blockFailures(databaseId)),
+        );
         versions.push(...found);
         if (settled(found)) break;
       }
@@ -405,17 +442,26 @@ export const makeDbReader = Effect.gen(function* () {
         const memtable = Stream.fromIterable(
           view.memtable.filter((row) => row.seq <= snapshotSeq && keyRangeContains(range, row.key)),
         );
-        const ssts = manifest.l0
+        const budgetGroup = readerBudgetGroup(databaseId, manifest);
+        const overlapping = manifest.l0
           .concat(manifest.sortedRuns.flatMap((run) => run.ssts))
-          .map((handle) =>
-            sstRows(
-              databaseId,
-              handle,
-              range,
-              snapshotSeq,
-              readerBudgetGroup(databaseId, manifest),
+          .filter((handle) =>
+            Option.exists(intersectKeyRanges(range, sstHandleVisibleRange(handle)), (effective) =>
+              keyRangeOverlapsClosed(effective, handle.firstKey, handle.lastKey),
             ),
           );
+        // Every overlapping SST's metadata at once: the merge opens its sources one after another,
+        // each waiting on a metadata read, before it can yield its first row (D67).
+        if (overlapping.length > 1) {
+          yield* Effect.forEach(
+            overlapping,
+            (handle) => blocks.meta(sstHandleOwner(handle, databaseId), handle, budgetGroup),
+            { concurrency: "unbounded", discard: true },
+          ).pipe(Effect.catchTags(blockFailures(databaseId)));
+        }
+        const ssts = overlapping.map((handle) =>
+          sstRows(databaseId, handle, range, snapshotSeq, budgetGroup),
+        );
         const visible = groupRowsByKey(mergeRowStreams([memtable, ...ssts])).pipe(
           Stream.mapEffect((versions) =>
             Effect.fromResult(resolveVisibleRow(versions, { snapshotSeq, now, mergeOperator })),
@@ -428,6 +474,8 @@ export const makeDbReader = Effect.gen(function* () {
         });
       }),
     ).pipe(Stream.withSpan("DbReader.scan", { attributes: { "database.id": databaseId } }));
+
+  const recentManifest = (databaseId: DatabaseId) => manifests.recent(databaseId);
 
   const currentManifest = Effect.fn("DbReader.currentManifest")(function* (databaseId: DatabaseId) {
     return yield* manifests
@@ -448,6 +496,8 @@ export const makeDbReader = Effect.gen(function* () {
       memtable: [],
       manifestId: Option.none(),
       maxLastL0Seq: Option.none(),
+      freshness: "Covering",
+      manifestHint: Option.none(),
     });
     if (Option.isNone(manifest.options.changelog)) {
       return yield* new ChangelogUnavailableError({
@@ -514,7 +564,7 @@ export const makeDbReader = Effect.gen(function* () {
     return rows;
   });
 
-  return DbReader.of({ getRow, scan, changelogRows, currentManifest });
+  return DbReader.of({ getRow, scan, changelogRows, currentManifest, recentManifest });
 });
 
 /** Provides the reader, leaving its caches and manifest reader visible. */

@@ -8,7 +8,14 @@ import { Clock, Effect, Option, Schema } from "effect";
 import { HttpClient, HttpClientRequest } from "effect/http";
 import { HttpApiClient } from "effect/http-api";
 
-import { exceptionType, measureHealth, pullMeasurementSpans, spansSince } from "./measurements.ts";
+import {
+  exceptionType,
+  forEachInvocationRecord,
+  measureHealth,
+  pullMeasurementSpans,
+  spansSince,
+  tailCursorAt,
+} from "./measurements.ts";
 import { ScenarioStack, uniqueId } from "./scenario.ts";
 
 const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
@@ -691,6 +698,49 @@ export const soak = (options: SoakOptions) =>
       }
     });
 
+    // Every invocation's outcome, from the unsampled tail records, folded into counts each minute:
+    // a 2-hour soak makes millions of them, too many to read in one go at the end.
+    const invocationOutcomes = new Map<string, number>();
+    const limitHits: Array<string> = [];
+    let tailCursor = tailCursorAt(startedAt);
+    let invocationsSeen = 0;
+    /** Folds the tail records since the last read into the counts; false when the read failed. */
+    const readTails = Effect.gen(function* () {
+      tailCursor = yield* forEachInvocationRecord(tailCursor, (records) => {
+        for (const record of records) {
+          invocationsSeen += 1;
+          const worker =
+            Option.getOrElse(record.scriptName, () => "unknown").split("-")[1] ?? "unknown";
+          const key = `${worker} ${record.outcome}`;
+          invocationOutcomes.set(key, (invocationOutcomes.get(key) ?? 0) + 1);
+          if (
+            ["exceededCpu", "exceededMemory", "exception"].includes(record.outcome) &&
+            limitHits.length < 50
+          ) {
+            limitHits.push(
+              `${worker} ${record.eventKind} ${Option.getOrElse(record.path, () => "")} ended ${record.outcome} (${record.cpuTimeMs} ms CPU)`,
+            );
+          }
+        }
+      });
+      return true;
+    }).pipe(
+      Effect.catchTags({
+        // The cursor only moves past records that were read, so the next read picks these up.
+        MeasurementError: (error) =>
+          Effect.sync(() => {
+            ledger.note("tail read", error.message.slice(0, 200));
+            return false;
+          }),
+      }),
+    );
+    const tailWatcher = Effect.gen(function* () {
+      while (yield* running) {
+        yield* pause(60_000);
+        yield* readTails;
+      }
+    });
+
     // Pull the stage's spans as they arrive, so the final pull is short: a busy stage exports
     // faster than one pull at the end could read.
     const tracePuller = Effect.gen(function* () {
@@ -730,6 +780,7 @@ export const soak = (options: SoakOptions) =>
         splitter,
         redeployer,
         tracePuller,
+        tailWatcher,
       ],
       { concurrency: "unbounded", discard: true },
     );
@@ -878,9 +929,29 @@ export const soak = (options: SoakOptions) =>
     }
 
     const endedAt = yield* Clock.currentTimeMillis;
-    const health = yield* measureHealth(Math.ceil((endedAt - startedAt) / 60_000) + 5).pipe(
-      Effect.option,
-    );
+    // The last tail records, then the health report over the soak's last minutes (its tail-record
+    // part over the whole soak is `invocationOutcomes` above).
+    yield* Effect.sleep("20 seconds");
+    let tailsRead = yield* readTails;
+    for (let attempt = 0; !tailsRead && attempt < 3; attempt++) {
+      yield* Effect.sleep("10 seconds");
+      tailsRead = yield* readTails;
+    }
+    if (!tailsRead) {
+      ledger.failures.push(
+        "the soak's last tail records could not be read, so some were not checked",
+      );
+    }
+    if (invocationsSeen === 0) {
+      ledger.failures.push("no tail records from the soak's window were read");
+    }
+    for (const hit of limitHits) ledger.failures.push(`invocation: ${hit}`);
+    const healthResult = yield* Effect.result(measureHealth(15));
+    if (healthResult._tag === "Failure") {
+      ledger.failures.push(`health report: ${healthResult.failure.message}`);
+    }
+    const health =
+      healthResult._tag === "Success" ? Option.some(healthResult.success) : Option.none();
     const pulledStore = yield* Effect.result(
       pullMeasurementSpans(Math.ceil((endedAt - startedAt) / 60_000) + 5),
     );
@@ -944,6 +1015,8 @@ export const soak = (options: SoakOptions) =>
       latencies,
       storage,
       spansChecked,
+      invocationsChecked: invocationsSeen,
+      invocationOutcomes: Object.fromEntries(invocationOutcomes),
       errorsByException: Object.fromEntries(errorsByException),
       unexpectedErrors: Object.fromEntries(unexpectedErrors),
       health: Option.getOrNull(health),

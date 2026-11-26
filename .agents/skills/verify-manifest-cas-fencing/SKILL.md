@@ -16,6 +16,11 @@ description: "Model-check shaledb's manifest CAS and writer/compactor epoch fenc
 - **LoadFindsHead**: `loadLatest` finds the newest manifest however far the `LATEST` hint lags (it
   is written in the background and may land late, out of order, or never) and whichever manifests
   GC deleted. Harm if broken: readers and committers act on an old manifest.
+- **LoadFromKnownFindsHead**: `loadLatestFrom(k)` finds the newest manifest from any manifest `k`
+  a commit was reported at (the writer's last flush, which a reader learns from the writer's
+  probe, D67), however long ago, whatever was committed since and whichever manifests GC deleted.
+  Harm if broken: a reader caches a superseded manifest as if it were the newest and keeps
+  reading it after GC deleted its SSTs.
 - **NoStaleCommit**: every committed edit was made by the writer or compactor epoch its base
   manifest names, so after a newer epoch commits, a stale writer or compactor commits nothing.
   Harm if broken: a fenced writer keeps writing next to its successor (split brain).
@@ -39,7 +44,7 @@ The first run downloads a pinned JDK 21 and `tla2tools.jar` 1.7.4 into `.tlc/` (
 Each TLC run has a hard time limit; a run that times out fails the verification. The whole check
 takes about 10 seconds.
 
-Expected output: eight `✓` lines. The code as written passes all three configs, and each broken
+Expected output: nine `✓` lines. The code as written passes all three configs, and each broken
 variant fails with its invariant. Any `✗` is a finding: read the next section.
 
 ## Read a result
@@ -53,7 +58,9 @@ budget, so it draws only bug paths. Use a small config when you want a chart.
 
 Telling a real bug from a modeling error: replay the path against the code, one action per step.
 `WriterUpload`, `JobUpload` are SST uploads; `*Load` steps are `ManifestReader.loadLatest` (hint and
-boundary read, probe from `max(hint, boundary + 1)`); `*Create` steps are one
+boundary read, probe from `max(hint, boundary + 1)`); `LoadLatestFrom(k)` is
+`ManifestReader.loadLatestFrom` (the boundary, `k`, and `k + 1` read together; probe forward from
+`k` when it is stored and above the boundary, else `loadLatest`); `*Create` steps are one
 `ManifestStore.create` (`ObjectStore.putIfAbsent` of `manifest/<view + 1>` and the boundary re-read)
 inside `ManifestStore.update` or `updateFrom`, with the edit (`fenceWriter`, `commitL0Flush`,
 `fenceCompactor`, `commitCompaction`) applied to the view: the loaded head, or for a writer's flush
@@ -71,6 +78,7 @@ an invariant to make it pass.
 | `WriterUpload` → `WriterFlushCreate` without a load; `wOpt` | `ManifestStore.updateFrom` from the writer's own view (`DbWriter.flushNow`, `DbWriter.seal`); a non-write outcome from that view reloads |
 | `CreateOutcome` (`Exists` / `Collected` / `Created`) | `ManifestStore.create`: `putIfAbsent`, then `loadManifestBoundary`; at or below it is a conflict |
 | `LoadLatest`, `Start`, `ProbeFrom` | `ManifestReader.loadLatest` (`manifest-reader.ts`): probe from `max(hint, boundary + 1)`; a missing start lists |
+| `LoadLatestFrom(k)` for `k` in `reported` | `ManifestReader.loadLatestFrom` (`manifest-reader.ts`), called by `ManifestCache.covering` with the writer's `flushedManifestId` (`manifest-cache.ts`, D67) |
 | `HintLands`, `HintLost` | `advanceLatestHint` run by `BackgroundWork` (`background-work.ts`) |
 | `GcAdvanceBoundary`, `GcDeleteManifest` | `ManifestStore.advanceManifestBoundary`, GC's manifest deletes (`garbage-collector.ts`) |
 | `Head` | the largest existing manifest id |
@@ -87,7 +95,10 @@ stale writer", "serializes concurrent edits", "writes nothing for an already-app
 "commits from its own view with one create and no load", "reloads instead of committing when its
 own view's next id was collected by GC", "trusts only a written commit from its own view",
 "advances the LATEST hint in the background and never moves it back", "finds the newest manifest
-when the hint lags below manifests GC deleted"). Mutations shown caught (D56): the boundary
+when the hint lags below manifests GC deleted", "loads the newest manifest from the writer's last
+flush, never that flush's superseded manifest (D67)"). Mutations shown caught (D67): `loadLatestFrom`
+returning the known manifest without probing forward, and ignoring the boundary. Mutations shown
+caught (D56): the boundary
 re-read removed, a non-write outcome trusted from the own view, the probe started at the hint
 alone, the hint written unconditionally, `updateFrom` always loading. The `flush` scenario asserts
 a flush commits from its own view with one create and no `ManifestReader.loadLatest` span.
@@ -112,15 +123,26 @@ a flush commits from its own view with one create and no `ManifestReader.loadLat
   does not depend on that.
 - Broken variants (`Broken` constant): `noWriterEpochCheck` → `NoStaleCommit`; `blindCreate` →
   `CreateOnce`; `noInputsCheck` → `AckedDataVisible` (race config); `noBoundaryReread` →
-  `CommitOnce` and `hintOnlyProbe` → `LoadFindsHead` (GC config). `hintOnlyProbe` is the reader as
-  it was before D56: with a lagging hint and a checkpoint keeping manifest `h` while GC deleted
-  `h + 1`, it stopped at `h`.
+  `CommitOnce`, `hintOnlyProbe` → `LoadFindsHead`, and `knownIgnoresBoundary` →
+  `LoadFromKnownFindsHead` (GC config). `hintOnlyProbe` is the reader as it was before D56: with a
+  lagging hint and a checkpoint keeping manifest `h` while GC deleted `h + 1`, it stopped at `h`.
+  `knownIgnoresBoundary` makes the same mistake from the writer's last flush.
 - Not a broken variant: trusting a failure or no-op from the writer's own view. In this model the
   writer's view can never give a wrong non-write answer (its view holds its own epoch and lacks its
   new SST), so such a variant would pass; the code rechecks them for generic edits (a checkpoint
   removal against an old view), which `manifest-store.test.ts` covers.
 
 ## Maintenance notes
+
+- D67 (v1 workstream 10): readers gained `ManifestReader.loadLatestFrom(knownId)`, which starts
+  from the manifest the writer's last flush committed instead of the `LATEST` hint. Modeled as
+  `LoadLatestFrom(k)` over every reported commit `k` (a superset of the writer's flushes), with the
+  invariant `LoadFromKnownFindsHead` in all three configs and the broken variant
+  `knownIgnoresBoundary` in the GC config. Like `loadLatest`, it is one step: its three reads are
+  concurrent, and a read racing a commit returns a slightly older head. `loadLatest`'s forward
+  probe moved into `probeForward`, shared by both; its steps are unchanged. Reran; every broken
+  variant fails. The first, unmodeled version returned the known manifest itself, which is what
+  `LoadFromKnownFindsHead` now rules out.
 
 - D64 (v1 workstream 9): `decodeStoredManifest`, the reader's single decode point, refuses a
   manifest whose `formatVersion` is newer than the code's (`StoredManifestInvalid`). That is one
@@ -146,7 +168,7 @@ a flush commits from its own view with one create and no `ManifestReader.loadLat
 
 ## Keeping it in step with the code
 
-Sync commit: the v1 workstream 2 commit (`fast manifest commits`, D56; the model was last
+Sync commit: the D67 commit (`perf(read)`: the covering manifest cache, `loadLatestFrom`, read-ahead, 16 KiB blocks) (the model was last
 confirmed to describe the code at this commit). When a covered file changed after it, diff it, update the model so each step still maps
 to one awaited effect in the code, rerun, and show the affected invariant still fails on a broken
 variant. Move the sync commit forward only after confirming the model describes the code at the

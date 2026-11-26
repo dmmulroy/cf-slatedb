@@ -5,18 +5,18 @@
 **v1 for production** ([`docs/handoff-v1.md`](handoff-v1.md)): ten workstreams, then the release
 checklist and Dillon's go-ahead (P6). The decisions asked of Dillon are under "Open questions".
 
-| Workstream                                | Status | Commit               |
-| ----------------------------------------- | ------ | -------------------- |
-| 1. The Stack owns its configuration       | done   | `012bdb5`            |
-| 2. Fast manifest commits                  | done   | `774ed7b`            |
-| 3. Splits pause briefly, never fail       | done   | `393758c`            |
-| 4. Transactions exact across flushes      | done   | `5f2850b`, `5df4099` |
-| 5. GC and maintenance that scale          | done   | `e06f3eb`            |
-| 6. Writer throughput and limits           | done   | `308defd`            |
-| 7. Corruption: prevent, detect, repair    | done   | `2cb5116`            |
-| 8. Production telemetry                   | done   | `62eab3d`            |
-| 9. Production readiness                   | done   | this commit          |
-| 10. Soak, release checklist, the go-ahead | next   |                      |
+| Workstream                                | Status      | Commit               |
+| ----------------------------------------- | ----------- | -------------------- |
+| 1. The Stack owns its configuration       | done        | `012bdb5`            |
+| 2. Fast manifest commits                  | done        | `774ed7b`            |
+| 3. Splits pause briefly, never fail       | done        | `393758c`            |
+| 4. Transactions exact across flushes      | done        | `5f2850b`, `5df4099` |
+| 5. GC and maintenance that scale          | done        | `e06f3eb`            |
+| 6. Writer throughput and limits           | done        | `308defd`            |
+| 7. Corruption: prevent, detect, repair    | done        | `2cb5116`            |
+| 8. Production telemetry                   | done        | `62eab3d`            |
+| 9. Production readiness                   | done        | this commit          |
+| 10. Soak, release checklist, the go-ahead | in progress |                      |
 
 The previous round (all ten build phases and `docs/handoff.md`'s seven items) is complete; its
 hand-off is below.
@@ -177,6 +177,30 @@ hand-off is below.
     500, and the shard router has tail records.
   - **Sampling.** The soak runs at production's 10% sampling; at 100% a busy preview exports
     faster than it can be read back.
+- **10, continued: read-path work validated and fixed (D67, D69).**
+  - **What it does.** A read the writer answered uses any cached manifest that holds the writer's
+    flushed rows, for up to half of `gcMinAge`, instead of reloading the manifest every second.
+    The writer's probe says where the newest manifest starts. Point reads and scans open their
+    SSTs together, scans read ahead 8 blocks per SST, and blocks default to 16 KiB.
+  - **Two defects found in review before it was committed, both fixed.** The first version cached
+    the manifest the writer named (its last flush), which a compaction has usually superseded:
+    on a database idle after a compaction, a new isolate would have read it for up to 30 minutes
+    while GC deleted its SSTs. It also let an `AtLeast` read be up to 30 minutes stale. The soak
+    could show neither (constant writes, fresh receipts). Now the writer's manifest is only where
+    the search for the newest starts (`loadLatestFrom`), and an `AtLeast` read skips the writer
+    only while a `Flushed` read would use the same manifest; otherwise it asks the writer.
+  - **Model.** `ManifestCasFencing` gained `LoadFromKnownFindsHead` and the broken variant
+    `knownIgnoresBoundary`; `vp run verify` is 27 runs. The other three skills record why no step
+    changed.
+  - **Also fixed (D69).** A request its endpoint's schemas refuse returned 500; it is now
+    `InvalidRequest` (400) naming the malformed part. `DbWriter.start` spans now mean an actual
+    start. The scenario runner reports what caused a failed request.
+  - **Verified.** `vp run ready` exit 0; `vp run verify` exit 0 (27/27); 13/13 scenarios under
+    `vp run dev` (exit 0). Eleven mutations of the new read path are each caught by a test.
+  - **Not reproduced.** Twice, the first `run all` after a fresh `vp run dev` failed the `flush`
+    scenario's first request with a transport error, right after a `write-read` that ran 6 s
+    long; three further fresh starts and two full runs passed. The runner now prints the cause
+    chain, so the next occurrence names it.
 
 ## Remaining-work log
 
