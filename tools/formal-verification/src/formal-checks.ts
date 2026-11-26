@@ -105,6 +105,12 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
         expect: "NoAckedWriteLost",
         timeLimitSeconds: 60,
       },
+      {
+        config: "NoAckedWriteLost.cfg",
+        broken: "noSnapshotUpperBound",
+        expect: "LatestSeesAcked",
+        timeLimitSeconds: 60,
+      },
     ],
   },
   {

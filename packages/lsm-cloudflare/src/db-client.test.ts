@@ -12,13 +12,14 @@ import { Arbitrary, Effect, Option, Result, Schema, Stream } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
-import { DbClient, dbClientTestLayer } from "./db-client.ts";
-import type { DbReaderServices } from "./db-reader.ts";
+import { DbClient, dbClientTestLayer, makeDbClient } from "./db-client.ts";
+import type { DbReader, DbReaderServices } from "./db-reader.ts";
 import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
 import { ManifestReader } from "./manifest-reader.ts";
 import { ManifestStore } from "./manifest-store.ts";
 import { sstKey } from "./object-keys.ts";
 import { ObjectStore } from "./object-store.ts";
+import { WriterClient } from "./writer-client.ts";
 
 const DB = DatabaseId.make("orders");
 const hex = (bytes: Uint8Array) =>
@@ -66,7 +67,13 @@ const run = <A, E>(
   program: Effect.Effect<
     A,
     E,
-    DbClient | ManifestStore | ManifestReader | ObjectStore | DbReaderServices
+    | DbClient
+    | DbReader
+    | WriterClient
+    | ManifestStore
+    | ManifestReader
+    | ObjectStore
+    | DbReaderServices
   >,
 ) =>
   program.pipe(
@@ -322,5 +329,97 @@ describe("DbClient against a Map oracle", () => {
     expect(outcome.atSnapshot).toEqual(Option.some(Uint8Array.of(1)));
     expect(outcome.prefix).toBe(1);
     expect(outcome.now).toEqual(Option.some(Uint8Array.of(2)));
+  });
+
+  /**
+   * A client whose writer is overtaken after it answers: a newer version of key 1 is written and
+   * flushed, and every older SST leaves the manifest, as when a compaction keeps only each key's
+   * newest version. `times` is how many times that happens. With `alsoBeforeAsking` it also
+   * happens before the writer is asked, so the manifest a previous attempt cached is behind too.
+   */
+  const clientOvertakenAfterWriterAnswers = (times: number, alsoBeforeAsking = false) =>
+    Effect.gen(function* () {
+      const client = yield* DbClient;
+      const writer = yield* WriterClient;
+      const store = yield* ManifestStore;
+      const manifests = yield* ManifestReader;
+      let overtaken = 0;
+      const overtake = Effect.gen(function* () {
+        if (overtaken >= times) return;
+        overtaken += 1;
+        yield* client.put(DB, keyBytes(1), Uint8Array.of(100 + overtaken));
+        yield* client.flush(DB);
+        const { manifest } = yield* manifests.loadLatest(DB);
+        for (const older of manifest.l0.slice(1)) {
+          yield* store.update(DB, (current) =>
+            dropSstFromManifest(current, {
+              sstId: older.id,
+              reason: "Forced",
+              droppedAt: Timestamp.make(0),
+            }),
+          );
+        }
+      }).pipe(Effect.orDie);
+      return yield* makeDbClient.pipe(
+        Effect.provideService(
+          WriterClient,
+          WriterClient.of({
+            ...writer,
+            probe: (databaseId, key) =>
+              (alsoBeforeAsking ? overtake : Effect.void).pipe(
+                Effect.andThen(Effect.tap(writer.probe(databaseId, key), () => overtake)),
+              ),
+            scan: (databaseId, request) =>
+              Effect.tap(writer.scan(databaseId, request), () => overtake),
+          }),
+        ),
+      );
+    });
+
+  const latest = {
+    consistency: { _tag: "Latest" as const },
+    snapshot: Option.none(),
+    refuseSealed: false,
+  };
+
+  it("a Latest read that finds only a manifest flushed past its snapshot asks the writer again, never missing the key (D70)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createDatabase;
+        const client = yield* DbClient;
+        yield* client.put(DB, keyBytes(1), Uint8Array.of(1));
+        yield* client.flush(DB);
+        // The writer answers "everything up to sequence number 1 is flushed". Before the reader
+        // loads a manifest, the key is rewritten, flushed, and compacted: the newest manifest
+        // holds only the new version, which the read's snapshot does not include.
+        const get = yield* (yield* clientOvertakenAfterWriterAnswers(1)).get(
+          DB,
+          keyBytes(1),
+          latest,
+        );
+        yield* client.put(DB, keyBytes(1), Uint8Array.of(2));
+        yield* client.flush(DB);
+        const scan = yield* Stream.runCollect(
+          (yield* clientOvertakenAfterWriterAnswers(1)).scan(DB, FULL_KEY_RANGE, {
+            ...latest,
+            limit: Option.none(),
+          }),
+        );
+        // Overtaken on every attempt, the read gives up with a failure the caller can retry.
+        const overtakenEachTime = yield* (yield* clientOvertakenAfterWriterAnswers(10, true))
+          .get(DB, keyBytes(1), latest)
+          .pipe(Effect.result);
+        return { get, scan: scan.map((row) => row.value), overtakenEachTime };
+      }),
+    );
+    // The value written while the read was in flight: never "not found", which no moment had.
+    expect(outcome.get).toEqual(Option.some(Uint8Array.of(101)));
+    expect(outcome.scan).toEqual([{ _tag: "Value", bytes: Uint8Array.of(101) }]);
+    expect(
+      Result.isFailure(outcome.overtakenEachTime) && [
+        outcome.overtakenEachTime.failure._tag,
+        "reason" in outcome.overtakenEachTime.failure && outcome.overtakenEachTime.failure.reason,
+      ],
+    ).toEqual(["ReaderUnavailableError", "StorageUnavailable"]);
   });
 });

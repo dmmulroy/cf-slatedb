@@ -55,9 +55,11 @@ export interface ReadView {
   /** Read exactly this manifest (a snapshot) instead of the newest one. */
   readonly manifestId: Option.Option<ManifestId>;
   /**
-   * The newest `lastL0Seq` the read accepts (a transaction's read sequence number): a manifest with
-   * data flushed after it may have compacted away versions the read needs, so the read fails with
-   * `SnapshotExpired` instead. None: any.
+   * The newest `lastL0Seq` the read accepts: the snapshot of a read that asked the writer, or a
+   * transaction's read sequence number. A manifest flushed after it may hold only versions newer
+   * than the snapshot (a compaction keeps each key's newest), so the read fails with
+   * `SnapshotExpired` instead of missing a version. None: any (the read's snapshot is the
+   * manifest's own `lastL0Seq`).
    */
   readonly maxLastL0Seq: Option.Option<SeqNum>;
   /**
