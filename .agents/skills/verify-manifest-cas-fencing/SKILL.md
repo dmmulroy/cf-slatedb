@@ -178,7 +178,7 @@ a flush commits from its own view with one create and no `ManifestReader.loadLat
 
 ## Keeping it in step with the code
 
-Sync commit: the D70–D73 commit (`fix(read)` and `perf`: the snapshot bound, the newest-version flush, the read path and flush path changes) (the model was last
+Sync commit: the D70–D74 commit (`fix(read)`, `fix(writer)`, and `perf`: the snapshot bound, the newest-version flush, the read and flush path changes, the writer's counters) (the model was last
 confirmed to describe the code at this commit). When a covered file changed after it, diff it, update the model so each step still maps
 to one awaited effect in the code, rerun, and show the affected invariant still fails on a broken
 variant. Move the sync commit forward only after confirming the model describes the code at the

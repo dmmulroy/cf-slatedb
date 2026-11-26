@@ -83,6 +83,10 @@ deletes rows. `writer.workerd.ts` refuses write skew through the public API.
 
 ## Maintenance notes
 
+- D74: `DbClient.beginTransaction` still reads `lastSeq` and the flushed manifest from
+  `DbWriter.status`, in one read of the writer's bookkeeping (`memTable.meta`); `status` no longer
+  scans the memtable for the unflushed size, which `begin` never used. No model step changed.
+
 - D70: (1) Fixed: `DbClient.scanAt` without a begin manifest (a caller from before D58) built its
   view with `minLastL0Seq = 0`, so within `manifestRefreshInterval` of a flush it could read a
   cached manifest from before that flush while the writer's pages no longer held the flushed
@@ -112,7 +116,7 @@ deletes rows. `writer.workerd.ts` refuses write skew through the public API.
 
 ## Keeping it in step with the code
 
-Sync commit: the D70–D73 commit (`fix(read)` and `perf`: the snapshot bound, the newest-version flush, the read path and flush path changes). When a covered function changes after it, update the model
+Sync commit: the D70–D74 commit (`fix(read)`, `fix(writer)`, and `perf`: the snapshot bound, the newest-version flush, the read and flush path changes, the writer's counters). When a covered function changes after it, update the model
 so each action is still one awaited effect in the code, rerun, and show each invariant still fails on
 a broken variant before moving the sync commit. For drift that skipped this skill, use
 `.agents/skills/maintain-formal-verification-skill/SKILL.md`.

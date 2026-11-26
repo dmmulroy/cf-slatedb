@@ -89,6 +89,25 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
     (`MayBeHeld`), and `ManifestCasFencing` (`LoadFromKnownFindsHead`; `knownIgnoresBoundary`
     fails).
   - **Live.** `docs/measurements.md` ("Read latency").
+- **A read never uses a manifest flushed past its snapshot** — done (D70). `ReadView.maxLastL0Seq`
+  set to the writer's snapshot by `DbClient.pointView` and `scanView`; `DbClient.getRow` and `scan`
+  ask the writer again on `SnapshotExpired` (`LATEST_READ_ATTEMPTS`); `DbClient.scanAt` without a
+  begin manifest requires the largest `flushedSeq` of its pages. Tests: `db-client.test.ts` (a
+  writer overtaken after it answers: get, scan, a scan between its pages, giving up as
+  retryable; each fails on the code before), `db-transaction.test.ts` (the scan without a begin
+  manifest). Formal: `NoAckedWriteLost` with `Compact`, the snapshot, and `ReadAgain`
+  (`noSnapshotUpperBound` fails `LatestSeesAcked`).
+- **Second round of the read path** — done (D72).
+  - **Refresh from the manifest held.** `ManifestCache.refresh` → `ManifestReader.loadLatestFrom`,
+    which also reads the `LATEST` hint and continues from it when the known manifest was
+    superseded. Tests: `manifest-store.test.ts`. Formal: `LoadFromKnownFindsHead` from every
+    stored manifest.
+  - **Hedged block reads.** `hedgedBlockRead`, `makeHedgedBlockSource`, `hedgedBlockSourceLayer`
+    (`block-source.ts`), `blockReadHedgeAfterMs`. Tests: `block-source.test.ts`.
+  - **Scans that follow their limit.** `mergeRowStreams` emits before it pulls an input again
+    (lsm-core); `scanFirstReadAheadBlocks` (`db-reader.ts`). Tests: `merge-iterator.test.ts`,
+    `db-client.test.ts`.
+  - **Live.** `docs/measurements.md` ("Read latency").
 - **SST skip by range and Bloom filter; index search; block seek** — done. `DbReader.getRow`/
   `sstVersions` (range and view skip, Bloom skip, `firstBlockForKey`, seek continuing across blocks,
   stop at the first settled level), `DbReader.scan` (`blocksOverlappingRange`). Since D67 a point
@@ -460,6 +479,26 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
     examples, scheme, headers), `manifest.test.ts` (the workstream 1 fixture),
     `manifest-store.test.ts` (newer format refused), and `compactor.test.ts` (newer state idle).
   - **Live.** Rotation on `preview-1`.
+- **A flush writes only the versions a read can reach** — done (D70). `keepReachableVersions`
+  (lsm-core `row-resolution.ts`), applied in `DbWriter.flushThen`. Tests:
+  `row-resolution.test.ts` (against the oracle for any window and any snapshot from its newest
+  row on), `db-writer.test.ts` (one row for a key written twice), the client-versus-oracle
+  property over histories of 20 to 60 steps. Formal: `NoAckedWriteLost` (`FlushUpload` keeps the
+  newest version).
+- **The flush path** — done (D73). The compactor wake is `BackgroundWork` (`DbWriter.wakeCompactor`;
+  `db-writer.test.ts`: a compactor that never answers holds up no flush). `SstStore.write` encodes
+  blocks a chunk of rows at a time. `tools/writer-bench/src/flush-bench.ts` times a flush in
+  process. Declined with measurements: concurrent multipart part uploads.
+- **One figure for unflushed bytes; no memtable scan per alarm, status, or transaction begin** —
+  done (D74). `memTableWriteBytes` (`mem-table.ts`); `DbWriter`'s `unflushedBytes`,
+  `unflushedRows`, and `oldestUnflushed` counters, read by `scheduleFlush`, `runAlarm`, and
+  `status`. Tests: `db-writer.test.ts` (counters equal a scan; the alarm near the threshold; a
+  recording SQLite storage shows no aggregate statement while idle).
+- **Tail records sampled like traces** — done (D71). `keepsInvocationRecord`, `tailSampleRateOf`
+  (`infra/shaledb/src/cpu-tail-worker.ts`), `TAIL_SAMPLE_RATE` bound by the Stack;
+  `invocationsRepresentedBy` in the measurement tools. Test: `cpu-tail-worker.test.ts`.
+- **A request the endpoint's schemas refuse is `InvalidRequest`** — done (D69).
+  `db-http-request.ts`; `writer.workerd.ts` (five malformed requests).
 - **Soak and production smoke test (v1 workstream 10)** — done (D65). `scenario-cli soak`
   (`tools/scenario-cli/src/soak.ts`: writers, readers at every consistency, scanners, transactors,
   snapshotters, a remover, a sharded group split twice, a midway redeploy; a model of every

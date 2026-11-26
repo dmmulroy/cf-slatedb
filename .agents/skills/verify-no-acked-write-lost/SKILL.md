@@ -93,6 +93,13 @@ past its snapshot filtered out the newer version and no longer found the older o
 
 ## Maintenance notes
 
+- D74: `DbWriter.write` now advances three in-memory counters (unflushed bytes with the formula
+  SQLite sums, unflushed rows, the oldest commit time), and `runAlarm` and `status` read them
+  instead of scanning the memtable. That changes when a flush is scheduled and what a status
+  call costs, not what a flush, a commit, or a probe does: `flushThen` still takes its cut from
+  `memTable.meta` and reads every row above `flushed_seq`. No model step changed; reran, all
+  broken variants still fail.
+
 - D70: two changes, modeled together. (1) The model gained `Compact` (it had left compaction to
   the GC and CAS models), the read's snapshot `rSnap`, and `ReadAgain`; `ReadManifest` now needs
   `lastL0Seq <= rSnap` and returns the newest version at or below it; the invariants are stated
@@ -156,7 +163,7 @@ past its snapshot filtered out the newer version and no longer found the older o
 
 ## Keeping it in step with the code
 
-Sync commit: the D70–D73 commit (`fix(read)` and `perf`: the snapshot bound, the newest-version flush, the read path and flush path changes). When a covered function changes after it, update the model so
+Sync commit: the D70–D74 commit (`fix(read)`, `fix(writer)`, and `perf`: the snapshot bound, the newest-version flush, the read and flush path changes, the writer's counters). When a covered function changes after it, update the model so
 each action is still one awaited effect in the code, rerun, and show each invariant still fails on a
 broken variant before moving the sync commit. For drift that skipped this skill, use
 `.agents/skills/maintain-formal-verification-skill/SKILL.md`.

@@ -334,6 +334,139 @@ outside the project's namespaces were `http.request.method`, `http.response.stat
 Before D63, the same run exported `client.address` (2,006 spans), `user_agent.original` (1,983),
 `url.full` (7,063), and `url.query` (7).
 
+## Read latency (v1 workstream 10: D67, D70, D72)
+
+`preview-3`, production settings, 100% sampling. One run is a 5-minute soak (`soak --minutes 5
+--databases 2 --keys-per-database 500 --split-at 2`), then `measure latency --minutes <the soak's
+length>`. `measure latency` reads the span each operation records in the API Worker, so the
+caller's network and the trace export after the response are not in it. Latencies are p50 / p90 /
+p99 in ms.
+
+| Operation          | Before the read work | D67 (`7ccd659`)   | D70–D73 (`9776317`) |
+| ------------------ | -------------------- | ----------------- | ------------------- |
+| Get `Latest`       | 124 / 251 / 613      | 20 / 72 / 426     | 19 / 73 / 352       |
+| Get `AtLeast`      | (with `Latest`)      | 10 / 23 / 431     | 21 / 62 / 265       |
+| Get `Flushed`      | 122 / 276 / 697      | 81 / 162 / 515    | 5 / 113 / 243       |
+| Scan, 100 rows     | ~360 / 714 / 1,046   | 76 / 555 / 2,146  | 60 / 257 / 983      |
+| Write batch        | —                    | 36 / 46 / 69      | 36 / 50 / 68        |
+| Transaction commit | —                    | 27 / 34 / 45      | 36 / 44 / 54        |
+| Scan block fetches | 16 / 32 (p50 / p90)  | 7 / 37            | 2 / 12              |
+| SST bytes stored   | —                    | 4.4 MB a database | 0.44 MB a database  |
+
+Samples per run: about 2,100 `Latest` gets, 450 `AtLeast`, 280 `Flushed`, 118 scans, 2,100 write
+batches, 265 commits. "Before" is from the hand-off's 5-minute soak; its scan figures came from
+tail records, which include the trace export.
+
+**Reading.**
+
+- **Gets.** D67 removed the manifest reload from four gets in five (two R2 round trips, about
+  90 ms). D72 made a `Flushed` read's refresh one round trip and hedges slow block reads.
+- **Scans.** D70's flush stores one row per key and D72 stops a scan when it has its rows: a
+  100-row scan fetched 37 blocks at p90 and now fetches 12. The soak rewrites the same 500 keys
+  all the time, so this is the most the flush change can do; a workload that never rewrites a key
+  between flushes stores what it stored before.
+- **The `AtLeast` and commit columns moved the wrong way, and it is placement, not code.** In
+  the D70–D73 run one of the two databases' writer Durable Objects was about 14 ms farther from
+  the API Worker: its probes took 25 ms at p50 against 10 ms for the other database and for
+  both databases in the other runs, and its commits 40 ms against 26 ms. Calls to a writer
+  include that distance, so compare them per database, or compare the reader's own spans.
+
+**Where a read's time goes** (the reader's spans, same runs):
+
+| Span                                 | D67                  | D72 with hedging      |
+| ------------------------------------ | -------------------- | --------------------- |
+| Block fetch (p50 / p90 / p99 / max)  | 7 / 96 / 439 / 1,896 | 7 / 74 / 101 / 159    |
+| Metadata fetch                       | 6 / 112 / 497 / 497  | 6 / 13 / 203 / 291    |
+| Fetches hedged; won by the bucket    | —                    | 21%; a third of those |
+| `DbReader.getRow` (p90 / p99 / max)  | 76 / 333 / 1,026     | 72 / 205 / 525        |
+| `ManifestCache.current` (p90)        | 118                  | 71 to 96              |
+| Writer probe (p50 / p90 / p99)       | 10 / 15 / 41         | 10 / 17 / 33          |
+| Writer start (fence-in), 12–14 a run | 521 (p50)            | 498                   |
+
+Block fetches by Workers Cache status, before hedging (95 minutes of `preview-3`): a `HIT` took
+6 / 19 / 109 ms with a slowest of 2,327 ms; a `MISS` took 86 / 328 / 564 ms, of which the
+`BlockServer`'s own bucket read was 44 / 82 / 192 ms and the rest was the hop to it. A manifest
+found from the writer's last flush took 66 ms at p50 (`loadLatestFrom`, one round trip) against
+178 ms from the `LATEST` hint (`loadLatest`).
+
+What is left in a get's p99 is writers starting: a fence-in is about 0.5 s, and a short soak
+starts a dozen.
+
+**From far away** (`preview-2`, `eu`, client and API Worker in the US, same method):
+
+| Operation      | D67                 | D72, no hedge       | D72, hedge at 50 ms |
+| -------------- | ------------------- | ------------------- | ------------------- |
+| Get `Latest`   | 130 / 270 / 1,481   | 130 / 271 / 1,490   | 128 / 272 / 1,259   |
+| Get `Flushed`  | 276 / 571 / 1,559   | 148 / 522 / 1,047   | 159 / 532 / 877     |
+| Scan, 100 rows | 671 / 2,158 / 4,700 | 799 / 2,404 / 5,019 | 807 / 2,408 / 6,670 |
+| Write batch    | 159 / 196 / 220     | 156 / 188 / 224     | 151 / 180 / 213     |
+
+Every call crosses the Atlantic there, and a restricted Stack has no Workers Cache, so a hedge has
+nothing faster to race. Only the `Flushed` refresh shows. The 20-minute `eu` soak, measured at the
+client, went from 448 ms to 168 ms for a `Latest` get (p50) and from 1,656 ms to 710 ms for a scan
+between the code before D67 and D67.
+
+## Flush and compaction CPU, block size, and part uploads (D73)
+
+`measure compaction-cpu --megabytes-per-flush 60` (four 60 MiB flushes of 1 KB rows, then their
+compaction), three runs per cell, each cell on `preview-2` and `preview-3` in a different order.
+CPU per flush is the alarm's and the flush request's together.
+
+| Block size | Parts in flight | CPU per flush, per run (ms)           | Flush CPU ÷ write CPU, per run  |
+| ---------: | --------------: | ------------------------------------- | ------------------------------- |
+|      4 KiB |               1 | 4,052 3,791 3,810 · 7,402 4,078 4,611 | 1.36 1.47 1.40 · 1.06 1.44 1.41 |
+|     16 KiB |               1 | 3,818 4,268 4,928 · 3,541 3,552       | 1.30 1.41 1.15 · 1.47 1.38      |
+|      4 KiB |               3 | 3,419 3,940 4,182 · 6,494 5,345 4,974 | 1.30 1.30 1.41 · 1.26 1.40 1.42 |
+|     16 KiB |               3 | 5,767 4,048 4,812 · 4,282 7,695 3,946 | 1.17 1.28 0.97 · 1.38 1.09 1.45 |
+
+(`preview-3` first, then `preview-2`.) The write CPU of the same 128 batches varied from 9.6 to
+28 s between runs, and the flush CPU with it: the machine a Durable Object lands on matters more
+than either setting.
+
+- **Block size** changes nothing in a flush's CPU. 16 KiB stays the default (D67).
+- **Parts in flight.** The SST write of a flush took 4.6 s (16 runs, 3.2 to 6.1 s) with three
+  parts in flight and 5.5 s (4 runs, 5.4 to 6.7 s) with one, for the same CPU. Not adopted (D73).
+- **The largest single invocation** in the sweep was 7.7 s (a flush), and a compaction step used
+  9.1 to 17.3 s: inside the 30 s and 60 s limits with the 2× headroom D61 set them for.
+- **The compactor wake.** The fourth flush of each run waited 5.4 to 9.2 s (six runs) for the
+  idle compactor's first call to reach its handler, which then ran 0.3 to 0.5 s. With the wake in
+  the background (D73) the flush no longer waits.
+
+**Flush CPU by row size** (`measure flush-cpu --megabytes 48 --value-bytes`, `preview-2`, one
+flush request, nothing else running):
+
+| Rows          | Code    | Flush CPU (ms) | CPU per MiB (ms) |
+| ------------- | ------- | -------------- | ---------------- |
+| 52,000 × 1 KB | D67     | 2,239 · 2,359  | 44 · 46          |
+| 52,000 × 1 KB | D70–D73 | 1,611 · 2,514  | 32 · 49          |
+| 5,200 × 10 KB | D67     | 1,281 · 1,907  | 26 · 38          |
+| 5,200 × 10 KB | D70–D73 | 1,110 · 847    | 22 · 17          |
+
+About 20 to 25 ms per MiB whatever the rows, plus about 20 µs a row. In local workerd, where the
+bucket is a disk, a 60 MB flush of 1 KB rows took 1.93 s before D73's chunked encoding and 1.60 s
+after (`tools/writer-bench/src/flush-bench.ts` and a workerd copy of it).
+
+**A correction to D61 and D62.** Their "flush CPU p50" for 60 MiB (about 1 s) was the median over
+alarm and request records together, each holding part of a flush. Per flush it was about 4 s
+then as now. The limits were set from the largest single invocation and stand.
+
+## The writer's alarm and `status` under a full memtable (D74)
+
+`measure writer-memory --megabytes 250` on `preview-3`, deployed with
+`--settings '{"l0SstSize":268435456,"maxL0Age":3600000}'`: one writer filled to
+`maxUnflushedBytes`, then one flush request.
+
+| Run                          | Flush request (client) | Alarm invocations | CPU of each | Writer reset                        |
+| ---------------------------- | ---------------------: | ----------------: | ----------: | ----------------------------------- |
+| D61's (workstream 6)         |                   82 s |              ~170 |      ~1.5 s | no                                  |
+| Before D74, run 1            |                   20 s |                 5 |       1.6 s | no                                  |
+| Before D74, runs 2, 3, and 5 |           202 to 223 s |        125 to 141 |       1.5 s | no                                  |
+| Before D74, two at once      |                   15 s |                35 |       1.4 s | yes: 45 writes refused as retryable |
+
+In the slow runs the alarm fired, scanned the memtable, did not flush, and was set again for now
+(D74). One `status` call on the full memtable used 1.58 s of CPU. A writer that was reset lost
+nothing it had acknowledged: 182.9 MB were unflushed in SQLite when it answered again.
+
 ## Live checks
 
 | Check                                       | Result                         | How                                                                                                                                                                                                                                                                                                                                                                                             |

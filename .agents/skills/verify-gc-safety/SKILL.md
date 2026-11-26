@@ -125,7 +125,7 @@ moment ago counted as old and its SSTs could be deleted under a reader. `ownUplo
 
 ## Keeping it in step with the code
 
-Sync commit: the D70–D73 commit (`fix(read)` and `perf`: the snapshot bound, the newest-version flush, the read path and flush path changes). When a covered function changes after it, update the model
+Sync commit: the D70–D74 commit (`fix(read)`, `fix(writer)`, and `perf`: the snapshot bound, the newest-version flush, the read and flush path changes, the writer's counters). When a covered function changes after it, update the model
 so each action is still one awaited effect in the code, rerun, and show each invariant still fails on
 a broken variant before moving the sync commit. For drift that skipped this skill, use
 `.agents/skills/maintain-formal-verification-skill/SKILL.md`.

@@ -1601,3 +1601,285 @@ envelope with status 400, the request id of the `x-request-id` header, and the p
 **Also.** `DbWriter.ensureReady` answers from memory once the writer is ready, so a
 `DbWriter.start` span now means an actual start (a fence-in), not every request. The scenario
 runner reports what caused a failed request (the `cause` chain of a transport error).
+
+## D70. A read never uses a manifest flushed past its snapshot; a flush writes only the versions a read can reach
+
+**A race found by the model, present since Phase 5.** A `Latest` read asks the writer, which gives
+it a snapshot (the newest sequence number), `flushedSeq`, and the rows above `flushedSeq`. It then
+reads the SSTs of a manifest covering `flushedSeq` and keeps rows at or below its snapshot. Nothing
+stopped it from using a manifest **newer** than its snapshot. A compaction keeps only each key's
+newest version, so:
+
+1. write 1 of a key is flushed;
+2. a read asks the writer: snapshot 1, nothing unflushed;
+3. write 2 of the same key is flushed, and a compaction merges both SSTs, keeping only 2;
+4. the read loads that manifest, drops version 2 (past its snapshot), and finds nothing.
+
+The read returns "not found" for a key that had a value at every moment. Both things in step 3
+must finish between the writer's answer and the manifest load, usually tens of milliseconds, and no
+soak or scenario has shown it. But it was reachable, and `NoAckedWriteLost.tla` could not see it:
+the model left compaction out.
+
+**The rule.** A read at snapshot `S` uses a manifest `M` only if `M.lastL0Seq <= S`. Then every SST
+in `M` holds, for each key, its newest version at or below `S`, whatever flushes and compactions
+dropped. `ReadView.maxLastL0Seq` already enforced this for transactions; every view built from a
+writer's answer now sets it to the snapshot (`DbClient.pointView`, `scanView`).
+
+- **A cached manifest always fits**: it was loaded before the writer was asked.
+- **A manifest loaded after the answer may not.** The reader then fails with `SnapshotExpired`,
+  and `DbClient.getRow` and `scan` ask the writer again, up to three times
+  (`LATEST_READ_ATTEMPTS`). Each further time needs another flush to commit in that same short
+  window. After three, the read fails with the retryable `StorageUnavailable`.
+- **A scan across a flush.** A scan reads the writer's unflushed rows in pages. If a flush commits
+  between two pages, the later pages no longer hold its rows, and the manifest that does was
+  flushed past the snapshot. The view's lower bound (the largest `flushedSeq` of its pages) is
+  then above its upper bound, no manifest fits, and the scan starts again. The reader checks the
+  manifest before it emits a row, so no row is returned twice.
+- **`Flushed` reads and snapshots** read a manifest at its own `lastL0Seq`, which always fits.
+
+**A flush writes only the versions a read can reach** (`keepReachableVersions`, lsm-core). With
+the rule in place, every read of the SST a flush writes is at a snapshot at or after the flush's
+newest row. A read at an older snapshot takes those rows from the writer, which keeps them (D58),
+or reads an older manifest. `resolveVisibleRow` walks a key's versions newest first and stops at
+the first value or delete, so a flush keeps each key's rows from the newest down to and including
+the first that is not a merge operand, and drops the rest. Time and merge operators do not matter:
+an expired value still ends the walk.
+
+- A key rewritten many times between two flushes is one row in the SST instead of one per write.
+- A key written once, and merge operands with no value under them, are written as before.
+- The changelog export is separate and still holds every change.
+
+**Also fixed: a transaction scan without a begin manifest.** `DbClient.scanAt`, for a caller that
+sends no `manifestId` (the API before D58, still accepted), built its view with `minLastL0Seq = 0`.
+Within `manifestRefreshInterval` of a flush it could read a cached manifest from before the flush
+while the writer's pages no longer held the flushed rows, and miss them. It now requires the
+largest `flushedSeq` its pages reported, as `getAt` always did.
+
+**Model.** `NoAckedWriteLost.tla` now has the versions of one key:
+
+- `Compact`: a new manifest holding only the newest version;
+- `FlushUpload` keeps the newest version of its window;
+- the read's snapshot, the two bounds in `ReadManifest`, and `ReadAgain`;
+- invariants stated for the key's newest acknowledged version.
+
+The new broken variant `noSnapshotUpperBound` fails `LatestSeesAcked`, with the flush as it is now
+and, checked once by hand, with the flush as it was (every version) plus compaction: the code
+before this change. `vp run verify` is 28 runs.
+
+**Tests.**
+
+- `db-client.test.ts`: a client whose writer is overtaken after it answers (the key is rewritten
+  and flushed, and the older SST leaves the manifest). A get and a scan return the new value; on
+  the code before this change they returned "not found". Overtaken on every attempt, the read
+  fails as retryable. A scan of 1,200 unflushed rows overtaken between its two pages returns all
+  1,200.
+- `db-transaction.test.ts`: the scan without a begin manifest, which fails on the old code.
+- `row-resolution.test.ts`: for any history, any flush window, and any snapshot from the
+  window's newest row on, at any time, reads over the kept versions equal the oracle.
+- `db-writer.test.ts`: a key written twice before a flush is one row in the SST.
+- **The client-versus-oracle property test was weaker than it looked.** Effect's
+  `Arbitrary.array` with `minLength: 1` makes arrays of two elements at the median and ten at
+  most, so that test ran histories too short to write a key twice between flushes and read it.
+  It now runs 20 to 60 steps (as the transactions test has since Phase 9), which the code before
+  and after this change passes, and which catches a flush that drops merge operands.
+- Eleven mutations are each caught by one of these tests.
+
+**Measured** on `preview-3`, a 5-minute soak at 100% sampling, the code before against all of
+D70 to D73 (`docs/measurements.md`, "Read latency"): SST bytes stored per database for the same
+workload fell from 4.4 MB to 0.44 MB, a scan's block fetches from 7 (p50) and 37 (p90) to 2 and
+12, and scan latency from 76 / 555 / 2,146 ms (p50 / p90 / p99) to 60 / 257 / 983 ms. The soak's
+workload rewrites 500 keys continuously, so it shows the most this can do; a workload that never
+rewrites a key between flushes is unchanged.
+
+## D71. Tail records are sampled like traces, except the ones that did not end `ok`
+
+The Tail Worker stored one R2 object per invocation, unsampled (D48, D63).
+
+- **It could not be read back as fast as it was written.** During the 2-hour soak, `preview-1`
+  finished 72 invocations a second. The collector returns 500 objects in about 7 s (14 s on
+  `preview-2`, read from the US), which is 71 a second at best. The soak's watcher never caught
+  up, and its final read took as long again as the backlog was old: the soak's report arrived
+  more than half an hour after its workload ended.
+- **It would have been a production cost.** One R2 write per invocation is about 25 million
+  writes a day at 100 requests a second.
+
+The Tail Worker now keeps every invocation that did not end `ok` (a limit hit, an exception, a
+cancellation: the ones a health report acts on) and, of the `ok` ones, the fraction the stage
+samples traces at (`TAIL_SAMPLE_RATE`, bound from `telemetry.traceSampleRate`: 10% in
+production, everything on previews). Each record carries the rate it was kept at (`sampleRate`;
+records from before have none and count as 1).
+
+- `measure health` and the soak scale `ok` counts back up (`invocationsRepresentedBy`), and report
+  how many records they read. CPU percentiles are taken from the kept records.
+- The measurements that need one particular invocation's CPU (`flush-cpu`, `compaction-cpu`,
+  `writes`) run on previews at 100% sampling, where nothing is dropped.
+
+Test: `cpu-tail-worker.test.ts` (every outcome but `ok` kept at any rate; the sampled fraction of
+`ok`; an unset or unreadable rate keeps everything).
+
+## D72. The read path, second round: refresh from the manifest held, hedged block reads, scans that follow their limit
+
+Measured first, on `preview-3` with 100% sampling; each change below answers one finding. The
+numbers are in `docs/measurements.md` ("Read latency").
+
+**A manifest refresh starts from the manifest the reader holds.** A `Flushed` read refreshes its
+manifest every second with `loadLatest`: the `LATEST` hint and GC's boundary, then the manifest
+and the id after it, two round trips of about 110 ms together. `ManifestCache.refresh` now calls
+`loadLatestFrom` with the manifest it holds, which reads the boundary, the hint, that manifest,
+and the id after it in one round. On a database that committed nothing since, that is the whole
+load.
+
+- `loadLatestFrom` now also reads the hint. When the known manifest was superseded it continues
+  from the hint, if that names a stored manifest further along, so a known manifest far behind
+  costs no more than `loadLatest`.
+- Model: `LoadFromKnownFindsHead` is checked from every stored manifest, with the hint jump
+  (`KnownStart`); `knownIgnoresBoundary` still fails.
+- `Flushed` gets: p50 81 ms → 24 ms.
+
+**A slow block read is hedged with a read straight from the bucket** (`hedgedBlockRead`,
+`blockReadHedgeAfterMs`, default 50 ms). A read through the `BlockServer` is answered by Workers
+Cache in about 6 ms nine times in ten. The rest are slow in two ways: a miss pays the hop to the
+`BlockServer` on top of its bucket read (86 ms at p50, 328 ms at p90, of which the `BlockServer`
+itself is 44 and 82 ms), and a rare hit takes seconds (the slowest get of the run was one
+2.3-second `HIT`). Once the `BlockServer` read has taken 50 ms, the reader also reads the same
+bytes from the bucket, which every reader Worker already reads manifests from, and takes
+whichever answers first.
+
+- Only a success of the bucket read counts. Its failures leave the outcome to the `BlockServer`
+  read, so a hedge never fails a read that would have been answered, and the loser is
+  interrupted.
+- The `BlockServer` read still runs, so the block still enters Workers Cache for the next reader.
+- Block fetches, p50 / p90 / p99 / max: 7 / 96 / 439 / 1,896 ms → 7 / 74 / 101 / 159 ms. 21% of
+  fetches were hedged and the bucket read won a third of those, so about a fifth more bucket
+  reads.
+- In a restricted (`eu`, `fedramp`) Stack there is no Workers Cache, and from a client an ocean
+  away both paths cost the same: measured on `preview-2`, no change either way.
+- `block.hedged` and `block.hedge_won` are span attributes on the cache read that started them.
+
+**Scans stop reading when they have what they asked for.**
+
+- **The merge emits before it pulls an input again.** `mergeRowStreams` filled a batch of 256
+  rows before emitting any, so a scan with a smaller limit still read blocks for 256 rows: in a
+  test, a 3-row scan read all 40 blocks of an SST. A batch now ends when it is full or when an
+  input's chunk runs out, and the input is pulled only when the consumer asks for more. The
+  merge's order and its handling of exact duplicates are unchanged; for a compaction, which
+  drains every input, it costs 12% of the merge's own time (0.06 s of a 10 s step).
+- **The first read-ahead follows the limit** (`scanFirstReadAheadBlocks`): the blocks that hold
+  `limit` rows at the SST's average rows per block, plus one, at most `SCAN_READ_AHEAD_BLOCKS`
+  (8). Reading ahead 8 blocks of every overlapping SST made a 100-row scan over seven SSTs start
+  51 block reads, and a Worker invocation has six simultaneous subrequests, so the blocks it
+  needed waited behind the rest. A scan that needs more reads on, 8 at a time.
+- With D70's flush, each SST holds one row per key, so the estimate is close. Scan block fetches
+  fell from 7 (p50) and 37 (p90) to 2 and 12.
+
+**What is left in a get's tail.** With these changes the reader's part of a get is 205 ms at p99.
+A whole get's p99 stayed near 400 ms in the short soaks, because their top 1% is writer Durable
+Objects starting: a fence-in costs about 0.5 s (a manifest load and a create-if-absent), and the
+soak starts 12 to 14 writers in five minutes for the databases and shards it creates.
+
+**Tests.** `manifest-store.test.ts` (the hint jump, a hint behind or naming nothing stored, one
+round of reads for an unchanged manifest), `block-source.test.ts` (six cases of the hedge under
+the test clock), `db-client.test.ts` (the short scan reads two blocks and reads on past deleted
+rows; the read-ahead estimate), and the merge's property tests. Sixteen mutations caught.
+
+## D73. The flush path: the compactor wake leaves it, rows are encoded a chunk at a time; concurrent part uploads declined
+
+**A flush no longer waits for the compactor it wakes.** When a flush leaves enough L0 SSTs to
+compact, the writer wakes the database's compactor. It did so inside the flush, which holds the
+flush lock, and for a split's seal the commit lock as well. On `preview-3` the first call to an
+idle compactor took 5.4 to 9.2 s to reach its handler, which then ran 0.3 to 0.5 s: a 60 MiB
+flush that wrote its SST in 5.4 s and committed in 0.5 s took 12.8 s. The wake is now
+`BackgroundWork` (the Durable Object's `waitUntil`), as a fork's has been since D57. A lost wake
+is repeated by the next flush that leaves enough L0 SSTs, and a write refused for L0 backlog
+wakes the compactor the same way.
+
+**SST blocks are encoded a chunk of rows at a time.** `SstStore.write` made one stream per row.
+Mapping each chunk of rows to the blocks it closes took a 60 MB flush from 1.93 s to 1.60 s in
+local workerd (`flush-bench`, 17%). Two other suspects were measured and left alone: decoding the
+rows read back from SQLite with their schema (2%), and converting each row's columns (within
+noise).
+
+**16 KiB blocks cost a flush no more CPU than 4 KiB.** A sweep on `preview-2` and `preview-3`,
+three runs per cell and each cell on both stages, measured 3.4 to 4.9 s of CPU per 60 MiB flush
+at either size, and the same ratio of flush CPU to write CPU (1.3 to 1.45) in every cell. D67's
+default stands.
+
+**Concurrent part uploads: measured, declined.** With three parts of a multipart upload in
+flight, the SST write of a 60 MiB flush took 4.6 s instead of 5.5 s, and used no less CPU. A
+flush is bound by its CPU (about 4 of those 5.5 s), not by its uploads, so the gain is 16% for
+24 MiB more memory in a writer and a second code path in the one place uploads are checked
+against their digests. Not adopted. It stays on the branch `proto/parallel-parts`.
+
+**How flush CPU is counted.** A flush's work is split between the alarm that starts it and the
+flush request that joins it, in proportions that vary. `measure compaction-cpu` summarized the
+two kinds of record together, so D61's and D62's "flush CPU p50" (about 1 s for 60 MiB) was the
+median of halves. Counted per flush it is about 4 s for 60 MiB, which is what `measure flush-cpu`
+has always reported (55 to 90 ms per MiB). The limits are unaffected: they were set from the
+largest single invocation, and the largest seen in this round is 7.7 s against the API Worker's
+30 s. CPU also varies between runs by up to 2× with the machine a Durable Object lands on, so
+comparisons use several runs and the ratio to the same run's write CPU.
+
+**Tests.** `db-writer.test.ts`: with a compactor that never answers, three flushes in a row
+complete and the compactor is woken twice; waiting for the wake, or dropping it, fails. The SST
+contents are covered by the existing writer, reader, and compaction tests.
+
+## D74. The writer keeps one figure for unflushed bytes; the alarm and `status` read counters, never the memtable
+
+**Found by repeating D61's memory measurement** (`measure writer-memory`, one writer filled to
+`maxUnflushedBytes`). The flush of 267 MB took 20 s in one run and 200 to 220 s in the next three.
+In the slow runs the writer's alarm fired about six times every ten seconds for three and a half
+minutes, each firing using about 1.5 s of CPU and ending `ok` without flushing. D61's own run shows
+the same thing: 174 writer invocations and an 82-second flush, read then as "flush CPU p50 1.5 s".
+
+**The cause: two figures for one quantity.**
+
+- Writes, backpressure, and `scheduleFlush` used an in-memory counter that added
+  `rowEncodedSizeEstimate(row) + 24` per row.
+- The alarm ran `MemTable.stats`, which sums `LENGTH(key) + LENGTH(payload) + 32` in SQLite: a
+  scan of every unflushed row, and a second scan of the rows kept for transactions.
+
+The counter ran 1% above the scan for 1 KB values and about 8% above it for 100-byte ones. In
+that gap the counter said "at `l0SstSize`, flush now" and set the alarm for now; the alarm
+scanned, found less than `l0SstSize`, did not flush, and called `scheduleFlush`, which set it for
+now again.
+
+- **With production settings** the gap closes once another 1 to 8% of `l0SstSize` is written, so
+  a busy writer wasted a few scans of up to 64 MiB per flush. A burst that stopped inside the gap
+  would spin until `maxL0Age` (60 s), at about 0.4 s of CPU per turn.
+- **In the measurement** `l0SstSize` equals `maxUnflushedBytes`, so the counter also refused
+  further writes and the gap never closed. The scans took nearly all of the single-threaded
+  writer's CPU, which is why the flush an operator then asked for took ten times as long.
+
+**`status` scanned too, and every transaction begins with it.** `DbClient.beginTransaction` calls
+`DbWriter.status`, which ran the same `stats`. One status call on the 267 MB memtable used 1.58 s
+of CPU. No soak could show it: their memtables hold a few hundred rows.
+
+**The fix.**
+
+- **One formula.** `memTableWriteBytes` (key, payload, 32 bytes) is what SQLite sums and what a
+  commit adds to the counter, so the counter equals what a scan would report.
+- **Three counters**: unflushed bytes, unflushed rows, and the oldest unflushed commit time. They
+  are read from SQLite when the writer starts and when a flush ends, and advanced by each commit.
+- **The alarm decides from the counters** `scheduleFlush` set it from, so the two cannot
+  disagree, and an alarm costs no scan.
+- **`status` reports the counters**: no scan on a transaction's begin or on a status request.
+- **`MemTable.stats` no longer scans the kept rows.** Nothing read that figure.
+
+A flush still scans twice when it ends: the refresh of the counters over what was written
+meanwhile, and the trim's sum over the rows it keeps (at most `maxRetainedBytes` plus the newest
+flush). Both are once per flush.
+
+**Tests** (`db-writer.test.ts`):
+
+- The counters equal `MemTable.stats` after writes of every kind and very different sizes, after a
+  flush, and after the next write.
+- With `l0SstSize` 1,040 and 1,033 bytes unflushed: the alarm is set for the age limit, an early
+  alarm neither flushes nor sets itself for now, and one more row sets it for now and the alarm
+  flushes. On the code before, the first assertion already fails.
+- A recording SQLite storage: a write, a status read, and an alarm that is not due run no
+  aggregate statement; the writer's start runs one and a flush two.
+- Six mutations caught: another formula, a row counter not advanced, `status` scanning, the alarm
+  scanning, a flush not refreshing, an alarm that flushes whenever anything is unflushed.
+
+**Model.** `NoAckedWriteLost` and `SealSplit` are indifferent to when a flush is scheduled; no
+step changed (the skills record it).
