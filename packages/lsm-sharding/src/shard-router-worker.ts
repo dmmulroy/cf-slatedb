@@ -1,12 +1,14 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
 import { DatabaseId, DEFAULT_DATABASE_OPTIONS, KeyRange, SeqNum } from "@cf-slatedb/lsm-core";
 import {
+  bindLsmWorkerSettings,
   DatabaseLifecycle,
   dbServicesLayer,
   eventTelemetryFlushForStage,
   lsmAccessGateForStage,
   lsmHttpServerLayer,
   lsmWorkerCompatibility,
+  type LsmWorkerSettingsSource,
   type LsmWorkerTelemetry,
 } from "@cf-slatedb/lsm-cloudflare";
 import type { HttpEffect } from "alchemy/Http";
@@ -260,6 +262,11 @@ export interface ShardRouterWorkerOptions<R = never> {
    * the Stack's own factory on live stages. `R` is what building it needs at plan time.
    */
   readonly telemetry: LsmWorkerTelemetry<R>;
+  /**
+   * The deployment's engine settings and jurisdiction, bound onto the Worker in full on every
+   * deploy (`bindLsmWorkerSettings`). The Stack owns where they come from.
+   */
+  readonly settings: LsmWorkerSettingsSource<R>;
   readonly devPort: number;
 }
 
@@ -296,6 +303,7 @@ export const shardRouterWorkerLayer = <R = never>(options: ShardRouterWorkerOpti
           shardedHttpRouterLayer.pipe(Layer.provide(Layer.succeedContext(context))),
         ),
       );
+      yield* bindLsmWorkerSettings(options.settings);
       return { fetch: withEventTelemetryFlush(withAccessGate(Effect.flatten(router))) };
     }).pipe(
       Effect.provide(

@@ -1,5 +1,6 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
 import {
+  bindLsmWorkerSettings,
   eventTelemetryFlushForStage,
   inLsmJurisdiction,
   lsmJurisdiction,
@@ -11,6 +12,7 @@ import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Effect } from "effect";
 import { HttpClientRequest, HttpServerRequest, HttpServerResponse } from "effect/http";
 
+import { cfSlatedbWorkerSettings } from "./cf-slatedb-stack-config.ts";
 import { cfSlatedbTelemetry } from "./cf-slatedb-telemetry.ts";
 
 interface TelemetryProbeServerContract {
@@ -67,6 +69,8 @@ export const telemetryProbeWorkerLayer = TelemetryProbeWorker.make(
     const jurisdiction = yield* lsmJurisdiction;
     const withEventTelemetryFlush = yield* eventTelemetryFlushForStage;
     const withAccessGate = yield* lsmAccessGateForStage;
+    // The probe addresses its Durable Object in the Stack's jurisdiction, like the engine Workers.
+    yield* bindLsmWorkerSettings(cfSlatedbWorkerSettings);
     return {
       fetch: withAccessGate(
         Effect.gen(function* () {

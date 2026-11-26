@@ -7,6 +7,7 @@
     "test": "vp test run"
   },
   "dependencies": {
+    "@cf-slatedb/lsm-core": "workspace:*",
     "@effect/platform-node": "catalog:",
     "effect": "catalog:"
   },

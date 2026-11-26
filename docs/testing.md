@@ -42,7 +42,9 @@ Never test against `production`, a developer's stage, or another run's stage.
 `node tools/scenario-cli/src/scenario-cli.ts run --stage <stage> all` runs every scenario against a
 preview (deploy it with `--dev-timings`: the scenarios expect compaction and GC within seconds), and
 `scenario-cli measure writes | flush-cpu | split-pause --stage <stage>` takes the design §12
-measurements (deploy without `--dev-timings`). Record results in
+measurements (deploy without `--dev-timings`). `preview-cli bindings <stage>` shows the settings and
+jurisdiction each Worker is bound (`production` means exactly the defaults); check it before a
+measurement. Record results in
 [`measurements.md`](measurements.md) with the stage and method.
 
 A preview's spans go to its own `TraceCollector` Worker. Run `node tools/trace-cli/src/trace-cli.ts

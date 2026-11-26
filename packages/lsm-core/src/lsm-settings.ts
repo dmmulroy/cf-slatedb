@@ -3,6 +3,78 @@ import { Schema } from "effect";
 const PositiveInt = Schema.Int.check(Schema.isGreaterThan(0));
 const PositiveNumber = Schema.Number.check(Schema.isGreaterThan(0));
 
+const LsmSettingsFields = Schema.Struct({
+  blockSize: PositiveInt,
+  filterBitsPerKey: PositiveNumber,
+  minFilterKeys: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  l0SstSize: PositiveInt,
+  maxL0Age: PositiveInt,
+  maxUnflushedBytes: PositiveInt,
+  l0MaxSsts: PositiveInt,
+  minCompactionSources: Schema.Int.check(Schema.isGreaterThanOrEqualTo(2)),
+  maxCompactionSources: Schema.Int.check(Schema.isGreaterThanOrEqualTo(2)),
+  includeSizeThreshold: PositiveNumber,
+  maxConcurrentCompactions: PositiveInt,
+  compactionOutputSstSize: PositiveInt,
+  multipartPartSize: Schema.Int.check(Schema.isGreaterThanOrEqualTo(5 * 1024 * 1024)),
+  manifestRefreshInterval: PositiveInt,
+  compactorPollInterval: PositiveInt,
+  compactionBudgetCapacity: PositiveInt,
+  compactionLeaseMs: PositiveInt,
+  gcMinAge: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  gcInterval: PositiveInt,
+  l1DataCacheBytes: PositiveInt,
+  l1MetaCacheBytes: PositiveInt,
+  l1GroupCacheShare: Schema.Number.check(Schema.isBetween({ minimum: 0.01, maximum: 1 })),
+});
+
+/** Every setting, each valid on its own. */
+type LsmSettingsFields = typeof LsmSettingsFields.Type;
+
+/** One rule between settings: the fields it relates, and what must hold between them. */
+interface LsmSettingsCombinationRule {
+  /** The field the issue is reported at. */
+  readonly field: string;
+  readonly holds: (settings: LsmSettingsFields) => boolean;
+  /** Why the combination is refused, and how to fix it. */
+  readonly message: string;
+}
+
+/**
+ * Rules between settings that every valid {@link LsmSettings} satisfies.
+ *
+ * **Details**
+ *
+ * - A compaction needs at least as many sources allowed as it requires.
+ * - A memtable must be able to reach `l0SstSize` before backpressure refuses writes, or writes stall
+ *   until `maxL0Age` flushes.
+ * - A compaction's budget lease must outlive the compactor's poll interval, which renews it.
+ */
+const LSM_SETTINGS_COMBINATION_RULES: ReadonlyArray<LsmSettingsCombinationRule> = [
+  {
+    field: "maxCompactionSources",
+    holds: (settings) => settings.minCompactionSources <= settings.maxCompactionSources,
+    message: "maxCompactionSources must be at least minCompactionSources",
+  },
+  {
+    field: "maxUnflushedBytes",
+    holds: (settings) => settings.l0SstSize <= settings.maxUnflushedBytes,
+    message:
+      "maxUnflushedBytes must be at least l0SstSize, or writes are refused before a flush starts",
+  },
+  {
+    field: "compactionLeaseMs",
+    holds: (settings) => settings.compactorPollInterval < settings.compactionLeaseMs,
+    message:
+      "compactionLeaseMs must be longer than compactorPollInterval, which renews the lease on every poll",
+  },
+];
+
+const lsmSettingsCombinationIssues = (settings: LsmSettingsFields) =>
+  LSM_SETTINGS_COMBINATION_RULES.flatMap((rule) =>
+    rule.holds(settings) ? [] : [{ path: [rule.field], issue: rule.message }],
+  );
+
 /**
  * Schema for the engine's tuning settings. Sizes are bytes; durations are milliseconds.
  *
@@ -31,31 +103,13 @@ const PositiveNumber = Schema.Number.check(Schema.isGreaterThan(0));
  *   stats) a reader isolate keeps in its L1 cache, counted as stored on R2.
  * - `l1GroupCacheShare`: the fraction of each L1 cache one `budgetGroup` may hold; under pressure the
  *   group holding the most gives up its least recently used entries first.
+ *
+ * Settings that only make sense together are checked together (`LSM_SETTINGS_COMBINATION_RULES`), so
+ * a deployment with a contradictory combination fails to decode instead of misbehaving later.
  */
-export const LsmSettings = Schema.Struct({
-  blockSize: PositiveInt,
-  filterBitsPerKey: PositiveNumber,
-  minFilterKeys: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-  l0SstSize: PositiveInt,
-  maxL0Age: PositiveInt,
-  maxUnflushedBytes: PositiveInt,
-  l0MaxSsts: PositiveInt,
-  minCompactionSources: Schema.Int.check(Schema.isGreaterThanOrEqualTo(2)),
-  maxCompactionSources: Schema.Int.check(Schema.isGreaterThanOrEqualTo(2)),
-  includeSizeThreshold: PositiveNumber,
-  maxConcurrentCompactions: PositiveInt,
-  compactionOutputSstSize: PositiveInt,
-  multipartPartSize: Schema.Int.check(Schema.isGreaterThanOrEqualTo(5 * 1024 * 1024)),
-  manifestRefreshInterval: PositiveInt,
-  compactorPollInterval: PositiveInt,
-  compactionBudgetCapacity: PositiveInt,
-  compactionLeaseMs: PositiveInt,
-  gcMinAge: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-  gcInterval: PositiveInt,
-  l1DataCacheBytes: PositiveInt,
-  l1MetaCacheBytes: PositiveInt,
-  l1GroupCacheShare: Schema.Number.check(Schema.isBetween({ minimum: 0.01, maximum: 1 })),
-});
+export const LsmSettings = LsmSettingsFields.check(
+  Schema.makeFilter(lsmSettingsCombinationIssues, { identifier: "LsmSettingsCombination" }),
+);
 
 /** The engine's tuning settings. */
 export type LsmSettings = typeof LsmSettings.Type;

@@ -6,6 +6,13 @@ export class LsmConfiguration extends Context.Service<LsmConfiguration, LsmSetti
   "@cf-slatedb/LsmConfiguration",
 ) {}
 
+/**
+ * Name of the setting that carries the engine's settings to a Worker: a JSON object of settings.
+ * Deployments bind the complete settings (`bindLsmWorkerSettings`); a partial object, as tests and
+ * deploys before D55 bound, overrides the defaults.
+ */
+export const LSM_SETTINGS_BINDING = "CF_SLATEDB_LSM_SETTINGS";
+
 const decodeLsmSettingsOverrides = Schema.decodeEffect(
   Schema.fromJsonString(Schema.Record(Schema.String, Schema.Number)),
 );
@@ -13,14 +20,15 @@ const decodeLsmSettings = Schema.decodeUnknownEffect(LsmSettings);
 
 /**
  * Reads the settings once at the composition root: the defaults, overridden by the JSON object in
- * the `CF_SLATEDB_LSM_SETTINGS` configuration value when it is set.
+ * the {@link LSM_SETTINGS_BINDING} configuration value when it is set (deployments bind every
+ * setting, so nothing falls back to a default there).
  *
  * @returns The settings; fails with a `ConfigError` when the value cannot be read.
  * @throws {SchemaError} As a startup defect when the override is not a JSON object of numbers that
  *   yields valid `LsmSettings`: a misconfigured Worker must not start.
  */
 export const makeLsmConfiguration = Effect.gen(function* () {
-  const text = yield* Config.String("CF_SLATEDB_LSM_SETTINGS").pipe(Config.option);
+  const text = yield* Config.String(LSM_SETTINGS_BINDING).pipe(Config.option);
   const overrides: Readonly<Record<string, number>> = Option.isSome(text)
     ? yield* decodeLsmSettingsOverrides(text.value).pipe(Effect.orDie)
     : {};

@@ -707,6 +707,8 @@ SSTs; restoring the defect, or not blocking the source, fails the test.
 
 ## D54. Deploys bind every setting explicitly; a setting a deploy stops setting stays bound
 
+**Superseded by D55** (the mechanism; the finding stands).
+
 Alchemy binds a `Config` value read during a Worker's init as a `secret_text`, and Cloudflare keeps a
 script's secrets across uploads. So when a deploy _stops_ setting a value, nothing replaces it: on
 `preview-1`, `CF_SLATEDB_LSM_SETTINGS` from a `--dev-timings` deploy stayed bound through the next
@@ -718,3 +720,53 @@ So the preview CLI always sets both explicitly (`deployEnvironment`): `CF_SLATED
 `{}` (no overrides) unless `--dev-timings`, and `CF_SLATEDB_JURISDICTION` is `eu`, `fedramp`, or the
 new value `none`, which `lsmJurisdiction` reads as no restriction. Verified on `preview-1`: every
 Worker's bindings now hold `{}` and `none`. A future production deploy task must do the same.
+
+## D55. The Stack owns its configuration and binds every Worker its complete settings
+
+Supersedes D54's mechanism. D54 patched one deploy path: `preview-cli` always passed
+`CF_SLATEDB_LSM_SETTINGS` and `CF_SLATEDB_JURISDICTION`, so the values Alchemy's `Config`
+interception binds (and Cloudflare keeps across uploads) were overwritten. Any other path — a manual
+`vp run …#deploy:*`, a future production task — still left whatever an earlier deploy bound, and
+three Workers (`BlockServer`, the probe, the trace collector) never had the settings bound at all.
+
+Now one typed configuration, `CfSlatedbStackConfig` (`infra/cf-slatedb/src/cf-slatedb-stack-config.ts`),
+is resolved from the deploy's environment with complete defaults: stage, jurisdiction (`eu` |
+`fedramp` | `none`, default `none`), the complete `LsmSettings` (defaults merged with the JSON
+overrides; unknown setting names refused), telemetry (trace sample rate: 1, or 0.1 in production;
+retention: 14 days), and the access mode (`Open` locally, `BearerToken` live). The Stack resolves it
+before declaring anything, so a refused variable stops the plan as a `ConfigError` naming it.
+
+Every Worker layer in `lsm-cloudflare` and `lsm-sharding` takes a required `settings` source
+(`LsmWorkerSettingsSource`), and its init calls `bindLsmWorkerSettings` last, after every `Config`
+read, so it replaces whatever interception bound from the environment. It binds both keys, always:
+the complete settings as JSON and the jurisdiction (`none` included). "Unset" can no longer mean
+"whatever was there before". `lsm-cloudflare` stays unaware of infra; the infra Workers (the probe
+and the trace collector) call the same function.
+
+- **The values stay `secret_text`.** They are not secret, but interception bound them that way on
+  every existing deployment; binding the same type avoids switching a binding's type on a live Worker.
+- **Workers read them back unchanged** (`makeLsmConfiguration`, `lsmJurisdiction`). The reader still
+  accepts a partial object, for tests and deploys before D55 (`lsm-worker-settings.test.ts`).
+- **Declaration-time reads.** The compaction Workflow's jurisdiction is a declaration prop read when
+  its module loads (`lsmJurisdictionAtDeclaration`), from the same variable with the same default. An
+  invalid value there reads as none, but the Stack's resolution refuses it first, so the plan fails.
+- **Contradictory settings fail.** `LsmSettings` checks combinations (`minCompactionSources ≤
+  maxCompactionSources`, `l0SstSize ≤ maxUnflushedBytes`, `compactorPollInterval <
+  compactionLeaseMs`); workstream 4 adds `transactionRetentionMs < gcMinAge`.
+- **`preview-cli` only translates flags.** `deployEnvironment` sets the jurisdiction and, with
+  `--dev-timings`, the dev overrides, and removes the Stack's other variables from the inherited
+  shell, so leftovers cannot change a preview. `preview-cli bindings <stage>` prints each Worker's
+  bound values from state.
+- **Ephemeral buckets are destroyable.** Found live: moving `preview-3` from `eu` to `none` replaces
+  both buckets, and Alchemy refused to delete the old EU trace bucket because it held spans
+  (`BucketNotEmpty`). The deploy had already rebound every Worker, but it failed and left the bucket.
+  Outside production, `LsmBucket` and `TraceBucket` now set `forceDestroy`, so a replaced or destroyed
+  preview bucket is emptied first; production keeps R2's refusal. A pending delete uses the props in
+  state, so the one orphaned bucket (23 trace and tail records) was emptied through the R2 API and the
+  deploy rerun.
+
+Verified live: `preview-1` deployed with `--dev-timings` (every Worker bound the complete settings
+with the dev timings), then by a bare `vp run @cf-slatedb/infra#deploy:preview-1` with no
+`CF_SLATEDB_*` variables (every Worker bound the complete production settings and `none`).
+`preview-3`, never deployed before, went `eu` → `none`, and every Worker was bound `none`. All three
+previews were then redeployed with the final code.

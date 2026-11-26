@@ -1,6 +1,7 @@
 import { blockServerWorkerLayer } from "@cf-slatedb/lsm-cloudflare";
 
 import { cfSlatedbTelemetry } from "./cf-slatedb-telemetry.ts";
+import { cfSlatedbWorkerSettings } from "./cf-slatedb-stack-config.ts";
 
 /** Local dev port of the `BlockServer` Worker (it has no public URL when deployed). */
 export const BLOCK_SERVER_DEV_PORT = 1338;
@@ -9,6 +10,7 @@ export const BLOCK_SERVER_DEV_PORT = 1338;
 export const cfSlatedbBlockServerWorkerLayer = blockServerWorkerLayer({
   main: import.meta.url,
   telemetry: cfSlatedbTelemetry,
+  settings: cfSlatedbWorkerSettings,
   devPort: BLOCK_SERVER_DEV_PORT,
 });
 

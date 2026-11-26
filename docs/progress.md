@@ -2,21 +2,46 @@
 
 ## Current phase
 
-**Next: v1 for production.** All ten phases of the build brief and all seven items of
-`docs/handoff.md`'s "Remaining work" are complete (hand-off below). The plan to close the remaining
-gaps and the live findings and ship a production v1 is
-[`docs/handoff-v1.md`](handoff-v1.md): ten workstreams, the decisions Dillon must make (P1–P6), and
-the prompt for the next agent.
+**v1 for production** ([`docs/handoff-v1.md`](handoff-v1.md)): ten workstreams, then the release
+checklist and Dillon's go-ahead (P6). The decisions asked of Dillon are under "Open questions".
 
-| Item                                   | Status | Commit                                     |
-| -------------------------------------- | ------ | ------------------------------------------ |
-| 1. Portable Alchemy state for previews | done   | `69ca966`                                  |
-| 2. Preview deployment tool             | done   | `73719e4`                                  |
-| 3. Traces from previews                | done   | `7c80311`                                  |
-| 4. Live checks                         | done   | `18c2024`                                  |
-| 5. Data residency, per Stack           | done   | `52f0133`                                  |
-| 6. Known gaps                          | done   | `a8f3231`, `82fe7f0`, `ac5e0c3`, `e033b20` |
-| 7. Finish                              | done   | this commit                                |
+| Workstream                                | Status      | Commit      |
+| ----------------------------------------- | ----------- | ----------- |
+| 1. The Stack owns its configuration       | done        | this commit |
+| 2. Fast manifest commits                  | next        |             |
+| 3. Splits pause briefly, never fail       | not started |             |
+| 4. Transactions exact across flushes      | not started |             |
+| 5. GC and maintenance that scale          | not started |             |
+| 6. Writer throughput and limits           | not started |             |
+| 7. Corruption: prevent, detect, repair    | not started |             |
+| 8. Production telemetry                   | not started |             |
+| 9. Production readiness                   | not started |             |
+| 10. Soak, release checklist, the go-ahead | not started |             |
+
+The previous round (all ten build phases and `docs/handoff.md`'s seven items) is complete; its
+hand-off is below.
+
+## v1 log
+
+- **Set up (v1 session, 2026-11-25).** Node 24.22, `vp` 1.8, pnpm 12.14; `repos/slatedb` and
+  `.tlc/` present; Alchemy logged in to the account (`preview-cli status` lists `preview-1` and
+  `preview-2`). Before any change: `vp run ready` exit 0, `vp run verify` exit 0 (20/20). P1–P6
+  written under "Open questions" and asked.
+- **1. The Stack owns its configuration (D55, supersedes D54's mechanism).** `CfSlatedbStackConfig`
+  (infra) is resolved once from the deploy's environment with complete defaults (stage,
+  jurisdiction, complete `LsmSettings`, telemetry, access mode) before the Stack declares anything; a
+  refused variable fails the plan. Every Worker layer takes a `settings` source and binds the
+  complete settings and an explicit jurisdiction last in its init (`bindLsmWorkerSettings`), so no
+  deploy path can leave an earlier value bound. `LsmSettings` refuses contradictory combinations.
+  `preview-cli` only translates flags; `preview-cli bindings <stage>` prints each Worker's bound
+  values. **Live:** `preview-1` `--dev-timings` → a bare `vp run …#deploy:preview-1` with no
+  variables → every Worker bound the complete production settings and `none` (D54's failure mode,
+  now fixed in the Stack); `preview-3` (first deploy) `eu` → `none` → every Worker `none`.
+  **Finding (fixed):** that move failed to delete the replaced EU trace bucket (`BucketNotEmpty`);
+  both buckets are now `forceDestroy` outside production, and the orphan was emptied once through
+  the R2 API. Scenarios: 11/11 locally; `write-read` and `transactions` on `preview-1`. All three
+  previews redeployed with the final code (`preview-1` and `preview-3` unrestricted, `preview-2`
+  `eu`; production settings).
 
 ## Remaining-work log
 
@@ -355,17 +380,18 @@ Details and methods are in [`docs/measurements.md`](measurements.md).
 
 ### Destroying the previews (Dillon runs these; agents never do)
 
-`preview-1` and `preview-2` are deployed; `preview-3` was never deployed.
+All three previews are deployed (`preview-3` since v1 workstream 1).
 
 ```sh
 vp run @cf-slatedb/infra#destroy:preview-1
 vp run @cf-slatedb/infra#destroy:preview-2
-vp run @cf-slatedb/infra#destroy:preview-3   # only if it is ever deployed
+vp run @cf-slatedb/infra#destroy:preview-3
 ```
 
 `node tools/preview-cli/src/preview-cli.ts destroy-command <stage>` prints the same. Each removes
-the stage's Workers, Durable Objects, Workflow, both buckets (data and traces), and its state
-records; nothing in them is retained.
+the stage's Workers, Durable Objects, Workflow, both buckets (data and traces, emptied first: they
+are `forceDestroy` outside production since D55), and its state records; nothing in them is
+retained.
 
 ## Findings
 
@@ -385,11 +411,22 @@ records; nothing in them is retained.
 
 ## Open questions
 
-None block anything. Optional, if Dillon wants them:
+### v1 decisions for Dillon (asked 2026-11-25; work proceeds on the defaults)
 
-1. Measure whether Durable Object SQLite's page cache counts against the 128 MB isolate limit, and
-   the Workflows concurrent-instance limit on the plan (both need a dedicated load run on a preview).
-2. Approve the `LATEST`-hint and async-wake optimizations above (they change model-covered code).
+Asked once, at the start of the v1 round (`docs/handoff-v1.md`). Until Dillon answers, each
+workstream builds the recommended default, records it as a decision, and keeps it easy to change.
+
+| #   | Decision                            | Recommended default (building this until answered)                                                                                                           | Answer  |
+| --- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------- |
+| P1  | How production callers authenticate | The access gate, with rotatable tokens: two valid at a time, held as Secrets Store secrets, rotated by a `vp run` task. Cloudflare Access in front optional. | pending |
+| P2  | Production data residency           | None (`CF_SLATEDB_JURISDICTION=none`). Fixed per installation; changing it later means a new installation.                                                   | pending |
+| P3  | Production hostname                 | The API Worker's `workers.dev` URL. A custom domain needs a zone in the account.                                                                             | pending |
+| P4  | Production telemetry                | The stage's own `TraceCollector`, a 14-day R2 lifecycle rule, head sampling at 10% (100% on previews).                                                       | pending |
+| P5  | Plan and limits                     | Workers Paid; `limits.cpu_ms` on the API and compactor Workers set to workstream 6's measurement plus 2× headroom.                                           | pending |
+| P6  | Release go-ahead                    | Dillon reviews `docs/release-v1.md`, adds `production` to the deploy guard, then says "deploy" or runs the deploy task himself.                              | pending |
+
+The two optional measurements and the optimizations of the last round's open questions are now
+workstreams 2, 3, and 6 of the v1 plan.
 
 Resolved this round: Workers Cache hit and R2 create-if-absent confirmed live; data residency is
 per Stack (Dillon's choice, D49); the §12 write, flush, and split measurements are recorded.

@@ -1,3 +1,4 @@
+import { DEFAULT_LSM_SETTINGS } from "@cf-slatedb/lsm-core";
 import { Data, Effect, Option, Schema } from "effect";
 
 /** Schema for one of the three reusable live preview stages. */
@@ -182,19 +183,123 @@ export const previewSecret = Effect.fn("PreviewStage.previewSecret")(function* (
 });
 
 /**
- * The environment a preview deploy runs with: the inherited one, with the engine settings and the
- * jurisdiction always set explicitly. A value a deploy stops setting stays bound on the Workers
- * (Cloudflare keeps a script's secrets across uploads, D54), so "no dev timings" is `{}` and "no
- * jurisdiction" is `none`, never an absent variable.
+ * Deploy variables the preview CLI decides from its flags. The Stack resolves the rest of its
+ * configuration from them (`CfSlatedbStackConfig`, D55); values left in the shell must not change a
+ * preview, so a variable a flag does not set is removed rather than inherited.
+ */
+const PREVIEW_DECIDED_VARIABLES = [
+  "CF_SLATEDB_LSM_SETTINGS",
+  "CF_SLATEDB_JURISDICTION",
+  "CF_SLATEDB_TRACE_SAMPLE_RATE",
+  "CF_SLATEDB_TRACE_RETENTION_DAYS",
+] as const;
+
+/**
+ * The environment a preview deploy runs with: the inherited one, with the variables the flags
+ * decide replaced. It only translates flags; the Stack resolves the complete configuration and binds
+ * every Worker its full settings and jurisdiction on each deploy, whatever this environment holds.
  */
 export const deployEnvironment = (
   inherited: Readonly<Record<string, string | undefined>>,
   options: { readonly devTimings: boolean; readonly jurisdiction: PreviewJurisdiction },
-): Record<string, string | undefined> => ({
-  ...inherited,
-  CF_SLATEDB_LSM_SETTINGS: options.devTimings ? JSON.stringify(PREVIEW_DEV_TIMINGS) : "{}",
-  CF_SLATEDB_JURISDICTION: options.jurisdiction,
-});
+): Record<string, string> => {
+  const environment: Record<string, string> = {};
+  for (const [name, value] of Object.entries(inherited)) {
+    if (value !== undefined && !PREVIEW_DECIDED_VARIABLES.some((decided) => decided === name)) {
+      environment[name] = value;
+    }
+  }
+  if (options.devTimings)
+    environment["CF_SLATEDB_LSM_SETTINGS"] = JSON.stringify(PREVIEW_DEV_TIMINGS);
+  environment["CF_SLATEDB_JURISDICTION"] = options.jurisdiction;
+  return environment;
+};
+
+/** The engine settings and jurisdiction one Worker of a stage is bound, as recorded in state. */
+export interface PreviewWorkerBindings {
+  /** The Worker's logical id (`DbApiWorker`, ...). */
+  readonly worker: string;
+  /** The bound engine settings JSON, or `None` when the Worker has no such binding. */
+  readonly lsmSettings: Option.Option<string>;
+  /** The bound jurisdiction, or `None` when the Worker has no such binding. */
+  readonly jurisdiction: Option.Option<string>;
+}
+
+const decodeWorkerRecord = Schema.decodeUnknownOption(
+  Schema.Struct({
+    resourceType: Schema.Literal("Cloudflare.Worker"),
+    props: Schema.Struct({
+      env: Schema.OptionFromOptionalKey(Schema.Record(Schema.String, Schema.Unknown)),
+    }),
+  }),
+);
+// A bound `Config` value is recorded as a redacted, packed `Redacted` marker; a literal as text.
+const decodeBoundValue = Schema.decodeUnknownOption(
+  Schema.Union([
+    Schema.String,
+    Schema.Struct({
+      __redacted__: Schema.fromJsonString(
+        Schema.Struct({ _tag: Schema.Literal("Redacted"), value: Schema.String }),
+      ),
+    }),
+  ]),
+);
+
+const boundText = (value: unknown): Option.Option<string> =>
+  Option.map(decodeBoundValue(value), (bound) =>
+    typeof bound === "string" ? bound : bound.__redacted__.value,
+  );
+
+/**
+ * The engine settings and jurisdiction every Worker of `stage` is bound, read from the Workers'
+ * records in `records` (the values the last deploy uploaded). Workers that bind neither are left
+ * out.
+ */
+export const previewWorkerBindings = (
+  records: StateRecords,
+  stage: PreviewStage,
+): ReadonlyArray<PreviewWorkerBindings> => {
+  const prefix = `${CF_SLATEDB_STACK_NAME}/${stage}/`;
+  const bindings: Array<PreviewWorkerBindings> = [];
+  for (const [path, record] of records) {
+    if (!path.startsWith(prefix)) continue;
+    const worker = decodeWorkerRecord(record);
+    if (Option.isNone(worker)) continue;
+    const env: Readonly<Record<string, unknown>> = Option.getOrElse(
+      worker.value.props.env,
+      () => ({}),
+    );
+    const bound = (name: string) => Option.flatMap(Option.fromUndefinedOr(env[name]), boundText);
+    const lsmSettings = bound("CF_SLATEDB_LSM_SETTINGS");
+    const jurisdiction = bound("CF_SLATEDB_JURISDICTION");
+    if (Option.isNone(lsmSettings) && Option.isNone(jurisdiction)) continue;
+    bindings.push({ worker: path.slice(prefix.length), lsmSettings, jurisdiction });
+  }
+  return bindings.sort((left, right) => left.worker.localeCompare(right.worker));
+};
+
+const decodeSettingsJson = Schema.decodeUnknownOption(
+  Schema.fromJsonString(Schema.Record(Schema.String, Schema.Number)),
+);
+
+/**
+ * Describes bound engine settings for a person: `production` when they are exactly the defaults,
+ * `partial: …` when they name only some settings (a deploy before D55), otherwise the settings that
+ * differ from the defaults.
+ */
+export const describeBoundLsmSettings = (json: string): string => {
+  const decoded = decodeSettingsJson(json);
+  if (Option.isNone(decoded)) return `unreadable: ${json}`;
+  const bound = decoded.value;
+  const names = Object.keys(DEFAULT_LSM_SETTINGS);
+  if (!names.every((name) => name in bound)) return `partial: ${json}`;
+  const differing = Object.entries(DEFAULT_LSM_SETTINGS).filter(
+    ([name, value]) => bound[name] !== value,
+  );
+  return differing.length === 0
+    ? "production"
+    : `complete, differs: ${differing.map(([name]) => `${name}=${String(bound[name])}`).join(", ")}`;
+};
 
 /** The `vp run` task that deploys a stage in place. */
 export const deployTask = (stage: PreviewStage) => `@cf-slatedb/infra#deploy:${stage}`;

@@ -1,13 +1,16 @@
+import { DEFAULT_LSM_SETTINGS } from "@cf-slatedb/lsm-core";
 import { Effect, Option } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
   deployEnvironment,
   deployJurisdiction,
+  describeBoundLsmSettings,
   destroyCommand,
   parseStateRead,
   previewOutputs,
   previewSecret,
+  previewWorkerBindings,
 } from "./preview-stage.ts";
 
 const outputs = {
@@ -102,15 +105,15 @@ describe("deployJurisdiction", () => {
 });
 
 describe("deployEnvironment", () => {
-  it("always binds the settings and the jurisdiction explicitly, whatever the shell holds", () => {
+  it("decides the Stack's variables from the flags alone, whatever the shell holds", () => {
     const shell = {
       PATH: "/bin",
       CF_SLATEDB_LSM_SETTINGS: '{"gcMinAge":1}',
       CF_SLATEDB_JURISDICTION: "eu",
+      CF_SLATEDB_TRACE_SAMPLE_RATE: "0.5",
     };
     expect(deployEnvironment(shell, { devTimings: false, jurisdiction: "none" })).toEqual({
       PATH: "/bin",
-      CF_SLATEDB_LSM_SETTINGS: "{}",
       CF_SLATEDB_JURISDICTION: "none",
     });
     expect(deployEnvironment(shell, { devTimings: true, jurisdiction: "fedramp" })).toEqual({
@@ -118,5 +121,54 @@ describe("deployEnvironment", () => {
       CF_SLATEDB_LSM_SETTINGS: '{"gcMinAge":10000,"compactorPollInterval":1000}',
       CF_SLATEDB_JURISDICTION: "fedramp",
     });
+  });
+});
+
+describe("previewWorkerBindings", () => {
+  it("reads each Worker's bound settings and jurisdiction from its state record", () => {
+    const bound = (value: string) => ({
+      __redacted__: JSON.stringify({ _tag: "Redacted", value }),
+    });
+    const complete = JSON.stringify(DEFAULT_LSM_SETTINGS);
+    const records = new Map<string, unknown>([
+      [
+        "CfSlatedb/preview-1/DbApiWorker",
+        {
+          resourceType: "Cloudflare.Worker",
+          props: {
+            env: {
+              CF_SLATEDB_LSM_SETTINGS: bound(complete),
+              CF_SLATEDB_JURISDICTION: bound("none"),
+              CF_SLATEDB_ACCESS_TOKEN: bound("secret"),
+            },
+          },
+        },
+      ],
+      [
+        "CfSlatedb/preview-1/BlockServerWorker",
+        {
+          resourceType: "Cloudflare.Worker",
+          props: { env: { CF_SLATEDB_JURISDICTION: bound("eu") } },
+        },
+      ],
+      ["CfSlatedb/preview-1/CpuTailWorker", { resourceType: "Cloudflare.Worker", props: {} }],
+      ["CfSlatedb/preview-1/LsmBucket", { resourceType: "Cloudflare.R2.Bucket", props: {} }],
+    ]);
+    expect(previewWorkerBindings(records, "preview-1")).toEqual([
+      { worker: "BlockServerWorker", lsmSettings: Option.none(), jurisdiction: Option.some("eu") },
+      {
+        worker: "DbApiWorker",
+        lsmSettings: Option.some(complete),
+        jurisdiction: Option.some("none"),
+      },
+    ]);
+  });
+
+  it("tells production settings from dev timings and from a partial binding", () => {
+    expect(describeBoundLsmSettings(JSON.stringify(DEFAULT_LSM_SETTINGS))).toBe("production");
+    expect(
+      describeBoundLsmSettings(JSON.stringify({ ...DEFAULT_LSM_SETTINGS, gcMinAge: 10_000 })),
+    ).toBe("complete, differs: gcMinAge=10000");
+    expect(describeBoundLsmSettings("{}")).toBe("partial: {}");
   });
 });

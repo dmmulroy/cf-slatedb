@@ -12,14 +12,6 @@ import { useDelayedCollector, workerUrl } from "../telemetry/delayed-otlp-collec
 import { INTEGRATION_PORTS } from "./integration-ports.ts";
 import { writerTestStack } from "./writer-stack.ts";
 
-// Bound into the Worker at deploy time by the settings Config; flush after two seconds of age.
-// Compactors poll every half second, and GC may collect what is a second old.
-process.env["CF_SLATEDB_LSM_SETTINGS"] = JSON.stringify({
-  maxL0Age: 2000,
-  compactorPollInterval: 500,
-  gcMinAge: 1000,
-});
-
 // The Workers flush telemetry before responding in test stages; this collector answers at once and
 // records the span names the test asserts on.
 const collector = useDelayedCollector(0, INTEGRATION_PORTS.collector);

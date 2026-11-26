@@ -14,8 +14,8 @@ export const LSM_PRODUCTION_STAGE = "production";
  *
  * **Details**
  *
- * Production would use the name `cf-slatedb` and be retained; every other stage gets a generated,
- * destroyable name. It is created in the Stack's jurisdiction (`lsmJurisdiction`), if any. Under
+ * Production would use the name `cf-slatedb` and be retained; every other stage gets a generated
+ * name and a bucket that destroying the stage empties and deletes. It is created in the Stack's jurisdiction (`lsmJurisdiction`), if any. Under
  * `alchemy dev` it is Alchemy's local R2 simulator.
  */
 export const LsmBucket = Effect.gen(function* () {
@@ -26,6 +26,9 @@ export const LsmBucket = Effect.gen(function* () {
     ...(production ? { name: "cf-slatedb" } : {}),
     // The Stack's jurisdiction (D49). Changing it replaces the bucket: it is fixed per installation.
     ...(Option.isSome(jurisdiction) ? { jurisdiction: jurisdiction.value } : {}),
+    // Every other stage's data is disposable: destroying or replacing its bucket empties it first,
+    // so a preview stays destroyable once it holds databases. Production keeps R2's refusal.
+    forceDestroy: !production,
   }).pipe(RemovalPolicy.retain(production));
 });
 

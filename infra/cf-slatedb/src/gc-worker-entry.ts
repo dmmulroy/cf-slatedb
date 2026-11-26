@@ -1,6 +1,7 @@
 import { gcWorkerLayer } from "@cf-slatedb/lsm-cloudflare";
 
 import { cfSlatedbTelemetry } from "./cf-slatedb-telemetry.ts";
+import { cfSlatedbWorkerSettings } from "./cf-slatedb-stack-config.ts";
 
 /** Local dev port of the GC Worker (live stages serve its operator API on workers.dev, gated). */
 export const GC_DEV_PORT = 1340;
@@ -9,6 +10,7 @@ export const GC_DEV_PORT = 1340;
 export const cfSlatedbGcWorkerLayer = gcWorkerLayer({
   main: import.meta.url,
   telemetry: cfSlatedbTelemetry,
+  settings: cfSlatedbWorkerSettings,
   devPort: GC_DEV_PORT,
   schedule: "*/5 * * * *",
 });

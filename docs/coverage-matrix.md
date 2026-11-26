@@ -240,6 +240,21 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   (`LsmAccessToken`, `lsmAccessGateForStage`), applied by `db-api-worker.ts`, `gc-worker.ts`,
   `shard-router-worker.ts`, and the telemetry probe. Test: `lsm-access-gate.test.ts`. Live:
   `preview-1` answers `401` without the token and serves the API with it. D44.
+- **The Stack owns its configuration (v1 workstream 1)** — done (D55). `CfSlatedbStackConfig`
+  (`infra/cf-slatedb/src/cf-slatedb-stack-config.ts`): stage, jurisdiction, complete `LsmSettings`,
+  telemetry, access mode, resolved once from the deploy's environment with complete defaults; the
+  Stack resolves it before declaring anything and a refused variable fails the plan.
+  `bindLsmWorkerSettings` / `lsmWorkerSettingsBindings` (`lsm-worker-settings.ts`) bind every Worker
+  the complete settings and an explicit jurisdiction on every deploy (each Worker layer's `settings`
+  option); `LsmSettings` refuses contradictory combinations (`lsm-settings.ts`). Both buckets are
+  `forceDestroy` outside production. `preview-cli bindings <stage>` reads each Worker's bound values
+  from state. Tests: `cf-slatedb-stack-config.test.ts` (defaults by stage, each variable, each
+  refusal, bindings never absent), `lsm-worker-settings.test.ts` (bindings round-trip through the
+  Workers' `Config` reads; pre-D55 partial values still read), `lsm-settings.test.ts`,
+  `preview-stage.test.ts` (`deployEnvironment`, `previewWorkerBindings`), `writer.workerd.ts` (the
+  integration stack's timings arrive only through the new binding). Live: `preview-1` deployed with
+  `--dev-timings`, then by a bare `vp run …#deploy:preview-1` with no variables set → every Worker
+  bound the complete production settings and `none`; `preview-3` `eu` → `none` → every Worker `none`.
 - **Layout `packages/lsm-core`, `packages/lsm-cloudflare`, `packages/lsm-sharding`,
   `infra/cf-slatedb`** — done. Enforced by `tools/workspace-boundaries` (D1, D2).
 

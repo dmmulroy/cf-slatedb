@@ -21,6 +21,7 @@ import { dbReaderLayer } from "./db-reader.ts";
 import { lsmAccessGateForStage } from "./lsm-access-gate.ts";
 import { lsmWorkerCompatibility } from "./lsm-stage.ts";
 import { lsmConfigurationLayer } from "./lsm-configuration.ts";
+import { bindLsmWorkerSettings, type LsmWorkerSettingsSource } from "./lsm-worker-settings.ts";
 import {
   eventTelemetryFlushForStage,
   type LsmWorkerTailConsumers,
@@ -44,6 +45,11 @@ export interface DbApiWorkerOptions<R = never> {
    * the Stack's own factory on live stages. `R` is what building it needs at plan time.
    */
   readonly telemetry: LsmWorkerTelemetry<R>;
+  /**
+   * The deployment's engine settings and jurisdiction, bound onto the Worker in full on every
+   * deploy (`bindLsmWorkerSettings`, D55). The Stack owns where they come from.
+   */
+  readonly settings: LsmWorkerSettingsSource<R>;
   /** Tail Workers attached to the Worker (`noLsmTailConsumers` locally). */
   readonly tailConsumers: LsmWorkerTailConsumers<R>;
   /** Local dev port. */
@@ -98,6 +104,7 @@ export const dbApiWorkerLayer = <R = never>(options: DbApiWorkerOptions<R>) =>
           ),
         ),
       );
+      yield* bindLsmWorkerSettings(options.settings);
       return { fetch: withEventTelemetryFlush(withAccessGate(Effect.flatten(router))) };
     }).pipe(
       // Built once per isolate: the reader's manifest cache and L1 block cache, the lifecycle, and

@@ -7,7 +7,9 @@ hand-off item 4. Every number here came from the **`preview-1`** stage on Dillon
 blocks). One correction (D54): an earlier `--dev-timings` deploy's `gcMinAge` (10 s) and
 `compactorPollInterval` (1 s) stayed bound on the Workers during these runs. Neither is on the
 writer's path (writes, flushes, the seal and forks); the faster compactor polling and GC could only
-have added background load. Deploys now bind every setting explicitly. The client was a laptop on a US residential connection calling the Workers'
+have added background load. Deploys now bind every setting explicitly, and since D55 every Worker is
+bound the complete settings on every deploy; `preview-cli bindings <stage>` shows them, and every
+later section records what it showed. The client was a laptop on a US residential connection calling the Workers'
 `workers.dev` URLs, so client-side latencies include an internet round trip.
 
 Reproduce with:

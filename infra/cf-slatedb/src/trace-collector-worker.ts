@@ -2,6 +2,7 @@ import * as Cloudflare from "@alchemy.run/cloudflare";
 import {
   LSM_WORKER_COMPATIBILITY_DATE,
   lsmAccessGateFor,
+  bindLsmWorkerSettings,
   lsmHttpServerLayer,
   lsmJurisdiction,
 } from "@cf-slatedb/lsm-cloudflare";
@@ -12,6 +13,9 @@ import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Context, Effect, Layer, Option, Schedule, Schema } from "effect";
 import { Base64 } from "effect/encoding";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
+
+import { CF_SLATEDB_PRODUCTION_STAGE } from "./cf-slatedb-stage.ts";
+import { cfSlatedbWorkerSettings } from "./cf-slatedb-stack-config.ts";
 
 /** Name of the secret binding that carries a stage's trace collector token. */
 export const TRACE_COLLECTOR_TOKEN_BINDING = "CF_SLATEDB_TRACE_COLLECTOR_TOKEN";
@@ -39,9 +43,16 @@ export const TraceCollectorToken = Alchemy.makeRandom("TraceCollectorToken");
  */
 export const TraceBucket = Cloudflare.R2.Bucket(
   "TraceBucket",
-  Effect.map(lsmJurisdiction, (jurisdiction) =>
-    Option.isSome(jurisdiction) ? { jurisdiction: jurisdiction.value } : {},
-  ),
+  Effect.gen(function* () {
+    const stage = yield* Alchemy.Stage;
+    const jurisdiction = yield* lsmJurisdiction;
+    return {
+      ...(Option.isSome(jurisdiction) ? { jurisdiction: jurisdiction.value } : {}),
+      // Traces are disposable. Outside production, replacing the bucket (a jurisdiction change) or
+      // destroying the stage empties it first instead of failing on its contents.
+      forceDestroy: stage !== CF_SLATEDB_PRODUCTION_STAGE,
+    };
+  }),
 );
 
 class TraceBucketClient extends Context.Service<
@@ -240,6 +251,8 @@ export const traceCollectorWorkerLayer = TraceCollectorWorker.make(
       Effect.map(TraceCollectorToken, Option.some),
     );
     const router = yield* makeExecutionMemo(HttpRouter.toHttpEffect(traceCollectorRoutesLayer));
+    // Its bucket is in the Stack's jurisdiction, read through the same binding as the engine's.
+    yield* bindLsmWorkerSettings(cfSlatedbWorkerSettings);
     return {
       fetch: withToken(
         Effect.flatten(router).pipe(Effect.provideService(TraceBucketClient, bucket)),

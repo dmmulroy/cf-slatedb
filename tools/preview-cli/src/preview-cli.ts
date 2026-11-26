@@ -11,6 +11,7 @@
  * - `url <stage>` prints one stage's URLs.
  * - `token <stage>` prints the stage's access token (its Workers answer `401` without it).
  * - `collector <stage>` prints the stage's trace collector URL and token (for `trace-cli pull`).
+ * - `bindings <stage>` prints the engine settings and jurisdiction each Worker is bound.
  * - `destroy-command <stage>` prints the command that tears a stage down. It never runs it.
  */
 import { spawnSync } from "node:child_process";
@@ -25,6 +26,7 @@ import {
   deployEnvironment,
   deployJurisdiction,
   deployTask,
+  describeBoundLsmSettings,
   destroyCommand,
   parseStateRead,
   PREVIEW_DEV_TIMINGS,
@@ -32,6 +34,7 @@ import {
   PreviewJurisdiction,
   previewOutputs,
   previewSecret,
+  previewWorkerBindings,
   encodePreviewOutputs,
   type PreviewOutputs,
   type PreviewStage,
@@ -249,6 +252,42 @@ const collector = Command.make(
   ),
 );
 
+const bindings = Command.make(
+  "bindings",
+  { stage: stageArgument, json: jsonFlag },
+  ({ stage, json }) =>
+    Effect.gen(function* () {
+      const { records } = yield* deployedOutputs(stage);
+      const workers = previewWorkerBindings(records, stage);
+      if (json) {
+        return yield* Console.log(
+          JSON.stringify(
+            workers.map((worker) => ({
+              stage,
+              worker: worker.worker,
+              lsmSettings: Option.getOrNull(worker.lsmSettings),
+              jurisdiction: Option.getOrNull(worker.jurisdiction),
+            })),
+          ),
+        );
+      }
+      for (const worker of workers) {
+        const settings = Option.match(worker.lsmSettings, {
+          onNone: () => "settings unbound",
+          onSome: describeBoundLsmSettings,
+        });
+        const residency = Option.getOrElse(worker.jurisdiction, () => "unbound");
+        yield* Console.log(
+          `${stage} ${worker.worker.padEnd(22)} jurisdiction ${residency.padEnd(8)} ${settings}`,
+        );
+      }
+    }),
+).pipe(
+  Command.withDescription(
+    "Print the engine settings and jurisdiction each of a preview stage's Workers is bound",
+  ),
+);
+
 const destroy = Command.make(
   "destroy-command",
   { stage: stageArgument, json: jsonFlag },
@@ -264,7 +303,7 @@ const destroy = Command.make(
 
 const previewCli = Command.make("preview").pipe(
   Command.withDescription("Deploy and inspect cf-slatedb's live preview stages"),
-  Command.withSubcommands([deploy, status, url, token, collector, destroy]),
+  Command.withSubcommands([deploy, status, url, token, collector, bindings, destroy]),
 );
 
 Command.run(previewCli, { version: "0.0.0" }).pipe(

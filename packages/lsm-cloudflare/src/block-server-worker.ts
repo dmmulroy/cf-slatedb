@@ -11,6 +11,7 @@ import {
   databaseCacheTag,
 } from "./block-server-http-handlers.ts";
 import { lsmJurisdiction } from "./lsm-jurisdiction.ts";
+import { bindLsmWorkerSettings, type LsmWorkerSettingsSource } from "./lsm-worker-settings.ts";
 import { lsmWorkerCompatibility } from "./lsm-stage.ts";
 import { eventTelemetryFlushForStage, type LsmWorkerTelemetry } from "./lsm-telemetry.ts";
 import { ObjectReader, objectReaderLayer } from "./object-reader.ts";
@@ -24,6 +25,11 @@ export interface BlockServerWorkerOptions<R = never> {
    * the Stack's own factory on live stages. `R` is what building it needs at plan time.
    */
   readonly telemetry: LsmWorkerTelemetry<R>;
+  /**
+   * The deployment's engine settings and jurisdiction, bound onto the Worker in full on every
+   * deploy (`bindLsmWorkerSettings`, D55). The Stack owns where they come from.
+   */
+  readonly settings: LsmWorkerSettingsSource<R>;
   readonly devPort: number;
 }
 
@@ -84,6 +90,7 @@ export const blockServerWorkerLayer = <R = never>(options: BlockServerWorkerOpti
           ),
         ),
       );
+      yield* bindLsmWorkerSettings(options.settings);
       return { fetch: withEventTelemetryFlush(Effect.flatten(router)) };
     }).pipe(
       Effect.provide(objectReaderLayer),

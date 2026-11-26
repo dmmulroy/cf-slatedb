@@ -9,9 +9,10 @@ import { defineConfig } from "vite-plus";
  * Workflows) with live reload and short GC and compactor timings (`CF_SLATEDB_LSM_SETTINGS`).
  *
  * `deploy:preview-<n>` deploys the Stack to one of the three reusable live preview stages, in place
- * (approved; `docs/handoff.md`). Use them through `tools/preview-cli`, which sets the timings and
- * trace settings and reads the outputs back. Each preview's settings are the production defaults
- * unless `CF_SLATEDB_LSM_SETTINGS` is set when it deploys.
+ * (approved; `docs/handoff-v1.md`). Use them through `tools/preview-cli`, which translates its flags
+ * into the deploy's environment and reads the outputs back. The Stack resolves its configuration from
+ * that environment (`CfSlatedbStackConfig`, D55) and binds every Worker the complete settings, so a
+ * deploy without overrides runs the production defaults whatever an earlier deploy bound.
  *
  * `destroy:preview-<n>` tears a preview down. Agents never run them (the deployment guard blocks
  * `alchemy destroy`); `preview-cli destroy-command <stage>` prints the command for Dillon.

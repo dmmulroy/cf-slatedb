@@ -14,6 +14,7 @@ import { compactionLauncherLayer } from "./compaction-workflow.ts";
 import { CompactorServer, compactorServerLayerWithoutDependencies } from "./compactor-server.ts";
 import { lsmWorkerCompatibility } from "./lsm-stage.ts";
 import { lsmConfigurationLayer } from "./lsm-configuration.ts";
+import { bindLsmWorkerSettings, type LsmWorkerSettingsSource } from "./lsm-worker-settings.ts";
 import {
   eventTelemetryFlushForStage,
   type LsmWorkerTailConsumers,
@@ -30,6 +31,11 @@ export interface CompactorWorkerOptions<R = never> {
    * the Stack's own factory on live stages. `R` is what building it needs at plan time.
    */
   readonly telemetry: LsmWorkerTelemetry<R>;
+  /**
+   * The deployment's engine settings and jurisdiction, bound onto the Worker in full on every
+   * deploy (`bindLsmWorkerSettings`, D55). The Stack owns where they come from.
+   */
+  readonly settings: LsmWorkerSettingsSource<R>;
   /** Tail Workers attached to the Worker (`noLsmTailConsumers` locally). */
   readonly tailConsumers: LsmWorkerTailConsumers<R>;
   readonly devPort: number;
@@ -62,6 +68,7 @@ export const compactorWorkerLayer = <R = never>(options: CompactorWorkerOptions<
       yield* CompactorServer;
       yield* CompactionBudgetServer;
       const withEventTelemetryFlush = yield* eventTelemetryFlushForStage;
+      yield* bindLsmWorkerSettings(options.settings);
       return {
         fetch: withEventTelemetryFlush(
           Effect.succeed(HttpServerResponse.text("Not found", { status: 404 })),

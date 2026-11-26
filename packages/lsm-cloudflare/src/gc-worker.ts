@@ -11,6 +11,7 @@ import { GarbageCollector, garbageCollectorLayerWithoutDependencies } from "./ga
 import { GcHttpApi } from "./gc-http-api.ts";
 import { lsmAccessGateForStage } from "./lsm-access-gate.ts";
 import { lsmConfigurationLayer } from "./lsm-configuration.ts";
+import { bindLsmWorkerSettings, type LsmWorkerSettingsSource } from "./lsm-worker-settings.ts";
 import { lsmHttpServerLayer } from "./lsm-http-server.ts";
 import { isLocalLsmStage, lsmWorkerCompatibility } from "./lsm-stage.ts";
 import { eventTelemetryFlushForStage, type LsmWorkerTelemetry } from "./lsm-telemetry.ts";
@@ -43,6 +44,11 @@ export interface GcWorkerOptions<R = never> {
    * the Stack's own factory on live stages. `R` is what building it needs at plan time.
    */
   readonly telemetry: LsmWorkerTelemetry<R>;
+  /**
+   * The deployment's engine settings and jurisdiction, bound onto the Worker in full on every
+   * deploy (`bindLsmWorkerSettings`, D55). The Stack owns where they come from.
+   */
+  readonly settings: LsmWorkerSettingsSource<R>;
   readonly devPort: number;
   /** Cron expression for collecting every database (`gcInterval` in cron form). */
   readonly schedule: string;
@@ -83,6 +89,7 @@ export const gcWorkerLayer = <R = never>(options: GcWorkerOptions<R>) =>
           gcHttpRouterLayer.pipe(Layer.provide(Layer.succeed(GarbageCollector, collector))),
         ),
       );
+      yield* bindLsmWorkerSettings(options.settings);
       return { fetch: withEventTelemetryFlush(withAccessGate(Effect.flatten(router))) };
     }).pipe(
       Effect.provide(Cloudflare.Workers.CronEventSourceLive),
