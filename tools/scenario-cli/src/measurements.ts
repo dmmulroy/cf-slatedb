@@ -348,7 +348,8 @@ export const measureFlushCpu = (megabytes: number, rowValueBytes = 1000) =>
     const client = yield* dbApi;
     // About 2 MB of values per batch whatever the value size, so the same bytes are written as
     // many small rows or few large ones: flush CPU that follows the row count is per-row work.
-    const batchRows = Math.max(1, Math.round(2_000_000 / rowValueBytes));
+    // (At most 10,000 rows, a write batch's limit, so small values go in smaller batches.)
+    const batchRows = Math.min(10_000, Math.max(1, Math.round(2_000_000 / rowValueBytes)));
     const batches = Math.ceil((megabytes * 1_048_576) / (batchRows * rowValueBytes));
     const value = valueBytes(rowValueBytes, 11);
     const since = yield* Clock.currentTimeMillis;
