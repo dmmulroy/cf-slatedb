@@ -815,16 +815,22 @@ export const measureWriterMemory = (megabytes: number) =>
           .pipe(
             Effect.catchCause((cause) =>
               Effect.sync(() => {
-                const tag = String(cause).slice(0, 60);
+                // The error's tag (`WriteStalledPublicError`, `StorageUnavailablePublicError`).
+                const tag = /Fail\((\w+)/.exec(String(cause))?.[1] ?? String(cause).slice(0, 60);
                 refused.set(tag, (refused.get(tag) ?? 0) + 1);
               }),
             ),
           ),
       { concurrency: 4, discard: true },
     );
+    // A writer that was reset under the load answers 503 while it starts again: wait for it, so
+    // the report says what the load did instead of failing on the first refused request.
     const before = yield* client.databases
       .status({ params: { databaseId } })
-      .pipe(Effect.mapError(failed("status before the flush")));
+      .pipe(
+        Effect.retry({ times: 20, schedule: Schedule.spaced("1 second") }),
+        Effect.mapError(failed("status before the flush")),
+      );
     const flushStarted = yield* Clock.currentTimeMillis;
     const flushed = yield* Effect.result(client.databases.flush({ params: { databaseId } }));
     const flushClientMs = (yield* Clock.currentTimeMillis) - flushStarted;
