@@ -270,31 +270,21 @@ export const makeHedgedBlockSource = Effect.gen(function* () {
   const objects = yield* ObjectReader;
   const settings = yield* LsmConfiguration;
   const fromBucket = readSstRangeFromBucket(objects.getRange);
+  // No span of its own: the `BlockServer` read keeps the one `BlockSource.block` span per fetch,
+  // the bucket read has `ObjectReader.getRange`, and `block.hedged` lands on the caller's span.
   return BlockSource.of({
-    block: Effect.fn("BlockSource.block")(function* (
-      owner: DatabaseId,
-      sstId: SstId,
-      offset: number,
-      length: number,
-    ) {
-      return yield* hedgedBlockRead(
+    block: (owner, sstId, offset, length) =>
+      hedgedBlockRead(
         blockServer.block(owner, sstId, offset, length),
         fromBucket(owner, sstId, offset, length),
         settings.blockReadHedgeAfterMs,
-      );
-    }),
-    meta: Effect.fn("BlockSource.meta")(function* (
-      owner: DatabaseId,
-      sstId: SstId,
-      offset: number,
-      length: number,
-    ) {
-      return yield* hedgedBlockRead(
+      ),
+    meta: (owner, sstId, offset, length) =>
+      hedgedBlockRead(
         blockServer.meta(owner, sstId, offset, length),
         fromBucket(owner, sstId, offset, length),
         settings.blockReadHedgeAfterMs,
-      );
-    }),
+      ),
     purge: blockServer.purge,
   });
 });

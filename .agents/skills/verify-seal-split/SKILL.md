@@ -66,6 +66,12 @@ views and ranges), `writer.workerd.ts` (the same split through the public API).
 
 ## Maintenance notes
 
+- D73: `DbWriter.flushThen`, which the seal runs under the commit lock, no longer waits for the
+  compactor it wakes (`BackgroundWork`). The wake changes no state the model has; the seal's
+  commit and the order of seal, holds, and forks are unchanged. A flush now writes only the
+  versions a read can reach (D70): a fork reads its source at the seal's manifest, at a snapshot
+  at or after every row in it. No model step changed; reran, all broken variants still fail.
+
 - D57 (v1 workstream 3): a split's seal (`DbWriter.seal` with `holdForSuccessors`) commits the final
   flush, the seal, and each successor's hold in one manifest CAS under the commit lock (`flushThen`
   with the seal edit; a separate seal CAS only when nothing is left to flush). The model's `Seal`

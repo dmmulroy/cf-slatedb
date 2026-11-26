@@ -134,6 +134,16 @@ a flush commits from its own view with one create and no `ManifestReader.loadLat
 
 ## Maintenance notes
 
+- D72: `loadLatestFrom` now also reads the `LATEST` hint in its first round and, when the known
+  manifest was superseded, continues from the hint if that names a stored manifest further along
+  (`KnownStart`), so a known manifest far behind costs no more than `loadLatest`. The manifest
+  cache's `refresh` calls it with the manifest it holds. `LoadFromKnownFindsHead` is therefore
+  checked from every stored manifest, not only reported commits. `loadLatest` split into reading
+  the hint and boundary and `newestFromHint`; its steps are unchanged. Mutations caught by
+  `manifest-store.test.ts`: no jump to the hint, a jump to a hint behind the known manifest,
+  trusting a hint whose manifest is not stored, a refresh that always searches from the hint, and
+  a superseded known manifest returned as the newest. Reran; every broken variant fails.
+
 - D67 (v1 workstream 10): readers gained `ManifestReader.loadLatestFrom(knownId)`, which starts
   from the manifest the writer's last flush committed instead of the `LATEST` hint. Modeled as
   `LoadLatestFrom(k)` over every reported commit `k` (a superset of the writer's flushes), with the
@@ -168,7 +178,7 @@ a flush commits from its own view with one create and no `ManifestReader.loadLat
 
 ## Keeping it in step with the code
 
-Sync commit: the D67 commit (`perf(read)`: the covering manifest cache, `loadLatestFrom`, read-ahead, 16 KiB blocks) (the model was last
+Sync commit: the D70–D73 commit (`fix(read)` and `perf`: the snapshot bound, the newest-version flush, the read path and flush path changes) (the model was last
 confirmed to describe the code at this commit). When a covered file changed after it, diff it, update the model so each step still maps
 to one awaited effect in the code, rerun, and show the affected invariant still fails on a broken
 variant. Move the sync commit forward only after confirming the model describes the code at the

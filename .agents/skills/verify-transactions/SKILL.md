@@ -83,6 +83,19 @@ deletes rows. `writer.workerd.ts` refuses write skew through the public API.
 
 ## Maintenance notes
 
+- D70: (1) Fixed: `DbClient.scanAt` without a begin manifest (a caller from before D58) built its
+  view with `minLastL0Seq = 0`, so within `manifestRefreshInterval` of a flush it could read a
+  cached manifest from before that flush while the writer's pages no longer held the flushed
+  rows. It now requires the largest `flushedSeq` its pages reported, as `getAt` always did.
+  Test: `db-transaction.test.ts` "a scan by a caller that sends no begin manifest reads rows
+  flushed since the reader cached its manifest", which fails on the old code. The model's reads
+  already took flushed rows from a manifest covering them, so no step changed. (2) A flush now
+  writes only the versions a read can reach. A transaction's reads take every row above its begin
+  manifest's `lastL0Seq` from the writer's kept rows, and the begin manifest's SSTs for the rest
+  at a snapshot at or after their newest rows; the model already represents a pinned manifest by
+  its `lastL0Seq` and lets `Compact` collapse versions, which covers a collapsing flush. Reran;
+  all broken variants still fail.
+
 - D67 (v1 workstream 10): `ReadView` gained `freshness` and `manifestHint`. `DbClient.getAt` and
   `scanAt` set `freshness: "Recent"` with no hint on every path (pinned and unpinned), so
   transaction reads find their manifest exactly as before: the pinned begin manifest, or for old
@@ -99,7 +112,7 @@ deletes rows. `writer.workerd.ts` refuses write skew through the public API.
 
 ## Keeping it in step with the code
 
-Sync commit: the D67 commit (`perf(read)`: the covering manifest cache, `loadLatestFrom`, read-ahead, 16 KiB blocks). When a covered function changes after it, update the model
+Sync commit: the D70–D73 commit (`fix(read)` and `perf`: the snapshot bound, the newest-version flush, the read path and flush path changes). When a covered function changes after it, update the model
 so each action is still one awaited effect in the code, rerun, and show each invariant still fails on
 a broken variant before moving the sync commit. For drift that skipped this skill, use
 `.agents/skills/maintain-formal-verification-skill/SKILL.md`.
