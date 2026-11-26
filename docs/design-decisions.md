@@ -1402,6 +1402,35 @@ p50 and p99 client latencies are recorded per operation.
   timeouts, and failures are logged with their time, so they can be found in tail records and
   traces.
 
+**Telemetry never holds up the soak.** A 130-minute release soak ran its workload and
+never reported: its tail-record watcher was one of the workload's fibers, and one read paged for
+as long as records kept arriving, so the workload could not end. It was stopped after 3 h 24 min
+with nothing written. Since then (`soak-telemetry.ts`, `soak-report.ts`):
+
+- **The watchers stop with the workload.** The tail-record watcher, the span puller, and the
+  report writer run beside the workload and are interrupted when it ends, wherever they are
+  (`whileWorkloadRuns`). An interrupted HTTP read is aborted; an interrupted `trace-cli` run
+  (`pull`, `grep`) is killed.
+- **Every telemetry read has a budget** (`readWithin`): 5 minutes while the workload runs, and
+  `--telemetry-budget-minutes` (default 10) for each final read: the tail-record catch-up, the
+  health report, the span pull, and each span search. A read that runs out is a failure that
+  says how far it got (tail records read, the time of the newest one), and the next check runs.
+  Pages read before a cut-off stay counted: a page is folded in and the cursor moved past it in
+  one synchronous step (`TailTally.foldPage`).
+- **Data first.** The final checks run in order: `final-reads` (every key at `Latest` and
+  `Flushed`, counters, the sharded group), `storage`, then `telemetry`.
+- **A report that survives.** `--report-file <path>` keeps the report as known so far, with its
+  `phase` (`workload`, `final-reads`, `storage`, `telemetry`, `done`) and `updatedAt`. It is
+  written to a temporary file and renamed over the path, every minute during the workload and
+  after each phase, so a stopped run leaves its last complete report. `passed` is `true` only
+  when `phase` is `done` (`soakPassed`). Stdout still prints the final report.
+
+Tests: `soak-telemetry.test.ts` (a source that never ends is cut off at its budget and the
+failure says how far it got; a watcher in the middle of an endless read is interrupted when the
+workload ends or fails), `soak-report.test.ts` (phases, the rename of a complete temporary file,
+the previous report kept when a write dies before the rename; the verdict), and
+`scenario.test.ts` (an interrupted child process is killed).
+
 **`scenario-cli smoke`** (`smoke.ts`) is the production smoke test. It runs only operations safe on
 a live installation, on databases it names itself (`smoke-<time>-…`), which it removes at the end
 whatever happened. It checks:
