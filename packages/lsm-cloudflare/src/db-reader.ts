@@ -177,13 +177,38 @@ const levels = (manifest: Manifest): ReadonlyArray<ReadonlyArray<SstHandle>> => 
 const readerBudgetGroup = (databaseId: DatabaseId, manifest: Manifest): string =>
   Option.getOrElse(manifest.options.budgetGroup, () => databaseId);
 
-/** Constructs the reader over the contextual manifest cache, manifest reader, and block cache. */
 /**
- * Blocks of one SST a scan reads ahead of the merge (D67). A block read from a Worker far from the
- * bucket takes hundreds of milliseconds, so a full page of 1,000 rows over several SSTs needs many
- * reads in flight; a short scan wastes at most this many speculative reads per SST.
+ * Most blocks of one SST a scan reads ahead of the merge (D67). A block read from a Worker far from
+ * the bucket takes hundreds of milliseconds, so a full page of 1,000 rows over several SSTs needs
+ * many reads in flight.
  */
 export const SCAN_READ_AHEAD_BLOCKS = 8;
+
+/**
+ * How many of an SST's blocks a scan that wants `limit` rows reads at once to begin with: the
+ * blocks that hold `limit` rows at the SST's average rows per block, plus one for a range that
+ * starts in the middle of a block, at most {@link SCAN_READ_AHEAD_BLOCKS}.
+ *
+ * **Details**
+ *
+ * A Worker invocation has six simultaneous subrequests. Reading ahead 8 blocks of every
+ * overlapping SST made a 100-row scan over seven SSTs start 51 block reads, and the one or two
+ * blocks per SST it needed waited behind the rest. A scan that turns out to need more (rows hidden
+ * by its snapshot, many versions of a key, deletes) reads on, {@link SCAN_READ_AHEAD_BLOCKS} at a
+ * time.
+ *
+ * @param limit - Rows the scan wants; none: all, which reads ahead fully.
+ */
+export const scanFirstReadAheadBlocks = (
+  limit: Option.Option<number>,
+  sst: { readonly rowCount: number; readonly blockCount: number },
+): number => {
+  if (Option.isNone(limit)) return SCAN_READ_AHEAD_BLOCKS;
+  const rowsPerBlock = Math.max(1, sst.rowCount / Math.max(1, sst.blockCount));
+  return Math.max(1, Math.min(SCAN_READ_AHEAD_BLOCKS, Math.ceil(limit.value / rowsPerBlock) + 1));
+};
+
+/** Constructs the reader over the contextual manifest cache, manifest reader, and block cache. */
 
 export const makeDbReader = Effect.gen(function* () {
   const manifests = yield* ManifestCache;
@@ -387,6 +412,7 @@ export const makeDbReader = Effect.gen(function* () {
     range: KeyRange,
     snapshotSeq: SeqNum,
     budgetGroup: string,
+    limit: Option.Option<number>,
   ) =>
     Stream.unwrap(
       Effect.gen(function* () {
@@ -400,19 +426,31 @@ export const makeDbReader = Effect.gen(function* () {
         const owner = sstHandleOwner(handle, databaseId);
         const meta = yield* blocks.meta(owner, handle, budgetGroup);
         const indexes = blocksOverlappingRange(meta, effective.value);
-        return Stream.fromIterable(indexes).pipe(
-          // Read ahead while the merge consumes this source: it pulls one source at a time, so
-          // without read-ahead a scan waits on one block read at a time (D67).
-          Stream.mapEffect(
-            (index) => {
-              const entry = meta.index[index];
-              return entry === undefined
-                ? Effect.succeed([])
-                : Effect.map(blocks.block(owner, handle, entry, budgetGroup), (block) => [
-                    ...block.rows(),
-                  ]);
-            },
-            { concurrency: Math.min(SCAN_READ_AHEAD_BLOCKS, Math.max(1, indexes.length)) },
+        // Read ahead while the merge consumes this source: it pulls one source at a time, so
+        // without read-ahead a scan waits on one block read at a time (D67).
+        const readAhead = (blockIndexes: ReadonlyArray<number>, concurrency: number) =>
+          Stream.fromIterable(blockIndexes).pipe(
+            Stream.mapEffect(
+              (index) => {
+                const entry = meta.index[index];
+                return entry === undefined
+                  ? Effect.succeed([])
+                  : Effect.map(blocks.block(owner, handle, entry, budgetGroup), (block) => [
+                      ...block.rows(),
+                    ]);
+              },
+              { concurrency: Math.max(1, Math.min(concurrency, blockIndexes.length)) },
+            ),
+          );
+        // First the blocks the scan's limit is likely to need, then, only if the merge asks for
+        // more, the rest.
+        const first = scanFirstReadAheadBlocks(limit, {
+          rowCount: meta.footer.rowCount,
+          blockCount: meta.index.length,
+        });
+        return readAhead(indexes.slice(0, first), first).pipe(
+          Stream.concat(
+            Stream.suspend(() => readAhead(indexes.slice(first), SCAN_READ_AHEAD_BLOCKS)),
           ),
           Stream.flatMap((rows) => Stream.fromIterable(rows)),
           Stream.filter(
@@ -460,7 +498,7 @@ export const makeDbReader = Effect.gen(function* () {
           ).pipe(Effect.catchTags(blockFailures(databaseId)));
         }
         const ssts = overlapping.map((handle) =>
-          sstRows(databaseId, handle, range, snapshotSeq, budgetGroup),
+          sstRows(databaseId, handle, range, snapshotSeq, budgetGroup, options.limit),
         );
         const visible = groupRowsByKey(mergeRowStreams([memtable, ...ssts])).pipe(
           Stream.mapEffect((versions) =>
