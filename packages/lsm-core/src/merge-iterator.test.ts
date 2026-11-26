@@ -107,8 +107,17 @@ describe("retainKeyVersions (compaction)", () => {
             ([key, value]) =>
               keyToHex(readable.get(key) ?? new Uint8Array([0xde])) === keyToHex(value),
           ) &&
-          // At most one version per key survives, and no delete survives at the bottom.
-          regrouped.every((versions) => versions.length === 1) &&
+          // A key keeps one version per run of rows that expire together (D81): no two adjacent
+          // survivors expire at the same time. No delete survives at the bottom.
+          regrouped.every((versions) =>
+            versions.every((version, index) => {
+              const older = versions[index + 1];
+              return (
+                older === undefined ||
+                Option.getOrUndefined(older.expireTs) !== Option.getOrUndefined(version.expireTs)
+              );
+            }),
+          ) &&
           (!isBottom || compacted.every((row) => row.value._tag !== "Tombstone"))
         );
       },

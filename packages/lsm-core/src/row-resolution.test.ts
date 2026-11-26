@@ -257,3 +257,94 @@ describe("retainKeyVersions", () => {
     });
   });
 });
+
+describe("retainKeyVersions with merge operands of mixed expiry (D81)", () => {
+  const key = Uint8Array.of(7);
+  const row = (seq: number, value: Row["value"], expireTs: number | undefined): Row => ({
+    key,
+    seq: SeqNum.make(seq),
+    value,
+    createTs: Option.some(Timestamp.make(0)),
+    expireTs: expireTs === undefined ? Option.none() : Option.some(Timestamp.make(expireTs)),
+  });
+  const operand = (seq: number, byte: number, expireTs?: number) =>
+    row(seq, RowValue.Merge({ operand: Uint8Array.of(byte) }), expireTs);
+  const value = (seq: number, byte: number, expireTs?: number) =>
+    row(seq, RowValue.Value({ bytes: Uint8Array.of(byte) }), expireTs);
+  const compact = (versions: ReadonlyArray<Row>, isBottom = true) =>
+    retainKeyVersions(versions, {
+      now: Timestamp.make(5),
+      retainAboveSeq: Option.none(),
+      isBottom,
+      mergeOperator: Option.some(MERGE_OPERATORS.Concat),
+    });
+  const readAt = (versions: ReadonlyArray<Row>, now: number) =>
+    Option.map(
+      Result.getOrThrow(
+        resolveVisibleRow(versions, {
+          snapshotSeq: SeqNum.make(100),
+          now: Timestamp.make(now),
+          mergeOperator: Option.some(MERGE_OPERATORS.Concat),
+        }),
+      ),
+      (found) => (found.value._tag === "Value" ? [...found.value.bytes] : []),
+    );
+  const shape = (versions: ReadonlyArray<Row>) =>
+    versions.map((version) => [
+      version.value._tag,
+      version.value._tag === "Value"
+        ? [...version.value.bytes]
+        : version.value._tag === "Merge"
+          ? [...version.value.operand]
+          : [],
+      Option.getOrUndefined(version.expireTs),
+    ]);
+
+  it("an operand that expires early leaves the base and the other operands readable after compaction", () => {
+    // Newest first: B (no TTL), A (expires at 10), base V (no TTL).
+    const versions = [operand(3, 66), operand(2, 65, 10), value(1, 86)];
+    const compacted = compact(versions);
+    for (const now of [5, 9, 10, 20, 1_000]) {
+      expect(readAt(compacted, now)).toEqual(readAt(versions, now));
+    }
+    expect(readAt(compacted, 20)).toEqual(Option.some([86, 66]));
+    // Nothing folds across a different expiry.
+    expect(shape(compacted)).toEqual([
+      ["Merge", [66], undefined],
+      ["Merge", [65], 10],
+      ["Value", [86], undefined],
+    ]);
+  });
+
+  it("folds runs of operands that expire together, and a base only with the same expiry", () => {
+    const versions = [
+      operand(5, 4, 30),
+      operand(4, 3, 30),
+      operand(3, 2),
+      operand(2, 1),
+      value(1, 0),
+    ];
+    expect(shape(compact(versions))).toEqual([
+      ["Merge", [3, 4], 30],
+      ["Value", [0, 1, 2], undefined],
+    ]);
+    // A base that expires on its own stays its own row.
+    expect(shape(compact([operand(3, 2), operand(2, 1), value(1, 0, 40)]))).toEqual([
+      ["Merge", [1, 2], undefined],
+      ["Value", [0], 40],
+    ]);
+  });
+
+  it("folds the operands just above a delete into a value that expires with them", () => {
+    const deleted = row(1, RowValue.Tombstone(), undefined);
+    const versions = [operand(3, 2), operand(2, 1, 30), deleted];
+    const compacted = compact(versions, false);
+    expect(shape(compacted)).toEqual([
+      ["Merge", [2], undefined],
+      ["Value", [1], 30],
+    ]);
+    for (const now of [5, 29, 30, 100]) {
+      expect(readAt(compacted, now)).toEqual(readAt(versions, now));
+    }
+  });
+});
