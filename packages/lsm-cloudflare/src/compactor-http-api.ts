@@ -3,6 +3,8 @@ import { Schema } from "effect";
 import { HttpApi, HttpApiEndpoint, HttpApiGroup, HttpApiSchema } from "effect/http-api";
 
 import { CompactorState, CompactorUnavailableError } from "./compactor.ts";
+import { GarbageCollectorUnavailableError } from "./garbage-collector.ts";
+import { GarbageCollectionReportSchema } from "./gc-http-api.ts";
 import { DatabaseIdMismatchError, DatabaseNotFoundError } from "./lsm-errors.ts";
 
 const DatabaseParams = Schema.Struct({ databaseId: DatabaseId });
@@ -33,6 +35,23 @@ export class CompactorHttpApiGroup extends HttpApiGroup.make("compactor")
   )
   .add(
     HttpApiEndpoint.post("destroy", "/databases/:databaseId/compactor/destroy", {
+      params: DatabaseParams,
+      success: HttpApiSchema.NoContent,
+      error: COMPACTOR_ERRORS,
+    }),
+  )
+  .add(
+    HttpApiEndpoint.post("collect", "/databases/:databaseId/compactor/collect", {
+      params: DatabaseParams,
+      success: GarbageCollectionReportSchema,
+      error: [
+        ...COMPACTOR_ERRORS,
+        GarbageCollectorUnavailableError.pipe(HttpApiSchema.status(503)),
+      ],
+    }),
+  )
+  .add(
+    HttpApiEndpoint.post("requestCollection", "/databases/:databaseId/compactor/collection", {
       params: DatabaseParams,
       success: HttpApiSchema.NoContent,
       error: COMPACTOR_ERRORS,

@@ -3,6 +3,7 @@ import { Context, Effect, Layer, Option, Ref } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
+import { GarbageCollector, makeGarbageCollector } from "./garbage-collector.ts";
 import { CompactionBudget, compactionBudgetTestLayer } from "./compaction-budget.ts";
 import { makeCompactionExecutor, CompactionExecutor } from "./compaction-executor.ts";
 import {
@@ -30,7 +31,11 @@ const ORDERS = DatabaseId.make("orders");
 const USERS = DatabaseId.make("users");
 
 /** Client, stores, executor, in-process launcher, and a budget of one compaction at a time. */
-const sharedLayer = Layer.mergeAll(compactionLauncherTestLayer, compactionBudgetTestLayer).pipe(
+const sharedLayer = Layer.mergeAll(
+  compactionLauncherTestLayer,
+  compactionBudgetTestLayer,
+  Layer.effect(GarbageCollector, makeGarbageCollector),
+).pipe(
   Layer.provideMerge(
     Layer.effect(CompactionExecutor, makeCompactionExecutor).pipe(
       Layer.provide(sstStoreLayerWithoutDependencies),
@@ -42,7 +47,12 @@ const sharedLayer = Layer.mergeAll(compactionLauncherTestLayer, compactionBudget
 /** A compactor instance with its own durable state and alarm, over the shared services. */
 const startCompactor = Effect.gen(function* () {
   const shared = yield* Effect.context<
-    ManifestReader | ManifestStore | CompactionLauncher | CompactionBudget | LsmConfiguration
+    | ManifestReader
+    | ManifestStore
+    | CompactionLauncher
+    | CompactionBudget
+    | LsmConfiguration
+    | GarbageCollector
   >();
   const built = yield* Layer.build(
     compactorLayerWithoutDependencies.pipe(
@@ -84,6 +94,7 @@ const run = <A, E>(
     | CompactionBudget
     | LsmConfiguration
     | ObjectStore
+    | GarbageCollector
     | DbReaderServices
   >,
 ) =>
@@ -96,6 +107,59 @@ const run = <A, E>(
   );
 
 describe("Compactor", () => {
+  it("collects its database's garbage from its alarm once old enough, then sets no alarm", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createWithL0(ORDERS, 4);
+        const { compactor, alarm, fire } = yield* startCompactor;
+        const objects = yield* ObjectStore;
+        const ssts = Effect.map(
+          objects.list(`db/${ORDERS}/compacted/`, Option.none()),
+          (page) => page.objects.length,
+        );
+        yield* compactor.wake(ORDERS);
+        yield* fire;
+        yield* TestClock.adjust("5 seconds");
+        yield* fire;
+        // The compaction finished: its four inputs are garbage, collectable after gcMinAge.
+        const due = Option.flatMap(
+          yield* compactor.status(ORDERS),
+          (state) => state.collectionDueAt,
+        );
+        const scheduled = yield* alarm.scheduled;
+        const before = yield* ssts;
+        yield* TestClock.adjust("1 hour");
+        yield* fire;
+        const after = yield* ssts;
+        // That collection's own commit superseded a manifest, collectable an hour later; the next
+        // collection commits nothing, so nothing more becomes due.
+        const secondDue = Option.flatMap(
+          yield* compactor.status(ORDERS),
+          (current) => current.collectionDueAt,
+        );
+        yield* TestClock.adjust("1 hour");
+        yield* fire;
+        const state = yield* compactor.status(ORDERS);
+        return {
+          due,
+          scheduled,
+          before,
+          after,
+          secondDue,
+          nextDue: Option.flatMap(state, (current) => current.collectionDueAt),
+          idleAlarm: yield* alarm.scheduled,
+        };
+      }),
+    );
+    expect(outcome.due).toEqual(Option.some(5_000 + 3_600_000));
+    expect(outcome.scheduled).toEqual(outcome.due);
+    expect(outcome.before).toBe(5);
+    expect(outcome.after).toBe(1);
+    expect(outcome.secondDue).toEqual(Option.some(5_000 + 2 * 3_600_000));
+    expect(outcome.nextDue).toEqual(Option.none());
+    expect(outcome.idleAlarm).toEqual(Option.none());
+  });
+
   it("fences in on wake, compacts L0 from its alarm, and goes idle with no work", async () => {
     const outcome = await run(
       Effect.gen(function* () {

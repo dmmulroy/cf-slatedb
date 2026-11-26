@@ -37,6 +37,7 @@ export * from "./compactor-server.ts";
 export * from "./compactor-worker.ts";
 export * from "./durable-object-alarm.ts";
 export * from "./garbage-collector.ts";
+export * from "./maintenance-sweep.ts";
 export * from "./gc-http-api.ts";
 export * from "./gc-worker.ts";
 export * from "./db-services.ts";

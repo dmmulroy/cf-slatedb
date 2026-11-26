@@ -80,6 +80,15 @@ hand-off is below.
   just acknowledged by a new shard (intermittent `fork-split` failure live). Routed `Latest` reads
   now refuse sealed databases (`refuseSealed`) and wait on the directory like writes; scans resume
   shard by shard. `fork-split` 5/5 and 11/11 scenarios on `preview-1`.
+- **5. GC and maintenance that scale (D60).** Each database's compactor collects its garbage from
+  its own alarm (due `gcMinAge` after a compaction, then when the last collection says something
+  becomes collectable; idle databases set no alarm), one collection at a time; "collect now" runs on
+  the compactor. The cron is a paged maintenance sweep (50 databases per run, stored cursor) for
+  removed databases' leftovers, fork compactor wakes, and piled-up manifests. **Live (`preview-1`,
+  dev timings):** 500 databases all collected by their own compactors; 15,517 of 15,535 invocations
+  `ok`, 18 runtime-`canceled` alarms and Workflow calls, none over a limit. Also fixed: the local
+  cleanup never matched `alchemy dev`'s process, so stacks piled up between runs (environment only).
+  11/11 scenarios locally and on `preview-1`.
 
 ## Remaining-work log
 

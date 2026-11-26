@@ -14,12 +14,17 @@ import {
   Timestamp,
 } from "@cf-slatedb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
-import { Clock, Context, Effect, Layer, Metric, Option, Result, Schema } from "effect";
+import { Clock, Context, Effect, Layer, Metric, Option, Result, Schema, Semaphore } from "effect";
 
 import { CompactionBudget } from "./compaction-budget.ts";
 import { CompactionLauncher, type CompactionJobProgress } from "./compaction-launcher.ts";
 import { type DurableObjectCell, inMemoryCell } from "./durable-object-cell.ts";
 import { DurableObjectAlarm } from "./durable-object-alarm.ts";
+import {
+  GarbageCollector,
+  type GarbageCollectionReport,
+  type GarbageCollectorUnavailableError,
+} from "./garbage-collector.ts";
 import { LsmConfiguration } from "./lsm-configuration.ts";
 import { DatabaseIdMismatchError, DatabaseNotFoundError } from "./lsm-errors.ts";
 import { ManifestReader } from "./manifest-reader.ts";
@@ -55,8 +60,9 @@ export type CorruptSst = typeof CorruptSst.Type;
 
 /**
  * Schema for a compactor's durable state: the database it serves, its epoch, its running jobs,
- * whether a newer compactor fenced it, and the corrupted SSTs it found (absent in state written
- * before D53, which decodes as none).
+ * whether a newer compactor fenced it, the corrupted SSTs it found (absent in state written before
+ * D53, which decodes as none), and when its database's garbage collection is next due (absent in
+ * state written before D60: none until the next compaction or request).
  */
 export const CompactorState = Schema.Struct({
   databaseId: DatabaseId,
@@ -64,6 +70,7 @@ export const CompactorState = Schema.Struct({
   running: Schema.Array(RunningCompaction),
   fenced: Schema.Boolean,
   corruptSsts: Schema.Array(CorruptSst).pipe(Schema.withDecodingDefaultKey(Effect.succeed([]))),
+  collectionDueAt: Schema.OptionFromOptionalKey(Timestamp),
 });
 
 /** A compactor's durable state; also its status. */
@@ -130,6 +137,10 @@ export const compactionsStarted = Metric.counter("lsm_compactions_started", {
  * and it stops. While jobs run or wait for budget, its alarm polls every `compactorPollInterval`:
  * it drops finished jobs (releasing their budget leases), renews the rest, and plans more. With no
  * work it sets no alarm, so an idle database costs nothing; the writer wakes it after a flush.
+ *
+ * It also owns its database's garbage collection (D60): due `gcMinAge` after a compaction finishes
+ * (its replaced inputs and manifests are then old enough), then again when the last collection says
+ * something it kept becomes collectable. The alarm runs it; one collection runs at a time.
  */
 export interface ICompactor {
   /** Fences in on first use and polls now. @returns The state after waking. */
@@ -147,7 +158,31 @@ export interface ICompactor {
   readonly destroy: (
     databaseId: DatabaseId,
   ) => Effect.Effect<void, DatabaseIdMismatchError, RuntimeContext>;
-  /** The alarm handler: polls, and schedules the next poll while there is work. Never fails. */
+  /**
+   * Collects the database's garbage now, under the compactor's collection lock (the operator's
+   * "collect now"), and schedules the next collection from the report. Needs no fenced compactor:
+   * a database without a manifest has its leftovers swept.
+   *
+   * @returns The report, `GarbageCollectorUnavailableError`, or `DatabaseIdMismatchError`.
+   */
+  readonly collect: (
+    databaseId: DatabaseId,
+  ) => Effect.Effect<
+    GarbageCollectionReport,
+    GarbageCollectorUnavailableError | DatabaseNotFoundError | DatabaseIdMismatchError,
+    RuntimeContext
+  >;
+  /**
+   * Makes a collection due now and sets the alarm (the maintenance sweep asks this of a database
+   * whose manifests piled up uncollected). Fences in on first use.
+   */
+  readonly requestCollection: (
+    databaseId: DatabaseId,
+  ) => Effect.Effect<void, CompactorError, RuntimeContext>;
+  /**
+   * The alarm handler: runs a due collection, polls, and schedules the next poll while there is
+   * work and the next collection when one is due. Never fails.
+   */
   readonly runAlarm: Effect.Effect<void, never, RuntimeContext>;
 }
 
@@ -163,6 +198,9 @@ export const makeCompactor = Effect.gen(function* () {
   const launcher = yield* CompactionLauncher;
   const budget = yield* CompactionBudget;
   const settings = yield* LsmConfiguration;
+  const collector = yield* GarbageCollector;
+  // One collection per database at a time: the alarm and an operator's request may overlap.
+  const collectionLock = yield* Semaphore.make(1);
 
   const unavailable = (databaseId: DatabaseId) => (error: { readonly message: string }) =>
     Effect.fail(
@@ -207,6 +245,7 @@ export const makeCompactor = Effect.gen(function* () {
         running: [],
         fenced: false,
         corruptSsts: [],
+        collectionDueAt: Option.none(),
       };
       yield* cell.set(state);
       yield* Effect.annotateCurrentSpan({
@@ -352,7 +391,21 @@ export const makeCompactor = Effect.gen(function* () {
           startedAt: Timestamp.make(yield* Clock.currentTimeMillis),
         });
       }
-      yield* cell.set({ ...state, running, corruptSsts });
+      // A finished job left garbage (its inputs, older manifests): collectable after gcMinAge.
+      const anyFinished = state.running.some(
+        (job) => !running.some((still) => still.jobId === job.jobId),
+      );
+      const collectionDueAt = anyFinished
+        ? Option.some(
+            Timestamp.make(
+              Math.min(
+                Option.getOrElse(state.collectionDueAt, () => Number.POSITIVE_INFINITY),
+                (yield* Clock.currentTimeMillis) + settings.gcMinAge,
+              ),
+            ),
+          )
+        : state.collectionDueAt;
+      yield* cell.set({ ...state, running, corruptSsts, collectionDueAt });
       if (running.length === 0) yield* releaseExternalRefs(databaseId, latest.manifest);
       yield* Effect.annotateCurrentSpan({
         "database.id": databaseId,
@@ -385,7 +438,58 @@ export const makeCompactor = Effect.gen(function* () {
     yield* cell.clear;
   });
 
+  /** Runs one collection and records when the next is due. */
+  const runCollection = (databaseId: DatabaseId) =>
+    collectionLock.withPermits(1)(
+      Effect.gen(function* () {
+        const report = yield* collector.collect(databaseId);
+        const state = yield* cell.get;
+        if (Option.isSome(state) && state.value.databaseId === databaseId) {
+          yield* cell.set({ ...state.value, collectionDueAt: report.nextCollectionAt });
+          if (Option.isSome(report.nextCollectionAt)) yield* pollBy(report.nextCollectionAt.value);
+        }
+        return report;
+      }),
+    );
+
+  const collect = Effect.fn("Compactor.collect")(function* (databaseId: DatabaseId) {
+    yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
+    const state = yield* cell.get;
+    if (Option.isSome(state)) yield* checkDatabase(state.value, databaseId);
+    return yield* runCollection(databaseId);
+  });
+
+  const requestCollection = Effect.fn("Compactor.requestCollection")(function* (
+    databaseId: DatabaseId,
+  ) {
+    yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
+    const state = yield* ensureState(databaseId);
+    const now = yield* Clock.currentTimeMillis;
+    yield* cell.set({ ...state, collectionDueAt: Option.some(Timestamp.make(now)) });
+    yield* pollBy(now);
+  });
+
   const runAlarm = Effect.gen(function* () {
+    const before = yield* cell.get;
+    if (Option.isNone(before) || before.value.fenced) return;
+    const now = yield* Clock.currentTimeMillis;
+    const { databaseId, collectionDueAt } = before.value;
+    if (Option.isSome(collectionDueAt) && collectionDueAt.value <= now) {
+      yield* runCollection(databaseId).pipe(
+        Effect.catchTags({
+          DatabaseNotFoundError: () => Effect.void,
+          // Storage unavailable now: try again after the GC interval.
+          GarbageCollectorUnavailableError: () =>
+            Effect.gen(function* () {
+              const current = yield* cell.get;
+              if (Option.isNone(current)) return;
+              const retryAt = Timestamp.make(now + settings.gcInterval);
+              yield* cell.set({ ...current.value, collectionDueAt: Option.some(retryAt) });
+              yield* pollBy(retryAt);
+            }),
+        }),
+      );
+    }
     const state = yield* cell.get;
     if (Option.isNone(state) || state.value.fenced) return;
     const again = yield* poll(state.value).pipe(
@@ -397,9 +501,14 @@ export const makeCompactor = Effect.gen(function* () {
       }),
     );
     if (again) yield* pollBy((yield* Clock.currentTimeMillis) + settings.compactorPollInterval);
+    // A collection still due keeps the alarm set even when compaction is idle.
+    const after = yield* cell.get;
+    if (Option.isSome(after) && Option.isSome(after.value.collectionDueAt)) {
+      yield* pollBy(after.value.collectionDueAt.value);
+    }
   }).pipe(Effect.withSpan("Compactor.alarm"));
 
-  return Compactor.of({ wake, status, destroy, runAlarm });
+  return Compactor.of({ wake, status, destroy, collect, requestCollection, runAlarm });
 });
 
 /** Provides the compactor, leaving its state cell, alarm, manifests, launcher, and budget visible. */

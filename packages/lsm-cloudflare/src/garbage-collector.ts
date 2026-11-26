@@ -1,6 +1,7 @@
 import {
   DatabaseId,
   hasSstCollectionCandidates,
+  nextCollectionTime,
   type Manifest,
   ManifestId,
   planManifestCollection,
@@ -41,6 +42,11 @@ export interface GarbageCollectionReport {
   readonly sstBoundary: Timestamp;
   readonly deletedSsts: number;
   readonly deletedManifests: number;
+  /**
+   * When collecting again can delete something this run had to keep (young garbage, an expiring
+   * checkpoint); none when nothing will become collectable (D60).
+   */
+  readonly nextCollectionAt: Option.Option<Timestamp>;
 }
 
 /**
@@ -79,12 +85,6 @@ export interface IGarbageCollector {
     GarbageCollectorUnavailableError | DatabaseNotFoundError,
     RuntimeContext
   >;
-  /** Collects every database in the bucket, a few at a time; one database's failure is logged. */
-  readonly collectAll: Effect.Effect<
-    ReadonlyArray<GarbageCollectionReport>,
-    GarbageCollectorUnavailableError,
-    RuntimeContext
-  >;
 }
 
 /** The contextual garbage collector. */
@@ -93,7 +93,6 @@ export class GarbageCollector extends Context.Service<GarbageCollector, IGarbage
 ) {}
 
 const decodeSstId = Schema.decodeUnknownOption(SstId);
-const decodeDatabaseId = Schema.decodeUnknownOption(DatabaseId);
 const decodeManifestId = Schema.decodeUnknownOption(
   Schema.NumberFromString.pipe(Schema.decodeTo(ManifestId)),
 );
@@ -159,6 +158,7 @@ export const makeGarbageCollector = Effect.gen(function* () {
         sstBoundary: cutoff,
         deletedSsts: leftovers.length,
         deletedManifests: 0,
+        nextCollectionAt: Option.none<Timestamp>(),
       };
     });
 
@@ -246,47 +246,30 @@ export const makeGarbageCollector = Effect.gen(function* () {
       "gc.deleted_ssts": deletedSsts.length,
       "gc.deleted_manifests": plan.deletable.length,
     });
+    const nextCollectionAt = nextCollectionTime({
+      latestId: committed.id,
+      latest: committed.manifest,
+      retainedIds: plan.retained,
+      retained,
+      stored: ssts,
+      boundary: sstBoundary,
+      now,
+      minAge: settings.gcMinAge,
+    });
+    yield* Effect.annotateCurrentSpan({
+      "gc.next_collection_at": Option.getOrElse(nextCollectionAt, () => 0),
+    });
     return {
       databaseId,
       manifestId: Option.some(committed.id),
       sstBoundary,
       deletedSsts: deletedSsts.length,
       deletedManifests: plan.deletable.length,
+      nextCollectionAt,
     };
   });
 
-  const collectAll = Effect.gen(function* () {
-    const databases: Array<DatabaseId> = [];
-    let cursor = Option.none<string>();
-    do {
-      const page = yield* objects
-        .listPrefixes("db/", cursor)
-        .pipe(Effect.catchTags(objectFailures("*")));
-      for (const prefix of page.prefixes) {
-        const id = decodeDatabaseId(prefix.slice("db/".length, -1));
-        if (Option.isSome(id) && databasePrefix(id.value) === prefix) databases.push(id.value);
-      }
-      cursor = page.cursor;
-    } while (Option.isSome(cursor));
-    const reports = yield* Effect.forEach(
-      databases,
-      (databaseId) =>
-        collect(databaseId).pipe(
-          Effect.map(Option.some),
-          Effect.catchCause((cause) =>
-            Effect.logWarning("Garbage collection of a database failed; the next run retries.", {
-              databaseId,
-              cause,
-            }).pipe(Effect.as(Option.none<GarbageCollectionReport>())),
-          ),
-        ),
-      { concurrency: 4 },
-    );
-    yield* Effect.annotateCurrentSpan({ "gc.databases": databases.length });
-    return reports.flatMap((report) => Option.toArray(report));
-  }).pipe(Effect.withSpan("GarbageCollector.collectAll"));
-
-  return GarbageCollector.of({ collect, collectAll });
+  return GarbageCollector.of({ collect });
 });
 
 /**

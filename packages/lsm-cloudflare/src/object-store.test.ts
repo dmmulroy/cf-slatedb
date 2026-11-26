@@ -92,7 +92,7 @@ describe("ObjectStore (in-memory)", () => {
         ]) {
           yield* store.put(key, Uint8Array.of(0));
         }
-        return yield* store.listPrefixes("db/", Option.none());
+        return yield* store.listPrefixes("db/", Option.none(), 1000);
       }),
     );
     expect(prefixes).toEqual({ prefixes: ["db/a/", "db/b/"], cursor: Option.none() });

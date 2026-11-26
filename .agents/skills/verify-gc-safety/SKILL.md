@@ -82,6 +82,12 @@ moment ago counted as old and its SSTs could be deleted under a reader. `ownUplo
 
 ## Maintenance notes
 
+- D60 (v1 workstream 5): collection now runs on each database's compactor (its alarm, or the
+  operator's collect-now through `Compactor.collect`), serialized by the compactor's lock, so the
+  model's one-GC-at-a-time assumption holds by construction; `collect`'s steps are unchanged, and it
+  still interleaves with compaction commits, which the model covers. The sweep's leftover sweep only
+  touches prefixes without a manifest (outside this model). Reran; all broken variants fail.
+
 - Checked against the v1 workstream 2 commit (D56). `collect` is unchanged; GC's manifest boundary
   is now read by `ManifestReader.loadManifestBoundary` for both `create`'s re-read and
   `loadLatest`'s starting point, and the commit path may start from a committer's own view. Neither

@@ -41,7 +41,7 @@ export type PutIfVersionOutcome = "Written" | "VersionChanged";
 /** One page of a delimited listing: the next-level prefixes under a prefix. */
 export interface PrefixListing {
   readonly prefixes: ReadonlyArray<string>;
-  /** Cursor for the next page, or none on the last page. */
+  /** The last prefix returned when more follow (pass it as `after` for the next page), or none. */
   readonly cursor: Option.Option<string>;
 }
 
@@ -140,12 +140,13 @@ export interface IObjectStore {
     cursor: Option.Option<string>,
   ) => Effect.Effect<ObjectListing, ObjectStoreUnavailableError, RuntimeContext>;
   /**
-   * Lists the next-level prefixes under `prefix` (delimiter `/`), at most 1000 per page. Never used
-   * on read paths.
+   * Up to `limit` (at most 1000) delimited prefixes directly under `prefix` (`db/<id>/`), in key
+   * order, strictly after `after` (a prefix an earlier page returned).
    */
   readonly listPrefixes: (
     prefix: string,
-    cursor: Option.Option<string>,
+    after: Option.Option<string>,
+    limit: number,
   ) => Effect.Effect<PrefixListing, ObjectStoreUnavailableError, RuntimeContext>;
   /** Deletes objects; deleting a missing key succeeds. */
   readonly delete: (
@@ -363,19 +364,27 @@ export const makeObjectStore = Effect.gen(function* () {
     }),
     listPrefixes: Effect.fn("ObjectStore.listPrefixes")(function* (
       prefix: string,
-      cursor: Option.Option<string>,
+      after: Option.Option<string>,
+      limit: number,
     ) {
+      const pageLimit = Math.max(1, Math.min(limit, 1000));
+      // Every key under `<p>/` sorts before `<p>0` ("/" is 0x2F, "0" is 0x30), so starting after it
+      // skips the whole earlier prefix and nothing that follows it.
+      const startAfter = Option.map(after, (previous) => `${previous.slice(0, -1)}0`);
       const page = yield* bucket
         .list({
           prefix,
           delimiter: "/",
-          limit: 1000,
-          ...(Option.isSome(cursor) ? { cursor: cursor.value } : {}),
+          limit: pageLimit,
+          ...(Option.isSome(startAfter) ? { startAfter: startAfter.value } : {}),
         })
         .pipe(Effect.retry(r2RetrySchedule), Effect.mapError(unavailable("list", prefix)));
+      const prefixes = page.delimitedPrefixes;
       return {
-        prefixes: page.delimitedPrefixes,
-        cursor: page.truncated ? Option.some(page.cursor) : Option.none(),
+        prefixes,
+        cursor: page.truncated
+          ? Option.fromUndefinedOr(prefixes[prefixes.length - 1])
+          : Option.none(),
       };
     }),
     delete: Effect.fn("ObjectStore.delete")(function* (keys: ReadonlyArray<string>) {
@@ -537,7 +546,8 @@ const inMemoryObjectStore = Effect.gen(function* () {
     }),
     listPrefixes: Effect.fn("ObjectStore.listPrefixes")(function* (
       prefix: string,
-      cursor: Option.Option<string>,
+      after: Option.Option<string>,
+      limit: number,
     ) {
       const current = yield* Ref.get(objects);
       const prefixes = new Set<string>();
@@ -548,12 +558,13 @@ const inMemoryObjectStore = Effect.gen(function* () {
       }
       const sorted = [...prefixes]
         .sort()
-        .filter((candidate) => Option.isNone(cursor) || candidate > cursor.value);
-      const page = sorted.slice(0, 1000);
+        .filter((candidate) => Option.isNone(after) || candidate > after.value);
+      const pageLimit = Math.max(1, Math.min(limit, 1000));
+      const page = sorted.slice(0, pageLimit);
       return {
         prefixes: page,
         cursor:
-          sorted.length > 1000 ? Option.fromUndefinedOr(page[page.length - 1]) : Option.none(),
+          sorted.length > pageLimit ? Option.fromUndefinedOr(page[page.length - 1]) : Option.none(),
       };
     }),
     delete: Effect.fn("ObjectStore.delete")(function* (keys: ReadonlyArray<string>) {

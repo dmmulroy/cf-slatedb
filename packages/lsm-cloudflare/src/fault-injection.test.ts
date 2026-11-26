@@ -56,8 +56,8 @@ const faultyObjectStoreLayer = Layer.effect(
       putMultipart: (key, body, partSize) =>
         Effect.andThen(gate("putMultipart", key), inner.putMultipart(key, body, partSize)),
       list: (prefix, cursor) => Effect.andThen(gate("list", prefix), inner.list(prefix, cursor)),
-      listPrefixes: (prefix, cursor) =>
-        Effect.andThen(gate("list", prefix), inner.listPrefixes(prefix, cursor)),
+      listPrefixes: (prefix, after, limit) =>
+        Effect.andThen(gate("list", prefix), inner.listPrefixes(prefix, after, limit)),
       delete: (keys) => Effect.andThen(gate("delete", keys[0] ?? ""), inner.delete(keys)),
     });
   }),

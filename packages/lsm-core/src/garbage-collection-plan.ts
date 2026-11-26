@@ -103,6 +103,41 @@ export const planSstCollection = (input: {
 };
 
 /**
+ * When collecting again can delete something this collection had to keep: an unreferenced SST or a
+ * superseded, unpinned manifest that was too young (old enough `minAge` from now), or a checkpoint
+ * that expires. None when nothing kept will become collectable, so an idle database schedules no
+ * further collection (D60).
+ */
+export const nextCollectionTime = (input: {
+  readonly latestId: ManifestId;
+  readonly latest: Manifest;
+  /** Manifests the collection kept, by id. */
+  readonly retainedIds: ReadonlyArray<ManifestId>;
+  /** The manifests the collection kept, by content (for the SSTs they reference). */
+  readonly retained: ReadonlyArray<Manifest>;
+  readonly stored: ReadonlyArray<StoredSst>;
+  /** SSTs created before it could be deleted this time. */
+  readonly boundary: Timestamp;
+  readonly now: Timestamp;
+  readonly minAge: number;
+}): Option.Option<Timestamp> => {
+  const live = new Set<SstId>();
+  for (const manifest of input.retained) for (const id of ownedSstIds(manifest)) live.add(id);
+  const pinned = new Set(input.latest.checkpoints.map((checkpoint) => checkpoint.manifestId));
+  const youngSst = input.stored.some(
+    (object) => !live.has(object.sstId) && sstCreatedAt(object.sstId) >= input.boundary,
+  );
+  const youngManifest = input.retainedIds.some((id) => id !== input.latestId && !pinned.has(id));
+  const times: Array<number> = [];
+  if (youngSst || youngManifest) times.push(input.now + input.minAge);
+  for (const checkpoint of input.latest.checkpoints) {
+    if (Option.isSome(checkpoint.expireAt))
+      times.push(Math.max(input.now, checkpoint.expireAt.value));
+  }
+  return times.length === 0 ? Option.none() : Option.some(Timestamp.make(Math.min(...times)));
+};
+
+/**
  * Whether any stored SST could be collected at `cutoff` judging by the latest manifest alone (a
  * superset of what {@link planSstCollection} deletes), so GC advances the boundary — one manifest
  * write — only when there may be something to delete. An idle database costs no writes.

@@ -8,29 +8,74 @@ import { HttpRouter } from "effect/http";
 import { HttpApiBuilder } from "effect/http-api";
 
 import { workerBackgroundWorkLayer } from "./background-work.ts";
-import { GarbageCollector, garbageCollectorLayerWithoutDependencies } from "./garbage-collector.ts";
+import { CompactorClient, compactorClientLayer } from "./compactor-client.ts";
+import {
+  GarbageCollectorUnavailableError,
+  garbageCollectorLayerWithoutDependencies,
+} from "./garbage-collector.ts";
 import { GcHttpApi } from "./gc-http-api.ts";
 import { lsmAccessGateForStage } from "./lsm-access-gate.ts";
 import { lsmConfigurationLayer } from "./lsm-configuration.ts";
 import { bindLsmWorkerSettings, type LsmWorkerSettingsSource } from "./lsm-worker-settings.ts";
 import { lsmHttpServerLayer } from "./lsm-http-server.ts";
 import { isLocalLsmStage, lsmWorkerCompatibility } from "./lsm-stage.ts";
-import { eventTelemetryFlushForStage, type LsmWorkerTelemetry } from "./lsm-telemetry.ts";
+import {
+  eventTelemetryFlushForStage,
+  type LsmWorkerTailConsumers,
+  type LsmWorkerTelemetry,
+} from "./lsm-telemetry.ts";
+import { MaintenanceSweep, maintenanceSweepLayerWithoutDependencies } from "./maintenance-sweep.ts";
+import { manifestReaderLayerWithoutDependencies } from "./manifest-reader.ts";
 import { objectStoreLayer } from "./object-store.ts";
 
-/** Handlers of the GC API, delegating to the contextual `GarbageCollector`. */
+/** Databases one maintenance sweep visits per cron run or `POST /v1/gc` (D60). */
+export const MAINTENANCE_SWEEP_PAGE_DATABASES = 50;
+
+/**
+ * Handlers of the GC API: "collect now" runs on the database's compactor, which owns its collection
+ * (one at a time per database, D60); `POST /v1/gc` runs one page of the maintenance sweep.
+ */
 export const gcHttpHandlersLayer = HttpApiBuilder.group(GcHttpApi, "gc", (handlers) =>
   Effect.gen(function* () {
-    const collector = yield* GarbageCollector;
+    const compactors = yield* CompactorClient;
+    const sweep = yield* MaintenanceSweep;
     return handlers
-      .handle("collect", ({ params }) => collector.collect(params.databaseId))
-      .handle("collectAll", () =>
-        collector.collectAll.pipe(Effect.map((reports) => ({ reports }))),
+      .handle("collect", ({ params }) =>
+        compactors.collect(params.databaseId).pipe(
+          Effect.scoped,
+          Effect.catchTags({
+            CompactorUnavailableError: (error) =>
+              Effect.fail(
+                new GarbageCollectorUnavailableError({
+                  databaseId: params.databaseId,
+                  message: error.message,
+                }),
+              ),
+            DatabaseIdMismatchError: (error) =>
+              Effect.fail(
+                new GarbageCollectorUnavailableError({
+                  databaseId: params.databaseId,
+                  message: error.message,
+                }),
+              ),
+          }),
+        ),
+      )
+      .handle("sweep", () =>
+        sweep.sweepPage(MAINTENANCE_SWEEP_PAGE_DATABASES).pipe(
+          Effect.map((report) => ({
+            visited: report.visited,
+            reports: report.sweptLeftovers,
+            woken: report.woken,
+            collectionsRequested: report.collectionsRequested,
+            cursor: report.cursor,
+          })),
+        ),
       );
   }),
 );
 
-/** Every GC HTTP route, needing only a `GarbageCollector`. */
+/** Every GC HTTP route, needing a `CompactorClient` and a `MaintenanceSweep`. */
 export const gcHttpRouterLayer = HttpApiBuilder.layer(GcHttpApi).pipe(
   Layer.provide(gcHttpHandlersLayer),
   Layer.provide(lsmHttpServerLayer),
@@ -45,6 +90,8 @@ export interface GcWorkerOptions<R = never> {
    * the Stack's own factory on live stages. `R` is what building it needs at plan time.
    */
   readonly telemetry: LsmWorkerTelemetry<R>;
+  /** Tail Workers attached to the Worker (`noLsmTailConsumers` locally). */
+  readonly tailConsumers: LsmWorkerTailConsumers<R>;
   /**
    * The deployment's engine settings and jurisdiction, bound onto the Worker in full on every
    * deploy (`bindLsmWorkerSettings`, D55). The Stack owns where they come from.
@@ -75,19 +122,25 @@ export const gcWorkerLayer = <R = never>(options: GcWorkerOptions<R>) =>
         // Live stages reach the operator API over workers.dev, behind the access token.
         workersDev: !isLocalLsmStage(stage),
         compatibility: yield* lsmWorkerCompatibility,
+        tailConsumers: yield* options.tailConsumers,
         dev: { host: "127.0.0.1", port: options.devPort },
       };
     }),
     Effect.gen(function* () {
-      const collector = yield* GarbageCollector;
+      const compactors = yield* CompactorClient;
+      const sweep = yield* MaintenanceSweep;
       const withEventTelemetryFlush = yield* eventTelemetryFlushForStage;
       const withAccessGate = yield* lsmAccessGateForStage;
+      // One page per run: the cost of a run is bounded whatever the number of databases.
       yield* Cloudflare.Workers.cron(options.schedule, () =>
-        withEventTelemetryFlush(collector.collectAll),
+        withEventTelemetryFlush(sweep.sweepPage(MAINTENANCE_SWEEP_PAGE_DATABASES)),
       );
       const router = yield* makeExecutionMemo(
         HttpRouter.toHttpEffect(
-          gcHttpRouterLayer.pipe(Layer.provide(Layer.succeed(GarbageCollector, collector))),
+          gcHttpRouterLayer.pipe(
+            Layer.provide(Layer.succeed(CompactorClient, compactors)),
+            Layer.provide(Layer.succeed(MaintenanceSweep, sweep)),
+          ),
         ),
       );
       yield* bindLsmWorkerSettings(options.settings);
@@ -95,7 +148,13 @@ export const gcWorkerLayer = <R = never>(options: GcWorkerOptions<R>) =>
     }).pipe(
       Effect.provide(Cloudflare.Workers.CronEventSourceLive),
       Effect.provide(
-        garbageCollectorLayerWithoutDependencies.pipe(Layer.provide(workerBackgroundWorkLayer)),
+        maintenanceSweepLayerWithoutDependencies.pipe(
+          Layer.provideMerge(compactorClientLayer),
+          Layer.provide(
+            garbageCollectorLayerWithoutDependencies.pipe(Layer.provide(workerBackgroundWorkLayer)),
+          ),
+          Layer.provide(manifestReaderLayerWithoutDependencies),
+        ),
       ),
       Effect.provide(Layer.mergeAll(objectStoreLayer, lsmConfigurationLayer)),
       Effect.provide(options.telemetry("cf-slatedb-gc")),

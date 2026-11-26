@@ -1,5 +1,5 @@
 import { gcWorkerLayer } from "../../src/gc-worker.ts";
-import { lsmOtlpTelemetry } from "../../src/lsm-telemetry.ts";
+import { lsmOtlpTelemetry, noLsmTailConsumers } from "../../src/lsm-telemetry.ts";
 import {
   INTEGRATION_OTLP_BASE_URL,
   INTEGRATION_PORTS,
@@ -10,6 +10,7 @@ import {
 const testGcLayer = gcWorkerLayer({
   main: import.meta.url,
   telemetry: lsmOtlpTelemetry(INTEGRATION_OTLP_BASE_URL),
+  tailConsumers: noLsmTailConsumers,
   settings: INTEGRATION_WORKER_SETTINGS,
   devPort: INTEGRATION_PORTS.gc,
   schedule: "0 0 1 1 *",

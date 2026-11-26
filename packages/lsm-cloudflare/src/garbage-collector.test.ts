@@ -5,15 +5,16 @@ import {
   type CompactionJob,
   DatabaseId,
   DEFAULT_DATABASE_OPTIONS,
+  fenceWriter,
   initialManifest,
-  ManifestId,
   manifestSstHandles,
+  replaceManifestFields,
   SeqNum,
   SortedRunId,
   SstId,
   Timestamp,
 } from "@cf-slatedb/lsm-core";
-import { Effect, Layer, Option, Stream } from "effect";
+import { Effect, Layer, Option, Ref, Stream } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -22,11 +23,17 @@ import { directStepRunner } from "./compaction-launcher.ts";
 import { runCompactionJob } from "./compaction-job.ts";
 import { DbClient, dbClientTestLayer } from "./db-client.ts";
 import type { DbReaderServices } from "./db-reader.ts";
+import { CompactorClientRecord, compactorClientTestLayer } from "./compactor-client.ts";
 import { GarbageCollector, makeGarbageCollector } from "./garbage-collector.ts";
 import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
+import {
+  MaintenanceSweep,
+  maintenanceSweepLayerWithoutDependencies,
+  MAX_UNCOLLECTED_MANIFESTS,
+} from "./maintenance-sweep.ts";
 import { ManifestReader } from "./manifest-reader.ts";
 import { ManifestStore } from "./manifest-store.ts";
-import { compactedPrefix, manifestPrefix, sstKey } from "./object-keys.ts";
+import { compactedPrefix, databasePrefix, manifestPrefix, sstKey } from "./object-keys.ts";
 import { ObjectStore } from "./object-store.ts";
 import { SstStore, sstStoreLayerWithoutDependencies } from "./sst-store.ts";
 
@@ -263,23 +270,62 @@ describe("GarbageCollector", () => {
     expect(outcome.left).toEqual([]);
   });
 
-  it("collects every database in the bucket", async () => {
-    const reports = await run(
-      Effect.gen(function* () {
-        yield* create;
-        yield* (yield* ManifestStore).initialize(
-          initialManifest(DatabaseId.make("users"), {
-            keyRange: Option.none(),
-            databaseOptions: DEFAULT_DATABASE_OPTIONS,
-          }),
-        );
-        return yield* (yield* GarbageCollector).collectAll;
-      }),
+  it("sweeps every database across paged runs, each kind handled once per cycle", async () => {
+    const outcome = await Effect.gen(function* () {
+      const store = yield* ManifestStore;
+      const objects = yield* ObjectStore;
+      const sweep = yield* MaintenanceSweep;
+      const options = { keyRange: Option.none(), databaseOptions: DEFAULT_DATABASE_OPTIONS };
+      const idle = Array.from({ length: 14 }, (_, index) => DatabaseId.make(`idle-${index}`));
+      for (const databaseId of idle) yield* store.initialize(initialManifest(databaseId, options));
+      // A fork still reading its source, and a database whose manifests piled up uncollected.
+      const fork = DatabaseId.make("fork-a");
+      yield* store.initialize(
+        replaceManifestFields(initialManifest(fork, options), {
+          externalRefs: [
+            {
+              owner: DatabaseId.make("idle-0"),
+              checkpointId: CheckpointId.make("01JD0000000000000000000001"),
+            },
+          ],
+        }),
+      );
+      const busy = DatabaseId.make("busy-a");
+      yield* store.initialize(initialManifest(busy, options));
+      for (let round = 0; round <= MAX_UNCOLLECTED_MANIFESTS; round++) {
+        yield* store.update(busy, (manifest) => fenceWriter(manifest));
+      }
+      // A removed database's leftovers: an object and no manifest.
+      const ghost = DatabaseId.make("ghost-a");
+      yield* objects.put(`${compactedPrefix(ghost)}leftover.sst`, Uint8Array.of(1));
+      yield* TestClock.adjust(MIN_AGE + 1);
+      const pages: Array<number> = [];
+      for (;;) {
+        const report = yield* sweep.sweepPage(5);
+        pages.push(report.visited);
+        if (Option.isNone(report.cursor)) break;
+      }
+      const calls = yield* Ref.get(yield* CompactorClientRecord);
+      const ghostLeft = yield* objects.list(databasePrefix(ghost), Option.none());
+      // The next run starts over from the first database.
+      const again = yield* sweep.sweepPage(5);
+      return { pages, calls, ghostLeft: ghostLeft.objects.length, again: again.visited };
+    }).pipe(
+      Effect.provide(
+        maintenanceSweepLayerWithoutDependencies.pipe(
+          Layer.provideMerge(compactorClientTestLayer),
+          Layer.provideMerge(testLayer),
+        ),
+      ),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.provide(TestClock.layer()),
+      Effect.runPromise,
     );
-    expect(reports.map((report) => report.databaseId).sort()).toEqual(["orders", "users"]);
-    expect(reports.map((report) => report.manifestId)).toEqual([
-      Option.some(ManifestId.make(1)),
-      Option.some(ManifestId.make(1)),
-    ]);
+    // 17 databases (14 idle, the fork, the busy one, the ghost) in pages of at most 5.
+    expect(outcome.pages).toEqual([5, 5, 5, 2]);
+    expect(outcome.calls.woken).toEqual(["fork-a"]);
+    expect(outcome.calls.collectionsRequested).toEqual(["busy-a"]);
+    expect(outcome.ghostLeft).toBe(0);
+    expect(outcome.again).toBe(5);
   });
 });

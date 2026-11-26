@@ -965,3 +965,45 @@ Test: `sharding.test.ts` "a router whose map went stale in another isolate still
 after a split" (a second router caches the old map; its get and scan see the new key), shown failing
 without the refusal. Live: `fork-split` passes 5/5 on `preview-1` (it had failed 2 of 3), and all 11
 scenarios pass.
+
+## D60. Each database's compactor collects its garbage; the cron is a paged sweep
+
+`GarbageCollector.collectAll` listed every `db/` prefix and collected every database in one cron
+invocation (concurrency 4). With thousands of databases it would exceed subrequest, CPU, or
+wall-time limits and silently stop partway.
+
+- **The compactor owns its database's collection.** `CompactorState` gains `collectionDueAt` (absent
+  in older state, which decodes as none). It is set `gcMinAge` after the compactor sees a compaction
+  finish, because the replaced inputs and manifests are old enough then. Each collection reports
+  `nextCollectionAt` (lsm-core `nextCollectionTime`): when something it had to keep becomes
+  collectable (a young unreferenced SST or superseded manifest, or a checkpoint that expires), or
+  none. The alarm runs a due collection and keeps the alarm set while one is due. An idle database
+  with no garbage sets no alarm. A collection's own commit supersedes one manifest, so a database
+  converges after a second, commit-free collection.
+- **One collection per database at a time.** The compactor serializes collections with a lock, and
+  the operator's "collect now" (`POST /v1/gc/databases/:id`) runs on the compactor
+  (`Compactor.collect`). That keeps `GcSafety.tla`'s one-collection-at-a-time assumption true by
+  construction. Collections still interleave with compaction commits, which the model already covers.
+- **The cron is a paged maintenance sweep** (`MaintenanceSweep.sweepPage`, 50 databases per run,
+  position in `maintenance/sweep.cursor`, listing with `startAfter`). It handles only what has no
+  actor of its own:
+  - It sweeps prefixes without a manifest (removed databases' leftovers).
+  - It wakes the compactor of any database whose manifest still names external refs, so a lost fork
+    wake (D57) only delays the rewrite.
+  - It asks for a collection on any database more than 16 manifests past GC's boundary.
+    `POST /v1/gc` runs one page. A run's cost is bounded by the page, whatever the number of databases.
+- The GC Worker now also reports to the CPU Tail Worker.
+
+Tests: `garbage-collector.test.ts` runs the sweep over 17 databases in pages of 5 and checks every
+database is visited once per cycle (fork woken, piled-up manifests requested, leftovers swept) and
+that the next run starts over. `compactor.test.ts` shows collection due `gcMinAge` after a
+compaction, run by the alarm, then idle with no alarm. The `gc` scenario asserts that the
+compactor's alarm collected (`GarbageCollector.collect` under `Compactor.alarm` with
+`gc.deleted_ssts=4`) and that collect-now runs on the compactor.
+
+Measured on `preview-1` with `--dev-timings` (`gcMinAge` 10 s): 500 databases, each flushed four
+times so each compacted. All 500 were collected by their own compactors (1,500 collection runs), and
+the sweep paged in runs of at most 50 databases at ~160 ms CPU each. Of 15,535 invocation records,
+15,517 had outcome `ok`; 18 were `canceled` (Durable Object alarms and Workflow RPC calls, at most
+213 ms wall and 11 ms CPU, ended by the runtime rather than by a limit). None was `exceededCpu` or
+`exceededMemory`.

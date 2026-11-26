@@ -1,5 +1,5 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
-import { CompactorEpoch, type DatabaseId } from "@cf-slatedb/lsm-core";
+import { CompactorEpoch, type DatabaseId, type Timestamp } from "@cf-slatedb/lsm-core";
 import { makeExecutionMemo } from "alchemy/Runtime/ExecutionMemo";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Cache, Context, Effect, Layer, Option, Ref, type Scope } from "effect";
@@ -12,6 +12,10 @@ import {
   CompactorUnavailableError,
 } from "./compactor.ts";
 import { CompactorHttpApi } from "./compactor-http-api.ts";
+import type {
+  GarbageCollectionReport,
+  GarbageCollectorUnavailableError,
+} from "./garbage-collector.ts";
 import { CompactorServer } from "./compactor-server.ts";
 import { CompactorWorker } from "./compactor-worker.ts";
 import { inLsmJurisdiction, lsmJurisdiction } from "./lsm-jurisdiction.ts";
@@ -30,6 +34,18 @@ export interface ICompactorClient {
   readonly status: (
     databaseId: DatabaseId,
   ) => Effect.Effect<Option.Option<CompactorState>, CompactorError, RuntimeContext | Scope.Scope>;
+  /** Has the database's compactor collect its garbage now (`Compactor.collect`). */
+  readonly collect: (
+    databaseId: DatabaseId,
+  ) => Effect.Effect<
+    GarbageCollectionReport,
+    CompactorError | GarbageCollectorUnavailableError,
+    RuntimeContext | Scope.Scope
+  >;
+  /** Makes a collection due now on the database's compactor (`Compactor.requestCollection`). */
+  readonly requestCollection: (
+    databaseId: DatabaseId,
+  ) => Effect.Effect<void, CompactorError, RuntimeContext | Scope.Scope>;
 }
 
 /** The contextual compactor client. */
@@ -101,20 +117,51 @@ export const compactorClientLayer = Layer.effect(
           );
         return response.state;
       }),
+      collect: Effect.fn("CompactorClient.collect")(function* (databaseId: DatabaseId) {
+        yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
+        return yield* (yield* client(databaseId)).compactor
+          .collect({ params: { databaseId } })
+          .pipe(
+            Effect.catchTags({
+              HttpClientError: unreachable(databaseId),
+              SchemaError: unreachable(databaseId),
+            }),
+          );
+      }),
+      requestCollection: Effect.fn("CompactorClient.requestCollection")(function* (
+        databaseId: DatabaseId,
+      ) {
+        yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
+        yield* (yield* client(databaseId)).compactor
+          .requestCollection({ params: { databaseId } })
+          .pipe(
+            Effect.catchTags({
+              HttpClientError: unreachable(databaseId),
+              SchemaError: unreachable(databaseId),
+            }),
+          );
+      }),
     });
   }),
 );
 
-/** The databases the test compactor client was asked to destroy, in order. */
+/** What the test compactor client was asked to do, by database, in order. */
+export interface CompactorClientCalls {
+  readonly destroyed: ReadonlyArray<DatabaseId>;
+  readonly woken: ReadonlyArray<DatabaseId>;
+  readonly collectionsRequested: ReadonlyArray<DatabaseId>;
+}
+
+/** The calls the test compactor client recorded. */
 export class CompactorClientRecord extends Context.Service<
   CompactorClientRecord,
-  Ref.Ref<ReadonlyArray<DatabaseId>>
+  Ref.Ref<CompactorClientCalls>
 >()("@cf-slatedb/CompactorClientRecord") {}
 
 /**
- * Provides a compactor client with no compactors: it records the databases it was asked to destroy
- * (in {@link CompactorClientRecord}, also output), reports no state, and wakes nothing. For tests of
- * code that only notifies compactors.
+ * Provides a compactor client with no compactors: it records the databases it was asked to destroy,
+ * wake, or collect later (in {@link CompactorClientRecord}, also output), reports no state, and runs
+ * nothing; an immediate collection is unavailable. For tests of code that only notifies compactors.
  */
 export const compactorClientTestLayer = Layer.effect(
   CompactorClient,
@@ -122,19 +169,40 @@ export const compactorClientTestLayer = Layer.effect(
     const record = yield* CompactorClientRecord;
     return CompactorClient.of({
       wake: (databaseId) =>
-        Effect.succeed({
-          databaseId,
-          compactorEpoch: CompactorEpoch.make(0),
-          running: [],
-          fenced: false,
-          corruptSsts: [],
-        }),
-      destroy: (databaseId) => Ref.update(record, (destroyed) => [...destroyed, databaseId]),
+        Ref.update(record, (calls) => ({ ...calls, woken: [...calls.woken, databaseId] })).pipe(
+          Effect.as({
+            databaseId,
+            compactorEpoch: CompactorEpoch.make(0),
+            running: [],
+            fenced: false,
+            corruptSsts: [],
+            collectionDueAt: Option.none<Timestamp>(),
+          }),
+        ),
+      destroy: (databaseId) =>
+        Ref.update(record, (calls) => ({ ...calls, destroyed: [...calls.destroyed, databaseId] })),
       status: () => Effect.succeed(Option.none()),
+      collect: (databaseId) =>
+        Effect.fail(
+          new CompactorUnavailableError({
+            databaseId,
+            message: `The test compactor client runs no collection for database ${databaseId}.`,
+          }),
+        ),
+      requestCollection: (databaseId) =>
+        Ref.update(record, (calls) => ({
+          ...calls,
+          collectionsRequested: [...calls.collectionsRequested, databaseId],
+        })),
     });
   }),
 ).pipe(
-  Layer.provideMerge(Layer.effect(CompactorClientRecord, Ref.make<ReadonlyArray<DatabaseId>>([]))),
+  Layer.provideMerge(
+    Layer.effect(
+      CompactorClientRecord,
+      Ref.make<CompactorClientCalls>({ destroyed: [], woken: [], collectionsRequested: [] }),
+    ),
+  ),
 );
 
 /**

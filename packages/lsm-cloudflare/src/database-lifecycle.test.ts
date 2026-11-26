@@ -166,7 +166,7 @@ describe("DatabaseLifecycle", () => {
         yield* lifecycle.remove(SOURCE);
         const remaining = yield* (yield* ObjectStore).list(databasePrefix(SOURCE), Option.none());
         const gone = yield* Effect.flip(reader.loadLatest(SOURCE));
-        const destroyed = yield* Ref.get(yield* CompactorClientRecord);
+        const { destroyed } = yield* Ref.get(yield* CompactorClientRecord);
         return {
           lateWrite,
           left,

@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { DatabaseId } from "@cf-slatedb/lsm-core";
-import { DbHttpApi } from "@cf-slatedb/lsm-cloudflare";
+import { DbHttpApi, GcHttpApi } from "@cf-slatedb/lsm-cloudflare";
 import { ShardedHttpApi, ShardGroup } from "@cf-slatedb/sharding";
 import { Clock, Context, Data, Effect, Option, Schema } from "effect";
 import { Base64 } from "effect/encoding";
@@ -505,6 +505,139 @@ export const measureR2Placement = (samples: number) =>
       }),
     );
     return { samples, regions };
+  });
+
+/** Options of {@link measureGcScale}. */
+export interface GcScaleLoad {
+  /** Databases to create, each with a compaction's worth of garbage. */
+  readonly databases: number;
+  /** Seconds to wait after the last compaction for collections (gcMinAge plus margin). */
+  readonly settleSeconds: number;
+}
+
+const GcSpans = Schema.Array(
+  Schema.Struct({
+    name: Schema.String,
+    attributes: Schema.Struct({
+      "database.id": Schema.optionalKey(Schema.String),
+      "gc.deleted_ssts": Schema.optionalKey(Schema.Number),
+    }),
+  }),
+);
+const decodeGcSpans = Schema.decodeUnknownEffect(Schema.fromJsonString(GcSpans));
+
+/**
+ * Creates `databases` databases, each flushed four times so its writer wakes its compactor and it
+ * compacts (leaving the four L0 SSTs as garbage), waits for each compactor to collect on its own
+ * (deploy with `--dev-timings`: `gcMinAge` 10 s), runs the maintenance sweep page by page until it
+ * wraps, and reports how many databases were collected and every invocation's outcome (D60).
+ *
+ * @returns The report, or `MeasurementError` when a database cannot be created or written, the sweep
+ *   fails, or tail records or spans cannot be read.
+ */
+export const measureGcScale = (load: GcScaleLoad) =>
+  Effect.gen(function* () {
+    const group = uniqueId("ms-gc");
+    const databases = Array.from({ length: load.databases }, (_, index) =>
+      DatabaseId.make(`${group}-${index.toString().padStart(4, "0")}`),
+    );
+    const client = yield* dbApi;
+    const since = yield* Clock.currentTimeMillis;
+    const value = valueBytes(100, 3);
+    yield* Effect.forEach(
+      databases,
+      (databaseId) =>
+        Effect.gen(function* () {
+          yield* createDatabase(databaseId);
+          for (let flush = 0; flush < 4; flush++) {
+            yield* client.databases
+              .write({
+                params: { databaseId },
+                payload: {
+                  operations: [
+                    {
+                      _tag: "Put" as const,
+                      key: keyBytes(0, flush, 0),
+                      value,
+                      ttlMillis: Option.none(),
+                    },
+                  ],
+                },
+              })
+              .pipe(Effect.mapError(failed("write")));
+            yield* client.databases
+              .flush({ params: { databaseId } })
+              .pipe(Effect.mapError(failed("flush")));
+          }
+        }),
+      { concurrency: 16, discard: true },
+    );
+    const loadedMs = (yield* Clock.currentTimeMillis) - since;
+    yield* Effect.sleep(`${load.settleSeconds} seconds`);
+    const { gc } = yield* ScenarioStack;
+    const gcClient = yield* HttpApiClient.makeWith(GcHttpApi, {
+      baseUrl: gc,
+      httpClient: yield* HttpClient.HttpClient,
+    });
+    const pages: Array<number> = [];
+    for (let page = 0; page < 10_000; page++) {
+      const swept = yield* gcClient.gc.sweep().pipe(Effect.mapError(failed("sweep")));
+      pages.push(swept.visited);
+      if (Option.isNone(swept.cursor)) break;
+    }
+    // Spans and tail records arrive after each invocation.
+    yield* Effect.sleep("20 seconds");
+    const { stage } = yield* MeasurementCollector;
+    yield* Effect.sync(() =>
+      spawnSync(process.execPath, [TRACE_CLI, "pull", "--stage", stage], { encoding: "utf8" }),
+    );
+    const grepped = yield* Effect.sync(() =>
+      spawnSync(
+        process.execPath,
+        [TRACE_CLI, "grep", "--name", "GarbageCollector.collect", "--json"],
+        {
+          encoding: "utf8",
+          maxBuffer: 256 * 1024 * 1024,
+        },
+      ),
+    );
+    const collections = (yield* decodeGcSpans(grepped.stdout).pipe(
+      Effect.mapError(failed("read GarbageCollector.collect spans")),
+    )).filter((span) => (span.attributes["database.id"] ?? "").startsWith(group));
+    const collected = new Set(
+      collections
+        .filter((span) => (span.attributes["gc.deleted_ssts"] ?? 0) >= 4)
+        .map((span) => span.attributes["database.id"] ?? ""),
+    );
+    const records = yield* readInvocationRecords(since);
+    const byScriptOutcome = new Map<string, number>();
+    for (const record of records) {
+      const script = Option.getOrElse(record.scriptName, () => "?").replace(/-preview-\d.*$/, "");
+      const key = `${script} ${record.outcome}`;
+      byScriptOutcome.set(key, (byScriptOutcome.get(key) ?? 0) + 1);
+    }
+    const sweeps = records.filter((record) =>
+      Option.exists(record.scriptName, (name) => name.includes("gcworker")),
+    );
+    return {
+      databases: load.databases,
+      loadSeconds: loadedMs / 1000,
+      sweepPages: pages,
+      databasesCollected: collected.size,
+      collectionRuns: collections.length,
+      invocations: records.length,
+      outcomes: Object.fromEntries(byScriptOutcome),
+      notOk: records.filter((record) => record.outcome !== "ok").length,
+      gcWorkerCpuMs: summarize(sweeps.map((record) => record.cpuTimeMs)),
+      gcWorkerWallMs: summarize(sweeps.map((record) => record.wallTimeMs)),
+      compactorCpuMs: summarize(
+        records
+          .filter((record) =>
+            Option.exists(record.scriptName, (name) => name.includes("compactorworker")),
+          )
+          .map((record) => record.cpuTimeMs),
+      ),
+    };
   });
 
 /** Options of {@link measureSplitPause}. */

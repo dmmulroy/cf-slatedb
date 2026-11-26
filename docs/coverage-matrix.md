@@ -369,6 +369,17 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   scenarios pass, and `BlockServer` responses carry no `Cf-Cache-Status`.
 - **Removal (fails while forks depend; purges in batches)** — done. `DatabaseLifecycle.remove`
   (`DatabaseHasDependentsError`; one tag purge per database through `BlockServer`).
+- **GC and maintenance that scale with the number of databases (v1 workstream 5)** — done (D60).
+  `Compactor` runs its database's collection from its alarm (`collectionDueAt`,
+  `Compactor.collect`/`requestCollection`, one at a time); lsm-core `nextCollectionTime`;
+  `MaintenanceSweep.sweepPage` (paged, cursor at `maintenance/sweep.cursor`; leftovers, fork wakes,
+  piled-up manifests); the GC Worker's cron runs a page and "collect now" goes through the
+  compactor; `ObjectStore.listPrefixes(prefix, after, limit)`. Tests: `garbage-collector.test.ts`
+  (17 databases in pages of 5, each visited once per cycle), `compactor.test.ts` (due after a
+  compaction, run by the alarm, idle with no alarm), `writer.workerd.ts` (collect-now through the
+  compactor), the `gc` scenario (the compactor's alarm collected 4 SSTs). Formal: `GcSafety` (one
+  collection per database, now enforced by the compactor). Live (`preview-1`, dev timings): 500
+  databases all collected by their compactors; no invocation exceeded a limit.
 - **Routed reads see writes across a split (stale maps)** — done (D59). `DbWriter.probe`/`scan`
   report `sealedSuccessors`; `ReadOptions.refuseSealed` (`db-client.ts`); `ShardRouter` gets route
   through `withRouting` and scans resume shard by shard (`scanFrom`). Test: `sharding.test.ts` (a

@@ -22,6 +22,7 @@ import {
   MeasurementCollector,
   measureFlushCpu,
   measureSplitPause,
+  measureGcScale,
   measureManifestCas,
   measureR2Placement,
   measureTransactionAborts,
@@ -260,6 +261,20 @@ const measureR2PlacementCommand = Command.make(
   ),
 );
 
+const measureGcScaleCommand = Command.make(
+  "gc-scale",
+  {
+    stage: measureStage,
+    databases: Flag.Int("databases").pipe(Flag.withDefault(500)),
+    settleSeconds: Flag.Int("settle-seconds").pipe(Flag.withDefault(60)),
+  },
+  ({ stage, ...load }) => runMeasurement(stage, measureGcScale(load)),
+).pipe(
+  Command.withDescription(
+    "Garbage collection across many databases: compactors collect, the sweep pages (D60)",
+  ),
+);
+
 const measure = Command.make("measure").pipe(
   Command.withDescription("Measurements against a live preview stage; JSON results"),
   Command.withSubcommands([
@@ -269,6 +284,7 @@ const measure = Command.make("measure").pipe(
     measureTransactionsCommand,
     measureManifestCasCommand,
     measureR2PlacementCommand,
+    measureGcScaleCommand,
   ]),
 );
 

@@ -281,8 +281,13 @@ test.provider(
         baseUrl: workerUrl(deployed.gcUrl),
         httpClient: yield* HttpClient.HttpClient,
       });
+      // The compactor collects its database's garbage from its alarm once it is gcMinAge old
+      // (D60), so this "collect now" (run on the compactor) may find it already gone: either way,
+      // nothing is left after it.
       const report = yield* gc.gc.collect({ params: { databaseId: compacted } });
-      expect(report.deletedSsts).toBe(4);
+      expect([0, 4]).toContain(report.deletedSsts);
+      const again = yield* gc.gc.collect({ params: { databaseId: compacted } });
+      expect(again.deletedSsts).toBe(0);
       // The compaction ran as a Workflow in the compactor Worker and committed once.
       const spanNames = new Set(collector.spans.map((span) => span.name));
       for (const name of [
@@ -290,6 +295,7 @@ test.provider(
         "CompactionWorkflow.run",
         "CompactionExecutor.commit",
         "GarbageCollector.collect",
+        "Compactor.collect",
       ]) {
         expect(spanNames.has(name)).toBe(true);
       }

@@ -274,32 +274,35 @@ const compaction: Scenario = {
 const gc: Scenario = {
   name: "gc",
   description:
-    "After a compaction and gcMinAge (10 s in dev), GC deletes the replaced L0 SSTs and old manifests; reads are unaffected.",
+    "After a compaction, the database's compactor collects the replaced L0 SSTs and old manifests from its own alarm once gcMinAge (10 s in dev) passes; a later collect-now finds nothing left, and reads are unaffected.",
   run: Effect.gen(function* () {
     const databaseId = DatabaseId.make(uniqueId("sc-gc"));
     yield* createDatabase(databaseId);
     yield* fourL0Ssts(databaseId);
     yield* compacted(databaseId);
-    yield* Effect.sleep("11 seconds");
+    // The compactor notices the finished job on its next poll and collects gcMinAge later.
+    yield* Effect.sleep("14 seconds");
+    yield* assertTraces("the compactor collected on its own", {
+      select: { databaseId, containing: { name: "Compactor.alarm" } },
+      checks: [
+        {
+          _tag: "SpanExists",
+          span: { name: "GarbageCollector.collect", attributes: { "gc.deleted_ssts": "4" } },
+        },
+        { _tag: "SpanExists", span: { name: "ManifestStore.advanceManifestBoundary" } },
+        { _tag: "NoErrorStatus" },
+      ],
+    });
     const collector = yield* gcApi;
     const report = yield* step("collect", collector.gc.collect({ params: { databaseId } }));
-    yield* expectThat(
-      "deleted SSTs",
-      report.deletedSsts >= 4,
-      `expected the 4 L0 SSTs collected, got ${report.deletedSsts}`,
-    );
-    yield* expectThat(
-      "deleted manifests",
-      report.deletedManifests > 0,
-      "expected old manifests collected",
-    );
+    yield* expectEqual("nothing left to collect", report.deletedSsts, 0);
     for (const round of [0, 1, 2, 3]) {
       yield* expectEqual(`k${round}`, yield* read(databaseId, `k${round}`, "Latest"), `v${round}`);
     }
-    yield* assertTraces("collection ran cleanly", {
-      select: { databaseId, containing: { name: "GarbageCollector.collect" } },
+    yield* assertTraces("collect-now runs on the compactor", {
+      select: { databaseId, containing: { name: "Compactor.collect" } },
       checks: [
-        { _tag: "SpanExists", span: { name: "ManifestStore.advanceManifestBoundary" } },
+        { _tag: "SpanExists", span: { name: "GarbageCollector.collect" } },
         { _tag: "NoErrorStatus" },
       ],
     });

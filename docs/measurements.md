@@ -226,6 +226,32 @@ node tools/scenario-cli/src/scenario-cli.ts measure transactions --stage preview
 aborted at its first flush, since it outlasted a whole flush (D50). A transaction now aborts as too
 old only if it outlives the writer's retention (60 s by default) or the retained-bytes bound.
 
+## Garbage collection across 500 databases (v1 workstream 5, D60)
+
+`measure gc-scale` creates 500 databases and flushes each four times (its writer wakes its
+compactor, which compacts and leaves four L0 SSTs as garbage). It waits four minutes, runs the
+maintenance sweep page by page until it wraps, then reads spans and tail records. `preview-1` with
+`--dev-timings` (`gcMinAge` 10 s, so collections happen within the run).
+
+```sh
+node tools/preview-cli/src/preview-cli.ts deploy preview-1 --dev-timings
+node tools/scenario-cli/src/scenario-cli.ts measure gc-scale --stage preview-1 --databases 500 --settle-seconds 240
+```
+
+| Databases | Collected by their compactor | Collection runs | Sweep pages (from the stored position to the wrap) | Invocations |   `ok` | `canceled` | `exceeded*` |
+| --------: | ---------------------------: | --------------: | -------------------------------------------------- | ----------: | -----: | ---------: | ----------: |
+|       500 |                          500 |            1500 | [50, 41]                                           |      15,535 | 15,517 |         18 |           0 |
+
+GC Worker (sweep) CPU p50 / max: 163 / 202 ms; compactor
+invocation CPU p50 / p99 / max: 16 / 111 / 177 ms.
+
+**Reading.** Every database's garbage was collected by its own compactor from its alarm, three
+collections each (the compaction's garbage, then the manifest that collection superseded, then a
+check that converges). The sweep visits at most 50 databases per run, so a run's cost does not grow
+with the number of databases. With 10,000 databases a full sweep cycle takes 200 runs, and it is
+only a backstop. The 18 `canceled` outcomes were Durable Object alarms and Workflow RPC calls ended
+by the runtime (at most 213 ms wall, 11 ms CPU), not limits.
+
 ## Live checks
 
 | Check                                       | Result                         | How                                                                                                                                                                                                                                                                                                                                                                                             |

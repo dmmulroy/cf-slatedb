@@ -12,12 +12,25 @@ export const GarbageCollectionReportSchema = Schema.Struct({
   sstBoundary: Timestamp,
   deletedSsts: Schema.Int,
   deletedManifests: Schema.Int,
+  nextCollectionAt: Schema.OptionFromNullOr(Timestamp),
 });
 
 /**
  * Operator endpoints of the GC Worker: collect one database now, or every database. The cron
  * trigger runs the second on a schedule.
  */
+/**
+ * Schema for one page of the maintenance sweep (see `MaintenanceSweepReport`); `reports` holds the
+ * removed databases' leftovers it swept.
+ */
+export const MaintenanceSweepReportSchema = Schema.Struct({
+  visited: Schema.Int,
+  reports: Schema.Array(GarbageCollectionReportSchema),
+  woken: Schema.Int,
+  collectionsRequested: Schema.Int,
+  cursor: Schema.OptionFromNullOr(Schema.String),
+});
+
 export class GcHttpApiGroup extends HttpApiGroup.make("gc")
   .add(
     HttpApiEndpoint.post("collect", "/gc/databases/:databaseId", {
@@ -30,8 +43,8 @@ export class GcHttpApiGroup extends HttpApiGroup.make("gc")
     }),
   )
   .add(
-    HttpApiEndpoint.post("collectAll", "/gc", {
-      success: Schema.Struct({ reports: Schema.Array(GarbageCollectionReportSchema) }),
+    HttpApiEndpoint.post("sweep", "/gc", {
+      success: MaintenanceSweepReportSchema,
       error: GarbageCollectorUnavailableError.pipe(HttpApiSchema.status(503)),
     }),
   ) {}
