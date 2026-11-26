@@ -27,13 +27,14 @@ batch gets one sequence number; all of it is visible, or none.
 - An acknowledged write survives the writer's eviction or crash: Durable Object SQLite holds it.
 - It is not yet in R2. It reaches R2 at the next flush: when `l0SstSize` (64 MiB) is unflushed,
   when the oldest unflushed row is `maxL0Age` (60 s) old, or on request.
-- Only one writer acknowledges for a database. A writer fences in with a new epoch when it starts
-  (`fenceWriter`), and a commit from an older epoch is refused (`WriterFencedError`).
+- Only one writer flushes for a database. A writer fences in with a new epoch when it starts
+  (`fenceWriter`), and a flush from an older epoch is refused at its manifest commit
+  (`commitL0Flush`, `WriterFencedError`).
 
-| Enforced by                                                                      | Checked by                                                                                                                   |
-| -------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `DbWriter.commitBatch` under the commit lock; `MemTable.commit` (`mem-table.ts`) | `db-writer.test.ts`, `mem-table.test.ts`; `NoAckedWriteLost.tla` (`Write`, `Crash`, `Restart`)                               |
-| `fenceWriter`, `commitL0Flush`'s epoch check (`lsm-core/src/manifest.ts`)        | `db-writer.test.ts` ("a stale writer cannot commit after a newer writer starts"); `ManifestCasFencing.tla` (`NoStaleCommit`) |
+| Enforced by                                                                      | Checked by                                                                                                                                                                               |
+| -------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DbWriter.commitBatch` under the commit lock; `MemTable.commit` (`mem-table.ts`) | `db-writer.test.ts`, `mem-table.test.ts`; `NoAckedWriteLost.tla` (`Write`, `Crash`, `Restart`)                                                                                           |
+| `fenceWriter`, `commitL0Flush`'s epoch check (`lsm-core/src/manifest.ts`)        | `db-writer.test.ts` ("a stale writer cannot commit after a newer writer starts, and its SST stays unreferenced"); `ManifestCasFencing.tla` (`NoStaleCommit`; `noWriterEpochCheck` fails) |
 
 ## A write is flushed
 
@@ -45,66 +46,82 @@ A write is **flushed** when a manifest with `lastL0Seq` at or above its sequence
 2. **Commit** a manifest that names the SST and sets `lastL0Seq = cut`
    (`ManifestStore.updateFrom(commitL0Flush)`, a create-if-absent of the next manifest id).
 3. **Record** `flushed_seq = cut` in SQLite (`MemTable.markFlushed`). The rows stay, for
-   transactions, until a separate trim.
+   transactions, until `MemTable.trim`, a separate SQLite transaction run after each flush.
 
 A crash between any two steps loses nothing: before step 2 the rows are still unflushed and the SST
-is an orphan GC removes; before step 3 the next start reads `lastL0Seq` from the manifest.
+is an orphan GC removes; before step 3 the next start records the manifest's `lastL0Seq` as
+`flushed_seq`.
 
-| Enforced by                                                                         | Checked by                                                                                                                                                                                                                                                  |
-| ----------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `DbWriter.flushThen` (`db-writer.ts`); `ManifestStore.create` (`manifest-store.ts`) | `db-writer.test.ts` ("a crash between the manifest commit and the memtable truncate loses and duplicates nothing"); `fault-injection.test.ts`; `NoAckedWriteLost.tla` (`truncateBeforeCommit` fails); `ManifestCasFencing.tla` (`CreateOnce`, `CommitOnce`) |
-| `keepReachableVersions` (`lsm-core/src/row-resolution.ts`)                          | `row-resolution.test.ts` (against the oracle for any flush window and any later snapshot)                                                                                                                                                                   |
+| Enforced by                                                                                       | Checked by                                                                                                                                                                                                                                                                                                                                                           |
+| ------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DbWriter.flushThen` (`db-writer.ts`); `ManifestStore.updateFrom`, `create` (`manifest-store.ts`) | `db-writer.test.ts` ("a crash between the manifest commit and the memtable truncate loses and duplicates nothing"); `fault-injection.test.ts` ("a crash between the L0 upload and the manifest commit leaves an orphan GC removes, and loses nothing"); `NoAckedWriteLost.tla` (`truncateBeforeCommit` fails); `ManifestCasFencing.tla` (`CreateOnce`, `CommitOnce`) |
+| `keepReachableVersions` (`lsm-core/src/row-resolution.ts`)                                        | `row-resolution.test.ts` ("drops only versions no read at or after the window's newest row can reach")                                                                                                                                                                                                                                                               |
 
 ## What each read may see
 
 Every read resolves a key from two places: rows the writer holds, and the SSTs of one manifest.
 What differs is which rows it asks the writer for and which manifest it may use.
 
-| Read             | Sees                                                                                | May miss                                                                     | Calls the writer                                         |
-| ---------------- | ----------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | -------------------------------------------------------- |
-| `Latest`         | Every write acknowledged before the read started                                    | Nothing acknowledged before it started                                       | Always (a probe)                                         |
-| `AtLeast(seq)`   | At least the write with sequence number `seq`                                       | Writes after `seq`, as a `Flushed` read may                                  | Only when the manifest it would use does not cover `seq` |
-| `Flushed`        | Every write flushed more than `manifestRefreshInterval` (1 s) ago                   | Unflushed writes: up to `maxL0Age` (60 s) of them, plus the refresh interval | Never                                                    |
-| At a snapshot    | Exactly the database as of the snapshot's manifest and sequence number              | Everything after it, by design                                               | Never                                                    |
-| In a transaction | Exactly the database as of the transaction's begin (`readSeq`), plus its own writes | Everything committed after its begin, by design                              | Always                                                   |
+| Read             | Sees                                                                                | May miss                                                                                                     | Calls the writer                                                           |
+| ---------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------- |
+| `Latest`         | Every write acknowledged before the read started                                    | Nothing acknowledged before it started                                                                       | Always (a probe)                                                           |
+| `AtLeast(seq)`   | At least the write with sequence number `seq`                                       | Writes after `seq`, as a `Flushed` read may                                                                  | Only when the manifest a `Flushed` read would use now does not cover `seq` |
+| `Flushed`        | Every write flushed more than about `manifestRefreshInterval` (1 s) before the read | Unflushed writes (normally at most `maxL0Age`, 60 s, of them), and newer flushes within the refresh interval | Never                                                                      |
+| At a snapshot    | Exactly the database as of the snapshot's manifest and sequence number              | Everything after it, by design                                                                               | Never                                                                      |
+| In a transaction | Exactly the database as of the transaction's begin (`readSeq`), plus its own writes | Everything committed after its begin, by design                                                              | Always                                                                     |
 
-**`Latest`.** The writer's probe returns, from one SQLite read, a snapshot (`last_seq`),
-`flushed_seq`, and the key's rows above `flushed_seq`. The read then uses a manifest `M` with
+**`Latest`.** The writer's probe returns, from one SQLite transaction (`MemTable.consistently`), a
+snapshot (`last_seq`), `flushed_seq`, and the key's rows above `flushed_seq`. The read then uses a
+manifest `M` with
 
 > `flushed_seq <= M.lastL0Seq <= snapshot`
 
 and takes the newest version at or below the snapshot. The lower bound means `M` holds every row
 the writer no longer returned. The upper bound means no flush or compaction after the snapshot
-shaped `M`. A cached manifest that fits is used however long ago it was loaded, up to half of
-`gcMinAge`. When only a manifest past the snapshot can be found, the read asks the writer again.
+shaped `M`. A cached manifest that fits is used however long ago it was confirmed, up to half of
+`gcMinAge` after it was loaded (`ManifestCache.covering`). When only a manifest past the snapshot
+can be found, the read asks the writer again, at most `LATEST_READ_ATTEMPTS` (3) times in all, then
+fails with the retryable `StorageUnavailable`. A scan reads the writer's rows in pages at one
+snapshot and takes the largest `flushed_seq` of its pages as the lower bound, so a flush between
+pages leaves no manifest that fits, and the scan starts again.
 
 **`AtLeast(seq)`** is `Flushed` when the manifest a `Flushed` read would use right now already
 covers `seq`, and `Latest` otherwise. It never loads a manifest to find out.
 
-**`Flushed`** reads the manifest at its own `lastL0Seq`. Two `Flushed` reads through one Worker
-isolate never go backwards; through different isolates they may, by up to the refresh interval.
+**`Flushed`** reads the manifest at its own `lastL0Seq` (`ManifestCache.current`): the cached one
+while it was confirmed to hold every flushed row less than `manifestRefreshInterval` ago (by its
+load, or by a `Latest` read's covering hit), otherwise a fresh load. One `Flushed` read after
+another in the same Worker isolate never sees an older manifest: the cache never replaces a manifest
+with an older one. Through different isolates they may go backwards, by about the refresh interval.
 
-**A snapshot** is a manifest id and a sequence number. An unpinned snapshot is readable while GC
-keeps its manifest: at least `gcMinAge` (1 h) after a newer manifest replaced it. After that the
-read fails with `SnapshotExpired`. A pinned snapshot (`DatabaseLifecycle.pinSnapshot`) holds a
-checkpoint, and stays readable until the checkpoint expires or is deleted.
+**A snapshot** is a manifest id and that manifest's `lastL0Seq`. `DbClient.snapshot` takes the
+manifest a `Flushed` read would use and writes nothing. It is readable while GC keeps that manifest:
+`gcMinAge` (1 h) after a newer manifest replaced it. The cache may serve a manifest a compaction
+replaced up to half of `gcMinAge` earlier, so from the moment it is taken an unpinned snapshot is
+guaranteed only half of `gcMinAge`. After that a read may fail with `SnapshotExpired`.
+`DatabaseLifecycle.pinSnapshot` flushes, then adds a checkpoint on the resulting manifest that
+expires after the given lifetime; the snapshot stays readable until it expires or is deleted.
 
-**A transaction** reads at the sequence number of its begin: the manifest that was flushed then,
-plus the rows the writer keeps above it. That is exact while the writer still keeps those rows:
-at least `transactionRetentionMs` (60 s), less only if `maxRetainedBytes` (64 MiB) of newer
-flushed rows pushed them out. After that, reads and the commit fail with `SnapshotTooOld`. A
-`SerializableSnapshot` commit succeeds only if no key or range it read was written since its begin,
-checked under the commit lock against the writer's rows.
+**A transaction** reads at `readSeq`, the writer's `last_seq` at its begin, from the manifest the
+writer's last flush committed (`flushed_manifest_id`) plus the rows the writer keeps in
+`(retained_from_seq, readSeq]` (`DbWriter.probeAt`). That is exact while the writer keeps every row
+above `readSeq`. A trim keeps a flush's rows at least `transactionRetentionMs` (60 s) after that
+flush, less only when more than `maxRetainedBytes` (64 MiB) of flushed rows are kept, and never
+removes the newest flush. Once a trim passes `readSeq`, the commit fails with `SnapshotTooOld`, and
+so does a read whose begin manifest no longer covers `retained_from_seq` or has been collected by
+GC. Every commit checks, under the commit lock, that no key it writes was written after `readSeq`
+(`MemTable.writtenAfter`). A `SerializableSnapshot` commit also checks every key and range it read.
 
-| Enforced by                                                                                                     | Checked by                                                                                                                                                                                         |
-| --------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `DbClient.pointView`, `scanView`, `coveredByManifest` (`db-client.ts`); `DbReader.manifestFor` (`db-reader.ts`) | `db-client.test.ts` (a `Map` oracle at every consistency; the two tests named in the worked example); `NoAckedWriteLost.tla` (`LatestSeesAcked`; `nonAtomicProbe` and `noSnapshotUpperBound` fail) |
-| `ManifestCache.covering`, `recent`, `current` (`manifest-cache.ts`); `ManifestReader.loadLatestFrom`            | `manifest-store.test.ts`; `ManifestCasFencing.tla` (`LoadFindsHead`, `LoadFromKnownFindsHead`)                                                                                                     |
-| `DbClient.beginTransaction`, `getAt`, `scanAt`; `DbWriter.commitTransaction`; `MemTable.writtenAfter`, `trim`   | `db-transaction.test.ts` (serializability over random interleavings with flushes and compactions); `Transactions.tla` (`Serializable`)                                                             |
+| Enforced by                                                                                                                             | Checked by                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| --------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DbClient.pointView`, `scanView`, `coveredByManifest`, `LATEST_READ_ATTEMPTS` (`db-client.ts`); `DbReader.manifestFor` (`db-reader.ts`) | `db-client.test.ts` ("Latest and AtLeast reads see every acknowledged write; Flushed reads see the last flush; scans agree", against a `Map` oracle; the two tests named in the worked example); `NoAckedWriteLost.tla` (`LatestSeesAcked`; `nonAtomicProbe` and `noSnapshotUpperBound` fail)                                                                                                                                                 |
+| `ManifestCache.covering`, `recent`, `current` (`manifest-cache.ts`); `ManifestReader.loadLatestFrom`                                    | `manifest-store.test.ts` ("a covering hit vouches for the cached manifest: Flushed reads use it for another refresh interval, not longer (D67)", "loads the newest manifest from the writer's last flush, never that flush's superseded manifest (D67)"); `ManifestCasFencing.tla` (`LoadFindsHead`, `LoadFromKnownFindsHead`)                                                                                                                |
+| `DbClient.beginTransaction`, `getAt`, `scanAt`; `DbWriter.commitTransaction`; `MemTable.writtenAfter`, `trim`                           | `db-transaction.test.ts` ("SerializableSnapshot: every committed transaction read what the database held at its commit", over random interleavings with flushes, compactions, and trims; "ends a transaction only once its rows are trimmed, and old callers at the first flush"); `mem-table.test.ts` ("trims flushed rows past retention or the byte bound, never the newest flush or unflushed rows"); `Transactions.tla` (`Serializable`) |
 
 ## When GC may reclaim an SST
 
-GC deletes an SST only when all four hold:
+`GarbageCollector.collect` deletes an SST of the database's own prefix only when all four hold. (A
+fork's SSTs that live under its source's prefix are never its candidates.)
 
 1. The newest manifest does not reference it.
 2. No manifest that was replaced less than `gcMinAge` (1 h) ago references it. Age is measured
@@ -112,24 +129,28 @@ GC deletes an SST only when all four hold:
    stayed newest for a day and was replaced a minute ago is one minute old.
 3. No manifest a checkpoint pins references it. A fork's hold on its source, a pinned snapshot,
    and an operator's checkpoint are all checkpoints.
-4. Its id is older than the manifest's `gcSstBoundary`, which GC advances to `now - gcMinAge` in
-   a manifest commit before it deletes. A flush or compaction whose SST is below the boundary is
-   refused at commit (`SstBelowGcBoundaryError`), so an upload that stalled for an hour cannot
-   commit an SST GC has already removed.
+4. Its id (a ULID) was created before both `now - gcMinAge` and the `gcSstBoundary` of the
+   manifest GC committed. GC advances that boundary to `now - gcMinAge` in a manifest commit before
+   it lists the manifests it keeps and deletes, and only when some old SST is unreferenced by the
+   newest manifest. A flush or compaction whose SST was created before the boundary is refused at
+   commit (`SstBelowGcBoundaryError`), so an upload that stalled past `gcMinAge` cannot commit an
+   SST GC may have removed.
 
 Readers keep their side of rule 2: a Worker isolate uses a cached manifest for at most half of
-`gcMinAge` after loading it, and caches a manifest only if it was the newest when loaded.
+`gcMinAge` after loading it (`maxHeldMs`), and caches a manifest only if it was the newest when
+loaded. Snapshots and transactions name a manifest by id instead; when GC has collected it, their
+reads fail (`SnapshotExpired`, `SnapshotTooOld`) rather than read a partial manifest.
 
-| Enforced by                                                                                                                               | Checked by                                                                                                                                                         |
-| ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `GarbageCollector.collect` (`garbage-collector.ts`); `planManifestCollection`, `planSstCollection`, `prepareGarbageCollection` (lsm-core) | `garbage-collector.test.ts`, `garbage-collection-plan.test.ts`; `GcSafety.tla` (`ReadableManifestsComplete`, `PinnedManifestsComplete`; four broken variants fail) |
-| The boundary check in `commitL0Flush` and `commitCompaction`; `ManifestStore.create`'s re-read of the manifest boundary                   | `manifest.test.ts`, `manifest-store.test.ts`; `ManifestCasFencing.tla` (`CommitOnce`; `noBoundaryReread` fails)                                                    |
-| `ManifestCache`'s hold (`maxHeldMs`), `forget` on a missing SST                                                                           | `manifest-store.test.ts` ("...never past half of gcMinAge"), `db-client.test.ts` ("a read that finds an SST of its cached manifest missing...")                    |
+| Enforced by                                                                                                                                                                                              | Checked by                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GarbageCollector.collect` (`garbage-collector.ts`); `planManifestCollection`, `planSstCollection`, `hasSstCollectionCandidates`, `prepareGarbageCollection` (`lsm-core/src/garbage-collection-plan.ts`) | `garbage-collector.test.ts` ("keeps young manifests and their SSTs, then collects them once older than gcMinAge", "keeps the SSTs of a checkpointed manifest however old it is"); `garbage-collection-plan.test.ts` ("measures a manifest's age from when it was superseded, not when it was written"); `GcSafety.tla` (`ReadableManifestsComplete`, `PinnedManifestsComplete`; `noBoundaryCheck`, `ownUploadAge`, `ignorePins`, `dropDeletesObject` fail) |
+| `belowGcBoundary` in `commitL0Flush` and `commitCompaction` (`lsm-core/src/manifest.ts`); `ManifestStore.create`'s re-read of the manifest boundary                                                      | `manifest.test.ts` ("rejects new SSTs created before GC's boundary, which only moves forward"); `garbage-collector.test.ts` ("collects an old orphan, and a late commit of it then fails instead of referencing a deleted SST"); `manifest-store.test.ts` ("does not commit a stale create that reuses an id GC collected (RFC 0026 boundary)"); `ManifestCasFencing.tla` (`CommitOnce`; `noBoundaryReread` fails)                                         |
+| `ManifestCache`'s hold (`maxHeldMs`), `forget` on a missing SST                                                                                                                                          | `manifest-store.test.ts` ("serves a covering manifest from cache past the refresh interval, never one missing flushed rows, and never past half of gcMinAge (D67)"); `db-client.test.ts` ("a read that finds an SST of its cached manifest missing drops the manifest, so the retry succeeds (D67)")                                                                                                                                                       |
 
 ## Worked example: the stale manifest after a compaction
 
 Two bugs found while v1 was finished came from the same place: a read and a compaction meeting
-across a manifest. Both passed every test and soak until the interaction was modeled or reviewed.
+across a manifest. Neither showed in a test or a soak; a model found one and a review the other.
 They show how to use the rules above.
 
 **A manifest too new for the read (D70).** A `Latest` read had the lower bound above and no upper
@@ -158,7 +179,7 @@ replaced up to an hour earlier, and the isolate would keep reading it for anothe
 GC deleted its SSTs. The fix: the writer's manifest is only where the search for the newest
 starts (`ManifestReader.loadLatestFrom`), and the cache holds only a manifest that was the newest
 when loaded. `ManifestCasFencing.tla`'s `LoadFromKnownFindsHead` checks that the search finds the
-newest from any stored manifest.
+newest from any stored manifest (`knownIgnoresBoundary` fails it).
 
 **The check to apply to a change.** For anything that makes a reader keep or reuse a manifest,
 answer both:
@@ -168,12 +189,18 @@ answer both:
 - For how long after it was replaced can the reader still be using it, and does GC wait longer?
   (Rule 2.)
 
+Applied to transactions, the second question finds an open gap. A transaction's begin manifest is
+the writer's last flush manifest, which a compaction replaces within seconds. On a database idle
+for `gcMinAge` after a compaction, while its writer stays up, GC has collected that manifest, so
+every read of every new transaction fails with `SnapshotTooOld` until the next flush. Nothing is
+read wrongly; the retry just never succeeds. It is reported and not yet fixed.
+
 ## Where the detail is
 
 - Each formal model's skill (`.agents/skills/verify-*`) lists the actions it models, the code each
   maps to, its bounds, and its maintenance notes. `vp run verify` runs all 28 checks.
 - [`design-decisions.md`](design-decisions.md) records why each rule is as it is: D21 (the atomic
-  probe), D29 (readers and GC), D33 (GC boundaries), D56 (manifest commits), D58 (transactions),
+  probe), D29 (`Flushed` lag), D33 (GC boundaries and `gcMinAge` for readers), D56 (manifest commits), D58 (transactions),
   D67 and D70 (the read path), D74 (the writer's counters).
 - [`coverage-matrix.md`](coverage-matrix.md) maps every design item to code, tests, trace
   assertions, and models.

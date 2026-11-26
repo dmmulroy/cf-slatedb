@@ -23,6 +23,55 @@ across databases.
 The design is [`docs/show-me-r2-lsm-design.html`](docs/show-me-r2-lsm-design.html).
 [`docs/design-decisions.md`](docs/design-decisions.md) records every judgment call it did not make.
 
+## Who it is for
+
+shaledb is for many independent writers spread across many databases, not one global hot writer.
+The unit of scale is the database, and each database has one writer Durable Object. Throughput
+grows by adding databases (and, for one key space, by splitting it with range sharding), not by
+making one database's writer faster.
+
+One database's write rate is bounded by its writer, which commits one batch at a time. The highest
+rates measured on one writer (`preview-1`, production settings, 16-byte keys and 100-byte values,
+a laptop client on a US residential connection, so latencies include an internet round trip):
+
+<!-- STEP4-NUMBERS: begin -->
+
+| Batch rows | Batches in flight | Rows/s acknowledged | Client latency p50 / p90 / p99 (ms) |
+| ---------: | ----------------: | ------------------: | ----------------------------------- |
+|        100 |                 8 |               6,547 | 105 / 136 / 427                     |
+|      1,000 |                16 |              15,257 | 961 / 1,706 / 2,400                 |
+
+The writer was busy about half the time at both loads, so these are the rates measured, not a
+proven ceiling ([`docs/measurements.md`](docs/measurements.md), "Writer throughput and limits").
+
+<!-- STEP4-NUMBERS: end -->
+
+Reads cost the writer differently by consistency:
+
+- **`Latest`** sees every acknowledged write, and costs its database's writer one probe on every
+  read (the probe took 10 ms at p50 measured in the API Worker). Every `Latest` read of a database
+  is served by that one writer, and pays the distance to it.
+- **`AtLeast`, `Flushed`, snapshots, and scans of flushed data** run in the caller's Worker and do
+  not touch the writer (`AtLeast` asks it only when the caller's cached manifest does not yet
+  cover the sequence number). They scale with readers, and a `Flushed` read may lag the newest
+  flush by about a second and unflushed writes by up to a minute.
+
+Both are measured in [`docs/measurements.md`](docs/measurements.md), "Read latency".
+[`docs/invariants.md`](docs/invariants.md) states exactly what each read may see.
+
+It is not a fit for:
+
+- one hot key range that needs more than one writer's throughput, without range sharding;
+- workloads that need atomic writes or transactions across databases: batches and transactions are
+  atomic within one database only;
+- `Latest` reads under 10 ms from far away: with the writer in the EU and the API Worker in the
+  US, a `Latest` get took about 130 ms at p50 in the API Worker, against 19 ms on `preview-3`, whose
+  writers answered probes in 10 ms;
+- anything [`docs/measurements.md`](docs/measurements.md) does not cover (its "Not measured" list
+  names what is open).
+
+<!-- BASELINE: the orchestrator fills this -->
+
 ## Quick start (local)
 
 Requirements: Node 24 and [Vite+](https://viteplus.dev) (`vp`).
