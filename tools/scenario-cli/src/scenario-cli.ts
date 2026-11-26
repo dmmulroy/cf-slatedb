@@ -29,6 +29,7 @@ import {
   measureManifestCas,
   measureR2Placement,
   measureTransactionAborts,
+  measureBaseline,
   measureHealth,
   measureLatency,
   measureSampling,
@@ -378,6 +379,23 @@ const measureLatencyCommand = Command.make(
   ),
 );
 
+const measureBaselineCommand = Command.make(
+  "baseline",
+  {
+    stage: measureStage,
+    batchRows: Flag.Int("batch-rows").pipe(Flag.withDefault(100)),
+    valueBytes: Flag.Int("value-bytes").pipe(Flag.withDefault(100)),
+    writers: Flag.Int("writers").pipe(Flag.withDefault(8)),
+    readers: Flag.Int("readers").pipe(Flag.withDefault(8)),
+    seconds: Flag.Int("seconds").pipe(Flag.withDefault(60)),
+  },
+  ({ stage, ...load }) => runMeasurement(stage, measureBaseline(load)),
+).pipe(
+  Command.withDescription(
+    "One workload against shaledb (reads at Latest, then Flushed) and a plain Durable Object SQLite table: client latency, invocations, CPU, R2 requests (D75)",
+  ),
+);
+
 const measureSamplingCommand = Command.make(
   "sampling",
   { stage: measureStage, requests: Flag.Int("requests").pipe(Flag.withDefault(200)) },
@@ -526,6 +544,7 @@ const measure = Command.make("measure").pipe(
     measureWorkflowBurstCommand,
     measureHealthCommand,
     measureLatencyCommand,
+    measureBaselineCommand,
     measureSamplingCommand,
   ]),
 );

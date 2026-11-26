@@ -1098,6 +1098,306 @@ const estimatedOutcomes = (records: ReadonlyArray<InvocationRecord>) =>
       .sort((left, right) => right[1] - left[1]),
   );
 
+/** Options of {@link measureBaseline}. */
+export interface BaselineLoad {
+  /** Rows per write batch. */
+  readonly batchRows: number;
+  /** Bytes per value (keys are 20 bytes). */
+  readonly valueBytes: number;
+  /** Loops writing batches of new keys, each sending its next batch when the last is answered. */
+  readonly writers: number;
+  /** Loops reading one random preloaded key at a time. */
+  readonly readers: number;
+  readonly seconds: number;
+}
+
+/** What {@link measureBaseline} runs the same workload against. */
+const BASELINE_TARGETS = [
+  "shaledb, reads at Latest",
+  "shaledb, reads at Flushed",
+  "plain Durable Object SQLite",
+] as const;
+type BaselineTarget = (typeof BASELINE_TARGETS)[number];
+
+/** Batches written before the timed run, so readers have keys to read. */
+const BASELINE_PRELOAD_BATCHES = 20;
+
+/**
+ * R2 requests one object store span stands for, by the class Cloudflare bills them in: class A
+ * changes or lists, class B reads. A multipart upload is a create, its parts, and a complete.
+ */
+const r2RequestsOfSpan = (span: typeof GreppedSpan.Type): { classA: number; classB: number } => {
+  const parts = span.attributes["object.parts"];
+  switch (span.name) {
+    case "ObjectStore.putMultipart":
+      return typeof parts === "number" && parts > 1
+        ? { classA: parts + 2, classB: 0 }
+        : { classA: 1, classB: 0 };
+    case "ObjectStore.put":
+    case "ObjectStore.putIfAbsent":
+    case "ObjectStore.putIfVersion":
+    case "ObjectStore.list":
+    case "ObjectStore.listPrefixes":
+      return { classA: 1, classB: 0 };
+    case "ObjectStore.get":
+    case "ObjectStore.getRange":
+    case "ObjectStore.getVersioned":
+    case "ObjectStore.head":
+    case "ObjectReader.get":
+    case "ObjectReader.getRange":
+      return { classA: 0, classB: 1 };
+    default:
+      return { classA: 0, classB: 0 };
+  }
+};
+
+/**
+ * Runs one workload against shaledb (with its reads at `Latest`, then at `Flushed`) and against
+ * a plain Durable Object SQLite table on the same stage (the probe Worker's `PlainSqliteServer`),
+ * each on a new database: `writers` loops of `batchRows`-row batches and `readers` loops of point
+ * reads, for `seconds`, after the same preload (D75).
+ *
+ * **Details**
+ *
+ * Per target it reports what the client saw (acknowledged rows per second; write and read
+ * latency percentiles; failures) and what the stage did for it during the timed run: invocations
+ * and CPU per Worker and Durable Object from tail records, and for shaledb the R2 requests its
+ * spans show, by billing class. Deploy the stage at 100% sampling, or the counts are a sample.
+ * The preload is flushed on shaledb, so its reads find rows in an SST, as they would in use.
+ *
+ * @returns The report per target, or `MeasurementError` when a database cannot be set up or the
+ *   stage's records cannot be read (failed requests during the run are counted, not raised).
+ */
+export const measureBaseline = (load: BaselineLoad) =>
+  Effect.gen(function* () {
+    const stack = yield* ScenarioStack;
+    const http = yield* HttpClient.HttpClient;
+    const client = yield* dbApi;
+    const value = valueBytes(load.valueBytes, 23);
+    const preloadKey = (index: number) =>
+      keyBytes(999, Math.floor(index / load.batchRows), index % load.batchRows);
+    const preloadedKeys = BASELINE_PRELOAD_BATCHES * load.batchRows;
+
+    const runTarget = (target: BaselineTarget) =>
+      Effect.gen(function* () {
+        const name = uniqueId("ms-base");
+        const databaseId = DatabaseId.make(name);
+        const plain = target === "plain Durable Object SQLite";
+        const plainRequest = (operation: "batches" | "get", body: unknown) =>
+          http
+            .execute(
+              HttpClientRequest.post(`${stack.probe}/v1/probe/sqlite/${name}/${operation}`).pipe(
+                HttpClientRequest.bodyText(JSON.stringify(body), "application/json"),
+              ),
+            )
+            .pipe(
+              Effect.flatMap((response) => Effect.map(response.text, () => response.status)),
+              Effect.mapError(failed(`plain SQLite ${operation}`)),
+              Effect.flatMap((status) =>
+                status === 200
+                  ? Effect.void
+                  : Effect.fail(
+                      new MeasurementError({
+                        step: `plain SQLite ${operation}`,
+                        reason: `Status${status}`,
+                        message: `The plain SQLite baseline answered ${status} to ${operation}. Run the measurement again.`,
+                      }),
+                    ),
+              ),
+            );
+        const writeBatch = (
+          keys: ReadonlyArray<Uint8Array>,
+        ): Effect.Effect<void, { readonly _tag: string; readonly message?: string }> =>
+          plain
+            ? plainRequest("batches", {
+                operations: keys.map((key) => ({
+                  key: Base64.encode(key),
+                  value: Base64.encode(value),
+                })),
+              })
+            : Effect.asVoid(
+                client.databases.write({
+                  params: { databaseId },
+                  payload: {
+                    operations: keys.map((key) => ({
+                      _tag: "Put" as const,
+                      key,
+                      value,
+                      ttlMillis: Option.none(),
+                    })),
+                  },
+                }),
+              );
+        const readKey = (
+          key: Uint8Array,
+        ): Effect.Effect<void, { readonly _tag: string; readonly message?: string }> =>
+          plain
+            ? plainRequest("get", { key: Base64.encode(key) })
+            : Effect.asVoid(
+                client.databases.get({
+                  params: { databaseId },
+                  payload: {
+                    key,
+                    consistency:
+                      target === "shaledb, reads at Flushed"
+                        ? { _tag: "Flushed" as const }
+                        : { _tag: "Latest" as const },
+                    snapshot: Option.none(),
+                  },
+                }),
+              );
+
+        if (!plain) yield* createDatabase(databaseId);
+        for (let batch = 0; batch < BASELINE_PRELOAD_BATCHES; batch++) {
+          yield* writeBatch(
+            Array.from({ length: load.batchRows }, (_, row) =>
+              preloadKey(batch * load.batchRows + row),
+            ),
+          ).pipe(Effect.mapError(failed("preload")));
+        }
+        if (!plain) {
+          yield* client.databases
+            .flush({ params: { databaseId } })
+            .pipe(Effect.mapError(failed("flush the preload")));
+        }
+
+        const writeLatencies: Array<number> = [];
+        const readLatencies: Array<number> = [];
+        const failures = new Map<string, number>();
+        let rows = 0;
+        const fail = (kind: string, error: { readonly _tag: string }) =>
+          failures.set(`${kind}: ${error._tag}`, (failures.get(`${kind}: ${error._tag}`) ?? 0) + 1);
+        const started = yield* Clock.currentTimeMillis;
+        const deadline = started + load.seconds * 1000;
+        const writer = (worker: number) =>
+          Effect.gen(function* () {
+            let sequence = 0;
+            while ((yield* Clock.currentTimeMillis) < deadline) {
+              sequence += 1;
+              const keys = Array.from({ length: load.batchRows }, (_, row) =>
+                keyBytes(worker, sequence, row),
+              );
+              const sent = yield* Clock.currentTimeMillis;
+              const outcome = yield* Effect.result(writeBatch(keys));
+              if (outcome._tag === "Success") {
+                writeLatencies.push((yield* Clock.currentTimeMillis) - sent);
+                rows += load.batchRows;
+              } else {
+                fail("write", outcome.failure);
+                yield* Effect.sleep("200 millis");
+              }
+            }
+          });
+        const reader = Effect.gen(function* () {
+          while ((yield* Clock.currentTimeMillis) < deadline) {
+            const key = preloadKey(Math.floor(Math.random() * preloadedKeys));
+            const sent = yield* Clock.currentTimeMillis;
+            const outcome = yield* Effect.result(readKey(key));
+            if (outcome._tag === "Success") {
+              readLatencies.push((yield* Clock.currentTimeMillis) - sent);
+            } else {
+              fail("read", outcome.failure);
+              yield* Effect.sleep("200 millis");
+            }
+          }
+        });
+        yield* Effect.all(
+          [
+            ...Array.from({ length: load.writers }, (_, worker) => writer(worker)),
+            ...Array.from({ length: load.readers }, () => reader),
+          ],
+          { concurrency: "unbounded", discard: true },
+        );
+        const ended = yield* Clock.currentTimeMillis;
+        return { target, name, started, ended, rows, writeLatencies, readLatencies, failures };
+      });
+
+    const runs = [];
+    for (const target of BASELINE_TARGETS) runs.push(yield* runTarget(target));
+
+    // Tail records and spans arrive after each invocation finishes.
+    yield* Effect.sleep("25 seconds");
+    const [first] = runs;
+    const since = first === undefined ? yield* Clock.currentTimeMillis : first.started;
+    const records = yield* readInvocationRecords(since);
+    const store = yield* pullMeasurementSpans(
+      Math.ceil(((yield* Clock.currentTimeMillis) - since) / 60_000) + 1,
+    );
+    const objectSpans = [
+      ...(yield* spansSince(store, since, ["--name-prefix", "ObjectStore."])),
+      ...(yield* spansSince(store, since, ["--name-prefix", "ObjectReader."])),
+    ];
+    const blockFetches = yield* spansSince(store, since, ["--name-prefix", "BlockSource."]);
+
+    return {
+      load,
+      preloadedRows: preloadedKeys,
+      targets: runs.map((run) => {
+        const inRun = (atMs: number) => atMs >= run.started && atMs <= run.ended + 2_000;
+        const own = records.filter(
+          (record) =>
+            Option.exists(record.eventTimestamp, inRun) &&
+            Option.exists(record.path, (path) => path.includes(`/${run.name}/`)),
+        );
+        // A Durable Object's requests carry the caller's path on shaledb, and only `/batches` or
+        // `/get` on the baseline: every record of the objects this run's requests reached is its.
+        const objects = new Set(own.flatMap((record) => Option.toArray(record.durableObjectId)));
+        const plainObject = records.filter(
+          (record) =>
+            run.target === "plain Durable Object SQLite" &&
+            Option.exists(record.eventTimestamp, inRun) &&
+            Option.isSome(record.durableObjectId) &&
+            Option.exists(record.scriptName, (script) => script.includes("telemetryprobe")),
+        );
+        const durable = [
+          ...records.filter(
+            (record) =>
+              Option.exists(record.eventTimestamp, inRun) &&
+              Option.exists(record.durableObjectId, (id) => objects.has(id)),
+          ),
+          ...plainObject,
+        ];
+        const workers = own.filter((record) => Option.isNone(record.durableObjectId));
+        const cpu = (list: ReadonlyArray<InvocationRecord>) =>
+          Math.round(list.reduce((sum, record) => sum + record.cpuTimeMs, 0));
+        const spanInRun = (span: typeof GreppedSpan.Type) =>
+          inRun(Number(BigInt(span.startTimeUnixNano) / 1_000_000n)) &&
+          span.attributes["database.id"] === run.name;
+        const traces = new Set(blockFetches.filter(spanInRun).map((span) => span.traceId));
+        // Object store spans carry no database id: they belong to a run through their trace, or
+        // (the writer's flush and the manifest loads) through their time, the only run going on.
+        const r2 = objectSpans
+          .filter((span) => inRun(Number(BigInt(span.startTimeUnixNano) / 1_000_000n)))
+          .reduce(
+            (sum, span) => {
+              const requests = r2RequestsOfSpan(span);
+              return {
+                classA: sum.classA + requests.classA,
+                classB: sum.classB + requests.classB,
+              };
+            },
+            { classA: 0, classB: 0 },
+          );
+        const seconds = (run.ended - run.started) / 1000;
+        return {
+          target: run.target,
+          name: run.name,
+          seconds,
+          acknowledgedRowsPerSecond: Math.round(run.rows / seconds),
+          writeBatchesPerSecond: Number((run.writeLatencies.length / seconds).toFixed(1)),
+          readsPerSecond: Number((run.readLatencies.length / seconds).toFixed(1)),
+          writeLatencyMs: summarize(run.writeLatencies),
+          readLatencyMs: summarize(run.readLatencies),
+          failures: Object.fromEntries(run.failures),
+          workerInvocations: { count: workers.length, cpuMs: cpu(workers) },
+          durableObjectInvocations: { count: durable.length, cpuMs: cpu(durable) },
+          r2Requests: run.target === "plain Durable Object SQLite" ? { classA: 0, classB: 0 } : r2,
+          tracesWithBlockFetches: traces.size,
+        };
+      }),
+    };
+  });
+
 /** The operations {@link measureLatency} reports, each a span the API Worker records per request. */
 const LATENCY_OPERATIONS: ReadonlyArray<{
   readonly operation: string;
