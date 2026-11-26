@@ -22,7 +22,8 @@ export interface CompactionRetention {
  * A streaming k-way merge (one chunk per input in memory) grouped by key, then
  * {@link retainKeyVersions} with no retained history: readers that need older versions read the
  * manifest they pinned, whose SSTs GC keeps. Expired values become deletes, expired operands are
- * dropped, operands fold onto their base, and deletes are dropped at the bottom. Keys left with no
+ * dropped, operands that expire together fold (onto their base when it expires with them, D81),
+ * and deletes are dropped at the bottom. Keys left with no
  * version are skipped. Each element holds one key's versions, newest first, so callers can split
  * output SSTs between keys.
  *

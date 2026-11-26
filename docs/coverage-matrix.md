@@ -245,8 +245,10 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   (oracle at any snapshot and time; earliest expiry; `U64Add`; `MergeOperatorMissingError`; raw
   operands without an operator), `compaction-merge.test.ts` (any split of inputs over three keys,
   with and without older data and an operator, matches the oracle; shown failing when deletes are
-  dropped above the bottom, an input is skipped, or expired operands are kept),
-  `compaction-executor.test.ts` (merges through real SSTs).
+  dropped above the bottom, an input is skipped, or expired operands are kept; D81: agrees at
+  every later time through flush windows and two compactions; mixed-expiry folds in
+  `row-resolution.test.ts`), `compaction-executor.test.ts` (merges through real SSTs). D10, D11,
+  D81.
 - **Checkpoints, clones (forks), transactions** — done. Checkpoints and forks (Phase 7, D37). Optimistic
   transactions (Phase 9, D41): lsm-core `transaction.ts` (`TransactionIsolation`,
   `TransactionCommit`, `TransactionConflictError`); `DbWriter.commitTransaction` (conflict check and

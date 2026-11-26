@@ -296,6 +296,13 @@ hand-off is below.
   - `manifest-cas-fencing` model check: 9/9 (no step changed).
   - Still to do live: wake `ms-cas-mwy5ujbj` after the deploy and confirm it compacts.
 
+- **D81: compaction folded merge operands across TTLs (found by review, 2026-11-26).** A
+  short-TTL operand made the whole folded key expire early. Compaction now folds only rows that
+  expire together (SlateDB's write-path rule).
+  - A new property compares reads at every later time through flushes and two compactions; it
+    fails on the code before.
+  - Five mutations are each caught.
+  - Already-compacted data keeps its early expiry; the release notes need a sentence (see D81).
 - **D80: the change feed's silent gap (found by review, 2026-11-26).** With every changelog entry
   pruned, or on a fork before its first flush, the feed skipped changes without `Expired`. Now the
   manifest records `changelogAfterSeq`, and the feed answers only when its changelog provably holds

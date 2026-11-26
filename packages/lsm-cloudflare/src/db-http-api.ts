@@ -208,7 +208,7 @@ export class DbHttpApiGroup extends HttpApiGroup.make("databases")
       OpenApi.annotations({
         summary: "Write a batch",
         description:
-          "Commits puts, deletes, and merges atomically with one sequence number. The write is durable when the response arrives. Pass the returned `seq` to an `AtLeast` read to read your own write.",
+          "Commits puts, deletes, and merges atomically with one sequence number. The write is durable when the response arrives. Pass the returned `seq` to an `AtLeast` read to read your own write. Each put and merge with `ttlMillis` expires on its own: a read treats an expired value as deleted and skips an expired merge operand, so operands that have not expired still apply (onto nothing, when the value under them has expired). Within one batch, a key's operations become one version: its merges must share one TTL, and the version expires at the earliest TTL among them.",
       }),
     ),
   )
