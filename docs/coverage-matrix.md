@@ -504,7 +504,9 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   snapshotters, a remover, a sharded group split twice, a midway redeploy; a model of every
   acknowledged write; final reads of every key; storage, tail-record, health, and span checks) and
   `scenario-cli smoke` (`smoke.ts`: only operations safe on a live installation, on databases it
-  removes). Live: `docs/measurements.md` ("Release soaks").
+  removes). Live: `docs/measurements.md` ("Release soaks"). Telemetry reads are bounded and stop
+  with the workload, and `--report-file` keeps the report through each phase (D65):
+  `soak-telemetry.test.ts`, `soak-report.test.ts`, `scenario.test.ts`.
 - **Routed reads see writes across a split (stale maps)** — done (D59). `DbWriter.probe`/`scan`
   report `sealedSuccessors`; `ReadOptions.refuseSealed` (`db-client.ts`); `ShardRouter` gets route
   through `withRouting` and scans resume shard by shard (`scanFrom`). Test: `sharding.test.ts` (a

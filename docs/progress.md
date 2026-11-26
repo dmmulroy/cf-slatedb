@@ -236,6 +236,14 @@ hand-off is below.
     show: 12,997 sampled gets and 879 scans (6,016 and 399 after minute 70), 16 sampled
     collections that deleted 48 SSTs, and no error span other than the remover's deliberate
     `DatabaseNotFound`. The release soaks are rerun on the final code.
+  - **The soak tool can no longer lose its results (D65).** A later 130-minute soak never
+    reported: its tail watcher's read never returned, which held the workload open, and the
+    report was only printed at the end. The watchers are now interrupted when the workload ends,
+    every telemetry read has a budget whose overrun is a failure saying how far it got, the data
+    checks run before telemetry, and `--report-file` keeps the report, atomically replaced, every
+    minute and after each phase. Tests: `soak-telemetry.test.ts`, `soak-report.test.ts`,
+    `scenario.test.ts` in `tools/scenario-cli`. A split or redeploy planned after `--minutes` is
+    skipped instead of holding the workload open (no test). Not yet run live.
   - **Lessons for running in parallel.** TLC on every core starves a client-driven measurement
     on the same laptop (transport errors, one failed run): run it niced and apart from timed
     runs. A tool started while a deploy has the checkout on another ref loads a mix of two

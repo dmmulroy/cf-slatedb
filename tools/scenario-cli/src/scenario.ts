@@ -146,23 +146,54 @@ const PREVIEW_ASSERT_ATTEMPTS = 6;
  */
 const PROCESS_STARTED_AT = Date.now();
 
-/** Runs the trace CLI in its own process; returns its exit status and output. */
+/**
+ * Runs Node with `nodeArgs` in its own process without blocking this one; returns its exit status,
+ * its output (when `captureStdout`), and its error output. Interrupting the effect kills the
+ * process and waits for it to exit, so a read cut off by a time budget stops reading.
+ */
+export const runNodeProcess = (nodeArgs: ReadonlyArray<string>, captureStdout: boolean) =>
+  Effect.callback<{ readonly status: number; readonly stdout: string; readonly stderr: string }>(
+    (resume) => {
+      const child = spawn(process.execPath, nodeArgs, {
+        stdio: ["ignore", captureStdout ? "pipe" : "ignore", "pipe"],
+      });
+      const stdout: Array<Buffer> = [];
+      let stderr = "";
+      child.stdout?.on("data", (chunk: Buffer) => stdout.push(chunk));
+      child.stderr?.on("data", (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+      const exited = new Promise<void>((settle) => child.on("exit", () => settle()));
+      child.on("exit", (code) =>
+        resume(
+          Effect.succeed({ status: code ?? -1, stdout: Buffer.concat(stdout).toString(), stderr }),
+        ),
+      );
+      return Effect.promise(() => {
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+        return exited;
+      });
+    },
+  );
+
 /**
  * Runs the trace CLI in its own process without blocking this one (a long `pull` must not stall a
- * soak's other fibers); returns its exit status and error output.
+ * soak's other fibers); returns its exit status and error output. Interrupting it kills the process.
  */
 export const runTraceCliAsync = (args: ReadonlyArray<string>) =>
-  Effect.callback<{ readonly status: number; readonly stderr: string }>((resume) => {
-    const child = spawn(process.execPath, [TRACE_CLI, ...args], {
-      stdio: ["ignore", "ignore", "pipe"],
-    });
-    let stderr = "";
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
-    });
-    child.on("exit", (code) => resume(Effect.succeed({ status: code ?? -1, stderr })));
-  });
+  Effect.map(runNodeProcess([TRACE_CLI, ...args], false), ({ status, stderr }) => ({
+    status,
+    stderr,
+  }));
 
+/**
+ * Runs the trace CLI in its own process without blocking this one; returns its exit status, output,
+ * and error output. Interrupting it kills the process: a `grep` over a large store can be cut off.
+ */
+export const runTraceCliCaptured = (args: ReadonlyArray<string>) =>
+  runNodeProcess([TRACE_CLI, ...args], true);
+
+/** Runs the trace CLI in its own process, blocking this one; returns its exit status and output. */
 export const runTraceCli = (args: ReadonlyArray<string>, input?: string) =>
   Effect.sync(() =>
     spawnSync(process.execPath, [TRACE_CLI, ...args], {
