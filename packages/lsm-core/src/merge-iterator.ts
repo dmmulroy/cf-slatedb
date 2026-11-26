@@ -92,6 +92,12 @@ class CursorHeap {
  * merge never buffers more than one chunk per input; the first chunk of every input is pulled
  * concurrently.
  *
+ * **Details**
+ *
+ * The merge emits what it has merged before it pulls an input again: an input's next chunk may
+ * wait on a read, and a consumer that needs only a few rows (a scan with a small limit) then never
+ * starts it. So a batch ends when it is full or when an input's chunk runs out, whichever is first.
+ *
  * @param sources - Inputs ordered newest first (memtable, then L0 newest to oldest, then sorted runs
  *   by id descending); on an exact duplicate the earliest input wins.
  */
@@ -107,6 +113,8 @@ export const mergeRowStreams = <E, R>(
         const heap = new CursorHeap();
         let started = false;
         let previous: Row | undefined;
+        /** The input whose chunk ran out in the last batch: pulled before the next row is taken. */
+        let exhausted: number | undefined;
 
         const refill = (source: number) =>
           Effect.gen(function* () {
@@ -130,6 +138,14 @@ export const mergeRowStreams = <E, R>(
             }
             const batch: Array<Row> = [];
             while (batch.length < MERGED_BATCH_SIZE) {
+              if (exhausted !== undefined) {
+                // Its next row may sort before every row in the heap. Rows already merged go out
+                // first, so the pull only happens once the consumer asks for more.
+                if (batch.length > 0) break;
+                const source = exhausted;
+                exhausted = undefined;
+                yield* refill(source);
+              }
               const cursor = heap.pop();
               if (cursor === undefined) break;
               const row = cursorRow(cursor);
@@ -143,7 +159,7 @@ export const mergeRowStreams = <E, R>(
               }
               cursor.index++;
               if (cursor.index < cursor.chunk.length) heap.push(cursor);
-              else yield* refill(cursor.source);
+              else exhausted = cursor.source;
             }
             if (Arr.isReadonlyArrayNonEmpty(batch)) return batch;
             return yield* Cause.done();

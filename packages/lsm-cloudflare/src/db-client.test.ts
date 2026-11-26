@@ -8,12 +8,16 @@ import {
   SeqNum,
   Timestamp,
 } from "@shaledb/lsm-core";
-import { Arbitrary, Effect, Option, Result, Schema, Stream } from "effect";
+import { Arbitrary, Effect, Option, Result, Schema, Stream, Tracer } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
 import { DbClient, dbClientTestLayer } from "./db-client.ts";
-import type { DbReaderServices } from "./db-reader.ts";
+import {
+  type DbReaderServices,
+  SCAN_READ_AHEAD_BLOCKS,
+  scanFirstReadAheadBlocks,
+} from "./db-reader.ts";
 import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
 import { ManifestReader } from "./manifest-reader.ts";
 import { ManifestStore } from "./manifest-store.ts";
@@ -283,6 +287,72 @@ describe("DbClient against a Map oracle", () => {
       "ReaderUnavailableError",
     );
     expect(outcome.retried).toEqual(Result.succeed(Option.none()));
+  });
+
+  it("sizes a scan's first read-ahead from its limit and the SST's rows per block (D67)", () => {
+    const sst = (rowCount: number, blockCount: number) => ({ rowCount, blockCount });
+    // No limit: everything is wanted, so read ahead fully.
+    expect(scanFirstReadAheadBlocks(Option.none(), sst(10_000, 100))).toBe(SCAN_READ_AHEAD_BLOCKS);
+    // 100 rows at 130 rows per block: one block, and one more for a range starting mid-block.
+    expect(scanFirstReadAheadBlocks(Option.some(100), sst(13_000, 100))).toBe(2);
+    // 100 rows at 16 rows per block (1 KB values in 16 KiB blocks): seven blocks and one more.
+    expect(scanFirstReadAheadBlocks(Option.some(100), sst(1_600, 100))).toBe(8);
+    // A full page of 1,000 small rows: capped.
+    expect(scanFirstReadAheadBlocks(Option.some(1000), sst(13_000, 100))).toBe(
+      SCAN_READ_AHEAD_BLOCKS,
+    );
+    expect(scanFirstReadAheadBlocks(Option.some(1), sst(13_000, 100))).toBe(2);
+    // Degenerate metadata never asks for less than one block or more than the cap.
+    expect(scanFirstReadAheadBlocks(Option.some(100), sst(0, 0))).toBe(SCAN_READ_AHEAD_BLOCKS);
+  });
+
+  it("a short scan reads only the blocks its limit needs, and reads on when rows turn out hidden (D67)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createDatabase;
+        const client = yield* DbClient;
+        // One SST of 120 small rows in 64-byte blocks: dozens of blocks, a few rows each.
+        for (let key = 1; key <= 120; key++) {
+          yield* client.put(DB, keyBytes(key), Uint8Array.of(key));
+        }
+        yield* client.flush(DB);
+        const scan = (limit: number) =>
+          Effect.gen(function* () {
+            const blockReads: Array<string> = [];
+            const recording = Tracer.make({
+              span: (options) => {
+                if (options.name === "BlockSource.block") blockReads.push(options.name);
+                return new Tracer.NativeSpan(options);
+              },
+            });
+            const rows = yield* Effect.withTracer(
+              Stream.runCollect(
+                client.scan(DB, FULL_KEY_RANGE, {
+                  consistency: { _tag: "Flushed" },
+                  snapshot: Option.none(),
+                  refuseSealed: false,
+                  limit: Option.some(limit),
+                }),
+              ),
+              recording,
+            );
+            return { keys: rows.map((row) => row.key[1]), blockReads: blockReads.length };
+          });
+        const short = yield* scan(3);
+        // A second SST deletes the first 60 keys: the scan's first three visible rows are far
+        // past the blocks its limit suggested.
+        for (let key = 1; key <= 60; key++) yield* client.delete(DB, keyBytes(key));
+        yield* client.flush(DB);
+        yield* TestClock.adjust("2 seconds");
+        const pastDeletes = yield* scan(3);
+        return { short, pastDeletes: pastDeletes.keys };
+      }),
+    );
+    expect(outcome.short.keys).toEqual([1, 2, 3]);
+    // The block holding the three rows and the one after it. The merge used to fill a batch of
+    // 256 rows before emitting any, which read all 40 blocks of this SST.
+    expect(outcome.short.blockReads).toBe(2);
+    expect(outcome.pastDeletes).toEqual([61, 62, 63]);
   });
 
   it("reads a snapshot pinned to a manifest, unaffected by later writes and flushes", async () => {
