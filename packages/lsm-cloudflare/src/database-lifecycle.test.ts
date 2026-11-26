@@ -686,6 +686,10 @@ describe("DatabaseLifecycle", () => {
         yield* TestClock.adjust(HOUR);
         yield* left.runDue;
         yield* right.runDue;
+        // The second split's halves collect before their own rewrite (an operator's collect-now, or
+        // a due collection); they still read the shard's SSTs through the left half, so keep it.
+        yield* gc.collect(A1);
+        yield* gc.collect(A2);
         const middleRewritten = {
           onShard: yield* holdsOn(SOURCE),
           onLeft: yield* holdsOn(LEFT),
