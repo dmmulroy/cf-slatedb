@@ -109,6 +109,12 @@ creating a new installation and forking or copying databases into it.
   read and `gcMinAge` (1 hour) has passed since. The fork's own collection releases its hold then,
   once no snapshot or cached manifest of the fork can still read the source (D77). After a split,
   the sealed database can be removed about an hour after both halves' rewrites.
+- **A fork of a fork** (or a split half split again before its rewrite) holds the middle database,
+  and the middle database holds the original one. After the inner fork releases its hold, the
+  middle database releases the original at its next collection. Only the sweep asks for that
+  collection, so it can take one full sweep cycle plus `gcMinAge`. A cycle is `ceil(P / 50)` runs
+  5 minutes apart, for `P` databases: 100 minutes at 1,000 databases, 16 h 40 min at 10,000
+  (D77). To release sooner, collect the middle database now (`POST /v1/gc/databases/<id>`).
 
 ## Capacity
 

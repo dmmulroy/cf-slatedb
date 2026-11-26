@@ -118,7 +118,12 @@ moment ago counted as old and its SSTs could be deleted under a reader. `ownUplo
   `GcSafetyFork.cfg`, with the invariant `ForkReadsComplete` and the broken variant
   `earlyForkRelease` (release as soon as the newest fork manifest stops reading the source, the
   rule before D77), which fails it. `GcSafety.cfg`'s state count is unchanged (27,408,658). Reran;
-  all broken variants still fail.
+  all broken variants still fail. Two code paths are left to tests:
+  - nothing is released when a kept manifest cannot be loaded;
+  - a crash between the two release steps leaves the fork's reference.
+
+  Both are in `database-lifecycle.test.ts`, which also covers a split half split again before its
+  rewrite. No model step changed.
 
 - D70–D73: no covered function changed. The manifest cache's `refresh` now finds the newest
   manifest from the one it holds (`loadLatestFrom`, D72), and still caches only the newest; a
