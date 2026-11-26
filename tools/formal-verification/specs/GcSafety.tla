@@ -23,8 +23,15 @@
 (*  - Writers and compactors commit by manifest CAS (ManifestStore.update),*)
 (*    which this model makes atomic (ManifestCasFencing checks CAS).       *)
 (*                                                                         *)
-(* A fork holds a checkpoint on its source, so a fork's reads are a pin    *)
-(* here; releasing it is Unpin. An SST's creation time is its ULID time.   *)
+(* A checkpoint is a pin (Pin/Unpin). With WithFork, one fork of this     *)
+(* database is modeled too, abstractly (D77): its hold is a checkpoint on  *)
+(* this database (`hold`), its first manifest reads the held manifest's    *)
+(* SSTs, its compaction rewrites them (ForkRewrite), and its own GC        *)
+(* releases the hold (ForkRelease) only once that first manifest was       *)
+(* superseded at least gcMinAge ago, i.e. once no manifest it keeps and a  *)
+(* reader may hold names this database's SSTs (releasableExternalRefs over *)
+(* planManifestCollection's retained set). An SST's creation time is its   *)
+(* ULID time.                                                              *)
 (* One GC runs at a time; its six steps interleave with everything else.   *)
 (*                                                                         *)
 (* Broken selects a deliberately broken variant (must fail):               *)
@@ -36,13 +43,16 @@
 (*                      min(boundary, cutoff) (expected redundant)         *)
 (*   "dropDeletesObject" an SST drop also deletes the SST's object at once *)
 (*                      instead of leaving it to GC                        *)
+(*   "earlyForkRelease" the fork releases its hold as soon as its newest   *)
+(*                      manifest no longer reads this database (before D77)*)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
-CONSTANTS Ssts, MaxTime, MinAge, MaxManifests, Broken
+CONSTANTS Ssts, MaxTime, MinAge, MaxManifests, Broken, WithFork
 
 ASSUME Broken \in {"none", "noBoundaryCheck", "ownUploadAge", "ignorePins", "noMinBoundary",
-                   "dropDeletesObject"}
+                   "dropDeletesObject", "earlyForkRelease"}
+ASSUME WithFork \in BOOLEAN
 ASSUME MinAge >= 1
 
 NotMinted == MaxTime + 1
@@ -52,12 +62,18 @@ VARIABLES
   created,    \* each SST's ULID time, NotMinted before it is written
   objects,    \* SST objects in the bucket
   pending,    \* SSTs uploaded by a flush or compaction and not yet committed or discarded
-  chain,      \* every manifest ever committed, by id: [ssts, boundary, pins, written]
+  chain,      \* every manifest ever committed, by id: [ssts, boundary, pins, hold, written]
   stored,     \* manifest ids whose objects still exist
-  gpc, gNow, gSsts, gAdvance, gCommitted, gListed  \* the GC run in progress
+  gpc, gNow, gSsts, gAdvance, gCommitted, gListed,  \* the GC run in progress
+  fState,       \* the fork: "none", "reading" (its manifests read the held manifest's SSTs),
+                \* "rewritten" (its newest manifest no longer does), "released" (hold removed)
+  fHeld,        \* the manifest id the fork's hold pins (its first manifest reads its SSTs)
+  fRewrittenAt  \* when the fork's rewrite committed (its first manifest's successor was written)
 
-vars == <<now, created, objects, pending, chain, stored, gpc, gNow, gSsts, gAdvance, gCommitted, gListed>>
+vars == <<now, created, objects, pending, chain, stored, gpc, gNow, gSsts, gAdvance, gCommitted, gListed,
+          fState, fHeld, fRewrittenAt>>
 gcVars == <<gpc, gNow, gSsts, gAdvance, gCommitted, gListed>>
+forkVars == <<fState, fHeld, fRewrittenAt>>
 
 LatestId == Len(chain)
 Latest == chain[LatestId]
@@ -69,9 +85,10 @@ Init ==
   /\ created = [s \in Ssts |-> NotMinted]
   /\ objects = {}
   /\ pending = {}
-  /\ chain = << [ssts |-> {}, boundary |-> 0, pins |-> {}, written |-> 0] >>
+  /\ chain = << [ssts |-> {}, boundary |-> 0, pins |-> {}, hold |-> 0, written |-> 0] >>
   /\ stored = {1}
   /\ gpc = "idle" /\ gNow = 0 /\ gSsts = {} /\ gAdvance = FALSE /\ gCommitted = 1 /\ gListed = {}
+  /\ fState = "none" /\ fHeld = 1 /\ fRewrittenAt = 0
 
 \* Commits a manifest (create-if-absent of id LatestId + 1, atomic here).
 Commit(m) ==
@@ -134,6 +151,36 @@ Unpin(p) ==
   /\ UNCHANGED <<now, created, objects, pending>> /\ UNCHANGED gcVars
 
 (***************************************************************************)
+(* The fork (WithFork), abstractly: its own manifests, compaction, and GC  *)
+(* are another database's; only what this database sees is modeled.       *)
+(***************************************************************************)
+\* forkRange / holdForSuccessors: a checkpoint held by the fork pins the newest manifest (a fork
+\* from an older checkpoint pins that checkpoint's manifest, which a pin already keeps). The fork's
+\* first manifest reads the held manifest's SSTs.
+ForkStart ==
+  /\ WithFork /\ fState = "none" /\ CanAppend
+  /\ Commit([Latest EXCEPT !.hold = LatestId])
+  /\ fState' = "reading" /\ fHeld' = LatestId
+  /\ UNCHANGED <<now, created, objects, pending, fRewrittenAt>> /\ UNCHANGED gcVars
+
+\* The fork's full compaction commits in its own database: its newest manifest stops naming this
+\* database's SSTs; its first manifest is superseded now, and readers may hold it for MinAge.
+ForkRewrite ==
+  /\ fState = "reading"
+  /\ fState' = "rewritten" /\ fRewrittenAt' = now
+  /\ UNCHANGED <<now, created, objects, pending, chain, stored, fHeld>> /\ UNCHANGED gcVars
+
+\* The fork's collection (GarbageCollector.collect on the fork) releases the hold by CAS here:
+\* only when its retained manifests name none of this database's SSTs, i.e. its first manifest was
+\* superseded at least MinAge before the collection's clock reading (<= now).
+ForkRelease ==
+  /\ fState = "rewritten" /\ CanAppend
+  /\ Broken = "earlyForkRelease" \/ fRewrittenAt + MinAge <= now
+  /\ Commit([Latest EXCEPT !.hold = 0])
+  /\ fState' = "released"
+  /\ UNCHANGED <<now, created, objects, pending, fHeld, fRewrittenAt>> /\ UNCHANGED gcVars
+
+(***************************************************************************)
 (* GC, step by step (GarbageCollector.collect).                            *)
 (***************************************************************************)
 Cutoff == IF gNow >= MinAge THEN gNow - MinAge ELSE 0
@@ -178,7 +225,8 @@ SupersededLongAgo(id) ==
     THEN chain[id].written + MinAge <= gNow
     ELSE /\ \E j \in gListed : j > id
          /\ chain[NextListed(id)].written + MinAge <= gNow
-Pinned(id) == Broken # "ignorePins" /\ id \in chain[gCommitted].pins
+Pinned(id) ==
+  Broken # "ignorePins" /\ (id \in chain[gCommitted].pins \/ id = chain[gCommitted].hold)
 Deletable == {id \in gListed : id < gCommitted /\ SupersededLongAgo(id) /\ ~Pinned(id)}
 Retained == (gListed \ Deletable) \cup {gCommitted}
 
@@ -200,13 +248,19 @@ GcDeleteManifests ==
   /\ UNCHANGED <<gNow, gSsts, gAdvance, gCommitted, gListed>>
   /\ UNCHANGED <<now, created, objects, pending, chain>>
 
-Next ==
+\* Everything this database's own actors and its GC do; the fork's variables stay.
+DatabaseNext ==
   \/ Tick
   \/ \E s \in Ssts : Upload(s) \/ CommitFlush(s) \/ Discard(s) \/ DropSst(s)
   \/ \E s \in Ssts, inputs \in SUBSET Ssts : CommitCompaction(s, inputs)
-  \/ Pin
-  \/ \E p \in 1..MaxManifests : Unpin(p)
+  \* With the fork, its hold is the only checkpoint (other pins are covered without it).
+  \/ ~WithFork /\ Pin
+  \/ ~WithFork /\ \E p \in 1..MaxManifests : Unpin(p)
   \/ GcListSsts \/ GcPrecheck \/ GcCommit \/ GcListManifests \/ GcDeleteSsts \/ GcDeleteManifests
+
+Next ==
+  \/ DatabaseNext /\ UNCHANGED forkVars
+  \/ ForkStart \/ ForkRewrite \/ ForkRelease
 
 Spec == Init /\ [][Next]_vars
 
@@ -220,6 +274,7 @@ TypeOK ==
   /\ now \in 0..MaxTime
   /\ objects \subseteq Ssts /\ pending \subseteq Ssts
   /\ stored \subseteq 1..Len(chain) /\ LatestId \in stored
+  /\ fState \in {"none", "reading", "rewritten", "released"}
 
 \* A reader may hold the newest manifest, or one superseded less than MinAge ago (D29).
 MayBeHeld(id) == id = LatestId \/ now < chain[id + 1].written + MinAge
@@ -228,7 +283,13 @@ MayBeHeld(id) == id = LatestId \/ now < chain[id + 1].written + MinAge
 ReadableManifestsComplete ==
   \A id \in 1..LatestId : MayBeHeld(id) => chain[id].ssts \subseteq objects
 
-\* Every checkpointed manifest (and so every manifest a fork reads) is stored with all its SSTs.
+\* Every checkpointed manifest (and the one the fork's hold pins) is stored with all its SSTs.
 PinnedManifestsComplete ==
-  \A p \in Latest.pins : p \in stored /\ chain[p].ssts \subseteq objects
+  \A p \in Latest.pins \cup ({Latest.hold} \ {0}) : p \in stored /\ chain[p].ssts \subseteq objects
+
+\* A reader of the fork may hold its first manifest while the fork reads it, and for MinAge after the
+\* rewrite replaced it (MayBeHeld in the fork's own chain, D29); every SST it names is still stored.
+ForkReadsComplete ==
+  (fState = "reading" \/ (fState \in {"rewritten", "released"} /\ now < fRewrittenAt + MinAge))
+    => chain[fHeld].ssts \subseteq objects
 =============================================================================

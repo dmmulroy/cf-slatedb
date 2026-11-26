@@ -142,6 +142,13 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
         expect: "ReadableManifestsComplete",
         timeLimitSeconds: 60,
       },
+      { config: "GcSafetyFork.cfg", broken: "none", expect: "pass", timeLimitSeconds: 120 },
+      {
+        config: "GcSafetyFork.cfg",
+        broken: "earlyForkRelease",
+        expect: "ForkReadsComplete",
+        timeLimitSeconds: 60,
+      },
     ],
   },
   {

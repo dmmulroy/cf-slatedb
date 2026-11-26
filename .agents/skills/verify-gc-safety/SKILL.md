@@ -15,6 +15,12 @@ description: "Model-check that shaledb garbage collection never deletes an SST t
 - **PinnedManifestsComplete**: every manifest a checkpoint in the newest manifest pins, which
   includes the checkpoint a fork holds on its source, is still stored with all its SSTs. Harm if
   broken: a fork or a backup loses data its source no longer references.
+- **ForkReadsComplete** (`GcSafetyFork.cfg`, D77): every SST of the source manifest a fork read
+  is still stored while the fork reads it and for `gcMinAge` after the fork's rewrite replaced its
+  manifest, the time a reader of the fork (a snapshot, a cached manifest) may still hold that
+  manifest. A fork releases its hold only when its own collection finds no kept manifest naming
+  the source's SSTs. Harm if broken: a fork's snapshot or cached manifest fails with
+  `StorageUnavailable` after the source collects or is removed.
 
 ## Run it
 
@@ -23,8 +29,9 @@ node tools/formal-verification/src/verify.ts gc-safety   # about 45 seconds
 vp run verify                                            # every formal check
 ```
 
-Expected: five `✓` lines. The code as written passes; `noBoundaryCheck`, `ownUploadAge`, and
-`dropDeletesObject` fail `ReadableManifestsComplete`; `ignorePins` fails `PinnedManifestsComplete`.
+Expected: seven `✓` lines. The code as written passes both configs; `noBoundaryCheck`,
+`ownUploadAge`, and `dropDeletesObject` fail `ReadableManifestsComplete`; `ignorePins` fails
+`PinnedManifestsComplete`; `earlyForkRelease` (`GcSafetyFork.cfg`) fails `ForkReadsComplete`.
 
 ## Read a result
 
@@ -40,7 +47,10 @@ step:
 | `CommitCompaction(s, inputs)` | `CompactionExecutor.commit` → `commitCompaction` (exact inputs, boundary check) |
 | `DropSst(s)` | `Compactor.dropSst` → `ManifestStore.update(dropSstFromManifest)` (D62): removes the reference only; the object is left to GC |
 | `Discard(s)` | a refused commit: the SST stays an orphan |
-| `Pin` / `Unpin(p)` | `addCheckpoint` / `removeCheckpoint` (a fork's checkpoint is added by `forkRange` and released when its compaction no longer reads the source) |
+| `Pin` / `Unpin(p)` | `addCheckpoint` / `removeCheckpoint` for checkpoints other than a fork's hold (`GcSafety.cfg` only) |
+| `ForkStart` | `forkRange` / `holdForSuccessors`: the fork's hold, a checkpoint held by the fork (`hold` here), pinning the newest manifest; the fork's first manifest (`forkManifest`) reads its SSTs |
+| `ForkRewrite` | the fork's full compaction commits in the fork's own manifest (`commitCompaction`): its newest manifest names none of the source's SSTs; the one before is superseded now |
+| `ForkRelease` | the fork's `GarbageCollector.collect`: `releasableExternalRefs` over `planManifestCollection`'s retained manifests is non-empty only once the pre-rewrite manifest was superseded `gcMinAge` ago; then `ManifestStore.update(removeCheckpoint)` on the source (this step), then `removeExternalRef` on the fork |
 | `GcListSsts` | `GarbageCollector.collect`: `now` read, `compacted/` and `changelog/` listed |
 | `GcPrecheck` | `hasSstCollectionCandidates(latest, ssts, cutoff)` |
 | `GcCommit` | `ManifestStore.update(prepareGarbageCollection)`: a new manifest only when the boundary moves |
@@ -53,10 +63,12 @@ the code's words.
 
 ## Coverage record
 
-Files: `packages/lsm-cloudflare/src/garbage-collector.ts` (`collect`), `packages/lsm-core/src/
-garbage-collection-plan.ts` (`planManifestCollection`, `planSstCollection`,
-`hasSstCollectionCandidates`, `prepareGarbageCollection`), `packages/lsm-core/src/manifest.ts`
-(`commitL0Flush`, `commitCompaction`, `advanceGcSstBoundary`, checkpoints). Code-level tests that
+Files: `packages/lsm-cloudflare/src/garbage-collector.ts` (`collect`, including the fork's
+release), `packages/lsm-core/src/garbage-collection-plan.ts` (`planManifestCollection`,
+`planSstCollection`, `hasSstCollectionCandidates`, `prepareGarbageCollection`),
+`packages/lsm-core/src/manifest.ts` (`commitL0Flush`, `commitCompaction`, `advanceGcSstBoundary`,
+checkpoints, `releasableExternalRefs`), `packages/lsm-cloudflare/src/maintenance-sweep.ts` (asks a
+rewritten fork that still holds its source to collect). Code-level tests that
 bind the steps to the code: `garbage-collector.test.ts` (old orphan collected and its late commit
 refused; checkpointed SSTs kept; young manifests kept; idle database writes nothing),
 `garbage-collection-plan.test.ts` (age from the successor, pins, owned SSTs only), `manifest.test.ts`
@@ -67,8 +79,24 @@ moment ago counted as old and its SSTs could be deleted under a reader. `ownUplo
 
 ## Bounds and assumptions
 
-- `GcSafety.cfg`: 2 SSTs (symmetric), clock 0–3, `MinAge` 1, at most 5 manifests (~21M distinct
-  states, about 40 s). Three SSTs or a longer clock exceed the time limit.
+- `GcSafety.cfg`: 2 SSTs (symmetric), clock 0–3, `MinAge` 1, at most 5 manifests (~27M distinct
+  states, 65–80 s). Three SSTs or a longer clock exceed the time limit. `WithFork = FALSE`.
+- `GcSafetyFork.cfg` (`WithFork = TRUE`): one source database and one fork of it, 1 SST, clock
+  0–3, `MinAge` 1, at most 6 manifests (~550k states, about 2 s). The early-release path needs six
+  manifests: a flush, the hold, a drop, the release, and GC's boundary commit. With 2 SSTs it takes
+  about 72 s, over the limit, so compaction of the source (which needs a second SST) is not in this
+  config: a drop is how the source's newest manifest stops naming the SST here. The fork's hold is
+  the only checkpoint in this config (other pins are covered by `GcSafety.cfg`).
+- The fork is abstract: its own manifests, compaction, and GC are not modeled step by step. Its
+  first manifest reads the held manifest's SSTs; `ForkRewrite` is the moment its successor is
+  written; `ForkRelease` is enabled once that was `MinAge` before the fork's collection, which is
+  what `releasableExternalRefs` over GC's retained set decides (the fork's own pins and retries
+  only delay it). The fork's readers' window is `MayBeHeld` in the fork's chain, written into
+  `ForkReadsComplete`.
+- Not modeled: a fork of a fork (D13; covered by `database-lifecycle.test.ts`, "keeps a fork of a
+  fork's holds down the chain…", and `manifest.test.ts`), and removal of the source, which deletes
+  every object but is refused while the hold exists (`markRemoved`; covered by
+  `database-lifecycle.test.ts`).
 - One GC run at a time; its steps interleave with every other action. Manifest CAS is atomic here
   (`verify-manifest-cas-fencing` checks it); stale manifest creates over collected ids are refused by
   `gc/manifest.boundary`, which `ManifestCasFencingGc.cfg` model-checks (`CommitOnce`, broken variant
@@ -82,6 +110,15 @@ moment ago counted as old and its SSTs could be deleted under a reader. `ownUplo
   modeled (as in SlateDB RFC 0029).
 
 ## Maintenance notes
+
+- D77: a fork's hold on its source is released by the fork's own collection
+  (`GarbageCollector.collect`), once no manifest it keeps (the newest, the pinned ones, and those
+  superseded less than `gcMinAge` ago) names another database's SST; the compactor's idle poll no
+  longer releases it. Modeled with `WithFork` (`ForkStart`, `ForkRewrite`, `ForkRelease`) in
+  `GcSafetyFork.cfg`, with the invariant `ForkReadsComplete` and the broken variant
+  `earlyForkRelease` (release as soon as the newest fork manifest stops reading the source, the
+  rule before D77), which fails it. `GcSafety.cfg`'s state count is unchanged (27,408,658). Reran;
+  all broken variants still fail.
 
 - D70–D73: no covered function changed. The manifest cache's `refresh` now finds the newest
   manifest from the one it holds (`loadLatestFrom`, D72), and still caches only the newest; a
@@ -125,7 +162,7 @@ moment ago counted as old and its SSTs could be deleted under a reader. `ownUplo
 
 ## Keeping it in step with the code
 
-Sync commit: the D70–D74 commit (`fix(read)`, `fix(writer)`, and `perf`: the snapshot bound, the newest-version flush, the read and flush path changes, the writer's counters). When a covered function changes after it, update the model
+Sync commit: the D77 commit (`fix(lsm-cloudflare): a fork releases its hold only when no manifest GC keeps names another database's SST`); before it the D70–D74 commit. When a covered function changes after it, update the model
 so each action is still one awaited effect in the code, rerun, and show each invariant still fails on
 a broken variant before moving the sync commit. For drift that skipped this skill, use
 `.agents/skills/maintain-formal-verification-skill/SKILL.md`.
