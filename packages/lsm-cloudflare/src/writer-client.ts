@@ -24,6 +24,7 @@ import {
   dbWriterLayerWithoutDependencies,
   type MemTableProbe,
   type MemTableScanPage,
+  type SealReceipt,
   type WriterStatus,
 } from "./db-writer.ts";
 import type { CompactionTrigger } from "./compaction-trigger.ts";
@@ -106,11 +107,15 @@ export interface IWriterClient {
   readonly destroy: (
     databaseId: DatabaseId,
   ) => Effect.Effect<void, WriterClientError, WriterClientServices>;
-  /** Flushes everything and seals the database with `successors`. Safe to repeat. */
+  /**
+   * Flushes everything and seals the database with `successors`; with `holdForSuccessors`, the same
+   * commit takes each successor a hold on the sealed manifest (D57). Safe to repeat.
+   */
   readonly seal: (
     databaseId: DatabaseId,
     successors: ReadonlyArray<DatabaseId>,
-  ) => Effect.Effect<SeqNum, WriterClientError, WriterClientServices>;
+    holdForSuccessors: boolean,
+  ) => Effect.Effect<SealReceipt, WriterClientError, WriterClientServices>;
 }
 
 /** The contextual writer client. */
@@ -241,13 +246,13 @@ const writerClientOperations = <E, R>(
     seal: Effect.fn("WriterClient.seal")(function* (
       databaseId: DatabaseId,
       successors: ReadonlyArray<DatabaseId>,
+      holdForSuccessors: boolean,
     ) {
       yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
       const client = yield* writerHttpClient(databaseId);
-      const response = yield* client.writer
-        .seal({ params: { databaseId }, payload: { successors } })
+      return yield* client.writer
+        .seal({ params: { databaseId }, payload: { successors, holdForSuccessors } })
         .pipe(Effect.catchTags(transport(databaseId, "seal")), Effect.retry(retryRoutable));
-      return response.flushedSeq;
     }),
   };
 };

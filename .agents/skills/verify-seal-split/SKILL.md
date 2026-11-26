@@ -66,6 +66,14 @@ views and ranges), `writer.workerd.ts` (the same split through the public API).
 
 ## Maintenance notes
 
+- D57 (v1 workstream 3): a split's seal (`DbWriter.seal` with `holdForSuccessors`) commits the final
+  flush, the seal, and each successor's hold in one manifest CAS under the commit lock (`flushThen`
+  with the seal edit; a separate seal CAS only when nothing is left to flush). The model's `Seal`
+  now takes the checkpoint (the holds) in the same step; `Checkpoint` exists only for the
+  `checkpointBeforeSeal` broken variant. The forks run concurrently from their own holds, which
+  the model already allows (each `Fork(s)` interleaves freely). The split publishes without a
+  separate checkpoint or its deletion. Reran; every broken variant still fails.
+
 - Checked against `c4ea735` (Phases 9–10). `DbWriter.write` now commits through `commitBatch`
   (the same commit lock and SQLite commit; the ack after it); `commitTransaction` runs its conflict
   check inside that lock before the same commit, so it is one more kind of `Commit`/`Write`.
@@ -73,7 +81,7 @@ views and ranges), `writer.workerd.ts` (the same split through the public API).
 
 ## Keeping it in step with the code
 
-Sync commit: `c4ea735`. When a covered function changes after it, update the model
+Sync commit: the v1 workstream 3 commit (`splits pause briefly`, D57); before it `c4ea735`. When a covered function changes after it, update the model
 so each action is still one awaited effect in the code, rerun, and show each invariant still fails on
 a broken variant before moving the sync commit. For drift that skipped this skill, use
 `.agents/skills/maintain-formal-verification-skill/SKILL.md`.

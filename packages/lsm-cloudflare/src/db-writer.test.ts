@@ -197,13 +197,24 @@ describe("DbWriter", () => {
         yield* writer.write(DB, put("a", "1"));
         yield* writer.write(DB, put("b", "2"));
         const successors = [DatabaseId.make("orders-a"), DatabaseId.make("orders-b")];
-        yield* writer.seal(DB, successors);
-        const again = yield* writer.seal(DB, successors);
+        const beforeSeal = (yield* (yield* ManifestReader).loadLatest(DB)).id;
+        const holds = yield* writer.seal(DB, successors, true);
+        const afterSeal = yield* (yield* ManifestReader).loadLatest(DB);
+        const again = yield* writer.seal(DB, successors, false);
         const refused = yield* Effect.flip(writer.write(DB, put("c", "3")));
         const durable = yield* durableValues;
-        return { again, refused, durable };
+        return { again, refused, durable, beforeSeal, holds, afterSeal };
       }),
     );
+    // The final flush, the seal, and both holds are one manifest commit, pinning that manifest.
+    expect(outcome.afterSeal.id).toBe(outcome.beforeSeal + 1);
+    expect(outcome.holds.successorHolds.map((hold) => hold.successor)).toEqual([
+      "orders-a",
+      "orders-b",
+    ]);
+    expect(
+      outcome.afterSeal.manifest.checkpoints.map((checkpoint) => checkpoint.manifestId),
+    ).toEqual([outcome.afterSeal.id, outcome.afterSeal.id]);
     expect(outcome.refused._tag).toBe("DatabaseSealedError");
     expect(outcome.refused._tag === "DatabaseSealedError" && outcome.refused.successors).toEqual([
       "orders-a",
@@ -211,7 +222,7 @@ describe("DbWriter", () => {
     ]);
     expect(Object.fromEntries(outcome.durable.values)).toEqual({ a: "1", b: "2" });
     expect(outcome.durable.manifest.state._tag).toBe("Sealed");
-    expect(outcome.again).toBe(2);
+    expect(outcome.again).toEqual({ flushedSeq: 2, successorHolds: [] });
   });
 
   it("exports a changelog SST in sequence order with each flush when the database enables it", async () => {

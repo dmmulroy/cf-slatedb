@@ -1,7 +1,7 @@
 import type { LsmSettings } from "@cf-slatedb/lsm-core";
 import { Effect, Layer } from "effect";
 
-import { workerBackgroundWorkLayer } from "./background-work.ts";
+import { backgroundWorkTestLayer, workerBackgroundWorkLayer } from "./background-work.ts";
 import { blockSourceLayer, blockSourceTestLayer } from "./block-source.ts";
 import { compactorClientLayer, compactorClientTestLayer } from "./compactor-client.ts";
 import { databaseLifecycleLayerWithoutDependencies } from "./database-lifecycle.ts";
@@ -37,9 +37,10 @@ export const dbServicesLayer = Layer.mergeAll(
   Layer.provideMerge(
     manifestStoreLayerWithoutDependencies.pipe(
       Layer.provideMerge(manifestReaderLayerWithoutDependencies),
-      Layer.provide(workerBackgroundWorkLayer),
     ),
   ),
+  // Manifest hints and forks' compactor wakes run after the response.
+  Layer.provideMerge(workerBackgroundWorkLayer),
   Layer.provideMerge(Layer.mergeAll(objectStoreLayer, lsmConfigurationLayer)),
 );
 
@@ -51,6 +52,7 @@ export const dbServicesLayer = Layer.mergeAll(
 export const dbServicesTestLayer = (overrides: Partial<LsmSettings> = {}) =>
   databaseLifecycleLayerWithoutDependencies.pipe(
     Layer.provide(blockSourceTestLayer),
+    Layer.provide(backgroundWorkTestLayer),
     Layer.provideMerge(compactorClientTestLayer),
     Layer.provideMerge(dbClientTestLayer(overrides)),
   );

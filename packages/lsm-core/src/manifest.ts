@@ -606,6 +606,65 @@ export const addCheckpoint = (
   );
 };
 
+/** A successor's hold on a sealed database: the checkpoint its fork reads through. */
+export interface SuccessorHold {
+  readonly successor: DatabaseId;
+  readonly checkpointId: CheckpointId;
+}
+
+/**
+ * Takes a hold for each successor that has none yet: a checkpoint held by the successor, pinning
+ * `pinnedManifestId` until its fork's compactor releases it (as `forkRange`'s own hold does). A
+ * split takes them in its seal commit, pinning the sealed manifest itself, so no separate checkpoint
+ * or hold commit stands between the seal and the forks (D57).
+ *
+ * @param proposed - A new checkpoint id per successor, used only for successors without a hold.
+ * @returns The manifest with every successor held (the same manifest when all already are), or
+ *   `DatabaseRemovedError`.
+ */
+export const holdForSuccessors = (
+  manifest: Manifest,
+  options: {
+    readonly pinnedManifestId: ManifestId;
+    readonly proposed: ReadonlyArray<SuccessorHold>;
+    readonly createdAt: Timestamp;
+  },
+): Result.Result<Manifest, DatabaseRemovedError> => {
+  let held = manifest;
+  for (const hold of options.proposed) {
+    if (held.checkpoints.some((existing) => Option.contains(existing.holder, hold.successor))) {
+      continue;
+    }
+    const added = addCheckpoint(held, {
+      id: hold.checkpointId,
+      manifestId: options.pinnedManifestId,
+      createdAt: options.createdAt,
+      expireAt: Option.none(),
+      holder: Option.some(hold.successor),
+      name: Option.some(`successor ${hold.successor}`),
+    });
+    if (Result.isFailure(added)) return added;
+    held = added.success;
+  }
+  return Result.succeed(held);
+};
+
+/** Each successor's hold in `manifest`, in `successors` order; successors without one are left out. */
+export const successorHoldsOf = (
+  manifest: Manifest,
+  successors: ReadonlyArray<DatabaseId>,
+): ReadonlyArray<SuccessorHold> =>
+  successors.flatMap((successor) =>
+    Option.toArray(
+      Option.map(
+        Option.fromUndefinedOr(
+          manifest.checkpoints.find((checkpoint) => Option.contains(checkpoint.holder, successor)),
+        ),
+        (checkpoint) => ({ successor, checkpointId: checkpoint.id }),
+      ),
+    ),
+  );
+
 /** The forks holding checkpoints on this database. */
 export const dependentForks = (manifest: Manifest): ReadonlyArray<DatabaseId> => [
   ...new Set(manifest.checkpoints.flatMap((checkpoint) => Option.toArray(checkpoint.holder))),

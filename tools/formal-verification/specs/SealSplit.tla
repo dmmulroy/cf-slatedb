@@ -10,12 +10,15 @@
 (*    sealed, commit the row to SQLite; the ack follows the lock release.  *)
 (*  - db-writer.ts seal: under the commit lock, flushNow (every committed  *)
 (*    row into L0, manifest CAS) and then the seal CAS (sealManifest,      *)
-(*    writerEpoch + 1); later writes fail with DatabaseSealedError.        *)
-(*  - database-lifecycle.ts createCheckpoint (after the seal) and          *)
-(*    forkRange (lsm-core forkManifest: the checkpoint's SSTs as views     *)
-(*    bounded to the fork's range).                                        *)
-(*  - The split order (lsm-sharding ShardSplit, Phase 8): seal, then one   *)
-(*    checkpoint, then a fork per successor range.                         *)
+(*    writerEpoch + 1); later writes fail with DatabaseSealedError. A      *)
+(*    split's seal (holdForSuccessors, D57) takes each successor's hold in *)
+(*    the same CAS, pinning the sealed manifest: the checkpoint the forks  *)
+(*    read.                                                                *)
+(*  - database-lifecycle.ts forkRange from that hold (lsm-core             *)
+(*    forkManifest: the pinned SSTs as views bounded to the fork's range); *)
+(*    the two forks run concurrently, so they interleave in any order.     *)
+(*  - The split order (lsm-sharding ShardSplit): seal with holds, then a   *)
+(*    fork per successor range, then publish.                              *)
 (*                                                                         *)
 (* A write is (key, seq). The writer is the database's single Durable      *)
 (* Object; fencing of a stale instance is checked by ManifestCasFencing.   *)
@@ -24,7 +27,7 @@
 (*   "none"                  the code as written                           *)
 (*   "sealWithoutLock"       seal flushes, releases the lock, then seals   *)
 (*   "writerNotFenced"       writes still commit after the seal            *)
-(*   "checkpointBeforeSeal"  the split checkpoints before sealing          *)
+(*   "checkpointBeforeSeal"  the holds are taken before the seal           *)
 (*   "overlappingRanges"     the successors' ranges overlap                *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets, TLC
@@ -85,12 +88,15 @@ Flush ==
   /\ flushed' = flushed \cup mem /\ mem' = {}
   /\ UNCHANGED <<seq, pending, acked, sealed, spc, checkpoint, taken, forks, forked, afterSeal>>
 
-\* DbWriter.seal: flushNow and the seal CAS under the commit lock, so no commit falls between.
+\* DbWriter.seal: flushNow and the seal CAS under the commit lock, so no commit falls between. The
+\* same CAS takes the successors' holds on the sealed manifest (unless they were taken before).
 Seal ==
   /\ spc = "idle" /\ Broken # "sealWithoutLock"
   /\ flushed' = flushed \cup mem /\ mem' = {}
   /\ sealed' = TRUE /\ spc' = "done"
-  /\ UNCHANGED <<seq, pending, acked, checkpoint, taken, forks, forked, afterSeal>>
+  /\ IF taken THEN UNCHANGED <<checkpoint, taken>>
+               ELSE checkpoint' = flushed \cup mem /\ taken' = TRUE
+  /\ UNCHANGED <<seq, pending, acked, forks, forked, afterSeal>>
 
 SealFlushUnlocked ==
   /\ spc = "idle" /\ Broken = "sealWithoutLock"
@@ -100,12 +106,15 @@ SealFlushUnlocked ==
 SealCommitUnlocked ==
   /\ spc = "flushed"
   /\ sealed' = TRUE /\ spc' = "done"
-  /\ UNCHANGED <<seq, mem, flushed, pending, acked, checkpoint, taken, forks, forked, afterSeal>>
+  /\ IF taken THEN UNCHANGED <<checkpoint, taken>>
+               ELSE checkpoint' = flushed /\ taken' = TRUE
+  /\ UNCHANGED <<seq, mem, flushed, pending, acked, forks, forked, afterSeal>>
 
-\* The split's checkpoint pins the newest manifest (after the seal, as the code orders it).
+\* checkpointBeforeSeal only: the holds pin the newest manifest before the seal (the code takes them
+\* in the seal's own CAS, above).
 Checkpoint ==
   /\ ~taken
-  /\ sealed \/ Broken = "checkpointBeforeSeal"
+  /\ Broken = "checkpointBeforeSeal"
   /\ checkpoint' = flushed /\ taken' = TRUE
   /\ UNCHANGED <<seq, mem, flushed, pending, acked, sealed, spc, forks, forked, afterSeal>>
 

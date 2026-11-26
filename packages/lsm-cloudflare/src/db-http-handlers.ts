@@ -80,8 +80,8 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
           .pipe(publicFailures("checkpoint")),
       )
       .handle("seal", ({ params, payload }) =>
-        lifecycle.seal(params.databaseId, payload.successors).pipe(
-          Effect.map((flushedSeq) => ({ flushedSeq })),
+        lifecycle.seal(params.databaseId, payload.successors, false).pipe(
+          Effect.map((receipt) => ({ flushedSeq: receipt.flushedSeq })),
           publicFailures("seal"),
         ),
       )

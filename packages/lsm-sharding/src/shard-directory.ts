@@ -1,7 +1,18 @@
 import { DatabaseId, generateCompactionJobId } from "@cf-slatedb/lsm-core";
 import { type DurableObjectCell, inMemoryCell } from "@cf-slatedb/lsm-cloudflare";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
-import { Context, Effect, Layer, Option, Result, Schema, Semaphore } from "effect";
+import {
+  Context,
+  Deferred,
+  Duration,
+  Effect,
+  Layer,
+  Option,
+  Ref,
+  Result,
+  Schema,
+  Semaphore,
+} from "effect";
 
 import {
   beginShardSplit,
@@ -9,7 +20,7 @@ import {
   initialShardMap,
   type PendingSplit,
   ShardGroup,
-  type ShardMap,
+  ShardMap,
   type ShardSplitInProgressError,
   type ShardSplitInvalidError,
 } from "./shard-map.ts";
@@ -50,6 +61,30 @@ export type ShardDirectoryError =
  * allocates the two new database ids (so a retried split resumes with the same ids, and only one
  * split runs at a time), `completeSplit` publishes the new map.
  */
+/**
+ * How a wait for a newer shard map ended: `Newer` (a newer map is published), `SplitFailed` (the
+ * pending split reported a failure; it stays recorded and resumable), `NoSplitPending` (nothing is
+ * publishing, so waiting cannot help), or `TimedOut`.
+ */
+export const ShardMapWaitOutcome = Schema.Literals([
+  "Newer",
+  "SplitFailed",
+  "NoSplitPending",
+  "TimedOut",
+]);
+
+/** How a wait for a newer shard map ended. */
+export type ShardMapWaitOutcome = typeof ShardMapWaitOutcome.Type;
+
+/** Schema for the end of a wait for a newer map: the group's current map and why the wait ended. */
+export const ShardMapWait = Schema.Struct({ map: ShardMap, outcome: ShardMapWaitOutcome });
+
+/** The end of a wait for a newer map. */
+export type ShardMapWait = typeof ShardMapWait.Type;
+
+/** Longest a single wait for a newer map lasts before it ends `TimedOut`. */
+export const MAX_SHARD_MAP_WAIT_MS = 25_000;
+
 export interface IShardDirectory {
   /** Creates a group with one shard, holding every key, in `databaseId`. */
   readonly create: (
@@ -58,6 +93,25 @@ export interface IShardDirectory {
   ) => Effect.Effect<ShardMap, ShardDirectoryError, RuntimeContext>;
   /** The group's current map. */
   readonly map: (group: ShardGroup) => Effect.Effect<ShardMap, ShardDirectoryError, RuntimeContext>;
+  /**
+   * Waits until the group's map is newer than `afterVersion`, and returns it: at once when it
+   * already is; otherwise as soon as a split publishes, or when the pending split reports a failure,
+   * or after `timeoutMs` (at most {@link MAX_SHARD_MAP_WAIT_MS}). Ends at once with
+   * `NoSplitPending` when nothing could publish a newer map.
+   */
+  readonly awaitMap: (
+    group: ShardGroup,
+    afterVersion: number,
+    timeoutMs: number,
+  ) => Effect.Effect<ShardMapWait, ShardDirectoryError, RuntimeContext>;
+  /**
+   * Records that the pending split of `databaseId` failed part-way: it stays recorded, so repeating
+   * the split resumes it, and routers waiting for it stop waiting.
+   */
+  readonly reportSplitFailed: (
+    group: ShardGroup,
+    databaseId: DatabaseId,
+  ) => Effect.Effect<void, ShardDirectoryError, RuntimeContext>;
   /** Records a split of `databaseId` at `atKey` (or returns the one already recorded). */
   readonly beginSplit: (
     group: ShardGroup,
@@ -91,6 +145,28 @@ export const makeShardDirectoryOver = (
   Effect.gen(function* () {
     // Edits of a group are serialized (a Durable Object's gates already serialize its events).
     const lock = yield* Semaphore.make(1);
+    // Waiters for a newer map, per group: completed (and replaced) when a split publishes or fails.
+    const signals = yield* Ref.make(
+      new Map<ShardGroup, Deferred.Deferred<"Newer" | "SplitFailed">>(),
+    );
+    const signalFor = (group: ShardGroup) =>
+      Effect.gen(function* () {
+        const fresh = yield* Deferred.make<"Newer" | "SplitFailed">();
+        return yield* Ref.modify(signals, (current) => {
+          const existing = current.get(group);
+          if (existing !== undefined) return [existing, current];
+          return [fresh, new Map(current).set(group, fresh)];
+        });
+      });
+    const signal = (group: ShardGroup, outcome: "Newer" | "SplitFailed") =>
+      Effect.gen(function* () {
+        const waiting = yield* Ref.modify(signals, (current) => {
+          const next = new Map(current);
+          next.delete(group);
+          return [current.get(group), next];
+        });
+        if (waiting !== undefined) yield* Deferred.succeed(waiting, outcome);
+      });
     const current = (group: ShardGroup) =>
       Effect.flatMap(cellFor(group).get, (stored) =>
         Option.isSome(stored)
@@ -162,8 +238,41 @@ export const makeShardDirectoryOver = (
         databaseId: DatabaseId,
       ) {
         const map = yield* editMap(group, (map) => completeShardSplit(map, databaseId));
+        yield* signal(group, "Newer");
         yield* Effect.annotateCurrentSpan({ "shard.group": group, "shard.version": map.version });
         return map;
+      }),
+      awaitMap: Effect.fn("ShardDirectory.awaitMap")(function* (
+        group: ShardGroup,
+        afterVersion: number,
+        timeoutMs: number,
+      ) {
+        yield* Effect.annotateCurrentSpan({
+          "shard.group": group,
+          "shard.after_version": afterVersion,
+        });
+        // Take the signal before reading the map, so a publish in between is not missed.
+        const published = yield* signalFor(group);
+        const map = yield* current(group);
+        if (map.version > afterVersion) return { map, outcome: "Newer" as const };
+        if (Option.isNone(map.pendingSplit)) return { map, outcome: "NoSplitPending" as const };
+        const outcome = yield* Deferred.await(published).pipe(
+          Effect.timeoutOption(Duration.millis(Math.min(timeoutMs, MAX_SHARD_MAP_WAIT_MS))),
+        );
+        const latest = yield* current(group);
+        const ended: ShardMapWaitOutcome =
+          latest.version > afterVersion
+            ? "Newer"
+            : Option.getOrElse(outcome, (): ShardMapWaitOutcome => "TimedOut");
+        yield* Effect.annotateCurrentSpan({ "shard.wait_outcome": ended });
+        return { map: latest, outcome: ended };
+      }),
+      reportSplitFailed: Effect.fn("ShardDirectory.reportSplitFailed")(function* (
+        group: ShardGroup,
+        databaseId: DatabaseId,
+      ) {
+        yield* Effect.annotateCurrentSpan({ "shard.group": group, "database.id": databaseId });
+        yield* signal(group, "SplitFailed");
       }),
     });
   });

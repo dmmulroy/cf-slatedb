@@ -8,6 +8,7 @@ import { Context, Effect, Layer, Option, Ref } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
+import { backgroundWorkTestLayer } from "./background-work.ts";
 import { blockSourceTestLayer } from "./block-source.ts";
 import { compactionBudgetTestLayer } from "./compaction-budget.ts";
 import { CompactionExecutor, makeCompactionExecutor } from "./compaction-executor.ts";
@@ -43,8 +44,11 @@ const RIGHT_RANGE: KeyRange = { start: SPLIT, end: Option.none() };
 
 /** Lifecycle, client, executor, in-process launcher, budget, and stores over one bucket. */
 const testLayer = Layer.mergeAll(
-  databaseLifecycleLayerWithoutDependencies.pipe(Layer.provide(blockSourceTestLayer)),
-  Layer.effect(GarbageCollector, makeGarbageCollector),
+  databaseLifecycleLayerWithoutDependencies.pipe(
+    Layer.provide(blockSourceTestLayer),
+    Layer.provide(backgroundWorkTestLayer),
+  ),
+  Layer.effect(GarbageCollector, makeGarbageCollector).pipe(Layer.provide(backgroundWorkTestLayer)),
   compactionLauncherTestLayer,
   compactionBudgetTestLayer,
 ).pipe(
@@ -119,7 +123,7 @@ describe("DatabaseLifecycle", () => {
           if (key === "c") yield* client.flush(SOURCE);
         }
         // Seal: the last writes are flushed into the sealed manifest; later writes are refused.
-        yield* lifecycle.seal(SOURCE, [LEFT, RIGHT]);
+        yield* lifecycle.seal(SOURCE, [LEFT, RIGHT], false);
         const lateWrite = yield* Effect.flip(client.put(SOURCE, bytes("g"), bytes("G")));
         const checkpoint = yield* lifecycle.createCheckpoint(SOURCE, {
           name: Option.some("split"),

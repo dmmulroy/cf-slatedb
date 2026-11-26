@@ -3,16 +3,22 @@ import {
   collapseWriteBatch,
   commitL0Flush,
   type DatabaseId,
+  type DatabaseRemovedError,
   DatabaseSealedError,
   fenceWriter,
+  generateCheckpointId,
+  holdForSuccessors as holdForSuccessors_,
   type KeyOutOfRangeError,
   type KeyRange,
   type Manifest,
+  ManifestId,
   MERGE_OPERATORS,
   type Row,
   rowEncodedSizeEstimate,
   sealManifest,
   SeqNum,
+  successorHoldsOf,
+  type SuccessorHold,
   Timestamp,
   type WriteBatch,
   type WriteBatchInvalidError,
@@ -97,6 +103,15 @@ export interface WriterStatus {
   readonly sealed: boolean;
 }
 
+/**
+ * What a seal left: the sequence number durable at the seal and, when the seal took them, each
+ * successor's hold on the sealed manifest (`holdForSuccessors`).
+ */
+export interface SealReceipt {
+  readonly flushedSeq: SeqNum;
+  readonly successorHolds: ReadonlyArray<SuccessorHold>;
+}
+
 /** Every failure a writer operation can report. */
 export type DbWriterError =
   | DatabaseNotFoundError
@@ -167,7 +182,8 @@ export interface IDbWriter {
   readonly seal: (
     databaseId: DatabaseId,
     successors: ReadonlyArray<DatabaseId>,
-  ) => Effect.Effect<SeqNum, DbWriterError, RuntimeContext>;
+    holdForSuccessors: boolean,
+  ) => Effect.Effect<SealReceipt, DbWriterError, RuntimeContext>;
   /**
    * Deletes the writer's state (the memtable and its sequence state) and its alarm, for a database
    * being removed; the next request starts a new writer, which finds the database gone.
@@ -383,7 +399,20 @@ export const makeDbWriter = Effect.gen(function* () {
   const markFenced = (databaseId: DatabaseId, error: WriterFencedError) =>
     Ref.set(phase, { _tag: "Fenced", databaseId, error });
 
-  const flushNow = (databaseId: DatabaseId) =>
+  /**
+   * Flushes every committed row and, in the same manifest commit, applies `alsoCommit` to the flushed
+   * manifest (the seal uses it to seal in the flush's own commit, D57).
+   *
+   * @returns The flushed sequence number, and the manifest the flush committed (none when there was
+   *   nothing to flush, so `alsoCommit` was not applied).
+   */
+  const flushThen = (
+    databaseId: DatabaseId,
+    alsoCommit: (
+      manifest: Manifest,
+      manifestId: ManifestId,
+    ) => Result.Result<Manifest, WriterFencedError | DatabaseRemovedError>,
+  ) =>
     flushLock
       .withPermits(1)(
         Effect.gen(function* () {
@@ -391,7 +420,9 @@ export const makeDbWriter = Effect.gen(function* () {
           const meta = yield* memTable.meta.pipe(Effect.mapError(unavailable(databaseId, "flush")));
           const cut = meta.lastSeq;
           yield* Effect.annotateCurrentSpan({ "database.id": databaseId, seq: cut });
-          if (cut <= meta.flushedSeq) return meta.flushedSeq;
+          const nothingCommitted = Option.none<VersionedManifest>();
+          if (cut <= meta.flushedSeq)
+            return { flushedSeq: meta.flushedSeq, committed: nothingCommitted };
           const options = ready.manifest.manifest.options;
           const written = yield* ssts
             .write({
@@ -410,7 +441,7 @@ export const makeDbWriter = Effect.gen(function* () {
           if (Option.isNone(written)) {
             // Nothing at or below the cut (already truncated): just record it.
             yield* memTable.truncate(cut).pipe(Effect.mapError(unavailable(databaseId, "flush")));
-            return cut;
+            return { flushedSeq: cut, committed: nothingCommitted };
           }
           const changelog = Option.isSome(options.changelog)
             ? yield* exportChangelog(databaseId, meta.flushedSeq, cut)
@@ -418,14 +449,17 @@ export const makeDbWriter = Effect.gen(function* () {
           // From the writer's own view: usually nothing else committed since, so the commit is one
           // create with no load (D56).
           const committed = yield* manifests
-            .updateFrom(ready.manifest, (manifest) =>
-              commitL0Flush(manifest, {
-                writerEpoch: ready.writerEpoch,
-                sst: written.value.handle,
-                lastSeq: cut,
-                clockTick: meta.clockTick,
-                changelog,
-              }),
+            .updateFrom(ready.manifest, (manifest, manifestId) =>
+              Result.flatMap(
+                commitL0Flush(manifest, {
+                  writerEpoch: ready.writerEpoch,
+                  sst: written.value.handle,
+                  lastSeq: cut,
+                  clockTick: meta.clockTick,
+                  changelog,
+                }),
+                (flushed) => alsoCommit(flushed, manifestId),
+              ),
             )
             .pipe(
               Effect.catchTags(manifestFailures(databaseId, "flush")),
@@ -434,6 +468,9 @@ export const makeDbWriter = Effect.gen(function* () {
               Effect.catchTags({
                 SstBelowGcBoundaryError: (error) =>
                   Effect.fail(unavailable(databaseId, "flush")(error)),
+                // A database being removed is gone for its writer.
+                DatabaseRemovedError: (error) =>
+                  Effect.fail(new DatabaseNotFoundError({ databaseId, message: error.message })),
               }),
               Effect.tapError((error) =>
                 error._tag === "WriterFencedError" ? markFenced(databaseId, error) : Effect.void,
@@ -457,10 +494,15 @@ export const makeDbWriter = Effect.gen(function* () {
             "sst.size": written.value.info.sizeBytes,
             "manifest.id": committed.id,
           });
-          return cut;
+          return { flushedSeq: cut, committed: Option.some(committed) };
         }),
       )
       .pipe(Effect.withSpan("DbWriter.flush"));
+
+  const flushNow = (databaseId: DatabaseId) =>
+    flushThen(databaseId, (manifest) => Result.succeed(manifest)).pipe(
+      Effect.map((flushed) => flushed.flushedSeq),
+    );
 
   /** Exports the flush's rows in sequence order as a changelog SST (change data capture). */
   const exportChangelog = (databaseId: DatabaseId, afterSeq: SeqNum, cut: SeqNum) =>
@@ -755,45 +797,80 @@ export const makeDbWriter = Effect.gen(function* () {
   const seal = Effect.fn("DbWriter.seal")(function* (
     databaseId: DatabaseId,
     successors: ReadonlyArray<DatabaseId>,
+    holdForSuccessors: boolean,
   ) {
     yield* Effect.annotateCurrentSpan({
       "database.id": databaseId,
       "seal.successors": successors.length,
+      "seal.holds": holdForSuccessors,
     });
     // Hold the commit lock: no write can be acknowledged between the final flush and the seal.
     return yield* commitLock.withPermits(1)(
       Effect.gen(function* () {
         const ready = yield* ensureReady(databaseId);
-        if (Option.isSome(ready.sealed)) {
+        if (Option.isSome(ready.sealed) && !holdForSuccessors) {
           const meta = yield* memTable.meta.pipe(Effect.mapError(unavailable(databaseId, "seal")));
-          return meta.flushedSeq;
+          return { flushedSeq: meta.flushedSeq, successorHolds: [] };
         }
-        const flushedSeq = yield* flushNow(databaseId);
-        // The view the final flush left, so the seal usually commits with one create (D56).
-        const view = (yield* ensureReady(databaseId)).manifest;
-        const sealed = yield* manifests
-          .updateFrom(view, (manifest) => {
-            if (manifest.writerEpoch !== ready.writerEpoch) {
-              return Result.fail(
-                new WriterFencedError({
-                  databaseId,
-                  writerEpoch: ready.writerEpoch,
-                  currentWriterEpoch: manifest.writerEpoch,
-                  message: `Writer epoch ${ready.writerEpoch} of database ${databaseId} was fenced by epoch ${manifest.writerEpoch} before it could seal. Retry the seal; the current writer will perform it.`,
-                }),
+        const proposed = yield* Effect.forEach(successors, (successor) =>
+          Effect.map(generateCheckpointId, (checkpointId) => ({ successor, checkpointId })),
+        );
+        const createdAt = Timestamp.make(yield* Clock.currentTimeMillis);
+        const sealEdit = (
+          manifest: Manifest,
+          manifestId: ManifestId,
+        ): Result.Result<Manifest, WriterFencedError | DatabaseRemovedError> => {
+          const alreadySealed = manifest.state._tag === "Sealed";
+          if (!alreadySealed && manifest.writerEpoch !== ready.writerEpoch) {
+            return Result.fail(
+              new WriterFencedError({
+                databaseId,
+                writerEpoch: ready.writerEpoch,
+                currentWriterEpoch: manifest.writerEpoch,
+                message: `Writer epoch ${ready.writerEpoch} of database ${databaseId} was fenced by epoch ${manifest.writerEpoch} before it could seal. Retry the seal; the current writer will perform it.`,
+              }),
+            );
+          }
+          const sealedManifest = alreadySealed ? manifest : sealManifest(manifest, successors);
+          if (!holdForSuccessors) return Result.succeed(sealedManifest);
+          // The holds pin the manifest this commit creates: sealed, with every acknowledged row in
+          // L0, and no later write (D57).
+          return holdForSuccessors_(sealedManifest, {
+            pinnedManifestId: ManifestId.make(manifestId + 1),
+            proposed,
+            createdAt,
+          });
+        };
+        const sealFailures = {
+          DatabaseRemovedError: (error: DatabaseRemovedError) =>
+            Effect.fail(new DatabaseNotFoundError({ databaseId, message: error.message })),
+        };
+        // The final flush and the seal in one manifest commit, so the commit lock is held for one
+        // upload and one commit (D57).
+        const flushed = yield* flushThen(databaseId, sealEdit);
+        // Nothing left to flush: the seal commits on its own, from the writer's view (D56).
+        const sealed = Option.isSome(flushed.committed)
+          ? flushed.committed.value
+          : yield* manifests
+              .updateFrom((yield* ensureReady(databaseId)).manifest, sealEdit)
+              .pipe(
+                Effect.catchTags(manifestFailures(databaseId, "seal")),
+                Effect.catchTags(sealFailures),
               );
-            }
-            return Result.succeed(sealManifest(manifest, successors));
-          })
-          .pipe(Effect.catchTags(manifestFailures(databaseId, "seal")));
+        const flushedSeq = flushed.flushedSeq;
+        const sealedSuccessors =
+          sealed.manifest.state._tag === "Sealed" ? sealed.manifest.state.successors : successors;
         yield* Ref.set(phase, {
           _tag: "Ready",
           databaseId,
           writerEpoch: WriterEpoch.make(sealed.manifest.writerEpoch),
           manifest: sealed,
-          sealed: Option.some(successors),
+          sealed: Option.some(sealedSuccessors),
         });
-        return flushedSeq;
+        return {
+          flushedSeq,
+          successorHolds: holdForSuccessors ? successorHoldsOf(sealed.manifest, successors) : [],
+        };
       }),
     );
   });

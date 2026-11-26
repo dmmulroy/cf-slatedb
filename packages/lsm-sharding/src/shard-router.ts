@@ -16,7 +16,7 @@ import {
   type ReadOptions,
   type ScanReadOptions,
 } from "@cf-slatedb/lsm-cloudflare";
-import { Context, Effect, Layer, Option, Ref, Schedule, Schema, Stream } from "effect";
+import { Clock, Context, Effect, Layer, Option, Ref, Result, Schema, Stream } from "effect";
 
 import { ShardDirectory, type ShardDirectoryError } from "./shard-directory.ts";
 import { ShardGroup, type ShardMap, shardFor, shardsOverlapping } from "./shard-map.ts";
@@ -99,15 +99,12 @@ const isRoutingError = (error: { readonly _tag: string }) =>
   error._tag === "DatabaseNotFoundError";
 
 /**
- * Refresh-and-retry while a split publishes: every 250 ms for up to 30 seconds. A split on a live
- * stage takes about 13 seconds (seal, checkpoint, two forks, publish; each manifest CAS is about a
- * second on R2: `docs/measurements.md`), so a shorter window turns a pause into failed writes.
+ * Longest a routed request waits for a split to publish before it fails (retryable). A split pauses a
+ * shard's writes for one small flush and a few manifest commits (`docs/measurements.md`); the router
+ * waits on the directory (`ShardDirectory.awaitMap`), so it retries the moment the new map is
+ * published rather than on a timer.
  */
-const routingRetry = {
-  while: isRoutingError,
-  schedule: Schedule.spaced("250 millis"),
-  times: 120,
-};
+const ROUTING_WAIT_MS = 30_000;
 
 /** Constructs the router over the contextual database client and shard directory. */
 export const makeShardRouter = Effect.gen(function* () {
@@ -127,27 +124,45 @@ export const makeShardRouter = Effect.gen(function* () {
       return cached === undefined ? refresh(group) : Effect.succeed(cached);
     });
 
-  /** The database holding `key`; the map covers every key, so a miss is a broken map. */
-  const databaseFor = (group: ShardGroup, key: Uint8Array) =>
-    Effect.flatMap(mapFor(group), (map) =>
-      Option.match(shardFor(map, key), {
-        onNone: () => Effect.die(new Error(`Shard map of group ${group} does not cover a key.`)),
-        onSome: (shard) => Effect.succeed(shard.databaseId),
-      }),
-    );
+  /** The database holding `key` in `map`; a map covers every key, so a miss is a broken map. */
+  const databaseIn = (map: ShardMap, group: ShardGroup, key: Uint8Array) =>
+    Option.match(shardFor(map, key), {
+      onNone: () => Effect.die(new Error(`Shard map of group ${group} does not cover a key.`)),
+      onSome: (shard) => Effect.succeed(shard.databaseId),
+    });
 
-  /** Runs `operation` on the key's database; on a routing error refreshes the map and retries. */
+  /**
+   * Runs `attempt` against the cached map; on a routing error (a split in progress, or a stale map)
+   * waits on the directory for a newer map and retries. It gives up with the routing error, which is
+   * retryable, when no newer map can come (the split failed, or none is pending) or after
+   * {@link ROUTING_WAIT_MS}.
+   */
+  const withRouting = <A, E extends { readonly _tag: string }, R>(
+    group: ShardGroup,
+    attempt: (map: ShardMap) => Effect.Effect<A, E, R>,
+  ) =>
+    Effect.gen(function* () {
+      const deadline = (yield* Clock.currentTimeMillis) + ROUTING_WAIT_MS;
+      for (;;) {
+        const map = yield* mapFor(group);
+        const outcome = yield* Effect.result(attempt(map));
+        if (Result.isSuccess(outcome)) return outcome.success;
+        const error = outcome.failure;
+        const remaining = deadline - (yield* Clock.currentTimeMillis);
+        if (!isRoutingError(error) || remaining <= 0) return yield* Effect.fail(error);
+        const waited = yield* directory.awaitMap(group, map.version, remaining);
+        yield* Ref.update(maps, (current) => new Map(current).set(group, waited.map));
+        yield* Effect.annotateCurrentSpan({ "shard.wait_outcome": waited.outcome });
+        if (waited.outcome !== "Newer") return yield* Effect.fail(error);
+      }
+    });
+
+  /** Runs `operation` on the key's database, routing around splits (see `withRouting`). */
   const routed = <A, E extends { readonly _tag: string }>(
     group: ShardGroup,
     key: Uint8Array,
     operation: (databaseId: DatabaseId) => Effect.Effect<A, E, DbReaderServices>,
-  ) =>
-    Effect.flatMap(databaseFor(group, key), operation).pipe(
-      Effect.tapError((error) =>
-        isRoutingError(error) ? Effect.ignore(refresh(group)) : Effect.void,
-      ),
-      Effect.retry(routingRetry),
-    );
+  ) => withRouting(group, (map) => Effect.flatMap(databaseIn(map, group, key), operation));
 
   const receipt =
     (databaseId: DatabaseId) =>
@@ -188,28 +203,23 @@ export const makeShardRouter = Effect.gen(function* () {
         Effect.map(client.write(databaseId, batch), receipt(databaseId)),
       );
     }
-    const attempt = Effect.gen(function* () {
-      const map = yield* mapFor(group);
-      const databases = new Set(
-        batch.operations.flatMap((operation) =>
-          Option.toArray(Option.map(shardFor(map, operation.key), (shard) => shard.databaseId)),
-        ),
-      );
-      if (databases.size > 1) {
-        return yield* new CrossShardBatchError({
-          group,
-          databases: [...databases],
-          message: `The batch's keys belong to ${databases.size} shards of group ${group}. Send one batch per shard; batches are atomic only within a database.`,
-        });
-      }
-      const databaseId = yield* databaseFor(group, first.key);
-      return receipt(databaseId)(yield* client.write(databaseId, batch));
-    });
-    return yield* attempt.pipe(
-      Effect.tapError((error) =>
-        isRoutingError(error) ? Effect.ignore(refresh(group)) : Effect.void,
-      ),
-      Effect.retry(routingRetry),
+    return yield* withRouting(group, (map) =>
+      Effect.gen(function* () {
+        const databases = new Set(
+          batch.operations.flatMap((operation) =>
+            Option.toArray(Option.map(shardFor(map, operation.key), (shard) => shard.databaseId)),
+          ),
+        );
+        if (databases.size > 1) {
+          return yield* new CrossShardBatchError({
+            group,
+            databases: [...databases],
+            message: `The batch's keys belong to ${databases.size} shards of group ${group}. Send one batch per shard; batches are atomic only within a database.`,
+          });
+        }
+        const databaseId = yield* databaseIn(map, group, first.key);
+        return receipt(databaseId)(yield* client.write(databaseId, batch));
+      }),
     );
   });
   const get = Effect.fn("ShardRouter.get")(function* (

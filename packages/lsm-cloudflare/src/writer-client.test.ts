@@ -59,7 +59,7 @@ describe("WriterClient over the writer HTTP API", () => {
       });
       const changes = yield* client.changes(A, SeqNum.make(0), 10);
       const flushed = yield* client.flush(A);
-      yield* client.seal(B, [DatabaseId.make("tenant-b2")]);
+      yield* client.seal(B, [DatabaseId.make("tenant-b2")], false);
       const sealed = yield* Effect.flip(
         client.write(B, { operations: [{ _tag: "Delete", key: bytes("k") }] }),
       );

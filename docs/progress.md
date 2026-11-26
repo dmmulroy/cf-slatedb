@@ -57,6 +57,14 @@ hand-off is below.
   from the US west coast, ~550–590 ms from Europe, ~900–1,000 ms from APAC/Oceania; `preview-1`'s
   writers are already near its bucket. `CF_SLATEDB_BUCKET_LOCATION` (default `auto`) lets an
   installation place its bucket once. Scenarios: 11/11 locally and on `preview-1`.
+- **3. Splits pause briefly and never fail (D57).** One manifest commit seals the shard, flushes
+  the last rows, and takes each successor's hold; the forks start from their holds concurrently
+  with no commit on the shard, and are warmed (writer fence-in, compactor wake) in the background;
+  routers long-poll the directory (`awaitMap`) instead of polling every 250 ms, and stop waiting at
+  once when a split reports failure. A lost CAS race is now a span outcome, not an error status.
+  **Live (`preview-1`, production settings):** write pause median 2.7 s (4 writers), 3.1 s (16),
+  from 13–16 s; 0 failed writes; split ~2 s. Model: `SealSplit`'s seal takes the holds. 11/11
+  scenarios locally and on `preview-1`.
 
 ## Remaining-work log
 
@@ -426,19 +434,21 @@ retained.
 
 ## Open questions
 
-### v1 decisions for Dillon (asked 2026-11-25; work proceeds on the defaults)
+### v1 decisions (asked 2026-11-25; Dillon delegated P1–P5)
 
-Asked once, at the start of the v1 round (`docs/handoff-v1.md`). Until Dillon answers, each
-workstream builds the recommended default, records it as a decision, and keeps it easy to change.
+Asked once, at the start of the v1 round (`docs/handoff-v1.md`). Dillon answered: decide with best
+judgement for the product, UX, and performance. P1–P5 are therefore decided as below (each recorded
+as a decision when its workstream builds it). P6 stays Dillon's: production is deployed only on his
+explicit go-ahead.
 
-| #   | Decision                            | Recommended default (building this until answered)                                                                                                           | Answer  |
-| --- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------- |
-| P1  | How production callers authenticate | The access gate, with rotatable tokens: two valid at a time, held as Secrets Store secrets, rotated by a `vp run` task. Cloudflare Access in front optional. | pending |
-| P2  | Production data residency           | None (`CF_SLATEDB_JURISDICTION=none`). Fixed per installation; changing it later means a new installation.                                                   | pending |
-| P3  | Production hostname                 | The API Worker's `workers.dev` URL. A custom domain needs a zone in the account.                                                                             | pending |
-| P4  | Production telemetry                | The stage's own `TraceCollector`, a 14-day R2 lifecycle rule, head sampling at 10% (100% on previews).                                                       | pending |
-| P5  | Plan and limits                     | Workers Paid; `limits.cpu_ms` on the API and compactor Workers set to workstream 6's measurement plus 2× headroom.                                           | pending |
-| P6  | Release go-ahead                    | Dillon reviews `docs/release-v1.md`, adds `production` to the deploy guard, then says "deploy" or runs the deploy task himself.                              | pending |
+| #   | Decision                            | Recommended default (building this until answered)                                                                                                           | Answer               |
+| --- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------- |
+| P1  | How production callers authenticate | The access gate, with rotatable tokens: two valid at a time, held as Secrets Store secrets, rotated by a `vp run` task. Cloudflare Access in front optional. | decided: the default |
+| P2  | Production data residency           | None (`CF_SLATEDB_JURISDICTION=none`). Fixed per installation; changing it later means a new installation.                                                   | decided: the default |
+| P3  | Production hostname                 | The API Worker's `workers.dev` URL. A custom domain needs a zone in the account.                                                                             | decided: the default |
+| P4  | Production telemetry                | The stage's own `TraceCollector`, a 14-day R2 lifecycle rule, head sampling at 10% (100% on previews).                                                       | decided: the default |
+| P5  | Plan and limits                     | Workers Paid; `limits.cpu_ms` on the API and compactor Workers set to workstream 6's measurement plus 2× headroom.                                           | decided: the default |
+| P6  | Release go-ahead                    | Dillon reviews `docs/release-v1.md`, adds `production` to the deploy guard, then says "deploy" or runs the deploy task himself.                              | pending              |
 
 Related to P2 (found in workstream 2, D56): the production LSM bucket's R2 location is fixed when it
 is created. `CF_SLATEDB_BUCKET_LOCATION` defaults to `auto` (R2 places it near the machine that

@@ -30,7 +30,7 @@ const testLayer = Layer.mergeAll(
   Layer.provideMerge(dbServicesTestLayer({ blockSize: 64 })),
 );
 
-// The real clock: routers back off 100 ms while a split publishes.
+// The real clock: routers wait on the directory while a split publishes.
 const provide = <A, E, R>(program: Effect.Effect<A, E, R>) =>
   program.pipe(
     Effect.scoped,
@@ -224,9 +224,18 @@ describe("sharding", () => {
           const directory = yield* ShardDirectory;
           // A split that crashed right after the seal.
           const pending = yield* directory.beginSplit(GROUP, FIRST, key(5));
-          yield* (yield* DatabaseLifecycle).seal(FIRST, [pending.left, pending.right]);
+          yield* (yield* DatabaseLifecycle).seal(FIRST, [pending.left, pending.right], false);
+          const reader = yield* ManifestReader;
+          const sealedAt = (yield* reader.loadLatest(FIRST)).id;
           const map = yield* (yield* ShardSplit).split(GROUP, FIRST, key(5));
-          return { pending, map, three: yield* router.get(GROUP, key(3), latest) };
+          const after = yield* reader.loadLatest(FIRST);
+          const sealedChain = {
+            holders: after.manifest.checkpoints.flatMap((checkpoint) =>
+              Option.toArray(checkpoint.holder),
+            ),
+            commitsAfterFirstSeal: after.id - sealedAt,
+          };
+          return { pending, map, sealedChain, three: yield* router.get(GROUP, key(3), latest) };
         }),
       ),
     );
@@ -235,5 +244,104 @@ describe("sharding", () => {
       outcome.pending.right,
     ]);
     expect(outcome.three).toEqual(Option.some(Uint8Array.of(3)));
+    // The resumed seal took both holds in one commit, and the forks needed no commit on the shard.
+    expect(outcome.sealedChain).toEqual({
+      holders: [outcome.pending.left, outcome.pending.right],
+      commitsAfterFirstSeal: 1,
+    });
+  }, 60_000);
+
+  it("answers a wait for a newer map at once, on publish, on a failed split, or on timeout", async () => {
+    const outcome = await Effect.runPromise(
+      provide(
+        Effect.gen(function* () {
+          yield* createGroup;
+          const directory = yield* ShardDirectory;
+          const initial = yield* directory.map(GROUP);
+          const idle = yield* directory.awaitMap(GROUP, initial.version, 5_000);
+          const stale = yield* directory.awaitMap(GROUP, initial.version - 1, 5_000);
+          yield* directory.beginSplit(GROUP, FIRST, key(5));
+          const timedOut = yield* directory.awaitMap(GROUP, initial.version, 50);
+          // A waiter released by a failure report, then one released by the publish.
+          const failed = yield* Effect.forkChild(directory.awaitMap(GROUP, initial.version, 5_000));
+          yield* Effect.sleep("20 millis");
+          yield* directory.reportSplitFailed(GROUP, FIRST);
+          const published = yield* Effect.forkChild(
+            directory.awaitMap(GROUP, initial.version, 20_000),
+          );
+          yield* Effect.sleep("20 millis");
+          const map = yield* (yield* ShardSplit).split(GROUP, FIRST, key(5));
+          const publishedAt = Date.now();
+          const releasedAfterMs = yield* Effect.map(
+            Fiber.join(published),
+            () => Date.now() - publishedAt,
+          );
+          return {
+            releasedAfterMs,
+            idle: idle.outcome,
+            stale: stale.outcome,
+            timedOut: timedOut.outcome,
+            failed: (yield* Fiber.join(failed)).outcome,
+            published: yield* Fiber.join(published),
+            version: map.version,
+          };
+        }),
+      ),
+    );
+    expect(outcome).toMatchObject({
+      idle: "NoSplitPending",
+      stale: "Newer",
+      timedOut: "TimedOut",
+      failed: "SplitFailed",
+    });
+    expect(outcome.published.outcome).toBe("Newer");
+    // Released by the publish itself, not by its timeout.
+    expect(outcome.releasedAfterMs).toBeLessThan(2_000);
+    expect(outcome.published.map.version).toBe(outcome.version);
+  }, 60_000);
+
+  it("routes a write held by a split to the new shard as soon as it publishes", async () => {
+    const outcome = await Effect.runPromise(
+      provide(
+        Effect.gen(function* () {
+          yield* createGroup;
+          const router = yield* ShardRouter;
+          const directory = yield* ShardDirectory;
+          yield* router.put(GROUP, key(3), Uint8Array.of(3));
+          // The split is under way: the shard is sealed and the new map not yet published.
+          const pending = yield* directory.beginSplit(GROUP, FIRST, key(5));
+          yield* (yield* DatabaseLifecycle).seal(FIRST, [pending.left, pending.right], false);
+          const held = yield* Effect.forkChild(router.put(GROUP, key(9), Uint8Array.of(9)));
+          yield* Effect.sleep("50 millis");
+          yield* (yield* ShardSplit).split(GROUP, FIRST, key(5));
+          const splitAt = Date.now();
+          const receipt = yield* Fiber.join(held);
+          const heldAfterMs = Date.now() - splitAt;
+          // A split that failed part-way fails a held write at once (retryable), not after 30 s.
+          yield* router.put(GROUP, key(1), Uint8Array.of(1));
+          const leftShard = receipt.databaseId === pending.right ? pending.left : pending.right;
+          const second = yield* directory.beginSplit(GROUP, leftShard, key(2));
+          yield* (yield* DatabaseLifecycle).seal(leftShard, [second.left, second.right], false);
+          const started = Date.now();
+          const refusedPut = yield* Effect.forkChild(
+            Effect.flip(router.put(GROUP, key(1), Uint8Array.of(2))),
+          );
+          yield* Effect.sleep("50 millis");
+          yield* directory.reportSplitFailed(GROUP, leftShard);
+          const refused = yield* Fiber.join(refusedPut);
+          return {
+            receipt,
+            heldAfterMs,
+            right: pending.right,
+            refused: refused._tag,
+            waitedMs: Date.now() - started,
+          };
+        }),
+      ),
+    );
+    expect(outcome.receipt.databaseId).toBe(outcome.right);
+    expect(outcome.heldAfterMs).toBeLessThan(2_000);
+    expect(outcome.refused).toBe("DatabaseSealedError");
+    expect(outcome.waitedMs).toBeLessThan(5_000);
   }, 60_000);
 });

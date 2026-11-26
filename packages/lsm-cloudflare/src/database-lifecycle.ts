@@ -14,15 +14,16 @@ import {
   ManifestId,
   markRemoved,
   removeCheckpoint,
-  type SeqNum,
   Timestamp,
 } from "@cf-slatedb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Clock, Context, Effect, Layer, Option, Result, Schema, type Scope } from "effect";
 
+import { BackgroundWork } from "./background-work.ts";
 import { BlockSource, type BlockSourceServices } from "./block-source.ts";
 import { CompactorClient } from "./compactor-client.ts";
 import { DbSnapshot } from "./db-client.ts";
+import type { SealReceipt } from "./db-writer.ts";
 import type { CompactorError } from "./compactor.ts";
 import { DatabaseNotFoundError, WriterUnavailableError } from "./lsm-errors.ts";
 import {
@@ -140,12 +141,22 @@ export interface IDatabaseLifecycle {
   ) => Effect.Effect<void, DatabaseLifecycleError, DatabaseLifecycleServices>;
   /**
    * Flushes and seals the database: no write commits after it, and later writes fail with
-   * `DatabaseSealedError` naming `successors`. @returns The sequence number durable at the seal.
+   * `DatabaseSealedError` naming `successors`.
+   *
+   * **Details**
+   *
+   * With `holdForSuccessors`, the seal's own commit also takes each successor a hold on the sealed
+   * manifest (a checkpoint the successor holds), so each can be forked from its hold at once with
+   * `forkRange`, without another checkpoint commit (a split, D57). A hold lasts until the fork's
+   * compactor releases it, or until `deleteCheckpoint`.
+   *
+   * @returns The sequence number durable at the seal and the successors' holds.
    */
   readonly seal: (
     databaseId: DatabaseId,
     successors: ReadonlyArray<DatabaseId>,
-  ) => Effect.Effect<SeqNum, DatabaseLifecycleError, DatabaseLifecycleServices>;
+    holdForSuccessors: boolean,
+  ) => Effect.Effect<SealReceipt, DatabaseLifecycleError, DatabaseLifecycleServices>;
   /**
    * Creates `forkId` as a zero-copy fork of `range` of the source at a checkpoint: its SSTs are
    * views of the source's files, and it holds its own checkpoint on the source until its compaction
@@ -180,6 +191,7 @@ export const makeDatabaseLifecycle = Effect.gen(function* () {
   const objects = yield* ObjectStore;
   const writers = yield* WriterClient;
   const compactors = yield* CompactorClient;
+  const background = yield* BackgroundWork;
   const blocks = yield* BlockSource;
 
   const unavailable =
@@ -303,12 +315,13 @@ export const makeDatabaseLifecycle = Effect.gen(function* () {
   const seal = Effect.fn("DatabaseLifecycle.seal")(function* (
     databaseId: DatabaseId,
     successors: ReadonlyArray<DatabaseId>,
+    holdForSuccessors: boolean,
   ) {
     yield* Effect.annotateCurrentSpan({
       "database.id": databaseId,
       "seal.successors": successors.length,
     });
-    return yield* writers.seal(databaseId, successors);
+    return yield* writers.seal(databaseId, successors, holdForSuccessors);
   });
 
   const forkRange = Effect.fn("DatabaseLifecycle.forkRange")(function* (request: ForkRangeRequest) {
@@ -330,35 +343,45 @@ export const makeDatabaseLifecycle = Effect.gen(function* () {
 
     // The fork's own hold on the source, pinning the same manifest. Taken while the caller's
     // checkpoint still pins it (checked in the same CAS), so GC never sees the manifest unpinned.
+    // A split's seal already took it (`seal` with `holdForSuccessors`): then no commit is needed.
     const holdId = yield* generateCheckpointId;
     const now = Timestamp.make(yield* Clock.currentTimeMillis);
-    const held = yield* manifests
-      .update(
-        source,
-        (manifest): Result.Result<Manifest, CheckpointNotFoundError | DatabaseRemovedError> => {
-          const existing = manifest.checkpoints.find(
-            (candidate) =>
-              Option.contains(candidate.holder, forkId) &&
-              candidate.manifestId === checkpoint.manifestId,
-          );
-          if (existing !== undefined) return Result.succeed(manifest);
-          if (!manifest.checkpoints.some((candidate) => candidate.id === checkpointId)) {
-            return Result.fail(checkpointNotFound(source, checkpointId));
-          }
-          return addCheckpoint(manifest, {
-            id: holdId,
-            manifestId: checkpoint.manifestId,
-            createdAt: now,
-            expireAt: Option.none(),
-            holder: Option.some(forkId),
-            name: Option.some(`fork ${forkId}`),
-          });
-        },
-      )
-      .pipe(
-        Effect.catchTags(updateFailures(source, "fork")),
-        Effect.catchTags(removedIsNotFound(source)),
-      );
+    const takenHold = latest.manifest.checkpoints.find(
+      (candidate) =>
+        Option.contains(candidate.holder, forkId) && candidate.manifestId === checkpoint.manifestId,
+    );
+    const held =
+      takenHold !== undefined
+        ? latest
+        : yield* manifests
+            .update(
+              source,
+              (
+                manifest,
+              ): Result.Result<Manifest, CheckpointNotFoundError | DatabaseRemovedError> => {
+                const existing = manifest.checkpoints.find(
+                  (candidate) =>
+                    Option.contains(candidate.holder, forkId) &&
+                    candidate.manifestId === checkpoint.manifestId,
+                );
+                if (existing !== undefined) return Result.succeed(manifest);
+                if (!manifest.checkpoints.some((candidate) => candidate.id === checkpointId)) {
+                  return Result.fail(checkpointNotFound(source, checkpointId));
+                }
+                return addCheckpoint(manifest, {
+                  id: holdId,
+                  manifestId: checkpoint.manifestId,
+                  createdAt: now,
+                  expireAt: Option.none(),
+                  holder: Option.some(forkId),
+                  name: Option.some(`fork ${forkId}`),
+                });
+              },
+            )
+            .pipe(
+              Effect.catchTags(updateFailures(source, "fork")),
+              Effect.catchTags(removedIsNotFound(source)),
+            );
     const hold = held.manifest.checkpoints.find(
       (candidate) =>
         Option.contains(candidate.holder, forkId) && candidate.manifestId === checkpoint.manifestId,
@@ -392,14 +415,39 @@ export const makeDatabaseLifecycle = Effect.gen(function* () {
           }),
       }),
     );
-    // The fork's compactor rewrites the source's SSTs into its own, then releases the hold.
-    yield* compactors.wake(forkId).pipe(
-      Effect.catchCause((cause) =>
-        Effect.logWarning("Waking a new fork's compactor failed; its first flush wakes it.", {
-          forkId,
-          cause,
-        }),
-      ),
+    // In the background, so a split's write pause waits for neither (D57): the fork's writer fences in
+    // now rather than on its first write, and its compactor starts rewriting the source's SSTs into
+    // its own, then releases the hold. A lost wake only delays them: the first write fences the
+    // writer, and the maintenance sweep wakes the compactor of any database still holding another's
+    // SSTs.
+    yield* background.run(
+      "DatabaseLifecycle.warmFork",
+      Effect.all(
+        [
+          writers.status(forkId).pipe(
+            Effect.asVoid,
+            Effect.catchCause((cause) =>
+              Effect.logWarning("Warming a new fork's writer failed; its first write starts it.", {
+                forkId,
+                cause,
+              }),
+            ),
+          ),
+          compactors.wake(forkId).pipe(
+            Effect.asVoid,
+            Effect.catchCause((cause) =>
+              Effect.logWarning(
+                "Waking a new fork's compactor failed; the maintenance sweep wakes it later.",
+                {
+                  forkId,
+                  cause,
+                },
+              ),
+            ),
+          ),
+        ],
+        { concurrency: 2, discard: true },
+      ).pipe(Effect.scoped),
     );
     yield* Effect.annotateCurrentSpan({ "manifest.id": created.id });
     return created;

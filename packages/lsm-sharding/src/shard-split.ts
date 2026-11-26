@@ -12,19 +12,21 @@ import type { ShardGroup, ShardMap } from "./shard-map.ts";
 /** Every failure a split can report. */
 export type ShardSplitError = DatabaseLifecycleError | ShardDirectoryError;
 
-/** How long the split's own checkpoint lasts if a split stops after taking it. */
-const SPLIT_CHECKPOINT_LIFETIME_MS = 3_600_000;
-
 /**
  * Splits a shard in two (design §12, `ShardSplit`): seal first, fork once, then publish.
  *
  * **Details**
  *
  * 1. Record the split in the group's directory (allocating the two new database ids).
- * 2. Seal the shard's database with the two as successors: its memtable is flushed and every later
- *    write fails with `DatabaseSealedError` (routers retry until the new map is published).
- * 3. Checkpoint the sealed manifest and fork each half from it (zero-copy).
- * 4. Delete the split's checkpoint (each fork holds its own) and publish the new map.
+ * 2. Seal the shard's database with the two as successors: its memtable is flushed, every later
+ *    write fails with `DatabaseSealedError` (routers wait on the directory until the new map is
+ *    published, `ShardDirectory.awaitMap`), and the same commit takes each half a hold on the
+ *    sealed manifest.
+ * 3. Fork both halves at once, each from its own hold (zero-copy, no commit on the shard).
+ * 4. Publish the new map.
+ *
+ * A failure after step 1 is reported to the directory (`reportSplitFailed`), so waiting routers
+ * stop waiting.
  *
  * Every step is idempotent, so retrying a failed split resumes it. The sealed database stays until
  * its forks' compactions release it; remove it then with `DatabaseLifecycle.remove`.
@@ -57,25 +59,44 @@ export const makeShardSplit = Effect.gen(function* () {
     const map = yield* directory.map(group);
     const shard = map.shards.find((candidate) => candidate.databaseId === databaseId);
     if (shard === undefined) return map;
-    yield* lifecycle.seal(databaseId, [pending.left, pending.right]);
-    const checkpoint = yield* lifecycle.createCheckpoint(databaseId, {
-      name: Option.some(`split ${pending.left} ${pending.right}`),
-      lifetimeMs: Option.some(SPLIT_CHECKPOINT_LIFETIME_MS),
-    });
-    yield* lifecycle.forkRange({
-      source: databaseId,
-      checkpointId: checkpoint.id,
-      range: { start: shard.range.start, end: Option.some(pending.atKey) },
-      forkId: pending.left,
-    });
-    yield* lifecycle.forkRange({
-      source: databaseId,
-      checkpointId: checkpoint.id,
-      range: { start: pending.atKey, end: shard.range.end },
-      forkId: pending.right,
-    });
-    yield* lifecycle.deleteCheckpoint(databaseId, checkpoint.id);
-    const published = yield* directory.completeSplit(group, databaseId);
+    // From here writes to the shard pause until the publish. A failure leaves the split recorded
+    // (repeating it resumes) and stops routers waiting for it.
+    const published = yield* Effect.gen(function* () {
+      // One commit seals the shard and takes each half a hold on the sealed manifest (D57).
+      const sealed = yield* lifecycle.seal(databaseId, [pending.left, pending.right], true);
+      const holdOf = (successor: DatabaseId) =>
+        Option.match(
+          Option.fromUndefinedOr(
+            sealed.successorHolds.find((hold) => hold.successor === successor),
+          ),
+          {
+            onNone: () =>
+              Effect.die(new Error(`The seal of ${databaseId} took no hold for ${successor}.`)),
+            onSome: (hold) => Effect.succeed(hold.checkpointId),
+          },
+        );
+      const leftHold = yield* holdOf(pending.left);
+      const rightHold = yield* holdOf(pending.right);
+      // Each half forks from its own hold, so neither needs another commit on the shard.
+      yield* Effect.all(
+        [
+          lifecycle.forkRange({
+            source: databaseId,
+            checkpointId: leftHold,
+            range: { start: shard.range.start, end: Option.some(pending.atKey) },
+            forkId: pending.left,
+          }),
+          lifecycle.forkRange({
+            source: databaseId,
+            checkpointId: rightHold,
+            range: { start: pending.atKey, end: shard.range.end },
+            forkId: pending.right,
+          }),
+        ],
+        { concurrency: 2, discard: true },
+      );
+      return yield* directory.completeSplit(group, databaseId);
+    }).pipe(Effect.tapError(() => Effect.ignore(directory.reportSplitFailed(group, databaseId))));
     yield* Effect.annotateCurrentSpan({
       "shard.version": published.version,
       "shard.left": pending.left,

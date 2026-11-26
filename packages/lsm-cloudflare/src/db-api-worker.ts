@@ -119,9 +119,10 @@ export const dbApiWorkerLayer = <R = never>(options: DbApiWorkerOptions<R>) =>
           Layer.provideMerge(
             manifestStoreLayerWithoutDependencies.pipe(
               Layer.provideMerge(manifestReaderLayerWithoutDependencies),
-              Layer.provide(workerBackgroundWorkLayer),
             ),
           ),
+          // Manifest hints and forks' compactor wakes run after the response.
+          Layer.provideMerge(workerBackgroundWorkLayer),
         ),
       ),
       Effect.provide(writerServerLayerWithoutDependencies),

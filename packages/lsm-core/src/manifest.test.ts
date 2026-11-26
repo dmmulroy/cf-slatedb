@@ -23,6 +23,7 @@ import {
   fenceCompactor,
   fenceWriter,
   forkManifest,
+  holdForSuccessors,
   markRemoved,
   releasableExternalRefs,
   initialManifest,
@@ -32,6 +33,7 @@ import {
   replaceManifestFields,
   sealManifest,
   type SstHandle,
+  successorHoldsOf,
 } from "./manifest.ts";
 
 const DB = DatabaseId.make("orders");
@@ -275,5 +277,63 @@ describe("manifest edits", () => {
     expect(releasableExternalRefs(rewritten, [])).toEqual([{ owner: DB, checkpointId }]);
     // But a checkpoint the fork holds pins a manifest that still reads the owner's SST (D13).
     expect(releasableExternalRefs(rewritten, [fork])).toEqual([]);
+  });
+});
+
+describe("holdForSuccessors", () => {
+  it("takes one hold per successor pinning the given manifest, once, and refuses a removed database", () => {
+    const left = DatabaseId.make("orders-a");
+    const right = DatabaseId.make("orders-b");
+    const proposed = [
+      {
+        successor: left,
+        checkpointId: CheckpointId.make(
+          encodeUlid(
+            1,
+            Array.from({ length: 16 }, () => 0),
+          ),
+        ),
+      },
+      {
+        successor: right,
+        checkpointId: CheckpointId.make(
+          encodeUlid(
+            2,
+            Array.from({ length: 16 }, () => 0),
+          ),
+        ),
+      },
+    ];
+    const sealed = sealManifest(empty, [left, right]);
+    const options = {
+      pinnedManifestId: ManifestId.make(7),
+      proposed,
+      createdAt: Timestamp.make(5),
+    };
+    const held = Result.getOrThrow(holdForSuccessors(sealed, options));
+    expect(
+      held.checkpoints.map((checkpoint) => [checkpoint.holder, checkpoint.manifestId]),
+    ).toEqual([
+      [Option.some(left), 7],
+      [Option.some(right), 7],
+    ]);
+    expect(successorHoldsOf(held, [right, left])).toEqual([proposed[1], proposed[0]]);
+    // Repeating it (a resumed split with new proposed ids) keeps the holds already taken.
+    const again = holdForSuccessors(held, {
+      ...options,
+      pinnedManifestId: ManifestId.make(9),
+      proposed: proposed.map((hold, index) => ({
+        ...hold,
+        checkpointId: CheckpointId.make(
+          encodeUlid(
+            10 + index,
+            Array.from({ length: 16 }, () => 0),
+          ),
+        ),
+      })),
+    });
+    expect(Result.getOrThrow(again)).toBe(held);
+    const removed = Result.getOrThrow(markRemoved(empty));
+    expect(Result.isFailure(holdForSuccessors(removed, options))).toBe(true);
   });
 });

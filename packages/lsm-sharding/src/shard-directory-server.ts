@@ -23,10 +23,12 @@ import {
 
 import {
   makeShardDirectoryOver,
+  MAX_SHARD_MAP_WAIT_MS,
   ShardDirectory,
   ShardDirectoryUnavailableError,
   ShardGroupExistsError,
   ShardGroupNotFoundError,
+  ShardMapWait,
 } from "./shard-directory.ts";
 import {
   PendingSplit,
@@ -65,6 +67,25 @@ export class ShardDirectoryHttpApiGroup extends HttpApiGroup.make("directory")
     }),
   )
   .add(
+    HttpApiEndpoint.get("awaitMap", "/groups/:group/map/next", {
+      params: GroupParams,
+      query: Schema.Struct({
+        afterVersion: Schema.NumberFromString,
+        timeoutMs: Schema.NumberFromString,
+      }),
+      success: ShardMapWait,
+      error: DIRECTORY_ERRORS,
+    }),
+  )
+  .add(
+    HttpApiEndpoint.post("reportSplitFailed", "/groups/:group/splits/failed", {
+      params: GroupParams,
+      payload: Schema.Struct({ databaseId: DatabaseId }),
+      success: HttpApiSchema.NoContent,
+      error: DIRECTORY_ERRORS,
+    }),
+  )
+  .add(
     HttpApiEndpoint.post("beginSplit", "/groups/:group/splits", {
       params: GroupParams,
       payload: Schema.Struct({ databaseId: DatabaseId, atKey: Schema.Uint8ArrayFromBase64 }),
@@ -98,6 +119,12 @@ const shardDirectoryHttpHandlersLayer = HttpApiBuilder.group(
           directory.create(params.group, payload.databaseId),
         )
         .handle("map", ({ params }) => directory.map(params.group))
+        .handle("awaitMap", ({ params, query }) =>
+          directory.awaitMap(params.group, query.afterVersion, query.timeoutMs),
+        )
+        .handle("reportSplitFailed", ({ params, payload }) =>
+          directory.reportSplitFailed(params.group, payload.databaseId),
+        )
         .handle("beginSplit", ({ params, payload }) =>
           directory.beginSplit(params.group, payload.databaseId, payload.atKey),
         )
@@ -184,6 +211,20 @@ export const shardDirectoryLayer = Layer.effect(
           Effect.catchTags(transport(group)),
           Effect.scoped,
         ),
+      awaitMap: (group, afterVersion, timeoutMs) =>
+        Effect.flatMap(client(group), (http) =>
+          http.directory.awaitMap({
+            params: { group },
+            query: {
+              afterVersion,
+              timeoutMs: Math.min(timeoutMs, MAX_SHARD_MAP_WAIT_MS),
+            },
+          }),
+        ).pipe(Effect.catchTags(transport(group)), Effect.scoped),
+      reportSplitFailed: (group, databaseId) =>
+        Effect.flatMap(client(group), (http) =>
+          http.directory.reportSplitFailed({ params: { group }, payload: { databaseId } }),
+        ).pipe(Effect.asVoid, Effect.catchTags(transport(group)), Effect.scoped),
       beginSplit: (group, databaseId, atKey) =>
         Effect.flatMap(client(group), (http) =>
           http.directory.beginSplit({ params: { group }, payload: { databaseId, atKey } }),

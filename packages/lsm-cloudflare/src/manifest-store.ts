@@ -244,12 +244,23 @@ export const makeManifestStore = Effect.gen(function* () {
     }
   });
 
-  const create = Effect.fn("ManifestStore.create")(function* (
+  /**
+   * One create attempt: `Created`, or a conflict (the id exists, or is at or below GC's manifest
+   * boundary) as `Conflict` with its message. A conflict is the CAS working, not a failure, so it is
+   * recorded as the span's `manifest.outcome` rather than an error status.
+   */
+  const attemptCreate = Effect.fn("ManifestStore.create")(function* (
     databaseId: DatabaseId,
     manifestId: ManifestId,
     manifest: Manifest,
   ) {
     yield* Effect.annotateCurrentSpan({ "database.id": databaseId, "manifest.id": manifestId });
+    const conflict = (message: string) =>
+      Effect.gen(function* () {
+        yield* Metric.update(manifestCasConflicts, 1);
+        yield* Effect.annotateCurrentSpan({ "manifest.outcome": "Conflict" });
+        return Result.fail(new ManifestConflictError({ databaseId, manifestId, message }));
+      });
     const outcome = yield* objects
       .putIfAbsent(
         manifestKey(databaseId, manifestId),
@@ -257,31 +268,30 @@ export const makeManifestStore = Effect.gen(function* () {
       )
       .pipe(writeUnavailable(databaseId));
     if (outcome === "AlreadyExists") {
-      yield* Metric.update(manifestCasConflicts, 1);
-      return yield* new ManifestConflictError({
-        databaseId,
-        manifestId,
-        message: `Manifest ${manifestId} of database ${databaseId} was created by a concurrent edit. Reload and reapply.`,
-      });
+      return yield* conflict(
+        `Manifest ${manifestId} of database ${databaseId} was created by a concurrent edit. Reload and reapply.`,
+      );
     }
     // Checked after the create: GC advances the boundary before deleting, so an id it may have
     // deleted (and that this create could have reused) is at or below it.
     const boundary = yield* readManifestBoundary(databaseId);
     if (manifestId <= boundary.id) {
-      yield* Metric.update(manifestCasConflicts, 1);
       yield* Effect.annotateCurrentSpan({ "manifest.gc_boundary": boundary.id });
-      return yield* new ManifestConflictError({
-        databaseId,
-        manifestId,
-        message: `Manifest ${manifestId} of database ${databaseId} is at or below GC's manifest boundary ${boundary.id}: the id was used before and its manifest collected. Reload and reapply.`,
-      });
+      return yield* conflict(
+        `Manifest ${manifestId} of database ${databaseId} is at or below GC's manifest boundary ${boundary.id}: the id was used before and its manifest collected. Reload and reapply.`,
+      );
     }
+    yield* Effect.annotateCurrentSpan({ "manifest.outcome": "Created" });
     // Off the critical path: the hint may land late or never; readers probe past it (D56).
     yield* background.run(
       "ManifestStore.advanceLatestHint",
       advanceLatestHint(databaseId, manifestId),
     );
+    return Result.succeed(undefined);
   });
+
+  const create = (databaseId: DatabaseId, manifestId: ManifestId, manifest: Manifest) =>
+    attemptCreate(databaseId, manifestId, manifest).pipe(Effect.flatMap(Effect.fromResult));
 
   const initialize = Effect.fn("ManifestStore.initialize")(function* (manifest: Manifest) {
     const id = ManifestId.make(1);
@@ -321,9 +331,8 @@ export const makeManifestStore = Effect.gen(function* () {
         const edited = edit(view.manifest, view.id);
         if (Result.isSuccess(edited) && edited.success !== view.manifest) {
           const nextId = ManifestId.make(view.id + 1);
-          const committedFromView = yield* create(databaseId, nextId, edited.success).pipe(
-            Effect.as(true),
-            Effect.catchTags({ ManifestConflictError: () => Effect.succeed(false) }),
+          const committedFromView = Result.isSuccess(
+            yield* attemptCreate(databaseId, nextId, edited.success),
           );
           if (committedFromView) {
             yield* Effect.annotateCurrentSpan({

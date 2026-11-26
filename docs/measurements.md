@@ -183,6 +183,31 @@ Oceania. `preview-1`'s writers run near its bucket (an own-view commit is one ~2
 ~76 ms read), so placement could not speed it up. An installation whose writers sit elsewhere should
 create its bucket there: `CF_SLATEDB_BUCKET_LOCATION` (fixed at creation; unrestricted Stacks only).
 
+## Split write pause after D57 (v1 workstream 3)
+
+`measure split-pause` as above, on `preview-1` with production settings, after D56 (fast commits)
+and D57 (seal, holds, and final flush in one commit; forks from their holds, concurrently and
+warmed in the background; routers waiting on the directory). Three runs per writer count.
+
+| Writers | Run | Split (client) | `DbWriter.seal` | Longest gap between acks | Longest put | Failed puts |
+| ------: | --- | -------------: | --------------: | -----------------------: | ----------: | ----------: |
+|       4 | a   |          2.0 s |           1.0 s |                    2.7 s |       3.5 s |     0 / 800 |
+|       4 | b   |          1.8 s |           0.8 s |                    3.2 s |       3.3 s |     0 / 875 |
+|       4 | c   |          1.8 s |           0.8 s |                    2.6 s |       3.0 s |     0 / 873 |
+|      16 | a   |          1.9 s |           1.0 s |                    3.1 s |       3.4 s |    0 / 2578 |
+|      16 | b   |          1.8 s |           1.3 s |                    2.6 s |       3.3 s |    0 / 3182 |
+|      16 | c   |          2.0 s |           1.6 s |                    3.4 s |       3.7 s |    0 / 1951 |
+
+**Reading.** Writes to a splitting shard now pause about **2.6–3.4 s** (median 2.7 s with 4
+writers, 3.1 s with 16), down from 13–16 s, with no failed writes. The split itself takes ~2 s: one
+upload and one manifest commit under the seal's lock (~0.8–1.6 s), two concurrent first-manifest
+creates, and the publish. The rest of the gap is writes queued behind the seal's commit lock and
+each router's retry once the directory answers. Between the D56-only runs (~8.6 s) and these, two
+intermediate variants were measured and discarded: concurrent forks each taking their own hold
+(their CAS raced) and a separate checkpoint (an extra commit). In one run R2 was slower overall
+(create-if-absent ~0.8–1.1 s instead of ~0.3 s), which stretched every commit; the design now has
+as few commits on the pause as it can.
+
 ## Live checks
 
 | Check                                       | Result                         | How                                                                                                                                                                                                                                                                                                                                                                                             |

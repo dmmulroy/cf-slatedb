@@ -25,9 +25,7 @@ export const writerHttpHandlersLayer = HttpApiBuilder.group(WriterHttpApi, "writ
       .handle("status", ({ params }) => writer.status(params.databaseId))
       .handle("destroy", ({ params }) => writer.destroy(params.databaseId))
       .handle("seal", ({ params, payload }) =>
-        writer
-          .seal(params.databaseId, payload.successors)
-          .pipe(Effect.map((flushedSeq) => ({ flushedSeq }))),
+        writer.seal(params.databaseId, payload.successors, payload.holdForSuccessors),
       );
   }),
 );

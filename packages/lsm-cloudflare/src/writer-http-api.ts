@@ -1,4 +1,5 @@
 import {
+  CheckpointId,
   DatabaseId,
   DatabaseSealedError,
   KeyOutOfRangeError,
@@ -75,8 +76,22 @@ export const ChangesResponse = Schema.Struct({
   flushedSeq: SeqNum,
 });
 
-/** Schema for a seal request: the databases that replace this one. */
-export const SealRequest = Schema.Struct({ successors: Schema.Array(DatabaseId) });
+/**
+ * Schema for a seal request: the databases that replace this one, and whether the seal takes each a
+ * hold on the sealed manifest (a split's seal, D57).
+ */
+export const SealRequest = Schema.Struct({
+  successors: Schema.Array(DatabaseId),
+  holdForSuccessors: Schema.Boolean,
+});
+
+/** Schema for a seal response (see `SealReceipt`). */
+export const SealResponse = Schema.Struct({
+  flushedSeq: SeqNum,
+  successorHolds: Schema.Array(
+    Schema.Struct({ successor: DatabaseId, checkpointId: CheckpointId }),
+  ),
+});
 
 /** Schema for the writer's status (see `WriterStatus`). */
 export const WriterStatusResponse = Schema.Struct({
@@ -174,7 +189,7 @@ export class WriterHttpApiGroup extends HttpApiGroup.make("writer")
     HttpApiEndpoint.post("seal", "/databases/:databaseId/seal", {
       params: DatabaseParams,
       payload: SealRequest,
-      success: FlushedResponse,
+      success: SealResponse,
       error: WRITER_ERRORS,
     }),
   ) {}

@@ -381,6 +381,8 @@ writer that finds the database gone.
 
 ## D40. Sharding: the directory records each split; routers retry while it publishes
 
+**Split order revised by D57** (the seal takes the successors' holds; forks run concurrently from them).
+
 The design's `ShardSplit` is seal → fork once → publish. Two databases are created per split, and a
 split that stops after sealing must be finishable, or the sealed shard refuses writes forever. So the
 group's directory (one `ShardDirectoryServer` per group) records the split first (`beginSplit`) and
@@ -542,6 +544,8 @@ which the flag does not affect. Local stages leave it off, because their spans g
 which a strictly public `fetch()` cannot reach.
 
 ## D48. Live stages record per-invocation CPU time with a Tail Worker; measurements drive the router's window
+
+**Router polling superseded by D57** (routers wait on the directory; the 30 s bound stays).
 
 Design §12 asks for flush CPU per MB and rows/s per writer, but a Worker cannot read its own CPU
 time (its clock advances only across I/O). Live stages therefore declare `CpuTailWorker`
@@ -828,3 +832,54 @@ Measured on `preview-1` with production settings, 30 small flushes in sequence:
 | own-view commit p50        |        – | 340 ms |          |
 | `loadLatest` p50           |   274 ms | 180 ms |          |
 | `DbWriter.flush` p50       | 1,508 ms | 709 ms | ≤ 900 ms |
+
+## D57. A split seals, holds, and forks in one commit; routers wait on the directory
+
+Supersedes D48's 30-second router polling window (the bound stays; the waiting is now on the
+directory) and changes D40's split order. A live split paused a shard's writes for 13–16 s at the
+start of v1. Workstream 2's faster commits brought it to ~8.6 s, still a chain of commits and waits:
+the final flush and its commit, the seal commit, a checkpoint commit, a hold commit per fork, a
+first-manifest create per fork, ~2 s per fork for its compactor to fence in, a checkpoint delete,
+and the router polling every 250 ms.
+
+- **One commit seals and holds.** `DbWriter.seal(…, holdForSuccessors)` commits the final flush,
+  the seal, and each successor's hold (lsm-core `holdForSuccessors`: a checkpoint the successor
+  holds, pinning the manifest this commit creates) in one manifest CAS under the commit lock
+  (`flushThen`). It needs a separate seal CAS only when nothing is left to flush. The public seal
+  endpoint keeps a plain seal.
+- **Forks need no commit on the shard.** Each fork starts from its own hold (`forkRange` finds the
+  hold already taken and skips its CAS). The two forks run concurrently, and the split publishes
+  without a separate checkpoint or its deletion.
+- **Forks are warmed in the background.** After its first manifest, each fork's writer fences in
+  and its compactor is woken via `BackgroundWork`, so the first write after the publish does not
+  pay the fence-in. A lost wake only delays the rewrite: the first write fences the writer, and
+  workstream 5's maintenance sweep wakes the compactor of any database still holding another's SSTs.
+- **Routers wait on the directory.** `ShardDirectory.awaitMap(group, afterVersion, timeout)` is a
+  long poll on the group's Durable Object. It returns at once when the map is already newer, as
+  soon as a split publishes (`Newer`), when the pending split reports a failure (`SplitFailed`,
+  from `ShardSplit` via `reportSplitFailed`; the split stays recorded and resumable), immediately
+  when nothing could publish (`NoSplitPending`), or after the timeout (at most 25 s). On
+  `DatabaseSealed`, `KeyOutOfRange`, or `DatabaseNotFound` the router waits on it and retries the
+  moment a newer map arrives. Otherwise it surfaces the routing error, which is retryable
+  (`ShardedRequestUnavailable`), bounded by 30 s in total.
+- **A lost CAS race is an outcome, not an error.** `ManifestStore.create` spans record
+  `manifest.outcome` (`Created` or `Conflict`) instead of an error status when the CAS loop retries,
+  like `ObjectStore.putIfAbsent`'s `AlreadyExists`. A legitimate race no longer fails a
+  `NoErrorStatus` trace check (found in the local `gc` scenario).
+
+Model: `SealSplit.tla`'s `Seal` now takes the checkpoint (the holds) in its own step; `Checkpoint` is
+only the `checkpointBeforeSeal` broken variant. Concurrent forks were already covered, and every
+broken variant still fails. Tests: `sharding.test.ts` covers each `awaitMap` outcome; a held write
+routed within 2 s of the publish; a failed split failing held writes at once; and a resumed split
+making exactly one commit on the shard. `db-writer.test.ts` checks that flush, seal, and holds are one
+commit pinning it, and `manifest.test.ts` covers `holdForSuccessors`. Mutations caught: no publish
+signal, no failure signal, a seal without holds.
+
+Measured on `preview-1` with production settings, `measure split-pause`, three runs each:
+
+| Writers |     Split | Longest gap between acknowledged writes | Failed writes |
+| ------: | --------: | --------------------------------------- | ------------: |
+|       4 | 1.8–2.0 s | 2.6 / 2.7 / 3.2 s (median 2.7 s)        |             0 |
+|      16 | 1.8–2.0 s | 2.6 / 3.1 / 3.4 s (median 3.1 s)        |             0 |
+
+Target: a write pause p50 ≤ 6 s with zero failed writes. Met.

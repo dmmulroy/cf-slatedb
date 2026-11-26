@@ -359,6 +359,17 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   scenarios pass, and `BlockServer` responses carry no `Cf-Cache-Status`.
 - **Removal (fails while forks depend; purges in batches)** — done. `DatabaseLifecycle.remove`
   (`DatabaseHasDependentsError`; one tag purge per database through `BlockServer`).
+- **Splits pause briefly and never fail (v1 workstream 3)** — done (D57). `DbWriter.seal` with
+  `holdForSuccessors` (`flushThen`: final flush, seal, and lsm-core `holdForSuccessors` in one
+  CAS); `DatabaseLifecycle.forkRange` reuses a hold already taken and warms the fork's writer and
+  compactor in the background; `ShardSplit` seals with holds, forks concurrently, publishes, and
+  reports failures (`reportSplitFailed`); `ShardDirectory.awaitMap` (long poll on the group's
+  Durable Object) and `ShardRouter.withRouting`. Tests: `sharding.test.ts` (every `awaitMap`
+  outcome, a held write routed within 2 s of the publish, a failed split failing held writes at once,
+  a resumed split making one commit), `db-writer.test.ts` (one commit seals, flushes, and holds),
+  `manifest.test.ts` (`holdForSuccessors`); mutations caught. Formal: `SealSplit` (the seal takes the
+  holds). Live (`preview-1`, production settings): pause median 2.7 s (4 writers) and 3.1 s (16),
+  0 failed writes; 11/11 scenarios.
 - **Sharding: `ShardDirectory`, `ShardRouter`, `ShardSplit`** — done. `packages/lsm-sharding`:
   `shard-map.ts` (range map, pending split, pure edits), `shard-directory.ts` +
   `shard-directory-server.ts` (one Durable Object per group), `shard-router.ts` (cached map; refresh
