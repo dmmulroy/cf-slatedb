@@ -190,7 +190,7 @@ const readBatchesUnder = (prefix: string) =>
             body: Base64.encode(bytes),
           });
         }),
-      { concurrency: 8 },
+      { concurrency: 32 },
     );
     const found = batches.flatMap((batch) => (Option.isSome(batch) ? [batch.value] : []));
     return HttpServerResponse.jsonUnsafe(

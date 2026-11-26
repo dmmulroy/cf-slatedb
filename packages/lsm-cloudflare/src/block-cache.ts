@@ -10,7 +10,7 @@ import {
   type SstIndexEntry,
   type SstMeta,
 } from "@cf-slatedb/lsm-core";
-import { Cause, Context, Deferred, Effect, Layer, Metric, Option } from "effect";
+import { Context, Effect, Layer, Metric, Option } from "effect";
 
 import {
   BlockSource,
@@ -76,12 +76,21 @@ const rangeKey = (owner: DatabaseId, sstId: SstId, offset: number, length: numbe
   `${owner}/${sstId}/${offset}-${length}`;
 
 /**
- * One L1 cache: decoded values within a {@link GroupByteBudgetLru}, each charged its encoded size,
- * with concurrent misses for a key joined into one read. Failures are never kept.
+ * One L1 cache: decoded values within a {@link GroupByteBudgetLru}, each charged its encoded size.
+ * Failures are never kept.
+ *
+ * **Details**
+ *
+ * The isolate shares the values, which are plain data, across requests. It does not share reads in
+ * flight (D66): a Worker's I/O belongs to the request that started it, so a request that waited on
+ * another request's read hung when the runtime cancelled that request (a client that hung up, an
+ * isolate retired by a deploy), and once it ended its work threw "Cannot call this
+ * AsyncLocalStorage bound function outside of the request in which it was created" in the waiter
+ * (found by the soak). Concurrent misses for one key each read; Workers Cache (L2) and the
+ * BlockServer answer the duplicates.
  */
 const makeL1Cache = <A>(budget: { readonly totalBytes: number; readonly groupBytes: number }) => {
   const held = new GroupByteBudgetLru<A>(budget);
-  const reading = new Map<string, Deferred.Deferred<A, BlockReadError>>();
   const get = <R>(
     key: string,
     budgetGroup: string,
@@ -91,37 +100,16 @@ const makeL1Cache = <A>(budget: { readonly totalBytes: number; readonly groupByt
     Effect.suspend(() => {
       const cached = held.get(key);
       if (Option.isSome(cached)) return Effect.succeed(cached.value);
-      const pending = reading.get(key);
-      if (pending !== undefined) {
-        // The read belongs to another invocation: if that one is interrupted, read again here.
-        return Deferred.await(pending).pipe(
-          Effect.catchCause((cause) =>
-            Cause.hasInterruptsOnly(cause)
-              ? get(key, budgetGroup, bytes, read)
-              : Effect.failCause(cause),
-          ),
-        );
-      }
-      return Effect.gen(function* () {
-        const deferred = yield* Deferred.make<A, BlockReadError>();
-        reading.set(key, deferred);
-        return yield* read.pipe(
-          Effect.tap((value) => Effect.sync(() => held.set(key, budgetGroup, bytes, value))),
-          Effect.onExit((exit) =>
-            Effect.andThen(
-              Effect.sync(() => reading.delete(key)),
-              Deferred.done(deferred, exit),
-            ),
-          ),
-        );
-      });
+      return read.pipe(
+        Effect.tap((value) => Effect.sync(() => held.set(key, budgetGroup, bytes, value))),
+      );
     });
   return { has: (key: string) => held.has(key), get };
 };
 
 /**
- * Constructs the L1 cache over the contextual block source and settings. Concurrent misses for one
- * key join one read; reads run with the calling invocation's services.
+ * Constructs the L1 cache over the contextual block source and settings. Each miss reads with the
+ * calling invocation's services, never waiting on another invocation's read (D66).
  */
 export const makeBlockCache = Effect.gen(function* () {
   const source = yield* BlockSource;

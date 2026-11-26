@@ -9,7 +9,7 @@ import { Base64 } from "effect/encoding";
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 import { HttpApiClient } from "effect/http-api";
 
-import { runTraceCli, ScenarioStack, uniqueId } from "./scenario.ts";
+import { runTraceCli, runTraceCliAsync, ScenarioStack, uniqueId } from "./scenario.ts";
 
 /**
  * A measurement could not run or its data could not be read: `step` names what it was doing and
@@ -951,7 +951,7 @@ export const pullMeasurementSpans = (minutes: number) =>
     const { previewStage } = yield* ScenarioStack;
     const stage = Option.getOrElse(previewStage, () => "local");
     if (Option.isSome(previewStage)) {
-      yield* runTraceCli([
+      const pulled = yield* runTraceCliAsync([
         "pull",
         "--stage",
         stage,
@@ -960,6 +960,13 @@ export const pullMeasurementSpans = (minutes: number) =>
         "--since-minutes",
         String(minutes),
       ]);
+      if (pulled.status !== 0) {
+        return yield* new MeasurementError({
+          step: "trace-cli pull",
+          reason: "TraceCliFailed",
+          message: `Pulling ${stage}'s spans failed: ${pulled.stderr.slice(-500)}. Run the measurement again.`,
+        });
+      }
     }
     return Option.isSome(previewStage)
       ? measurementStore(stage)

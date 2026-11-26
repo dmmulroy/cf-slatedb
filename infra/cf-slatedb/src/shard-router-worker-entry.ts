@@ -1,7 +1,7 @@
 import { shardRouterWorkerLayer } from "@cf-slatedb/sharding";
 
 import { cfSlatedbAccessTokens } from "./cf-slatedb-access-tokens.ts";
-import { cfSlatedbTelemetry } from "./cf-slatedb-telemetry.ts";
+import { cfSlatedbTailConsumers, cfSlatedbTelemetry } from "./cf-slatedb-telemetry.ts";
 import { cfSlatedbWorkerSettings } from "./cf-slatedb-stack-config.ts";
 
 /** Local dev port of the shard router Worker. */
@@ -16,6 +16,7 @@ export const cfSlatedbShardRouterWorkerLayer = shardRouterWorkerLayer({
   telemetry: cfSlatedbTelemetry,
   settings: cfSlatedbWorkerSettings,
   accessTokens: cfSlatedbAccessTokens,
+  tailConsumers: cfSlatedbTailConsumers,
   devPort: SHARD_ROUTER_DEV_PORT,
 });
 

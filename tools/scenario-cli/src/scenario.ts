@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { Context, Data, Effect, Option, Schedule } from "effect";
@@ -122,6 +122,22 @@ const PREVIEW_SPAN_SETTLE = "5 seconds";
 const PREVIEW_ASSERT_ATTEMPTS = 6;
 
 /** Runs the trace CLI in its own process; returns its exit status and output. */
+/**
+ * Runs the trace CLI in its own process without blocking this one (a long `pull` must not stall a
+ * soak's other fibers); returns its exit status and error output.
+ */
+export const runTraceCliAsync = (args: ReadonlyArray<string>) =>
+  Effect.callback<{ readonly status: number; readonly stderr: string }>((resume) => {
+    const child = spawn(process.execPath, [TRACE_CLI, ...args], {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+    child.on("exit", (code) => resume(Effect.succeed({ status: code ?? -1, stderr })));
+  });
+
 export const runTraceCli = (args: ReadonlyArray<string>, input?: string) =>
   Effect.sync(() =>
     spawnSync(process.execPath, [TRACE_CLI, ...args], {

@@ -9,7 +9,7 @@ import {
   sstHandleFromInfo,
   type SstHandle,
 } from "@cf-slatedb/lsm-core";
-import { Bytes, Effect, Layer, Option, Ref } from "effect";
+import { Bytes, Effect, Fiber, Layer, Option, Ref } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 
 import { BlockCache, blockCacheLayerWithoutDependencies } from "./block-cache.ts";
@@ -53,8 +53,11 @@ const recordingSource = (ssts: ReadonlyArray<{ bytes: Uint8Array; handle: SstHan
   Effect.gen(function* () {
     const reads = yield* Ref.make(new Map<string, number>());
     const failing = yield* Ref.make(false);
+    const hanging = yield* Ref.make(false);
     const read = (sstId: string, offset: number, length: number) =>
       Effect.gen(function* () {
+        // A read that never finishes, as one whose request the runtime cancelled.
+        if (yield* Ref.get(hanging)) return yield* Effect.never;
         yield* Ref.update(reads, (current) => {
           const key = `${sstId}/${offset}`;
           return new Map(current).set(key, (current.get(key) ?? 0) + 1);
@@ -76,7 +79,7 @@ const recordingSource = (ssts: ReadonlyArray<{ bytes: Uint8Array; handle: SstHan
       meta: (_owner, sstId, offset, length) => read(sstId, offset, length),
       purge: () => Effect.succeed(true),
     });
-    return { source, reads, failing };
+    return { source, reads, failing, hanging };
   });
 
 const run = <A, E>(
@@ -115,7 +118,7 @@ const readAllBlocks = (sst: { handle: SstHandle }, group: string) =>
   });
 
 describe("BlockCache", () => {
-  it("joins concurrent misses for one block into one read, and keeps the result", async () => {
+  it("keeps a block once read, so later reads of it make no request", async () => {
     const sst = buildSst("01JD00000000000000000000A1", 4);
     const reads = await run([sst], { data: 1 << 20, share: 1 }, ({ reads }) =>
       Effect.gen(function* () {
@@ -123,16 +126,34 @@ describe("BlockCache", () => {
         const meta = yield* cache.meta(OWNER, sst.handle, "g");
         const entry = meta.index[0];
         if (entry === undefined) return yield* Effect.die("no blocks");
-        yield* Effect.forEach(
-          Array.from({ length: 8 }),
-          () => cache.block(OWNER, sst.handle, entry, "g"),
-          { concurrency: "unbounded" },
-        );
-        yield* cache.block(OWNER, sst.handle, entry, "g");
+        for (let read = 0; read < 8; read++) yield* cache.block(OWNER, sst.handle, entry, "g");
         return (yield* Ref.get(reads)).get(`${sst.handle.id}/${entry.offset}`);
       }),
     );
     expect(reads).toBe(1);
+  });
+
+  it("never makes a miss wait on another invocation's read, even one that never finishes (D66)", async () => {
+    const sst = buildSst("01JD00000000000000000000A2", 4);
+    const outcome = await run([sst], { data: 1 << 20, share: 1 }, ({ hanging }) =>
+      Effect.gen(function* () {
+        const cache = yield* BlockCache;
+        const meta = yield* cache.meta(OWNER, sst.handle, "g");
+        const entry = meta.index[0];
+        if (entry === undefined) return yield* Effect.die("no blocks");
+        // Another invocation's read of the same block, stuck.
+        yield* Ref.set(hanging, true);
+        const stuck = yield* Effect.forkChild(cache.block(OWNER, sst.handle, entry, "g"));
+        yield* Effect.yieldNow;
+        yield* Ref.set(hanging, false);
+        const block = yield* cache
+          .block(OWNER, sst.handle, entry, "g")
+          .pipe(Effect.timeoutOption("1 second"));
+        yield* Fiber.interrupt(stuck);
+        return Option.isSome(block);
+      }),
+    );
+    expect(outcome).toBe(true);
   });
 
   it("never keeps a failed read", async () => {

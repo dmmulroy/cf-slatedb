@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { Data, Effect, FileSystem, Option, Path, Schema } from "effect";
+import { Data, Effect, Fiber, FileSystem, Option, Path, Schema } from "effect";
 import { Base64 } from "effect/encoding";
 import { HttpClient, HttpClientRequest } from "effect/http";
 
@@ -151,43 +151,55 @@ export const pullPreviewTraces = (
       });
     const unavailable = (message: string) =>
       new PreviewTracePullError({ reason: "CollectorUnavailable", stage, message });
-    while (true) {
-      const url = new URL("/v1/traces/batches", collector.url);
-      url.searchParams.set("limit", "100");
-      if (Option.isSome(after)) url.searchParams.set("after", after.value);
-      const response = yield* client
-        .execute(
-          HttpClientRequest.get(url.toString()).pipe(
-            HttpClientRequest.bearerToken(collector.token),
-          ),
-        )
-        .pipe(
-          Effect.mapError((error) =>
+    /** Fetches and decodes the page of exports after `from`. */
+    const fetchPage = (from: Option.Option<string>) =>
+      Effect.gen(function* () {
+        const url = new URL("/v1/traces/batches", collector.url);
+        url.searchParams.set("limit", "100");
+        if (Option.isSome(from)) url.searchParams.set("after", from.value);
+        const response = yield* client
+          .execute(
+            HttpClientRequest.get(url.toString()).pipe(
+              HttpClientRequest.bearerToken(collector.token),
+            ),
+          )
+          .pipe(
+            Effect.mapError((error) =>
+              unavailable(
+                `${stage}'s trace collector could not be reached (${error.message}). Pull again: it resumes after the last export stored.`,
+              ),
+            ),
+          );
+        if (response.status === 401) {
+          return yield* new PreviewTracePullError({
+            reason: "CollectorUnauthorized",
+            stage,
+            message: `${stage}'s trace collector refused the token. Redeploy ${stage} with \`preview-cli deploy ${stage}\` and pull again.`,
+          });
+        }
+        if (response.status !== 200) {
+          return yield* unavailable(
+            `${stage}'s trace collector answered ${response.status}. Pull again: it resumes after the last export stored.`,
+          );
+        }
+        const page = yield* response.json.pipe(
+          Effect.flatMap(decodeCollectorPage),
+          Effect.mapError(() =>
             unavailable(
-              `${stage}'s trace collector could not be reached (${error.message}). Pull again: it resumes after the last export stored.`,
+              `${stage}'s trace collector returned a page this CLI cannot read. Redeploy ${stage} so the collector matches this CLI, then pull again.`,
             ),
           ),
         );
-      if (response.status === 401) {
-        return yield* new PreviewTracePullError({
-          reason: "CollectorUnauthorized",
-          stage,
-          message: `${stage}'s trace collector refused the token. Redeploy ${stage} with \`preview-cli deploy ${stage}\` and pull again.`,
-        });
-      }
-      if (response.status !== 200) {
-        return yield* unavailable(
-          `${stage}'s trace collector answered ${response.status}. Pull again: it resumes after the last export stored.`,
-        );
-      }
-      const page = yield* response.json.pipe(
-        Effect.flatMap(decodeCollectorPage),
-        Effect.mapError(() =>
-          unavailable(
-            `${stage}'s trace collector returned a page this CLI cannot read. Redeploy ${stage} so the collector matches this CLI, then pull again.`,
-          ),
-        ),
-      );
+        return page;
+      });
+    // The next page is requested while this one is stored: the collector's reads, not this
+    // process, bound how fast a pull goes.
+    let next = yield* Effect.forkChild(fetchPage(after));
+    while (true) {
+      const page = yield* Fiber.join(next);
+      const nextAfter = page.next !== null ? Option.some(page.next) : after;
+      const more = page.more && page.batches.length > 0;
+      if (more) next = yield* Effect.forkChild(fetchPage(nextAfter));
       for (const batch of page.batches) {
         const body = Base64.decode(batch.body);
         if (body._tag === "Failure") {
@@ -215,13 +227,10 @@ export const pullPreviewTraces = (
         exports += 1;
         spans += decoded.length;
         after = Option.some(batch.key);
-        yield* saveCursor(batch.key);
       }
-      if (page.next !== null && Option.getOrUndefined(after) !== page.next) {
-        after = Option.some(page.next);
-        yield* saveCursor(page.next);
-      }
-      if (!page.more || page.batches.length === 0) break;
+      after = nextAfter;
+      if (Option.isSome(after)) yield* saveCursor(after.value);
+      if (!more) break;
     }
     const pulled: PreviewTracePull = { stage, exports, spans };
     return pulled;

@@ -109,6 +109,11 @@ class SoakLedger {
   readonly checks = new Map<string, number>();
   readonly mismatches: Array<string> = [];
   readonly retried = new Map<string, number>();
+  /** When each retry, timeout, or failure happened, for finding them in traces and tail records. */
+  readonly events: Array<string> = [];
+  note(kind: string, what: string) {
+    if (this.events.length < 300) this.events.push(`${new Date().toISOString()} ${kind}: ${what}`);
+  }
   time(kind: string, ms: number) {
     const list = this.latencies.get(kind) ?? [];
     list.push(ms);
@@ -145,12 +150,29 @@ const isRetryable = (error: unknown) =>
   typeof error === "object" &&
   error !== null &&
   (("retryable" in error && error.retryable === true) ||
-    ("_tag" in error && (error._tag === "HttpClientError" || error._tag === "SchemaError")));
+    ("_tag" in error &&
+      (error._tag === "HttpClientError" ||
+        error._tag === "SchemaError" ||
+        error._tag === "TimeoutError" ||
+        // The sharded API's retryable error (its envelope has no `retryable` field).
+        error._tag === "ShardedRequestUnavailableError")));
+
+/** How long one request may take before the soak counts it as lost and retries it. */
+const REQUEST_TIMEOUT = "90 seconds";
 
 const tagOf = (error: unknown) =>
   typeof error === "object" && error !== null && "_tag" in error && typeof error._tag === "string"
     ? error._tag
     : "unknown";
+
+/** The error's tag, with the database error behind it when the sharded API names one. */
+const describe = (error: unknown) =>
+  typeof error === "object" &&
+  error !== null &&
+  "reason" in error &&
+  typeof error.reason === "string"
+    ? `${tagOf(error)} (${error.reason})`
+    : tagOf(error);
 
 /**
  * Sends `effect` until it succeeds, waiting a second between tries, for failures that may succeed
@@ -164,13 +186,15 @@ const untilSuccess = <A, E, R>(
 ) =>
   Effect.gen(function* () {
     for (let attempt = 1; ; attempt++) {
-      const result = yield* Effect.result(effect);
+      const result = yield* Effect.result(effect.pipe(Effect.timeout(REQUEST_TIMEOUT)));
       if (result._tag === "Success") return Option.some(result.success);
       if (!isRetryable(result.failure) || attempt >= attempts) {
-        ledger.failures.push(`${kind}: ${tagOf(result.failure)}`);
+        ledger.failures.push(`${kind}: ${describe(result.failure)}`);
+        ledger.note(kind, `failed: ${describe(result.failure)}`);
         return Option.none<A>();
       }
       ledger.retry(kind);
+      ledger.note(kind, `retry ${attempt}: ${describe(result.failure)}`);
       yield* Effect.sleep("1 second");
     }
   });
@@ -244,6 +268,11 @@ export const soak = (options: SoakOptions) =>
     const startedAt = yield* Clock.currentTimeMillis;
     const deadline = startedAt + options.minutes * 60_000;
     const running = Effect.map(Clock.currentTimeMillis, (now) => now < deadline);
+    /** Sleeps for `ms`, or until the deadline when that comes first: loops end on time. */
+    const pause = (ms: number) =>
+      Effect.flatMap(Clock.currentTimeMillis, (now) =>
+        Effect.sleep(`${Math.max(0, Math.min(ms, deadline - now))} millis`),
+      );
     const prefix = uniqueId("soak");
     const models = Array.from(
       { length: options.databases },
@@ -429,28 +458,30 @@ export const soak = (options: SoakOptions) =>
             onSome: (row) => (row.value._tag === "Value" ? Number(stringOf(row.value.bytes)) : 0),
           });
           const commit = yield* Effect.result(
-            timed(
-              ledger,
-              "transaction.commit",
-              api.databases.commitTransaction({
-                params: { databaseId: model.databaseId },
-                payload: {
-                  readSeq: begun.value.readSeq,
-                  isolation: "SerializableSnapshot",
-                  batch: {
-                    operations: [
-                      {
-                        _tag: "Put",
-                        key: bytesOf(COUNTER),
-                        value: bytesOf(String(current + 1)),
-                        ttlMillis: Option.none(),
-                      },
-                    ],
+            Effect.timeout(REQUEST_TIMEOUT)(
+              timed(
+                ledger,
+                "transaction.commit",
+                api.databases.commitTransaction({
+                  params: { databaseId: model.databaseId },
+                  payload: {
+                    readSeq: begun.value.readSeq,
+                    isolation: "SerializableSnapshot",
+                    batch: {
+                      operations: [
+                        {
+                          _tag: "Put",
+                          key: bytesOf(COUNTER),
+                          value: bytesOf(String(current + 1)),
+                          ttlMillis: Option.none(),
+                        },
+                      ],
+                    },
+                    readKeys: [bytesOf(COUNTER)],
+                    readRanges: [],
                   },
-                  readKeys: [bytesOf(COUNTER)],
-                  readRanges: [],
-                },
-              }),
+                }),
+              ),
             ),
           );
           if (commit._tag === "Success") {
@@ -461,6 +492,7 @@ export const soak = (options: SoakOptions) =>
           } else if (isRetryable(commit.failure)) {
             model.counterUncertain += 1;
             ledger.retry("transaction.commit");
+            ledger.note("transaction.commit", `uncertain: ${tagOf(commit.failure)}`);
           } else {
             ledger.failures.push(`transaction.commit: ${tagOf(commit.failure)}`);
           }
@@ -471,7 +503,7 @@ export const soak = (options: SoakOptions) =>
     /** Pins a snapshot every few minutes and reads sampled keys at it later. */
     const snapshotter = (model: DatabaseModel) =>
       Effect.gen(function* () {
-        yield* Effect.sleep("3 minutes");
+        yield* pause(3 * 60_000);
         while (yield* running) {
           const pinned = yield* untilSuccess(
             ledger,
@@ -492,7 +524,7 @@ export const soak = (options: SoakOptions) =>
                 onSome: (value) => [{ key, value }],
               }),
             );
-            yield* Effect.sleep("4 minutes");
+            yield* pause(4 * 60_000);
             for (const { key, value } of expected) {
               const got = yield* untilSuccess(
                 ledger,
@@ -527,7 +559,7 @@ export const soak = (options: SoakOptions) =>
               }),
             );
           }
-          yield* Effect.sleep("6 minutes");
+          yield* pause(6 * 60_000);
         }
       });
 
@@ -535,7 +567,8 @@ export const soak = (options: SoakOptions) =>
     const remover = Effect.gen(function* () {
       let round = 0;
       while (yield* running) {
-        yield* Effect.sleep("9 minutes");
+        yield* pause(9 * 60_000);
+        if (!(yield* running)) break;
         const databaseId = DatabaseId.make(`${prefix}-tmp-${round++}`);
         yield* untilSuccess(
           ledger,
@@ -648,6 +681,17 @@ export const soak = (options: SoakOptions) =>
       }
     });
 
+    // Pull the stage's spans as they arrive, so the final pull is short: a busy stage exports
+    // faster than one pull at the end could read.
+    const tracePuller = Effect.gen(function* () {
+      while (yield* running) {
+        yield* pause(60_000);
+        const pulled = yield* Effect.result(pullMeasurementSpans(options.minutes + 10));
+        if (pulled._tag === "Failure")
+          ledger.note("trace pull", pulled.failure.message.slice(0, 200));
+      }
+    });
+
     const redeployer = Option.match(options.redeployAtMinute, {
       onNone: () => Effect.void,
       onSome: (minute) =>
@@ -672,6 +716,7 @@ export const soak = (options: SoakOptions) =>
         groupWriter,
         splitter,
         redeployer,
+        tracePuller,
       ],
       { concurrency: "unbounded", discard: true },
     );
@@ -738,20 +783,25 @@ export const soak = (options: SoakOptions) =>
           }
         }
       }
-      for (const [key] of groupModel.keys) {
-        const got = yield* untilSuccess(
-          ledger,
-          "final.shards.get",
-          shards.groups.get({ params: { group }, payload: { key: bytesOf(key) } }),
-        );
-        if (Option.isNone(got)) continue;
-        const expected = Option.flatten(groupModel.current(key));
-        if (
-          Option.getOrNull(Option.map(got.value.value, stringOf)) !== Option.getOrNull(expected)
-        ) {
-          ledger.mismatch(`group ${key} final: expected ${Option.getOrNull(expected)}`);
-        }
-      }
+      yield* Effect.forEach(
+        [...groupModel.keys.keys()],
+        (key) =>
+          Effect.gen(function* () {
+            const got = yield* untilSuccess(
+              ledger,
+              "final.shards.get",
+              shards.groups.get({ params: { group }, payload: { key: bytesOf(key) } }),
+            );
+            if (Option.isNone(got)) return;
+            const expected = Option.flatten(groupModel.current(key));
+            if (
+              Option.getOrNull(Option.map(got.value.value, stringOf)) !== Option.getOrNull(expected)
+            ) {
+              ledger.mismatch(`group ${key} final: expected ${Option.getOrNull(expected)}`);
+            }
+          }),
+        { concurrency: 16, discard: true },
+      );
       ledger.checked("final.group");
     });
     yield* finalChecks;
@@ -787,6 +837,7 @@ export const soak = (options: SoakOptions) =>
         .pipe(
           Effect.flatMap((response) => response.text),
           Effect.flatMap(decodeStorageReport),
+          Effect.timeout(REQUEST_TIMEOUT),
           Effect.option,
         );
       if (Option.isNone(status) || Option.isNone(described)) continue;
@@ -817,10 +868,27 @@ export const soak = (options: SoakOptions) =>
     const health = yield* measureHealth(Math.ceil((endedAt - startedAt) / 60_000) + 5).pipe(
       Effect.option,
     );
-    const store = yield* pullMeasurementSpans(Math.ceil((endedAt - startedAt) / 60_000) + 5);
-    const errorSpans = yield* spansSince(store, startedAt, ["--error"]).pipe(
-      Effect.orElseSucceed(() => []),
+    const pulledStore = yield* Effect.result(
+      pullMeasurementSpans(Math.ceil((endedAt - startedAt) / 60_000) + 5),
     );
+    if (pulledStore._tag === "Failure")
+      ledger.failures.push(`trace pull: ${pulledStore.failure.message}`);
+    const store = pulledStore._tag === "Success" ? pulledStore.success : "";
+    const errorSpans =
+      store === ""
+        ? []
+        : yield* spansSince(store, startedAt, ["--error"]).pipe(
+            Effect.tapError((error) =>
+              Effect.sync(() => ledger.failures.push(`trace grep: ${error.message}`)),
+            ),
+            Effect.orElseSucceed(() => []),
+          );
+    // A soak whose spans were not read cannot claim no unexpected errors.
+    const spansChecked = yield* spansSince(store, startedAt, ["--name", "DbWriter.write"]).pipe(
+      Effect.map((spans) => spans.length),
+      Effect.orElseSucceed(() => 0),
+    );
+    if (spansChecked === 0) ledger.failures.push("no spans from the soak's window were read");
     const errorsByException = new Map<string, number>();
     for (const span of errorSpans) {
       const type = exceptionType(span);
@@ -854,6 +922,7 @@ export const soak = (options: SoakOptions) =>
       failures: ledger.failures,
       checks: Object.fromEntries(ledger.checks),
       retried: Object.fromEntries(ledger.retried),
+      events: ledger.events,
       counters: models.map((model) => ({
         databaseId: model.databaseId,
         committed: model.counterCommitted,
@@ -861,6 +930,7 @@ export const soak = (options: SoakOptions) =>
       })),
       latencies,
       storage,
+      spansChecked,
       errorsByException: Object.fromEntries(errorsByException),
       unexpectedErrors: Object.fromEntries(unexpectedErrors),
       health: Option.getOrNull(health),

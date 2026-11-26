@@ -157,6 +157,13 @@ const readerBudgetGroup = (databaseId: DatabaseId, manifest: Manifest): string =
   Option.getOrElse(manifest.options.budgetGroup, () => databaseId);
 
 /** Constructs the reader over the contextual manifest cache, manifest reader, and block cache. */
+/**
+ * Blocks of one SST a scan reads ahead of the merge (D67). A block read from a Worker far from the
+ * bucket takes hundreds of milliseconds, so a full page of 1,000 rows over several SSTs needs many
+ * reads in flight; a short scan wastes at most this many speculative reads per SST.
+ */
+export const SCAN_READ_AHEAD_BLOCKS = 8;
+
 export const makeDbReader = Effect.gen(function* () {
   const manifests = yield* ManifestCache;
   const reader = yield* ManifestReader;
@@ -357,7 +364,8 @@ export const makeDbReader = Effect.gen(function* () {
         const meta = yield* blocks.meta(owner, handle, budgetGroup);
         const indexes = blocksOverlappingRange(meta, effective.value);
         return Stream.fromIterable(indexes).pipe(
-          // Fetch the next block while the current one is consumed.
+          // Read ahead while the merge consumes this source: it pulls one source at a time, so
+          // without read-ahead a scan waits on one block read at a time (D67).
           Stream.mapEffect(
             (index) => {
               const entry = meta.index[index];
@@ -367,7 +375,7 @@ export const makeDbReader = Effect.gen(function* () {
                     ...block.rows(),
                   ]);
             },
-            { concurrency: 2 },
+            { concurrency: Math.min(SCAN_READ_AHEAD_BLOCKS, Math.max(1, indexes.length)) },
           ),
           Stream.flatMap((rows) => Stream.fromIterable(rows)),
           Stream.filter(

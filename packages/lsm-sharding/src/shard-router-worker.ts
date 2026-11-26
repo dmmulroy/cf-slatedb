@@ -7,6 +7,7 @@ import {
   eventTelemetryFlushForStage,
   lsmAccessGateFrom,
   type LsmAccessTokenSource,
+  type LsmWorkerTailConsumers,
   lsmHttpServerLayer,
   lsmWorkerCompatibility,
   type LsmWorkerSettingsSource,
@@ -276,6 +277,8 @@ export interface ShardRouterWorkerOptions<R = never> {
    * `lsmStageAccessTokens` for a stage's single state-held one.
    */
   readonly accessTokens: LsmAccessTokenSource<R>;
+  /** Tail Workers attached to the Worker and its directories (`noLsmTailConsumers` locally). */
+  readonly tailConsumers: LsmWorkerTailConsumers<R>;
   readonly devPort: number;
 }
 
@@ -296,6 +299,7 @@ export const shardRouterWorkerLayer = <R = never>(options: ShardRouterWorkerOpti
       return {
         main: options.main,
         compatibility: yield* lsmWorkerCompatibility,
+        tailConsumers: yield* options.tailConsumers,
         dev: { host: "127.0.0.1", port: options.devPort },
       };
     }),
