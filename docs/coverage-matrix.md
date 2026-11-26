@@ -369,6 +369,11 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   scenarios pass, and `BlockServer` responses carry no `Cf-Cache-Status`.
 - **Removal (fails while forks depend; purges in batches)** — done. `DatabaseLifecycle.remove`
   (`DatabaseHasDependentsError`; one tag purge per database through `BlockServer`).
+- **Routed reads see writes across a split (stale maps)** — done (D59). `DbWriter.probe`/`scan`
+  report `sealedSuccessors`; `ReadOptions.refuseSealed` (`db-client.ts`); `ShardRouter` gets route
+  through `withRouting` and scans resume shard by shard (`scanFrom`). Test: `sharding.test.ts` (a
+  second router with a stale map reads the new key by get and scan), mutation caught. Live:
+  `fork-split` 5/5 on `preview-1`.
 - **Splits pause briefly and never fail (v1 workstream 3)** — done (D57). `DbWriter.seal` with
   `holdForSuccessors` (`flushThen`: final flush, seal, and lsm-core `holdForSuccessors` in one
   CAS); `DatabaseLifecycle.forkRange` reuses a hold already taken and warms the fork's writer and

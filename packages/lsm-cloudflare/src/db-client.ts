@@ -1,5 +1,6 @@
 import {
   type DatabaseId,
+  DatabaseSealedError,
   keyRangeContains,
   keyRangeOfPrefix,
   type KeyRange,
@@ -73,6 +74,13 @@ export interface ReadOptions {
   readonly consistency: ReadConsistency;
   /** Read at this snapshot instead (consistency is ignored). */
   readonly snapshot: Option.Option<DbSnapshot>;
+  /**
+   * Whether a `Latest` read of a sealed database fails with `DatabaseSealedError` (naming its
+   * successors) instead of reading it. A router that picks the database from a cached map sets it,
+   * so a stale map cannot return data from before a split (D57). Other reads leave it false: a
+   * sealed database stays readable.
+   */
+  readonly refuseSealed: boolean;
 }
 
 /** Options of a scan. */
@@ -304,6 +312,22 @@ export const makeDbClient = Effect.gen(function* () {
         )
       : Effect.succeed(consistency._tag === "Flushed");
 
+  /** With `refuseSealed`, a sealed database's `Latest` read fails as a write would. */
+  const refuseIfSealed = (
+    databaseId: DatabaseId,
+    options: ReadOptions,
+    sealedSuccessors: Option.Option<ReadonlyArray<DatabaseId>>,
+  ) =>
+    options.refuseSealed && Option.isSome(sealedSuccessors)
+      ? Effect.fail(
+          new DatabaseSealedError({
+            databaseId,
+            successors: sealedSuccessors.value,
+            message: `Database ${databaseId} is sealed; its successors are ${sealedSuccessors.value.join(", ")}. Read from the successor whose key range holds the key.`,
+          }),
+        )
+      : Effect.void;
+
   const pointView = (databaseId: DatabaseId, key: Uint8Array, options: ReadOptions) =>
     Effect.gen(function* () {
       if (Option.isSome(options.snapshot)) return snapshotView(options.snapshot.value);
@@ -313,6 +337,7 @@ export const makeDbClient = Effect.gen(function* () {
           : FLUSHED_VIEW;
       }
       const probe = yield* writer.probe(databaseId, key);
+      yield* refuseIfSealed(databaseId, options, probe.sealedSuccessors);
       return {
         minLastL0Seq: probe.flushedSeq,
         snapshotSeq: Option.some(probe.snapshotSeq),
@@ -343,6 +368,7 @@ export const makeDbClient = Effect.gen(function* () {
           limit: MEMTABLE_PAGE_ROWS,
           includeRetained: false,
         });
+        yield* refuseIfSealed(databaseId, options, page.sealedSuccessors);
         rows.push(...page.rows);
         snapshotSeq = Option.some(page.snapshotSeq);
         if (page.flushedSeq > flushedSeq) flushedSeq = page.flushedSeq;

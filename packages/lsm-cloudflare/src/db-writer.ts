@@ -72,6 +72,8 @@ export interface MemTableProbe {
    * gone from the memtable, so the reader needs a manifest with `lastL0Seq >= flushedSeq`.
    */
   readonly flushedSeq: SeqNum;
+  /** The database's successors when it is sealed, so a router can tell its map is stale. */
+  readonly sealedSuccessors: Option.Option<ReadonlyArray<DatabaseId>>;
 }
 
 /**
@@ -92,6 +94,8 @@ export interface MemTableScanPage {
   readonly flushedSeq: SeqNum;
   /** Rows at or below it are gone from SQLite (see `WriterMeta.retainedFromSeq`). */
   readonly retainedFromSeq: SeqNum;
+  /** The database's successors when it is sealed (see `MemTableProbe.sealedSuccessors`). */
+  readonly sealedSuccessors: Option.Option<ReadonlyArray<DatabaseId>>;
   /** Where the next page starts, or none on the last page. */
   readonly nextCursor: Option.Option<MemTableCursor>;
 }
@@ -739,7 +743,7 @@ export const makeDbWriter = Effect.gen(function* () {
 
   const probe = Effect.fn("DbWriter.probe")(function* (databaseId: DatabaseId, key: Uint8Array) {
     yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
-    yield* ensureReady(databaseId);
+    const ready = yield* ensureReady(databaseId);
     // Read flushedSeq and the versions atomically: a flush truncating in between would hide rows.
     const { meta, versions } = yield* memTable
       .consistently((meta) =>
@@ -754,7 +758,12 @@ export const makeDbWriter = Effect.gen(function* () {
       "probe.versions": versions.length,
       "probe.flushed_seq": meta.flushedSeq,
     });
-    return { versions, snapshotSeq: meta.lastSeq, flushedSeq: meta.flushedSeq };
+    return {
+      versions,
+      snapshotSeq: meta.lastSeq,
+      flushedSeq: meta.flushedSeq,
+      sealedSuccessors: ready.sealed,
+    };
   });
 
   const probeAt = Effect.fn("DbWriter.probeAt")(function* (
@@ -790,7 +799,7 @@ export const makeDbWriter = Effect.gen(function* () {
     },
   ) {
     yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
-    yield* ensureReady(databaseId);
+    const ready = yield* ensureReady(databaseId);
     const limit = Math.max(1, Math.min(request.limit, 1000));
     // One page is read atomically with flushedSeq; across pages the reader takes the largest one.
     const { meta, snapshotSeq, rows } = yield* memTable
@@ -818,6 +827,7 @@ export const makeDbWriter = Effect.gen(function* () {
       snapshotSeq,
       flushedSeq: meta.flushedSeq,
       retainedFromSeq: meta.retainedFromSeq,
+      sealedSuccessors: ready.sealed,
       nextCursor:
         rows.length === limit && last !== undefined
           ? Option.some({ key: last.key, seq: last.seq })

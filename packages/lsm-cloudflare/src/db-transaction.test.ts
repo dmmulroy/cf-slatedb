@@ -314,10 +314,12 @@ describe("transactions", () => {
           const after = yield* client.get(DB, key(1), {
             consistency: { _tag: "Latest" },
             snapshot: Option.none(),
+            refuseSealed: false,
           });
           const three = yield* client.get(DB, key(3), {
             consistency: { _tag: "Latest" },
             snapshot: Option.none(),
+            refuseSealed: false,
           });
           return { result, after, three };
         }),

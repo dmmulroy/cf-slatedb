@@ -16,7 +16,7 @@ import {
   type ReadOptions,
   type ScanReadOptions,
 } from "@cf-slatedb/lsm-cloudflare";
-import { Clock, Context, Effect, Layer, Option, Ref, Result, Schema, Stream } from "effect";
+import { Bytes, Clock, Context, Effect, Layer, Option, Ref, Result, Schema, Stream } from "effect";
 
 import { ShardDirectory, type ShardDirectoryError } from "./shard-directory.ts";
 import { ShardGroup, type ShardMap, shardFor, shardsOverlapping } from "./shard-map.ts";
@@ -230,18 +230,60 @@ export const makeShardRouter = Effect.gen(function* () {
     return yield* routed(group, key, (databaseId) => client.get(databaseId, key, options));
   });
 
+  /**
+   * Scans `range` shard by shard in key order. A shard whose database turns out to be sealed (a
+   * stale map; `Latest` scans refuse sealed databases when `refuseSealed` is set) fails before it
+   * emits a row, so the scan waits on the directory for the newer map and resumes that shard's part
+   * from it, within the same deadline as a routed write.
+   */
+  const scanFrom = (
+    group: ShardGroup,
+    range: KeyRange,
+    options: ScanReadOptions,
+    deadline: number,
+  ): Stream.Stream<Row, DbClientReadError | ShardDirectoryError, DbReaderServices> =>
+    Stream.unwrap(
+      Effect.gen(function* () {
+        const map = yield* mapFor(group);
+        const [first] = shardsOverlapping(map, range);
+        if (first === undefined) return Stream.empty;
+        const part = intersectKeyRanges(range, first.range);
+        if (Option.isNone(part)) return Stream.empty;
+        const head = client
+          .scan(first.databaseId, part.value, { ...options, limit: Option.none() })
+          .pipe(
+            Stream.catchIf(isRoutingError, (error) =>
+              Stream.unwrap(
+                Effect.gen(function* () {
+                  const remaining = deadline - (yield* Clock.currentTimeMillis);
+                  if (remaining <= 0) return Stream.fail(error);
+                  const waited = yield* directory.awaitMap(group, map.version, remaining);
+                  yield* Ref.update(maps, (current) => new Map(current).set(group, waited.map));
+                  return waited.outcome === "Newer"
+                    ? scanFrom(group, range, options, deadline)
+                    : Stream.fail(error);
+                }),
+              ),
+            ),
+          );
+        // Shards are in key order and disjoint: the rest of the range starts where this shard ends.
+        const rest = Option.match(first.range.end, {
+          onNone: () => Stream.empty,
+          onSome: (end) =>
+            Option.isSome(range.end) && Bytes.Order(range.end.value, end) <= 0
+              ? Stream.empty
+              : Stream.suspend(() =>
+                  scanFrom(group, { start: end, end: range.end }, options, deadline),
+                ),
+        });
+        return Stream.concat(head, rest);
+      }),
+    );
+
   const scan = (group: ShardGroup, range: KeyRange, options: ScanReadOptions) =>
     Stream.unwrap(
-      Effect.map(mapFor(group), (map) => {
-        const perShard = shardsOverlapping(map, range).map((shard) =>
-          Option.match(intersectKeyRanges(range, shard.range), {
-            onNone: () => Stream.empty,
-            onSome: (part) =>
-              client.scan(shard.databaseId, part, { ...options, limit: Option.none() }),
-          }),
-        );
-        // Shards are in key order and disjoint, so concatenation is the merged order.
-        const all = Stream.fromIterable(perShard).pipe(Stream.flatMap((rows) => rows));
+      Effect.map(Clock.currentTimeMillis, (now) => {
+        const all = scanFrom(group, range, options, now + ROUTING_WAIT_MS);
         return Option.match(options.limit, {
           onNone: () => all,
           onSome: (limit) => Stream.take(all, limit),

@@ -939,3 +939,29 @@ new `trimUnflushed` variant fails `NoAckedWriteLost`.
 Measured on `preview-1` with production settings: 4 transactors held each transaction open ~21.7 s
 between its reads while 4 writers loaded the database and it was flushed every 3 s (23 flushes).
 24/24 committed, 0 `SnapshotTooOld`.
+
+## D59. Routed `Latest` reads refuse a sealed database, so a stale map cannot hide a split
+
+Found live while checking D58 on `preview-1`: the `fork-split` scenario intermittently read `None`
+for a key it had just written to a new shard (and a scan missed it). The router Worker isolate
+that served the write had learned the new map, because the sealed source refused the write. The next
+request reached another isolate whose cached map was still the old one. Reads of a sealed database
+succeed (it stays readable for its own callers), so nothing told that isolate its map was stale, and
+it read the sealed source, missing the acknowledged write. The bug was latent since Phase 8;
+D57's faster splits made the window easy to hit.
+
+- **The writer says when it is sealed.** `DbWriter.probe` and `scan` report `sealedSuccessors`.
+- **`ReadOptions.refuseSealed`.** A `Latest` read or scan with it set fails with
+  `DatabaseSealedError` (naming the successors) on a sealed database, before returning any row. The
+  shard router sets it; the public database API and every other caller leave it false.
+- **Routed reads route like writes.** A routed get goes through the same directory wait as a write
+  (`withRouting`). A routed scan goes shard by shard and, when one shard turns out sealed, waits on
+  the directory and resumes that shard's part from the new map. A refused shard emits no rows, so
+  nothing is returned twice.
+- **`Flushed` and `AtLeast` reads** never consult the writer and stay eventually consistent; reading
+  a sealed source through them returns its state at the seal, a valid older snapshot.
+
+Test: `sharding.test.ts` "a router whose map went stale in another isolate still reads its writes
+after a split" (a second router caches the old map; its get and scan see the new key), shown failing
+without the refusal. Live: `fork-split` passes 5/5 on `preview-1` (it had failed 2 of 3), and all 11
+scenarios pass.

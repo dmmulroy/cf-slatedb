@@ -38,6 +38,7 @@ export const ProbeResponse = Schema.Struct({
   versions: Schema.Array(RowSchema),
   snapshotSeq: SeqNum,
   flushedSeq: SeqNum,
+  sealedSuccessors: Schema.OptionFromNullOr(Schema.Array(DatabaseId)),
 });
 
 /** Schema for a transaction's probe of one key at its read sequence number. */
@@ -67,6 +68,7 @@ export const MemTableScanResponse = Schema.Struct({
   snapshotSeq: SeqNum,
   flushedSeq: SeqNum,
   retainedFromSeq: SeqNum,
+  sealedSuccessors: Schema.OptionFromNullOr(Schema.Array(DatabaseId)),
   nextCursor: Schema.OptionFromNullOr(MemTableCursorSchema),
 });
 

@@ -220,6 +220,7 @@ const shardedHttpHandlersLayer = HttpApiBuilder.group(ShardedHttpApi, "groups", 
             .get(params.group, payload.key, {
               consistency: { _tag: "Latest" },
               snapshot: Option.none(),
+              refuseSealed: true,
             })
             .pipe(Effect.map((value) => ({ value }))),
         ),
@@ -230,6 +231,7 @@ const shardedHttpHandlersLayer = HttpApiBuilder.group(ShardedHttpApi, "groups", 
             router.scan(params.group, payload.range, {
               consistency: { _tag: "Latest" },
               snapshot: Option.none(),
+              refuseSealed: true,
               limit: Option.some(payload.limit),
             }),
           ).pipe(

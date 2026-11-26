@@ -72,7 +72,14 @@ hand-off is below.
   old callers and old writer state keep the previous behavior. Models: `Transactions` rewritten
   (new broken variants `trimWithoutAbort`, `noReadHorizonCheck`), `NoAckedWriteLost` with `Trim`
   (`trimUnflushed`). **Live (`preview-1`, production settings):** 24/24 transactions held ~21.7 s
-  across 6–7 flushes committed, 0 `SnapshotTooOld`. 11/11 scenarios locally.
+  across 6–7 flushes committed, 0 `SnapshotTooOld`. 11/11 scenarios locally. **Process slip:** the
+  live scenario run after deploying it failed `fork-split`, and the commit (`5f2850b`) went out
+  before I read the result; the cause was not D58 but a latent routing bug, fixed in the next
+  commit (D59) before any further work.
+- **Finding (fixed, D59):** a router isolate with a stale map read a sealed shard and missed a write
+  just acknowledged by a new shard (intermittent `fork-split` failure live). Routed `Latest` reads
+  now refuse sealed databases (`refuseSealed`) and wait on the directory like writes; scans resume
+  shard by shard. `fork-split` 5/5 and 11/11 scenarios on `preview-1`.
 
 ## Remaining-work log
 

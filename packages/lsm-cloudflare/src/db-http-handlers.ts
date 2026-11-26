@@ -161,6 +161,7 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
           .getRow(params.databaseId, payload.key, {
             consistency: payload.consistency,
             snapshot: payload.snapshot,
+            refuseSealed: false,
           })
           .pipe(
             Effect.map((row) => ({ row })),
@@ -172,6 +173,7 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
           client.scan(params.databaseId, payload.range, {
             consistency: payload.consistency,
             snapshot: payload.snapshot,
+            refuseSealed: false,
             // One extra row tells whether another page follows.
             limit: Option.some(payload.limit + 1),
           }),

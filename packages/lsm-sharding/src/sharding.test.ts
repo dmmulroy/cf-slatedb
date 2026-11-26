@@ -11,7 +11,11 @@ import { describe, expect, it } from "vite-plus/test";
 
 import { ShardDirectory, shardDirectoryTestLayer } from "./shard-directory.ts";
 import { ShardGroup, shardFor } from "./shard-map.ts";
-import { ShardRouter, shardRouterLayerWithoutDependencies } from "./shard-router.ts";
+import {
+  makeShardRouter,
+  ShardRouter,
+  shardRouterLayerWithoutDependencies,
+} from "./shard-router.ts";
 import { ShardSplit, shardSplitLayerWithoutDependencies } from "./shard-split.ts";
 
 const GROUP = ShardGroup.make("orders");
@@ -19,7 +23,11 @@ const FIRST = DatabaseId.make("orders-0");
 const smallInt = (minimum: number, maximum: number) =>
   Arbitrary.schema(Schema.Int.check(Schema.isBetween({ minimum, maximum })));
 const key = (n: number) => Uint8Array.of(n);
-const latest = { consistency: { _tag: "Latest" } as const, snapshot: Option.none() };
+const latest = {
+  consistency: { _tag: "Latest" } as const,
+  snapshot: Option.none(),
+  refuseSealed: true,
+};
 
 /** Router, split, directory, and an in-memory database deployment. */
 const testLayer = Layer.mergeAll(
@@ -141,6 +149,31 @@ describe("sharding", () => {
     const failure = Arbitrary.formatCheckFailure(result);
     if (failure !== undefined) throw new Error(failure);
   }, 120_000);
+
+  it("a router whose map went stale in another isolate still reads its writes after a split", async () => {
+    const outcome = await Effect.runPromise(
+      provide(
+        Effect.gen(function* () {
+          yield* createGroup;
+          const writer = yield* ShardRouter;
+          // A second router (another isolate) caches the one-shard map before the split.
+          const reader = yield* makeShardRouter;
+          yield* writer.put(GROUP, key(1), Uint8Array.of(1));
+          yield* reader.get(GROUP, key(1), latest);
+          yield* (yield* ShardSplit).split(GROUP, FIRST, key(8));
+          // The writer learns the new map from the sealed shard; the reader never saw it.
+          yield* writer.put(GROUP, key(9), Uint8Array.of(9));
+          const nine = yield* reader.get(GROUP, key(9), latest);
+          const scanned = yield* Stream.runCollect(
+            reader.scan(GROUP, FULL_KEY_RANGE, { ...latest, limit: Option.none() }),
+          );
+          return { nine, scanned: scanned.map((row) => row.key[0]) };
+        }),
+      ),
+    );
+    expect(outcome.nine).toEqual(Option.some(Uint8Array.of(9)));
+    expect(outcome.scanned).toEqual([1, 9]);
+  }, 60_000);
 
   it("refuses a batch spanning shards, and a stale router reaches the new shards", async () => {
     const outcome = await Effect.runPromise(

@@ -116,6 +116,7 @@ describe("Compactor", () => {
         const value = yield* (yield* DbClient).get(ORDERS, Uint8Array.of(2), {
           consistency: { _tag: "Latest" },
           snapshot: Option.none(),
+          refuseSealed: false,
         });
         return {
           woken,

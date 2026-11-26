@@ -102,6 +102,7 @@ const valuesIn = (databaseId: DatabaseId) =>
       const value = yield* client.get(databaseId, bytes(key), {
         consistency: { _tag: "Latest" },
         snapshot: Option.none(),
+        refuseSealed: false,
       });
       if (Option.isSome(value)) found.push(`${key}=${text(value.value)}`);
     }
@@ -287,6 +288,7 @@ describe("DatabaseLifecycle", () => {
             .get(SOURCE, bytes("a"), {
               consistency: { _tag: "Flushed" },
               snapshot: Option.some(snapshot),
+              refuseSealed: false,
             })
             .pipe(
               Effect.map((value) => Option.getOrElse(Option.map(value, text), () => "none")),

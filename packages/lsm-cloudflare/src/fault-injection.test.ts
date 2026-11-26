@@ -158,6 +158,7 @@ describe("fault injection", () => {
                     client.get(DB, Uint8Array.of(step.key), {
                       consistency: { _tag: "Latest" },
                       snapshot: Option.none(),
+                      refuseSealed: false,
                     }),
                   );
                   if (got._tag === "Success") {
@@ -186,6 +187,7 @@ describe("fault injection", () => {
                   const got = yield* client.get(DB, Uint8Array.of(key), {
                     consistency,
                     snapshot: Option.none(),
+                    refuseSealed: false,
                   });
                   if (
                     Option.getOrUndefined(Option.map(got, (bytes) => bytes[0])) !== oracle.get(key)
@@ -226,6 +228,7 @@ describe("fault injection", () => {
           const value = yield* client.get(DB, Uint8Array.of(1), {
             consistency: { _tag: "Flushed" },
             snapshot: Option.none(),
+            refuseSealed: false,
           });
           yield* TestClock.adjust("11 seconds");
           const report = yield* (yield* GarbageCollector).collect(DB);
@@ -303,6 +306,7 @@ describe("fault injection", () => {
             const got = yield* client.get(DB, Uint8Array.of(key), {
               consistency: { _tag: "Flushed" },
               snapshot: Option.none(),
+              refuseSealed: false,
             });
             values.push(
               Option.match(got, { onNone: () => "-", onSome: (bytes) => bytes.join(".") }),

@@ -119,6 +119,7 @@ describe("DbClient against a Map oracle", () => {
                   const got = yield* client.get(DB, keyBytes(step.key), {
                     consistency,
                     snapshot: Option.none(),
+                    refuseSealed: false,
                   });
                   const want = (consistency._tag === "Flushed" ? flushed : latest).get(step.key);
                   if (
@@ -140,6 +141,7 @@ describe("DbClient against a Map oracle", () => {
                 client.scan(DB, FULL_KEY_RANGE, {
                   consistency,
                   snapshot: Option.none(),
+                  refuseSealed: false,
                   limit: Option.none(),
                 }),
               );
@@ -173,6 +175,7 @@ describe("DbClient against a Map oracle", () => {
         const flushedRead = client.get(DB, keyBytes(1), {
           consistency: { _tag: "Flushed" },
           snapshot: Option.none(),
+          refuseSealed: false,
         });
         const before = yield* flushedRead;
         const receipt = yield* client.put(DB, keyBytes(1), Uint8Array.of(9));
@@ -181,6 +184,7 @@ describe("DbClient against a Map oracle", () => {
         const atLeast = yield* client.get(DB, keyBytes(1), {
           consistency: { _tag: "AtLeast", seq: receipt.seq },
           snapshot: Option.none(),
+          refuseSealed: false,
         });
         yield* TestClock.adjust("2 seconds");
         const fresh = yield* flushedRead;
@@ -209,11 +213,13 @@ describe("DbClient against a Map oracle", () => {
         const atSnapshot = yield* client.get(DB, keyBytes(1), {
           consistency: { _tag: "Latest" },
           snapshot: Option.some(snapshot),
+          refuseSealed: false,
         });
         const prefix = yield* Stream.runCollect(
           client.scanPrefix(DB, Uint8Array.of(0x6b), {
             consistency: { _tag: "Flushed" },
             snapshot: Option.some(snapshot),
+            refuseSealed: false,
             limit: Option.none(),
           }),
         );
@@ -222,6 +228,7 @@ describe("DbClient against a Map oracle", () => {
         const now = yield* client.get(DB, keyBytes(1), {
           consistency: { _tag: "Flushed" },
           snapshot: Option.none(),
+          refuseSealed: false,
         });
         return { atSnapshot, prefix: prefix.length, now };
       }),

@@ -103,7 +103,12 @@ const readAll = Effect.gen(function* () {
     (yield* DbClient).scan(
       DB,
       { start: new Uint8Array(0), end: Option.none() },
-      { consistency: { _tag: "Latest" }, snapshot: Option.none(), limit: Option.none() },
+      {
+        consistency: { _tag: "Latest" },
+        snapshot: Option.none(),
+        refuseSealed: false,
+        limit: Option.none(),
+      },
     ),
   );
   return rows.map((row) => row.key[0]);

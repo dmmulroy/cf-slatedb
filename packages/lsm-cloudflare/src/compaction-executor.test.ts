@@ -171,6 +171,7 @@ describe("CompactionExecutor", () => {
                   client.scan(DB, FULL_KEY_RANGE, {
                     consistency,
                     snapshot: Option.none(),
+                    refuseSealed: false,
                     limit: Option.none(),
                   }),
                 );
@@ -185,6 +186,7 @@ describe("CompactionExecutor", () => {
                   const got = yield* client.get(DB, keyBytes(key), {
                     consistency,
                     snapshot: Option.none(),
+                    refuseSealed: false,
                   });
                   if (
                     hex(Option.getOrElse(got, () => Uint8Array.of())) !==
@@ -261,6 +263,7 @@ describe("CompactionExecutor", () => {
           return yield* client.get(DB, keyBytes(1), {
             consistency: { _tag: "Flushed" },
             snapshot: Option.none(),
+            refuseSealed: false,
           });
         }),
       ),
