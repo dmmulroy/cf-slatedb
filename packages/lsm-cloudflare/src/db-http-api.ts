@@ -208,7 +208,7 @@ export class DbHttpApiGroup extends HttpApiGroup.make("databases")
       OpenApi.annotations({
         summary: "Write a batch",
         description:
-          "Commits puts, deletes, and merges atomically with one sequence number. The write is durable when the response arrives. Pass the returned `seq` to an `AtLeast` read to read your own write.",
+          "Commits puts, deletes, and merges atomically with one sequence number. The write is durable when the response arrives. Pass the returned `seq` to an `AtLeast` read to read your own write. Each put and merge with `ttlMillis` expires on its own: a read treats an expired value as deleted and skips an expired merge operand, so operands that have not expired still apply (onto nothing, when the value under them has expired). Within one batch, a key's operations become one version: its merges must share one TTL, and the version expires at the earliest TTL among them.",
       }),
     ),
   )
@@ -465,7 +465,7 @@ export class DbHttpApiGroup extends HttpApiGroup.make("databases")
       OpenApi.annotations({
         summary: "Read the change feed",
         description:
-          "Returns committed changes after `afterSeq` in sequence order (flushed ones from the changelog, then unflushed ones), never splitting a batch. Continue from `nextAfterSeq`. Requires the database's changelog; fails with ChangelogUnavailable when it is disabled or the changes were dropped by retention.",
+          "Returns committed changes after `afterSeq` in sequence order (flushed ones from the changelog, then unflushed ones), never splitting a batch. Continue from `nextAfterSeq`. Requires the database's changelog; fails with ChangelogUnavailable when it is disabled or the changes were dropped by retention. A fork or split successor's feed starts at its fork point: changes up to it are in the source's feed, and an earlier `afterSeq` fails with ChangelogUnavailable (Expired). To follow a database through a split, read the sealed source's feed until a page returns no rows, then read each successor's feed with `afterSeq` set to the source's `lastSeq` from its status.",
       }),
     ),
   ) {}

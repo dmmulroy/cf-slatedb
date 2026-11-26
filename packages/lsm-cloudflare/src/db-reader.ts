@@ -11,6 +11,8 @@ import {
   MERGE_OPERATORS,
   type MergeOperatorMissingError,
   mergeRowStreams,
+  changelogAfterSeqOf,
+  changelogHoldsChangesAfter,
   resolveVisibleRow,
   type Row,
   type SeqNum,
@@ -592,17 +594,19 @@ export const makeDbReader = Effect.gen(function* () {
         message: `Database ${databaseId} exports no changelog, so flushed changes cannot be read. Create the database with a changelog retention to use the change feed.`,
       });
     }
-    const entries = [...manifest.changelog]
-      .filter((entry) => entry.lastSeq > afterSeq)
-      .sort((left, right) => left.firstSeq - right.firstSeq);
-    const [oldest] = entries;
-    if (oldest !== undefined && oldest.firstSeq > afterSeq + 1) {
+    // Only when the changelog provably holds every change after `afterSeq` (D80): retention may
+    // have pruned them, or they may belong to the source of a fork.
+    if (!changelogHoldsChangesAfter(manifest, afterSeq)) {
+      const heldAfter = changelogAfterSeqOf(manifest);
       return yield* new ChangelogUnavailableError({
         databaseId,
         reason: "Expired",
-        message: `Changes of database ${databaseId} after sequence number ${afterSeq} were dropped by changelog retention (the oldest kept starts at ${oldest.firstSeq}). Restart the consumer from a snapshot.`,
+        message: `Changes of database ${databaseId} after sequence number ${afterSeq} are no longer in its changelog: it holds only the changes after sequence number ${heldAfter} (older ones were dropped by changelog retention, or, for a fork or split successor, belong to its source's feed). Restart the consumer from a snapshot, or read the source's feed up to ${heldAfter}.`,
       });
     }
+    const entries = [...manifest.changelog]
+      .filter((entry) => entry.lastSeq > afterSeq)
+      .sort((left, right) => left.firstSeq - right.firstSeq);
     // Changelog SSTs are read sequentially and once per consumer: straight from R2, not cached.
     const unavailable = (key: string) => (error: { readonly message: string }) =>
       new ReaderUnavailableError({

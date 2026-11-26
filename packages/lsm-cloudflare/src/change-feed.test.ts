@@ -1,25 +1,32 @@
 import {
+  changelogAfterSeqOf,
+  CheckpointId,
   DatabaseId,
   DEFAULT_DATABASE_OPTIONS,
+  FULL_KEY_RANGE,
+  forkManifest,
   initialManifest,
   pruneChangelog,
   SeqNum,
   Timestamp,
 } from "@shaledb/lsm-core";
-import { Arbitrary, Effect, Option, Result, Schema } from "effect";
+import { Arbitrary, Clock, Effect, Option, Result, Schema } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
 import { cutAtSequenceBoundary, DbClient, dbClientTestLayer } from "./db-client.ts";
 import type { DbReaderServices } from "./db-reader.ts";
 import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
+import { ManifestReader } from "./manifest-reader.ts";
 import { ManifestStore } from "./manifest-store.ts";
 
 const DB = DatabaseId.make("orders");
 const smallInt = (minimum: number, maximum: number) =>
   Arbitrary.schema(Schema.Int.check(Schema.isBetween({ minimum, maximum })));
 
-const provide = <A, E>(program: Effect.Effect<A, E, DbClient | ManifestStore | DbReaderServices>) =>
+const provide = <A, E>(
+  program: Effect.Effect<A, E, DbClient | ManifestStore | ManifestReader | DbReaderServices>,
+) =>
   program.pipe(
     Effect.scoped,
     Effect.provide(dbClientTestLayer({ blockSize: 64 })),
@@ -43,22 +50,24 @@ const create = (changelog: boolean) =>
 type Step =
   | { readonly _tag: "Batch"; readonly keys: ReadonlyArray<number> }
   | { readonly _tag: "Flush" }
+  | { readonly _tag: "Prune" }
   | { readonly _tag: "Consume"; readonly limit: number };
 
 const stepArbitrary: Arbitrary.Arbitrary<Step> = Arbitrary.all({
-  kind: smallInt(0, 9),
+  kind: smallInt(0, 10),
   keys: Arbitrary.array(smallInt(0, 5), { minLength: 1, maxLength: 3 }),
   limit: smallInt(1, 4),
 }).pipe(
   Arbitrary.map(({ kind, keys, limit }): Step => {
     if (kind <= 5) return { _tag: "Batch", keys };
     if (kind <= 7) return { _tag: "Flush" };
+    if (kind === 8) return { _tag: "Prune" };
     return { _tag: "Consume", limit };
   }),
 );
 
 describe("change feed", () => {
-  it("delivers every committed change exactly once, in sequence order, across flushes and pages", async () => {
+  it("delivers every committed change exactly once, in sequence order, across flushes, pages, and retention, or says Expired (D80)", async () => {
     const result = await Effect.runPromise(
       Arbitrary.checkEffect(
         Arbitrary.array(stepArbitrary, { minLength: 10, maxLength: 40 }),
@@ -70,10 +79,42 @@ describe("change feed", () => {
               // Each committed change as "seq:key", in commit order (one seq per batch).
               const committed: Array<string> = [];
               const consumed: Array<string> = [];
+              // Changes the feed reported lost (Expired), which the consumer skipped knowingly.
+              const lost: Array<string> = [];
               let cursor = SeqNum.make(0);
+              const seqOf = (change: string) => Number(change.split(":")[0]);
+              const between = (after: number, upTo: number) =>
+                committed.filter((change) => seqOf(change) > after && seqOf(change) <= upTo);
               const consume = (limit: number) =>
                 Effect.gen(function* () {
-                  const page = yield* client.changes(DB, cursor, limit);
+                  const result = yield* Effect.result(client.changes(DB, cursor, limit));
+                  if (Result.isFailure(result)) {
+                    const failure = result.failure;
+                    if (
+                      failure._tag !== "ChangelogUnavailableError" ||
+                      failure.reason !== "Expired"
+                    ) {
+                      return false;
+                    }
+                    // Expired only when retention really dropped changes after the cursor; the
+                    // consumer restarts from where the changelog holds every change.
+                    const heldAfter = changelogAfterSeqOf(
+                      (yield* (yield* ManifestReader).loadLatest(DB)).manifest,
+                    );
+                    if (heldAfter <= cursor) return false;
+                    lost.push(...between(cursor, heldAfter));
+                    cursor = heldAfter;
+                    return true;
+                  }
+                  const page = result.success;
+                  // Exactly the committed changes in (cursor, nextAfterSeq]: no silent gap.
+                  const got = page.rows.map((row) => `${row.seq}:${row.key[0]}`);
+                  if (
+                    [...got].sort().join(",") !==
+                    [...between(cursor, page.nextAfterSeq)].sort().join(",")
+                  ) {
+                    return false;
+                  }
                   // Pages never split a batch.
                   const seqs = new Set(page.rows.map((row) => row.seq));
                   for (const seq of seqs) {
@@ -102,12 +143,20 @@ describe("change feed", () => {
                 } else if (step._tag === "Flush") {
                   yield* client.flush(DB);
                   yield* TestClock.adjust("2 seconds");
+                } else if (step._tag === "Prune") {
+                  // Retention drops every entry flushed so far.
+                  yield* prune(yield* Clock.currentTimeMillis);
+                  yield* TestClock.adjust("2 seconds");
                 } else if (!(yield* consume(step.limit))) {
                   return false;
                 }
               }
               // Drain.
-              for (let page = 0; page < 200 && consumed.length < committed.length; page++) {
+              for (
+                let page = 0;
+                page < 200 && consumed.length + lost.length < committed.length;
+                page++
+              ) {
                 if (!(yield* consume(3))) return false;
               }
               const sortBySeqThenKey = (changes: ReadonlyArray<string>) =>
@@ -117,7 +166,7 @@ describe("change feed", () => {
                   return seqA - seqB || keyA - keyB;
                 });
               return (
-                sortBySeqThenKey(consumed).join(",") === committed.join(",") &&
+                sortBySeqThenKey([...lost, ...consumed]).join(",") === committed.join(",") &&
                 consumed.every((change, index) => {
                   const previous = consumed[index - 1];
                   return (
@@ -189,5 +238,119 @@ describe("change feed", () => {
     expect(seqs(2)).toEqual([1]);
     expect(seqs(3)).toEqual([1, 2, 2]);
     expect(cutAtSequenceBoundary([row(2, 1), row(2, 2)], 1).map((r) => r.seq)).toEqual([2, 2]);
+  });
+});
+
+/** The outcome of one feed request: the keys and the next cursor, or the unavailable reason. */
+const feed = (databaseId: DatabaseId, afterSeq: number) =>
+  Effect.gen(function* () {
+    const result = yield* Effect.result(
+      (yield* DbClient).changes(databaseId, SeqNum.make(afterSeq), 10),
+    );
+    if (Result.isSuccess(result)) {
+      return {
+        keys: result.success.rows.map((row) => row.key[0]),
+        next: result.success.nextAfterSeq,
+      };
+    }
+    const failure = result.failure;
+    return failure._tag === "ChangelogUnavailableError" ? failure.reason : failure._tag;
+  });
+
+/** GC's retention prune of every changelog entry created before `cutoff`. */
+const prune = (cutoff: number) =>
+  Effect.flatMap(ManifestStore, (store) =>
+    store.update(DB, (manifest) =>
+      Result.succeed(pruneChangelog(manifest, Timestamp.make(cutoff))),
+    ),
+  );
+
+describe("change feed gaps (D80)", () => {
+  it("is Expired, not silently empty, when retention pruned every entry after afterSeq", async () => {
+    const outcome = await Effect.runPromise(
+      provide(
+        Effect.gen(function* () {
+          yield* create(true);
+          const client = yield* DbClient;
+          yield* client.put(DB, Uint8Array.of(1), Uint8Array.of(1));
+          yield* client.flush(DB);
+          yield* TestClock.adjust("120 seconds");
+          yield* prune(60_000);
+          const nothingSince = yield* feed(DB, 0);
+          // An unflushed change above the pruned range.
+          yield* client.put(DB, Uint8Array.of(2), Uint8Array.of(2));
+          yield* TestClock.adjust("2 seconds");
+          return {
+            nothingSince,
+            withUnflushed: yield* feed(DB, 0),
+            // Exactly at the pruned boundary: everything after it is still there.
+            atBoundary: yield* feed(DB, 1),
+          };
+        }),
+      ),
+    );
+    expect(outcome).toEqual({
+      nothingSince: "Expired",
+      withUnflushed: "Expired",
+      atBoundary: { keys: [2], next: 2 },
+    });
+  });
+
+  it("answers from the boundary of a prune that kept later entries, and is Expired one below it", async () => {
+    const outcome = await Effect.runPromise(
+      provide(
+        Effect.gen(function* () {
+          yield* create(true);
+          const client = yield* DbClient;
+          yield* client.put(DB, Uint8Array.of(1), Uint8Array.of(1));
+          yield* client.put(DB, Uint8Array.of(2), Uint8Array.of(2));
+          yield* client.flush(DB);
+          yield* TestClock.adjust("120 seconds");
+          yield* client.put(DB, Uint8Array.of(3), Uint8Array.of(3));
+          yield* client.flush(DB);
+          yield* prune(60_000);
+          yield* TestClock.adjust("2 seconds");
+          return [yield* feed(DB, 1), yield* feed(DB, 2), yield* feed(DB, 3)];
+        }),
+      ),
+    );
+    expect(outcome).toEqual(["Expired", { keys: [3], next: 3 }, { keys: [], next: 3 }]);
+  });
+
+  it("serves a fork's feed only from the fork point, before and after its first flush", async () => {
+    const FORK = DatabaseId.make("orders-fork");
+    const outcome = await Effect.runPromise(
+      provide(
+        Effect.gen(function* () {
+          yield* create(true);
+          const client = yield* DbClient;
+          yield* client.put(DB, Uint8Array.of(1), Uint8Array.of(1));
+          yield* client.put(DB, Uint8Array.of(2), Uint8Array.of(2));
+          yield* client.flush(DB);
+          const source = yield* (yield* ManifestReader).loadLatest(DB);
+          yield* (yield* ManifestStore).initialize(
+            forkManifest(source.manifest, {
+              databaseId: FORK,
+              checkpointId: CheckpointId.make("01JD0000000000000000000001"),
+              range: FULL_KEY_RANGE,
+            }),
+          );
+          const forkPoint = source.manifest.lastL0Seq;
+          yield* client.put(FORK, Uint8Array.of(3), Uint8Array.of(3));
+          const beforeFlush = [yield* feed(FORK, 0), yield* feed(FORK, forkPoint)];
+          yield* client.flush(FORK);
+          yield* TestClock.adjust("2 seconds");
+          const afterFlush = [yield* feed(FORK, forkPoint - 1), yield* feed(FORK, forkPoint)];
+          return { forkPoint, beforeFlush, afterFlush, source: yield* feed(DB, 0) };
+        }),
+      ),
+    );
+    expect(outcome).toEqual({
+      forkPoint: 2,
+      // Changes up to the fork point belong to the source's feed.
+      beforeFlush: ["Expired", { keys: [3], next: 3 }],
+      afterFlush: ["Expired", { keys: [3], next: 3 }],
+      source: { keys: [1, 2], next: 2 },
+    });
   });
 });

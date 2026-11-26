@@ -24,7 +24,8 @@ const TtlMillis = Schema.OptionFromNullOr(Schema.Int.check(Schema.isGreaterThan(
  *
  * - `Put`: set the key's value; `ttlMillis` makes it expire that long after the batch commits.
  * - `Delete`: delete the key.
- * - `Merge`: add a merge operand, combined by the database's merge operator.
+ * - `Merge`: add a merge operand, combined by the database's merge operator; `ttlMillis` makes this
+ *   operand expire on its own (D81).
  */
 export const WriteOperation = Schema.Union([
   Schema.TaggedStruct("Put", {

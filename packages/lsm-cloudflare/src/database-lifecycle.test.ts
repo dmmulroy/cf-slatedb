@@ -4,6 +4,7 @@ import {
   type KeyRange,
   ManifestId,
   manifestSstHandles,
+  SeqNum,
 } from "@shaledb/lsm-core";
 import { Clock, Context, Effect, Layer, Option, Ref } from "effect";
 import { TestClock } from "effect/testing";
@@ -33,6 +34,7 @@ import { ManifestReader } from "./manifest-reader.ts";
 import { databasePrefix, manifestKey, manifestPrefix } from "./object-keys.ts";
 import { ObjectStore, ObjectStoreUnavailableError, objectStoreTestLayer } from "./object-store.ts";
 import { sstStoreLayerWithoutDependencies } from "./sst-store.ts";
+import { WriterClient } from "./writer-client.ts";
 
 const SOURCE = DatabaseId.make("orders");
 const LEFT = DatabaseId.make("orders-a");
@@ -738,6 +740,77 @@ describe("DatabaseLifecycle", () => {
     expect(outcome.halvesReleased).toEqual({ onShard: 1, onLeft: 0 });
     expect(outcome.leftReleased).toEqual({ onShard: 0, leftRefs: 0 });
     expect(outcome.values).toEqual({ a1: ["a=A"], a2: ["b=B", "c=C"], right: ["e=E"] });
+  });
+
+  it("a consumer follows the feed through a split: the sealed source to its last sequence, then each successor from it (D80)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const client = yield* DbClient;
+        const writers = yield* WriterClient;
+        yield* lifecycle.create(SOURCE, {
+          keyRange: Option.none(),
+          databaseOptions: {
+            ...DEFAULT_DATABASE_OPTIONS,
+            changelog: Option.some({ retentionMs: 3_600_000 }),
+          },
+        });
+        for (const key of ["a", "b", "c", "d", "e", "f"]) {
+          yield* client.put(SOURCE, bytes(key), bytes(key.toUpperCase()));
+          if (key === "c") yield* client.flush(SOURCE);
+        }
+        const receipt = yield* lifecycle.seal(SOURCE, [LEFT, RIGHT], false);
+        const checkpoint = yield* lifecycle.createCheckpoint(SOURCE, {
+          name: Option.some("split"),
+          lifetimeMs: Option.none(),
+        });
+        for (const [forkId, range] of [
+          [LEFT, LEFT_RANGE],
+          [RIGHT, RIGHT_RANGE],
+        ] as const) {
+          yield* lifecycle.forkRange({
+            source: SOURCE,
+            checkpointId: checkpoint.id,
+            range,
+            forkId,
+          });
+        }
+        yield* client.put(LEFT, bytes("b"), bytes("B2"));
+        yield* client.put(RIGHT, bytes("x"), bytes("X"));
+        const keysOf = (rows: ReadonlyArray<{ readonly key: Uint8Array }>) =>
+          rows.map((row) => text(row.key));
+        // 1. The sealed source's feed, to its end: no rows after its last sequence number.
+        const sourcePage = yield* client.changes(SOURCE, SeqNum.make(0), 100);
+        const sourceEnd = yield* client.changes(SOURCE, sourcePage.nextAfterSeq, 100);
+        const sourceStatus = yield* writers.status(SOURCE);
+        // 2. Each successor's feed from the source's last sequence number (the fork point).
+        const from = sourceStatus.lastSeq;
+        const left = yield* client.changes(LEFT, from, 100);
+        const right = yield* client.changes(RIGHT, from, 100);
+        // Below the fork point a successor's feed is Expired: those changes are the source's.
+        const leftBelow = yield* Effect.flip(client.changes(LEFT, SeqNum.make(from - 1), 100));
+        return {
+          sealedSeq: receipt.flushedSeq,
+          source: keysOf(sourcePage.rows),
+          sourceEnd: sourceEnd.rows.length,
+          sealed: sourceStatus.sealed,
+          from,
+          left: keysOf(left.rows),
+          right: keysOf(right.rows),
+          leftBelow: leftBelow._tag === "ChangelogUnavailableError" && leftBelow.reason,
+        };
+      }),
+    );
+    expect(outcome).toEqual({
+      sealedSeq: 6,
+      source: ["a", "b", "c", "d", "e", "f"],
+      sourceEnd: 0,
+      sealed: true,
+      from: 6,
+      left: ["b"],
+      right: ["x"],
+      leftBelow: "Expired",
+    });
   });
 
   it("removing a fork releases its hold on the source", async () => {

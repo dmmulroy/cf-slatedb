@@ -304,6 +304,20 @@ hand-off is below.
     owner: at most one sweep cycle (`ceil(P / 50)` runs, 5 minutes apart) plus `gcMinAge` after its
     fork's release.
 
+- **D81: compaction folded merge operands across TTLs (found by review, 2026-11-26).** A
+  short-TTL operand made the whole folded key expire early. Compaction now folds only rows that
+  expire together (SlateDB's write-path rule).
+  - A new property compares reads at every later time through flushes and two compactions; it
+    fails on the code before.
+  - Five mutations are each caught.
+  - Already-compacted data keeps its early expiry; the release notes need a sentence (see D81).
+- **D80: the change feed's silent gap (found by review, 2026-11-26).** With every changelog entry
+  pruned, or on a fork before its first flush, the feed skipped changes without `Expired`. Now the
+  manifest records `changelogAfterSeq`, and the feed answers only when its changelog provably holds
+  every change after `afterSeq`.
+  - The four new tests failed before the fix; seven mutations are each caught.
+  - A fork's feed starts at its fork point. The split procedure is in D80 and the OpenAPI text.
+
 ## Remaining-work log
 
 - **Set up (new session).** Node 24.22, `vp` 1.8, pnpm 12.14; `repos/slatedb` and `.tlc/` present;

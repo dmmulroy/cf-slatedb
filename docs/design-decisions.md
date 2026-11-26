@@ -117,7 +117,9 @@ the 8-byte hash pair per distinct key, not the keys, so a 64 MiB SST's filter ne
 SlateDB returns expired rows from reads and relies on compaction to delete them. shaledb hides
 them: an expired value reads as a delete and an expired merge operand is skipped
 (`resolveVisibleRow`). Compaction applies SlateDB's rules (expired value → tombstone, expired operand
-dropped; `retainKeyVersions`), so reads before and after compaction agree (property-tested).
+dropped; `retainKeyVersions`), so reads before and after compaction agree (property-tested). Until
+D81 they agreed only at the compaction's own time: compaction folded operands of different
+expiries into one value that expired with the earliest of them.
 
 ## D11. Merge operators are named, built-in, and stored in the manifest
 
@@ -215,7 +217,8 @@ drops exact duplicates), but dropping them keeps the next L0 SST small.
 One batch has one sequence number, so a batch is collapsed to one row per key (`collapseWriteBatch`):
 a later put or delete replaces earlier operations on the key; merges fold with the database's merge
 operator (SlateDB's rule that merges of one key share one TTL); folded results expire at the
-earliest TTL. Limits: key 16 KiB, value 1 MiB (Durable Object SQLite rows hold at most 2 MB),
+earliest TTL. The batch is one version per key, so this is the batch's rule. Rows written in
+different batches expire on their own, and compaction keeps that (D81). Limits: key 16 KiB, value 1 MiB (Durable Object SQLite rows hold at most 2 MB),
 10,000 operations, 8 MiB per batch.
 
 ## D24. Binary over the HTTP boundary: base64 JSON for v1
@@ -443,7 +446,8 @@ memtable holds exactly the rows above `flushed_seq`). Changelog SSTs are read st
 `compacted/` SSTs. A page never ends inside a batch: it is cut between sequence numbers (and a batch
 larger than the page is returned whole; the writer's internal page allows a whole batch,
 `MAX_BATCH_OPERATIONS`), so a consumer resuming from `nextAfterSeq` cannot skip rows. A consumer
-behind retention gets `ChangelogUnavailable` (`Expired`) instead of a silent gap.
+behind retention gets `ChangelogUnavailable` (`Expired`) instead of a silent gap. (Until D80 that
+held only while some entry was kept; D80 states the rule exactly and enforces it in one place.)
 
 ## D43. Live stages keep Alchemy state in Cloudflare; local stages keep it on the machine
 
@@ -2390,3 +2394,164 @@ of anything an operator needs.
   more mutation is not counted, because `later` is symmetric and the mutation changed nothing.
   `writer.stall_reason` for `L0Backlog` has no test of its own; the same line for
   `UnflushedBytes` does.
+
+## D80. The change feed answers only what its changelog provably holds; a fork's feed starts at its fork point
+
+**Found by the review agent's scratch test.** `DbReader.changelogRows` detected retention only by
+comparing the oldest kept entry's `firstSeq` with `afterSeq`. When no entry above `afterSeq` was
+kept, it returned no rows and no error, so `DbClient.changes` moved the consumer's cursor over
+`(afterSeq, flushed_seq]` as if nothing had changed. There were two ways in:
+
+- **Retention pruned every entry.** GC's `pruneChangelog` dropped them all and nothing was flushed
+  since. The consumer was handed the unflushed changes above them and lost the pruned ones without
+  being told.
+- **A fork or split successor before its first flush.** It starts with an empty changelog, and its
+  sequence numbers continue above its source's, so a consumer asking from before the fork point
+  got the fork's own changes and none of the source's.
+
+D42 promised `Expired` in both cases; for a feed, a silent gap is data loss.
+
+**The rule, enforced in one place.** The feed answers a request for changes after `afterSeq` only
+if the manifest's changelog holds every change in `(afterSeq, lastL0Seq]`
+(`changelogHoldsChangesAfter`). Otherwise it fails with `ChangelogUnavailable` (`Expired`).
+`DbReader.changelogRows` is the only caller. The unflushed part comes from the writer, which holds
+every row above `flushed_seq` (D42).
+
+**What the manifest records.** A new field, `changelogAfterSeq`: the changelog holds every change
+with a sequence number above it, up to `lastL0Seq`.
+
+- `initialManifest` sets it to 0.
+- A flush leaves it unchanged. Its entry covers `(previous lastL0Seq, cut]`, and a flush with no
+  rows adds no entry and loses nothing.
+- `pruneChangelog` raises it to the newest `lastSeq` it drops.
+- `forkManifest` sets it to the fork point (the checkpoint's `lastL0Seq`).
+
+**The format.** The field is optional and needs no `formatVersion` change (D64). A manifest
+without it reads as follows (`changelogAfterSeqOf`):
+
+- the oldest kept entry's `firstSeq - 1`, or `lastL0Seq` when no entry is kept;
+- that is never below the true value, because an entry's rows all lie above the previous flush's
+  cut;
+- so the default only answers `Expired` more often, never with a gap.
+
+Older code ignores the field when it decodes a manifest (as D49's dropped option showed), so a
+manifest it rewrites after a rollback loses the field and falls back to that safe default.
+`manifest.test.ts` checks the default against the field over random flushes, rows without
+sequence numbers, and prunes.
+
+**A fork's and a split successor's feed** start at the fork point; changes up to it are in the
+source's feed. A consumer following a database through a split:
+
+1. Reads the sealed source's feed until a page returns no rows. A sealed database accepts no
+   writes, so the feed has ended. Its `status` shows `sealed: true`, and its `lastSeq` is the
+   sequence number the seal made durable.
+2. Reads each successor's feed with `afterSeq` set to the source's `lastSeq`. Each successor was
+   forked from a checkpoint of the sealed manifest, whose `lastL0Seq` is that number, so the
+   successor's feed starts exactly there.
+
+The consumer must use the source's `lastSeq`, not its own cursor, which may be lower when the
+last sequence numbers carried no rows. `database-lifecycle.test.ts` runs that procedure through a
+split, and the OpenAPI description of the feed says it. The shard router exposes no feed.
+
+**Tests:**
+
+- `change-feed.test.ts`:
+  - every entry pruned, with nothing flushed since and with unflushed changes above the pruned
+    range;
+  - the boundary at exactly `afterSeq`, and one below it;
+  - a fork before and after its first flush;
+  - the property test now also prunes, and checks each page against the oracle: exactly the
+    committed changes in `(cursor, nextAfterSeq]`, or `Expired` only when the manifest says
+    changes after the cursor were dropped.
+- `database-lifecycle.test.ts`: the split procedure.
+- `manifest.test.ts`: the edits and the default.
+
+The three gap tests and the split test fail on the code before. Seven mutations are each caught:
+the rule removed, the prune not raising the field (two tests), the fork starting at 0, the
+boundary off by one, and two unsafe defaults.
+
+## D81. Merge operands and values expire on their own; compaction folds only rows that expire together
+
+**Found by the review agent's scratch test.** A key with a value `V` (no TTL), an operand `A`
+expiring at 10, and an operand `B` (no TTL) reads `VAB` before 10 and `VB` after it.
+`retainKeyVersions` folded all three into one value that expired with the earliest of them (10),
+so after a compaction the key read as absent from 10 on. D10 promises that reads before and after
+a compaction agree.
+
+**The semantics** (`resolveVisibleRow`, unchanged; checked against this statement):
+
+- **Each row expires on its own.** A row is a put, a merge operand, or a delete, written by its own
+  batch.
+- **A read at time `t`** walks the key's versions newest first, down to the first value or delete,
+  and merges the operands it passed onto that value. At each point:
+  - an operand that has expired by `t` is skipped;
+  - a value that has expired by `t` reads as a delete, so it ends the walk, older versions stay
+    hidden, and the operands above it merge onto nothing.
+
+  So a key with an expired base under live operands reads as those operands merged onto nothing.
+
+- **The `expireTs` a read reports** is the earliest among the rows it merged: when the answer
+  next changes, not when the key disappears.
+- **Within one batch** a key's operations are one version (D23): its merges share one TTL, and the
+  version expires at the earliest TTL among them.
+
+`DbReader.getRow` and `scan` collect the key's versions (memtable first, then the SSTs newest
+level first, stopping at a level holding a value or delete) and call `resolveVisibleRow`. The read
+path is consistent with the statement above.
+
+**Compaction preserves it.** This is SlateDB's write-path rule (`merge_operator.rs`,
+`merge_different_expire_ts: false`): only rows with the same `expire_ts` merge.
+`retainKeyVersions` now:
+
+- drops expired operands, and turns an expired value into a delete, as before;
+- folds each run of consecutive operands with one expiry into one operand that expires with them;
+- folds the run just above the base onto it, into a value, only when the base expires with the
+  run or is a delete;
+- otherwise keeps the base as its own row;
+- drops a delete left on its own at the bottom.
+
+**Why nothing else can fold.**
+
+- **Rows that expire together** are all present or all absent at any later time. Their fold reads
+  the same (merge operators are associative, D11).
+- **A delete under a run expiring at `E`:** folding gives a value expiring at `E`. Before `E` it
+  reads the same. After `E` it reads as a delete, as the delete under the expired run did.
+- **Rows with different expiries** cannot fold without one of them outliving, or dying with,
+  the other.
+- **Non-adjacent rows with the same expiry** cannot fold either: a non-commutative operator such as
+  `Concat` needs their order.
+
+**Checked for the same fold elsewhere.**
+
+- **The flush** (`keepReachableVersions`, D70) folds nothing. It only drops versions below a key's
+  first value or delete, which no read reaches at any time.
+- **`collapseWriteBatch`** folds within one batch, which is one version by D23.
+- **The bottom-level rules** (expired value to delete, a lone delete dropped at the bottom) are
+  unchanged and agree with the statement.
+
+**Existing data.** SSTs compacted before D81 may hold a folded value that expires at the earliest
+expiry among what it folded. Nothing can recover the parts that should have outlived it. After
+the fix such a value still expires early, exactly as it did before, and later compactions turn it
+into a delete as usual. New compactions fold nothing new across expiries.
+
+**Tests:**
+
+- **`row-resolution.test.ts`:**
+  - the review's case at five times;
+  - runs and base folding;
+  - a delete absorbing the run above it.
+- **`compaction-merge.test.ts`:** a new property. Random histories of puts, deletes and operands
+  with random TTLs are split into three flush windows (`keepReachableVersions`), compacted over
+  older data, then compacted again later with everything. The oracle reads the uncompacted rows,
+  the flushed rows, and both compactions' outputs alike at every time from the compaction to past
+  every expiry.
+
+  The existing property compared reads only at the compaction's own `now`, before any expiry it
+  had folded could pass, so it could not see this. On the code before, the new property and all
+  three unit tests fail.
+
+- **`merge-iterator.test.ts`:** its property asserted one surviving version per key, which is the
+  old rule. It now asserts that no two adjacent survivors expire together.
+- **Mutations, all five caught:** runs folding across expiries, the base folding whatever its
+  expiry, a folded run that never expires, a delete not absorbing its run, and the base folding
+  into every run.

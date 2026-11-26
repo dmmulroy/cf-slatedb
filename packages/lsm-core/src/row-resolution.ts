@@ -74,6 +74,14 @@ export const MERGE_OPERATORS: Readonly<Record<MergeOperatorName, MergeOperator>>
 const isExpired = (row: Row, now: Timestamp): boolean =>
   Option.isSome(row.expireTs) && row.expireTs.value <= now;
 
+/** Whether two optional expiry times are the same (none: never expires). */
+const sameExpiry = (
+  left: Option.Option<Timestamp> | undefined,
+  right: Option.Option<Timestamp>,
+): boolean =>
+  left !== undefined &&
+  (Option.isNone(left) ? Option.isNone(right) : Option.contains(right, left.value));
+
 const minExpire = (
   left: Option.Option<Timestamp>,
   right: Option.Option<Timestamp>,
@@ -174,11 +182,15 @@ export interface RetentionOptions {
  *
  * **Details**
  *
- * Versions above `retainAboveSeq` are kept as they are. Below it, history collapses into one
- * version (SlateDB's retention rules): an expired value becomes a delete (so older versions stay
- * hidden), an expired operand is dropped, operands fold onto their base with the merge operator,
- * versions older than the base are dropped, and a delete is dropped at the bottom. Without a merge
- * operator, operands and their base are kept unchanged. Never fails.
+ * Versions above `retainAboveSeq` are kept as they are. Below it, history collapses (SlateDB's
+ * retention rules): an expired value becomes a delete (so older versions stay hidden), an expired
+ * operand is dropped, and versions older than the base are dropped.
+ *
+ * With a merge operator, only rows that expire at the same time fold (D81). Each run of
+ * consecutive operands with one expiry becomes one operand. The run just above the base folds
+ * onto it into a value when the base is a delete or expires with the run; otherwise the base stays
+ * its own row. A delete left on its own is dropped at the bottom. Without a merge operator,
+ * operands and their base are kept unchanged. Never fails.
  */
 export const retainKeyVersions = (
   versions: ReadonlyArray<Row>,
@@ -220,30 +232,49 @@ export const retainKeyVersions = (
     if (Option.isSome(base) && !(baseIsDelete && options.isBottom)) kept.push(base.value);
     return kept;
   }
-  const ordered = [...operands].reverse();
-  const operandBytes = ordered.map((row) =>
-    row.value._tag === "Merge" ? row.value.operand : new Uint8Array(0),
-  );
-  if (!Arr.isReadonlyArrayNonEmpty(operandBytes)) return kept;
-  const existing = Option.flatMap(base, (row) =>
-    row.value._tag === "Value" ? Option.some(row.value.bytes) : Option.none(),
-  );
-  const merged = options.mergeOperator.value.merge(newest.key, existing, operandBytes);
-  const expireTs = [...ordered, ...Option.toArray(base)].reduce<Option.Option<Timestamp>>(
-    (earliest, row) => minExpire(earliest, row.expireTs),
-    Option.none(),
-  );
-  // With a base (value or delete) the history is complete: the result is a value. Without one,
-  // older data may still sit in lower levels, so the folded operands stay an operand.
-  kept.push({
-    key: newest.key,
-    seq: newest.seq,
-    value: Option.isSome(base)
-      ? RowValue.Value({ bytes: merged })
-      : RowValue.Merge({ operand: merged }),
-    createTs: newest.createTs,
-    expireTs,
-  });
+  // Fold only rows that expire together (D81, SlateDB's write-path rule): runs of consecutive
+  // operands with one expiry, and the base only into the run just above it when it expires with
+  // that run (or is a delete). Each row expires on its own, so folding rows with different
+  // expiries would make the result expire with the earliest and hide the rest from later reads.
+  const mergeOperator = options.mergeOperator.value;
+  const runs: Array<Array<Row>> = [];
+  for (const operand of operands) {
+    const run = runs[runs.length - 1];
+    if (run !== undefined && sameExpiry(run[0]?.expireTs, operand.expireTs)) run.push(operand);
+    else runs.push([operand]);
+  }
+  const oldestRun = runs[runs.length - 1] ?? [];
+  const absorbsBase =
+    Option.isSome(base) &&
+    (base.value.value._tag === "Tombstone" ||
+      sameExpiry(oldestRun[0]?.expireTs, base.value.expireTs));
+  for (const [index, run] of runs.entries()) {
+    const [runNewest] = run;
+    if (runNewest === undefined) continue;
+    const operandBytes = [...run]
+      .reverse()
+      .map((row) => (row.value._tag === "Merge" ? row.value.operand : new Uint8Array(0)));
+    if (!Arr.isReadonlyArrayNonEmpty(operandBytes)) continue;
+    const withBase = absorbsBase && index === runs.length - 1;
+    const existing = withBase
+      ? Option.flatMap(base, (row) =>
+          row.value._tag === "Value" ? Option.some(row.value.bytes) : Option.none(),
+        )
+      : Option.none<Uint8Array>();
+    const merged = mergeOperator.merge(runNewest.key, existing, operandBytes);
+    // With its base (value or delete) the history is complete: the result is a value. Without
+    // one, older data may sit in lower levels or below the base, so it stays an operand.
+    kept.push({
+      key: runNewest.key,
+      seq: runNewest.seq,
+      value: withBase ? RowValue.Value({ bytes: merged }) : RowValue.Merge({ operand: merged }),
+      createTs: runNewest.createTs,
+      expireTs: runNewest.expireTs,
+    });
+  }
+  if (Option.isSome(base) && !absorbsBase && !(baseIsDelete && options.isBottom)) {
+    kept.push(base.value);
+  }
   return kept;
 };
 
