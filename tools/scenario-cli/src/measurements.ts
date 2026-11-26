@@ -9,6 +9,10 @@ import { Base64 } from "effect/encoding";
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 import { HttpApiClient } from "effect/http-api";
 
+import { percentile, summarizeHealth, summarizeValues } from "./health-report.ts";
+
+export { exceptionType, percentile } from "./health-report.ts";
+
 import {
   pullStageSpansSinceStart,
   runTraceCliCaptured,
@@ -48,21 +52,7 @@ export class MeasurementCollector extends Context.Service<
   IMeasurementCollector
 >()("@shaledb/scenario/MeasurementCollector") {}
 
-/** Percentile (nearest rank) of `values`, in their unit; `0` when empty. */
-export const percentile = (values: ReadonlyArray<number>, fraction: number): number => {
-  if (values.length === 0) return 0;
-  const sorted = [...values].sort((left, right) => left - right);
-  const rank = Math.min(sorted.length - 1, Math.max(0, Math.ceil(fraction * sorted.length) - 1));
-  return sorted[rank] ?? 0;
-};
-
-const summarize = (values: ReadonlyArray<number>) => ({
-  count: values.length,
-  p50: percentile(values, 0.5),
-  p90: percentile(values, 0.9),
-  p99: percentile(values, 0.99),
-  max: values.length === 0 ? 0 : Math.max(...values),
-});
+const summarize = summarizeValues;
 
 const dbApi = Effect.gen(function* () {
   return yield* HttpApiClient.makeWith(DbHttpApi, {
@@ -1062,25 +1052,6 @@ export const spansSince = (store: string, sinceMs: number, args: ReadonlyArray<s
     return spans.filter((span) => Number(BigInt(span.startTimeUnixNano) / 1_000_000n) >= sinceMs);
   });
 
-/** The type of the exception a failed span recorded, such as `WriteStalledError`. */
-export const exceptionType = (span: typeof GreppedSpan.Type) => {
-  const type = span.events?.find((event) => event.name === "exception")?.attributes?.[
-    "exception.type"
-  ];
-  return typeof type === "string" ? type : "unknown";
-};
-
-/** Counts of `values`, most frequent first. */
-const tally = (values: ReadonlyArray<string>) =>
-  Object.fromEntries(
-    [
-      ...values.reduce(
-        (counts, value) => counts.set(value, (counts.get(value) ?? 0) + 1),
-        new Map<string, number>(),
-      ),
-    ].sort((left, right) => right[1] - left[1]),
-  );
-
 /** Invocations by outcome, most frequent first, scaled up from the kept records (D71). */
 const estimatedOutcomes = (records: ReadonlyArray<InvocationRecord>) =>
   Object.fromEntries(
@@ -1507,16 +1478,17 @@ export const measureSampling = (requests: number) =>
   });
 
 /**
- * A live stage's health over the last `minutes` (D63), from its tail records and its spans: what
- * `docs/operations.md` says to watch.
+ * A live stage's health over the last `minutes` (D63, D82), from its tail records and its spans:
+ * what `docs/operations.md` says to watch.
  *
- * - Invocations per Worker: outcomes (any `exceededCpu`, `exceededMemory`, or `exception` is an
- *   issue) and CPU.
- * - Writes refused (`DbWriter.write` errors, by message), flush duration, and the L0 backlog
- *   (`manifest.l0_ssts` on `Compactor.poll`, highest per database).
- * - Corrupted SSTs, failed collections and sweeps, and the most frequent error spans.
+ * - Invocations per Worker: outcomes and CPU, from the tail records. Any `exceededCpu`,
+ *   `exceededMemory`, or `exception` is an issue.
+ * - Everything else is judged by {@link summarizeHealth} from spans: stalled writes per database
+ *   and reason, flushes, the L0 backlog, corrupted SSTs, fenced compactors, multipart uploads with
+ *   a re-sent or unverified part, failed collections and sweeps, and the most frequent error spans.
  *
- * Spans are sampled in production (P4), so span counts there are a sample; tail records are not.
+ * Spans are sampled in production (P4), so span counts there are a sample; tail records of
+ * invocations that did not end `ok` are not (D71).
  *
  * @returns The report with an `issues` list (empty when healthy), or `MeasurementError` when tail
  *   records cannot be read.
@@ -1543,78 +1515,26 @@ export const measureHealth = (minutes: number) =>
         },
       ]),
     );
-    const exceeded = records.filter((record) =>
-      ["exceededCpu", "exceededMemory", "exception"].includes(record.outcome),
-    );
-    const refusedWrites = yield* spansSince(store, sinceMs, [
-      "--name",
-      "DbWriter.write",
-      "--error",
-    ]);
-    const flushes = yield* spansSince(store, sinceMs, ["--name", "DbWriter.flush"]);
-    const polls = yield* spansSince(store, sinceMs, ["--name", "Compactor.poll"]);
-    const backlog = new Map<string, number>();
-    // Corruption is judged by each database's latest poll: a repaired one no longer reports it.
-    const latestPoll = new Map<string, typeof GreppedSpan.Type>();
-    for (const poll of polls) {
-      const id = poll.attributes["database.id"];
-      const database = typeof id === "string" ? id : "unknown";
-      const l0 = Number(poll.attributes["manifest.l0_ssts"] ?? 0);
-      backlog.set(database, Math.max(backlog.get(database) ?? 0, l0));
-      const seen = latestPoll.get(database);
-      if (seen === undefined || BigInt(seen.startTimeUnixNano) < BigInt(poll.startTimeUnixNano)) {
-        latestPoll.set(database, poll);
-      }
-    }
-    const corrupt = new Set(
-      [...latestPoll]
-        .filter(([, poll]) => Number(poll.attributes["compaction.corrupt_ssts"] ?? 0) > 0)
-        .map(([database]) => database),
-    );
-    // Sealed and fenced refusals are routing, not trouble; a stalled write is backpressure.
-    const stalled = refusedWrites.filter((span) => exceptionType(span) === "WriteStalledError");
-    const failedCollections = yield* spansSince(store, sinceMs, [
-      "--name",
-      "GarbageCollector.collect",
-      "--error",
-    ]);
-    const failedSweeps = yield* spansSince(store, sinceMs, [
-      "--name",
-      "MaintenanceSweep.sweepPage",
-      "--error",
-    ]);
-    const errors = yield* spansSince(store, sinceMs, ["--error"]);
-    const deepestBacklog = [...backlog].sort((left, right) => right[1] - left[1]).slice(0, 5);
-    const issues = [
-      ...exceeded.map(
-        (record) =>
-          `${Option.getOrElse(record.scriptName, () => "a Worker")} invocation ended ${record.outcome} (${record.eventKind}, ${record.cpuTimeMs} ms CPU)`,
-      ),
-      ...[...corrupt].map(
-        (database) => `database ${database} has corrupted SSTs: see docs/operations.md`,
-      ),
-      ...(failedCollections.length > 0 ? [`${failedCollections.length} collections failed`] : []),
-      ...(failedSweeps.length > 0 ? [`${failedSweeps.length} maintenance sweeps failed`] : []),
-      ...(stalled.length > 0
-        ? [`${stalled.length} writes stalled (WriteStalled): L0 or unflushed bytes at their limit`]
-        : []),
-    ];
-    return {
-      minutes,
-      healthy: issues.length === 0,
-      issues,
-      invocations,
-      writes: {
-        refusedByError: tally(refusedWrites.map(exceptionType)),
-      },
-      flushMs: summarize(flushes.map((span) => span.durationMs)),
-      l0Backlog: { deepest: Object.fromEntries(deepestBacklog), databases: backlog.size },
-      corruptSsts: [...corrupt],
-      gc: { failedCollections: failedCollections.length, failedSweeps: failedSweeps.length },
-      errorSpans: Object.fromEntries(
-        Object.entries(tally(errors.map((span) => span.name))).slice(0, 10),
-      ),
-    };
+    const limitHits = records
+      .filter((record) => ["exceededCpu", "exceededMemory", "exception"].includes(record.outcome))
+      .map((record) => ({
+        worker: Option.getOrElse(record.scriptName, () => "a Worker"),
+        outcome: record.outcome,
+        eventKind: record.eventKind,
+        cpuTimeMs: record.cpuTimeMs,
+      }));
+    const named = (name: string, ...more: ReadonlyArray<string>) =>
+      spansSince(store, sinceMs, ["--name", name, ...more]);
+    const report = summarizeHealth(limitHits, {
+      refusedWrites: yield* named("DbWriter.write", "--error"),
+      flushes: yield* named("DbWriter.flush"),
+      polls: yield* named("Compactor.poll"),
+      uploads: yield* named("ObjectStore.putMultipart"),
+      failedCollections: yield* named("GarbageCollector.collect", "--error"),
+      failedSweeps: yield* named("MaintenanceSweep.sweepPage", "--error"),
+      errors: yield* spansSince(store, sinceMs, ["--error"]),
+    });
+    return { minutes, ...report, invocations };
   });
 
 /** Options of {@link measureSplitPause}. */

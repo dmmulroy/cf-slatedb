@@ -288,6 +288,7 @@ export const uploadPartVerified = <E extends { readonly message: string }, R>(
         return { uploaded, verified: false };
       }
       yield* Metric.update(objectPartIntegrityRetries, 1);
+      yield* Effect.annotateCurrentSpan({ "object.part_retried": true });
       yield* Effect.logWarning(
         `Part ${partNumber} of ${key} was stored with MD5 ${stored}, not the ${expected} sent; uploading it again.`,
       );

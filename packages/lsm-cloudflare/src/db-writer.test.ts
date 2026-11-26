@@ -263,6 +263,31 @@ describe("DbWriter", () => {
     expect(outcome.after).toBe(3);
   });
 
+  it("names the reason a write stalled on its span, for the health report (D82)", async () => {
+    const spans: Array<Tracer.NativeSpan> = [];
+    const recordingTracer = Tracer.make({
+      span: (options) => {
+        const span = new Tracer.NativeSpan(options);
+        spans.push(span);
+        return span;
+      },
+    });
+    await run(
+      Effect.gen(function* () {
+        yield* createDatabase();
+        const writer = yield* DbWriter;
+        yield* writer.write(DB, put("a", "x".repeat(600)));
+        yield* writer.write(DB, put("b", "x".repeat(600)));
+        yield* Effect.flip(writer.write(DB, put("c", "x")));
+      }).pipe(Effect.withTracer(recordingTracer)),
+      { maxUnflushedBytes: 1000 },
+    );
+    const reasons = spans
+      .filter((span) => span.name === "DbWriter.write")
+      .map((span) => span.attributes.get("writer.stall_reason"));
+    expect(reasons).toEqual([undefined, undefined, "UnflushedBytes"]);
+  });
+
   it("schedules a flush at maxL0Age and flushes from the alarm once it is due", async () => {
     const outcome = await run(
       Effect.gen(function* () {

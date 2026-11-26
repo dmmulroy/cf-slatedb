@@ -747,6 +747,7 @@ export const makeDbWriter = Effect.gen(function* () {
             const { bytes } = yield* Ref.get(unflushed);
             if (bytes >= settings.maxUnflushedBytes) {
               yield* Metric.update(writeStalls, 1);
+              yield* Effect.annotateCurrentSpan({ "writer.stall_reason": "UnflushedBytes" });
               yield* scheduleFlush(databaseId);
               return yield* Effect.fail(
                 new WriteStalledError({
@@ -766,6 +767,7 @@ export const makeDbWriter = Effect.gen(function* () {
               yield* Ref.set(phase, ready);
               if (latest.manifest.l0.length >= settings.l0MaxSsts) {
                 yield* Metric.update(writeStalls, 1);
+                yield* Effect.annotateCurrentSpan({ "writer.stall_reason": "L0Backlog" });
                 // Compaction is behind: make sure the compactor is awake (a lost wake would stall forever).
                 yield* wakeCompactor(databaseId);
                 return yield* Effect.fail(

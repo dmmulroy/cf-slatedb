@@ -483,7 +483,7 @@ export const makeCompactor = Effect.gen(function* () {
             ? { ...current, running: [], fenced: true }
             : current,
         );
-        yield* Effect.annotateCurrentSpan({ "compactor.fenced": true });
+        yield* Effect.annotateCurrentSpan({ "database.id": databaseId, "compactor.fenced": true });
         return false;
       }
       const running: Array<RunningCompaction> = [];

@@ -7,7 +7,7 @@ import {
   SstId,
   Timestamp,
 } from "@shaledb/lsm-core";
-import { Context, Deferred, Effect, Fiber, Layer, Option, Ref, Result } from "effect";
+import { Context, Deferred, Effect, Fiber, Layer, Option, Ref, Result, Tracer } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -365,6 +365,31 @@ describe("Compactor", () => {
     );
     expect(outcome.newer.compactorEpoch).toBe(2);
     expect(Option.map(outcome.stale, (state) => state.fenced)).toEqual(Option.some(true));
+  });
+
+  it("names the database on the poll that finds its compactor fenced, for the health report (D82)", async () => {
+    const spans: Array<Tracer.NativeSpan> = [];
+    const tracer = Tracer.make({
+      span: (options) => {
+        const span = new Tracer.NativeSpan(options);
+        spans.push(span);
+        return span;
+      },
+    });
+    await run(
+      Effect.gen(function* () {
+        yield* createWithL0(ORDERS, 1);
+        const first = yield* startCompactor;
+        yield* first.compactor.wake(ORDERS);
+        const second = yield* startCompactor;
+        yield* second.compactor.wake(ORDERS);
+        yield* first.fire;
+      }).pipe(Effect.withTracer(tracer)),
+    );
+    const fenced = spans.filter(
+      (span) => span.name === "Compactor.poll" && span.attributes.get("compactor.fenced") === true,
+    );
+    expect(fenced.map((span) => span.attributes.get("database.id"))).toEqual([ORDERS]);
   });
 
   it("shares the compaction budget: a second database waits until the first job's lease is released", async () => {

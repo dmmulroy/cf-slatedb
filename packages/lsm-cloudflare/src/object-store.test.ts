@@ -1,5 +1,5 @@
 import { DatabaseId, ManifestId, md5Hex, SstId } from "@shaledb/lsm-core";
-import { Arbitrary, Bytes, Effect, Option, Schema, Stream } from "effect";
+import { Arbitrary, Bytes, Effect, Option, Schema, Stream, Tracer } from "effect";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -164,6 +164,30 @@ describe("multipart part integrity (D62)", () => {
       verified: true,
     });
     expect(attempts).toEqual([1, 1]);
+  });
+
+  it("marks the upload's span when a part had to be sent again, for the health report (D82)", async () => {
+    const spans: Array<Tracer.NativeSpan> = [];
+    const tracer = Tracer.make({
+      span: (options) => {
+        const span = new Tracer.NativeSpan(options);
+        spans.push(span);
+        return span;
+      },
+    });
+    const md5Of123 = '"5289df737df57326fcdd22597afb1fac"';
+    const sendWith = (etags: Array<string>) =>
+      Effect.runPromise(
+        uploadPartVerified("k", 1, Uint8Array.of(1, 2, 3), (partNumber) =>
+          Effect.sync(() => ({ partNumber, etag: etags.shift() ?? md5Of123 })),
+        ).pipe(Effect.withSpan("upload"), Effect.withTracer(tracer)),
+      );
+    await sendWith([md5Of123]);
+    await sendWith(['"00000000000000000000000000000000"', md5Of123]);
+    expect(spans.map((span) => span.attributes.get("object.part_retried"))).toEqual([
+      undefined,
+      true,
+    ]);
   });
 
   it("accepts a part as unverified when the ETag is not an MD5 (local R2's are opaque)", async () => {

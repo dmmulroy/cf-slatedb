@@ -215,21 +215,38 @@ node tools/scenario-cli/src/scenario-cli.ts measure health --collector-url "$SHA
 node tools/scenario-cli/src/scenario-cli.ts measure health --stage preview-1 --minutes 60
 ```
 
-It prints `healthy: false` and an `issues` list when any of the conditions below holds.
-`measure latency` takes the same two forms and reports server-side latency per operation over
+It prints `healthy: false` and an `issues` list when any condition marked "issue" below holds
+(D82). `measure latency` takes the same two forms and reports server-side latency per operation over
 `--minutes` (default 15). Each keeps its spans in `.traces/measure/<name>`: the preview's name, or
 the collector URL's host for `--collector-url`, so production and a preview never share a store.
 
-| Signal                       | Where                                                                                            | Act when                                                                                                                             |
-| ---------------------------- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
-| Invocations that hit a limit | Tail records: outcome `exceededCpu`, `exceededMemory`, `exception`                               | Any. CPU limits are 30 s (API, writers) and 60 s (compactor); see `docs/measurements.md`                                             |
-| Writes stalled               | `DbWriter.write` errors with `WriteStalledError`; public `WriteStalled` (503)                    | Sustained: L0 is not draining (compaction backlog or corruption) or a writer is overloaded                                           |
-| Flush duration               | `DbWriter.flush` span duration                                                                   | p99 above about 30 s, or rising                                                                                                      |
-| Compaction backlog           | `manifest.l0_ssts` on `Compactor.poll`; `compactor.fenced`, `compactor.refenced` on its spans    | Near `l0MaxSsts` (16), where writes stall. A fenced compactor fences in again on its next wake (D78); one that stays fenced is a bug |
-| Corrupted SSTs               | `lsm_compaction_corrupt_ssts`; `compaction.corrupt_ssts` on `Compactor.poll`; `GET …/compaction` | Any: follow the corruption runbook                                                                                                   |
-| Upload integrity             | `lsm_object_part_integrity_retries`, `lsm_object_parts_unverified`                               | Retries: transient, unless frequent. Any unverified part on R2: parts are no longer checked                                          |
-| Garbage collection           | `GarbageCollector.collect` and `MaintenanceSweep.sweepPage` errors                               | Repeated failures: storage unreachable or a manifest unreadable                                                                      |
-| Error spans                  | `trace-cli grep --error`, after a `pull`                                                         | A new name in the top errors                                                                                                         |
+Every signal below is read from a span or a tail record. For the `trace-cli` commands, first pull
+the stage's spans into a store (`trace-cli pull … --store "$S"`, "Reading a stage's telemetry")
+and pass the same `--store "$S"`.
+
+| Signal                       | Where it is recorded                                                                                          | Read it with                                                                                                 | Act when                                                                                              |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
+| Invocations that hit a limit | Tail records: outcome `exceededCpu`, `exceededMemory`, `exception` (every one kept, D71)                      | `measure health`: issue                                                                                      | Any. CPU limits are 30 s (API, writers) and 60 s (compactor); see `docs/measurements.md`              |
+| Writes stalled               | `DbWriter.write` errors with `WriteStalledError` and `writer.stall_reason` (`L0Backlog`, `UnflushedBytes`)    | `measure health`: issue per database and reason; `trace-cli grep --store "$S" --name DbWriter.write --error` | Sustained: L0 is not draining (backlog, corruption, a fenced compactor) or a writer is overloaded     |
+| Flush duration               | `DbWriter.flush` span duration                                                                                | `measure health`: `flushMs`, issue above 30 s at p99; `trace-cli stats --store "$S" --name DbWriter.flush`   | p99 above about 30 s, or rising                                                                       |
+| Compaction backlog           | `manifest.l0_ssts` on `Compactor.poll`                                                                        | `measure health`: `l0Backlog`, issue at `l0MaxSsts` (16)                                                     | Near `l0MaxSsts`, where writes stall                                                                  |
+| Fenced compactor             | `compactor.fenced` and `database.id` on `Compactor.poll`; `compactor.refenced` on the next start's span (D78) | `measure health`: issue per database; `GET …/databases/<id>/compaction` (`compactor.fenced`)                 | Any: it fences in again on its next start, but its state was overwritten, which is a defect to report |
+| Corrupted SSTs               | `compaction.corrupt_ssts` on `Compactor.poll`; the compactor's error log (a span event on that poll)          | `measure health`: issue, from each database's latest poll; `GET …/compaction` (`corruptSsts`)                | Any: follow the corruption runbook                                                                    |
+| Unverified parts             | `object.parts_unverified` on `ObjectStore.putMultipart`                                                       | `measure health`: issue                                                                                      | Any: R2 stopped returning part digests, so parts are no longer checked                                |
+| Re-sent parts                | `object.part_retried` on `ObjectStore.putMultipart`; its warning log is a span event there                    | `measure health`: `uploads.withRetriedPart` (a count, not an issue)                                          | Frequent: parts keep arriving changed                                                                 |
+| Garbage collection           | errors on `GarbageCollector.collect` and `MaintenanceSweep.sweepPage`                                         | `measure health`: issue                                                                                      | Repeated failures: storage unreachable or a manifest unreadable                                       |
+| Error spans                  | any span with an error status                                                                                 | `measure health`: `errorSpans`; `trace-cli stats --store "$S" --error`                                       | A new name in the top errors                                                                          |
+
+**Sampling.** Spans are sampled in production (10%, P4), so these span-borne signals are samples.
+A stall or a corruption repeats on every write or poll and is seen when it persists. A single
+unverified part or fenced poll can be missed. A database that neither writes nor compacts produces
+no spans, so nothing here shows it.
+
+**Metrics are not collected.** The engine also counts events as OTLP metrics:
+`lsm_compaction_corrupt_ssts`, `lsm_object_part_integrity_retries`, `lsm_object_parts_unverified`,
+`lsm_write_stalls`, and eight more (D82). The trace collector and the local trace receiver accept
+metrics and discard them, so no stage keeps them and no command reads them. They are there for a
+future collector. Every signal above travels on a span instead.
 
 Expected errors that are not trouble: `DatabaseSealedError` (a stale router's write to a sealed
 shard; the router retries), `TransactionConflictError`, and `DatabaseAlreadyExists` on create.
@@ -242,9 +259,10 @@ shard; the router retries), `TransactionConflictError`, and `DatabaseAlreadyExis
   changed in transit, and the write fails and retries.
 - Multipart uploads (large SSTs) check each part against the MD5 R2 returns as its ETag. A part
   that arrived changed is uploaded again, up to three times. Then the upload fails, is aborted, and
-  the flush or compaction retries. `lsm_object_part_integrity_retries` counts the re-uploads.
-  `lsm_object_parts_unverified` counts parts whose ETag was not an MD5. On R2 this should stay 0;
-  if it rises, R2 stopped reporting part digests and parts are no longer checked.
+  the flush or compaction retries. An upload that re-sent a part carries `object.part_retried`, and
+  `object.parts_unverified` counts its parts whose ETag was not an MD5. On R2 that should stay 0;
+  if it rises, R2 stopped reporting part digests and parts are no longer checked. `measure health`
+  reports both ("What to watch").
 - Every SST block and section carries a CRC32C that every read checks.
 
 ### How corruption is detected
@@ -253,7 +271,7 @@ A compaction that reads a damaged SST ends with a typed `Corrupted` outcome (D53
 compactor then:
 
 - records the SST,
-- increments `lsm_compaction_corrupt_ssts`,
+- reports it on every poll as `compaction.corrupt_ssts` (which `measure health` reads),
 - logs `Database <id>'s SST <sst> is corrupted (<reason> in <section>)`,
 - stops compacting that SST's L0 SST or sorted run.
 
