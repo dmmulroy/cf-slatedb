@@ -42,6 +42,7 @@ const text = (value: Uint8Array) => new TextDecoder().decode(value);
 const SPLIT = bytes("d");
 const LEFT_RANGE: KeyRange = { start: new Uint8Array(0), end: Option.some(SPLIT) };
 const RIGHT_RANGE: KeyRange = { start: SPLIT, end: Option.none() };
+const FULL_RANGE: KeyRange = { start: new Uint8Array(0), end: Option.none() };
 
 /**
  * Faults injected into the bucket, none by default: a `get` that finds nothing (an object deleted
@@ -624,6 +625,115 @@ describe("DatabaseLifecycle", () => {
     // The source's checkpoint went first; the fork's reference is still there to retry from.
     expect(outcome.interrupted).toEqual({ holds: 0, refs: 1 });
     expect(outcome.finished).toEqual({ holds: 0, refs: 0 });
+  });
+
+  it("keeps the holds of a split successor that is split again before its rewrite (D57, D77)", async () => {
+    // ShardSplit's own calls: one seal that takes each half a hold, then a fork from each hold.
+    const A1 = DatabaseId.make("orders-a1");
+    const A2 = DatabaseId.make("orders-a2");
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const client = yield* DbClient;
+        const reader = yield* ManifestReader;
+        const gc = yield* GarbageCollector;
+        const holdsOn = (databaseId: DatabaseId) =>
+          Effect.map(reader.loadLatest(databaseId), (latest) => latest.manifest.checkpoints.length);
+        const refsOf = (databaseId: DatabaseId) =>
+          Effect.map(
+            reader.loadLatest(databaseId),
+            (latest) => latest.manifest.externalRefs.length,
+          );
+        const splitLike = (
+          databaseId: DatabaseId,
+          halves: readonly [DatabaseId, DatabaseId],
+          ranges: readonly [KeyRange, KeyRange],
+        ) =>
+          Effect.gen(function* () {
+            const sealed = yield* lifecycle.seal(databaseId, halves, true);
+            for (const [index, forkId] of halves.entries()) {
+              const hold = sealed.successorHolds.find((held) => held.successor === forkId);
+              if (hold === undefined) return yield* Effect.die(`no hold for ${forkId}`);
+              yield* lifecycle.forkRange({
+                source: databaseId,
+                checkpointId: hold.checkpointId,
+                range: ranges[index] ?? FULL_RANGE,
+                forkId,
+              });
+            }
+          });
+        yield* lifecycle.create(SOURCE, {
+          keyRange: Option.none(),
+          databaseOptions: DEFAULT_DATABASE_OPTIONS,
+        });
+        for (const key of ["a", "b", "c", "e"]) {
+          yield* client.put(SOURCE, bytes(key), bytes(key.toUpperCase()));
+        }
+        yield* splitLike(SOURCE, [LEFT, RIGHT], [LEFT_RANGE, RIGHT_RANGE]);
+        // The left half is split again before its compactor rewrote anything: its halves read the
+        // original shard's SSTs through their holds on the left half.
+        const atB: KeyRange = { start: new Uint8Array(0), end: Option.some(bytes("b")) };
+        const fromB: KeyRange = { start: bytes("b"), end: Option.some(SPLIT) };
+        yield* splitLike(LEFT, [A1, A2], [atB, fromB]);
+        const a1Owners = manifestSstHandles((yield* reader.loadLatest(A1)).manifest).map((sst) =>
+          Option.getOrUndefined(sst.owner),
+        );
+        // The sealed left half and the right half rewrite; gcMinAge later the right half has
+        // released the shard, but the left half keeps its hold: its halves' holds pin its sealed
+        // manifest, which names the shard's SSTs.
+        const left = yield* compactorOf(LEFT);
+        const right = yield* compactorOf(RIGHT);
+        yield* TestClock.adjust(HOUR);
+        yield* left.runDue;
+        yield* right.runDue;
+        const middleRewritten = {
+          onShard: yield* holdsOn(SOURCE),
+          onLeft: yield* holdsOn(LEFT),
+          leftRefs: yield* refsOf(LEFT),
+        };
+        // The second split's halves rewrite; they keep their holds for gcMinAge.
+        const a1 = yield* compactorOf(A1);
+        const a2 = yield* compactorOf(A2);
+        const halvesRewritten = {
+          onShard: yield* holdsOn(SOURCE),
+          onLeft: yield* holdsOn(LEFT),
+          removeShard: (yield* Effect.flip(lifecycle.remove(SOURCE)))._tag,
+          removeLeft: (yield* Effect.flip(lifecycle.remove(LEFT)))._tag,
+        };
+        yield* TestClock.adjust(HOUR);
+        yield* a1.runDue;
+        yield* a2.runDue;
+        const halvesReleased = { onShard: yield* holdsOn(SOURCE), onLeft: yield* holdsOn(LEFT) };
+        // The left half's next collection (the maintenance sweep asks for it) releases the shard.
+        yield* gc.collect(LEFT);
+        const leftReleased = { onShard: yield* holdsOn(SOURCE), leftRefs: yield* refsOf(LEFT) };
+        yield* lifecycle.remove(LEFT);
+        yield* lifecycle.remove(SOURCE);
+        return {
+          a1Owners,
+          middleRewritten,
+          halvesRewritten,
+          halvesReleased,
+          leftReleased,
+          values: {
+            a1: yield* valuesIn(A1),
+            a2: yield* valuesIn(A2),
+            right: yield* valuesIn(RIGHT),
+          },
+        };
+      }),
+    );
+    expect(outcome.a1Owners).toEqual([SOURCE]);
+    expect(outcome.middleRewritten).toEqual({ onShard: 1, onLeft: 2, leftRefs: 1 });
+    expect(outcome.halvesRewritten).toEqual({
+      onShard: 1,
+      onLeft: 2,
+      removeShard: "DatabaseHasDependentsError",
+      removeLeft: "DatabaseHasDependentsError",
+    });
+    expect(outcome.halvesReleased).toEqual({ onShard: 1, onLeft: 0 });
+    expect(outcome.leftReleased).toEqual({ onShard: 0, leftRefs: 0 });
+    expect(outcome.values).toEqual({ a1: ["a=A"], a2: ["b=B", "c=C"], right: ["e=E"] });
   });
 
   it("removing a fork releases its hold on the source", async () => {
