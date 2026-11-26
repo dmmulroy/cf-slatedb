@@ -6,7 +6,8 @@
  * `--store <dir>` (default `.traces/` at the repository root, or `TRACE_STORE_DIR`) and `--json`
  * for machine-readable output. `pull --stage <stage>` downloads a live preview stage's spans from
  * its trace collector into the store, and `tail --stage <stage>` follows them live; every other
- * command then works on them unchanged.
+ * command then works on them unchanged. For production (or any live stage), name the collector by
+ * URL instead: `--collector-url <url>` with its token in `SHALEDB_TRACE_TOKEN`.
  */
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
 import { Clock, Console, Data, Effect, FileSystem, Layer, Option, Schema } from "effect";
@@ -30,6 +31,12 @@ import {
   type TraceSummary,
 } from "./trace-analysis.ts";
 import { pullPreviewTraces, resolvePreviewCollector } from "./preview-trace-pull.ts";
+import {
+  requireTraceCollector,
+  selectTraceCollector,
+  TRACE_TOKEN_VARIABLE,
+  type TraceCollectorSelection,
+} from "./trace-collector-option.ts";
 import { decodeTraceAssertionJson, evaluateTraceAssertion } from "./trace-assertion.ts";
 import { DEFAULT_TRACE_STORE_DIRECTORY, TraceStore, traceStoreLayer } from "./trace-store.ts";
 
@@ -61,6 +68,18 @@ const stageFlag = Flag.String("stage").pipe(
   Flag.withDescription("Live preview stage (preview-1, preview-2, preview-3) to pull spans from"),
   Flag.optional,
 );
+const collectorUrlFlag = Flag.String("collector-url").pipe(
+  Flag.withDescription(
+    `Trace collector URL of any live stage (production: its traceCollectorUrl output), instead of --stage; the token is read from ${TRACE_TOKEN_VARIABLE}`,
+  ),
+  Flag.optional,
+);
+
+/** The collector a selection names: a preview's is read through the preview CLI. */
+const resolveTraceCollector = (selection: TraceCollectorSelection) =>
+  selection._tag === "Stage"
+    ? resolvePreviewCollector(selection.stage)
+    : Effect.succeed(selection.collector);
 const sinceFlag = Flag.Int("since").pipe(
   Flag.withDescription("Only traces that started at or after this Unix millisecond time"),
   Flag.optional,
@@ -364,8 +383,11 @@ const tail = Command.make(
     json: jsonFlag,
     ...filterFlags,
     stage: stageFlag,
+    collectorUrl: collectorUrlFlag,
     interval: Flag.Int("interval").pipe(
-      Flag.withDescription("Poll interval in milliseconds (at least 2000 with --stage)"),
+      Flag.withDescription(
+        "Poll interval in milliseconds (at least 2000 with --stage or --collector-url)",
+      ),
       Flag.withDefault(250),
     ),
   },
@@ -375,10 +397,11 @@ const tail = Command.make(
       Effect.gen(function* () {
         const store = yield* TraceStore;
         const filter = toSpanFilter(flags);
-        const collector = Option.isSome(flags.stage)
-          ? Option.some(yield* resolvePreviewCollector(flags.stage.value))
+        const selection = yield* selectTraceCollector(flags, process.env);
+        const collector = Option.isSome(selection)
+          ? Option.some(yield* resolveTraceCollector(selection.value))
           : Option.none();
-        // With a stage, each poll first pulls what its collector received since the last one.
+        // With a collector, each poll first pulls what it received since the last one.
         const pullOnce = Option.match(collector, {
           onNone: () => Effect.void,
           onSome: (target) =>
@@ -414,18 +437,19 @@ const tail = Command.make(
         );
       }).pipe(Effect.provide(FetchHttpClient.layer)),
     ),
-).pipe(Command.withDescription("Follow spans as they arrive (from a preview stage with --stage)"));
+).pipe(
+  Command.withDescription(
+    "Follow spans as they arrive (from a live stage with --stage or --collector-url)",
+  ),
+);
 
 const pull = Command.make(
   "pull",
   {
     store: storeFlag,
     json: jsonFlag,
-    stage: Flag.String("stage").pipe(
-      Flag.withDescription(
-        "Live preview stage (preview-1, preview-2, preview-3) to pull spans from",
-      ),
-    ),
+    stage: stageFlag,
+    collectorUrl: collectorUrlFlag,
     sinceMinutes: Flag.Int("since-minutes").pipe(
       Flag.withDescription(
         "Only exports from the last N minutes (a fresh store otherwise pulls all)",
@@ -433,25 +457,26 @@ const pull = Command.make(
       Flag.optional,
     ),
   },
-  ({ store, json, stage, sinceMinutes }) =>
+  ({ store, json, stage, collectorUrl, sinceMinutes }) =>
     withStore(
       store,
       Effect.gen(function* () {
+        const selection = yield* requireTraceCollector({ stage, collectorUrl }, process.env);
         const now = yield* Clock.currentTimeMillis;
         const pulled = yield* pullPreviewTraces(
-          yield* resolvePreviewCollector(stage),
+          yield* resolveTraceCollector(selection),
           Option.map(sinceMinutes, (minutes) => now - minutes * 60_000),
         );
         yield* json
           ? Console.log(JSON.stringify(pulled))
           : Console.log(
-              `Pulled ${pulled.exports} export(s), ${pulled.spans} span(s) from ${stage} into ${store}`,
+              `Pulled ${pulled.exports} export(s), ${pulled.spans} span(s) from ${pulled.collector} into ${store}`,
             );
       }).pipe(Effect.provide(FetchHttpClient.layer)),
     ),
 ).pipe(
   Command.withDescription(
-    "Download a preview stage's spans from its trace collector into the store (only what is new)",
+    "Download a live stage's spans from its trace collector into the store (only what is new)",
   ),
 );
 

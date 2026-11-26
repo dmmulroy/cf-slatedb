@@ -1,11 +1,12 @@
 import { NodeServices } from "@effect/platform-node";
-import { Effect, Layer } from "effect";
+import { Effect, Layer, Option } from "effect";
 import { Base64 } from "effect/encoding";
 import { HttpClient, HttpClientResponse } from "effect/http";
 import { OtlpSerialization, OtlpTracer } from "effect/observability";
 import { describe, expect, it } from "vite-plus/test";
 
 import { pullPreviewTraces } from "./preview-trace-pull.ts";
+import type { TraceCollector } from "./trace-collector-option.ts";
 import { TraceStore, traceStoreTestLayer } from "./trace-store.ts";
 
 const COLLECTOR_URL = "https://collector.example.workers.dev";
@@ -76,7 +77,12 @@ describe("pullPreviewTraces", () => {
       yield* exportSpans(collector.client, OtlpSerialization.layerJson, 3);
       yield* exportSpans(collector.client, OtlpSerialization.layerProtobuf, 2);
       yield* exportSpans(collector.client, OtlpSerialization.layerJson, 1);
-      const target = { stage: "preview-1", url: COLLECTOR_URL, token: TOKEN };
+      const target = {
+        name: "preview-1",
+        url: COLLECTOR_URL,
+        token: TOKEN,
+        stage: Option.some("preview-1"),
+      };
       const pull = pullPreviewTraces(target).pipe(
         Effect.provideService(HttpClient.HttpClient, collector.client),
       );
@@ -90,27 +96,82 @@ describe("pullPreviewTraces", () => {
       return { first, again, later, counts: counts.sort((left, right) => left - right) };
     }).pipe(Effect.provide([traceStoreTestLayer, NodeServices.layer]), Effect.runPromise);
     expect(collector.exports.length).toBe(4);
-    expect(result.first).toEqual({ stage: "preview-1", exports: 3, spans: 6 });
-    expect(result.again).toEqual({ stage: "preview-1", exports: 0, spans: 0 });
-    expect(result.later).toEqual({ stage: "preview-1", exports: 1, spans: 4 });
+    expect(result.first).toEqual({ collector: "preview-1", exports: 3, spans: 6 });
+    expect(result.again).toEqual({ collector: "preview-1", exports: 0, spans: 0 });
+    expect(result.later).toEqual({ collector: "preview-1", exports: 1, spans: 4 });
     expect(result.counts).toEqual([1, 2, 3, 4]);
   });
 
-  it("reports a refused token as CollectorUnauthorized", async () => {
+  it("resumes one collector's pulls whether it is named by stage or by URL", async () => {
     const collector = makeCollector(10);
-    const failure = await pullPreviewTraces({
-      stage: "preview-2",
+    const result = await Effect.gen(function* () {
+      yield* exportSpans(collector.client, OtlpSerialization.layerJson, 2);
+      const pull = (target: TraceCollector) =>
+        pullPreviewTraces(target).pipe(
+          Effect.provideService(HttpClient.HttpClient, collector.client),
+        );
+      const byStage = yield* pull({
+        name: "preview-3",
+        url: COLLECTOR_URL,
+        token: TOKEN,
+        stage: Option.some("preview-3"),
+      });
+      const byUrl = {
+        name: "collector.example.workers.dev",
+        url: COLLECTOR_URL,
+        token: TOKEN,
+        stage: Option.none<string>(),
+      };
+      const thenByUrl = yield* pull(byUrl);
+      yield* exportSpans(collector.client, OtlpSerialization.layerJson, 1);
+      const later = yield* pull(byUrl);
+      const store = yield* TraceStore;
+      return { byStage, thenByUrl, later, traces: (yield* store.listTraceIds).length };
+    }).pipe(Effect.provide([traceStoreTestLayer, NodeServices.layer]), Effect.runPromise);
+    expect(result.byStage).toEqual({ collector: "preview-3", exports: 1, spans: 2 });
+    // The URL form finds the stage form's cursor for the same URL: nothing is stored twice.
+    expect(result.thenByUrl).toEqual({
+      collector: "collector.example.workers.dev",
+      exports: 0,
+      spans: 0,
+    });
+    expect(result.later).toEqual({
+      collector: "collector.example.workers.dev",
+      exports: 1,
+      spans: 1,
+    });
+    expect(result.traces).toBe(2);
+  });
+
+  it("reports a refused token as CollectorUnauthorized, naming what to fix for each form", async () => {
+    const collector = makeCollector(10);
+    const refused = (target: TraceCollector) =>
+      pullPreviewTraces(target).pipe(
+        Effect.provideService(HttpClient.HttpClient, collector.client),
+        Effect.provide([traceStoreTestLayer, NodeServices.layer]),
+        Effect.flip,
+        Effect.runPromise,
+      );
+    const byStage = await refused({
+      name: "preview-2",
       url: COLLECTOR_URL,
       token: "wrong",
-    }).pipe(
-      Effect.provideService(HttpClient.HttpClient, collector.client),
-      Effect.provide([traceStoreTestLayer, NodeServices.layer]),
-      Effect.flip,
-      Effect.runPromise,
-    );
-    expect(failure._tag).toBe("PreviewTracePullError");
-    expect(failure._tag === "PreviewTracePullError" ? failure.reason : "").toBe(
-      "CollectorUnauthorized",
-    );
+      stage: Option.some("preview-2"),
+    });
+    const byUrl = await refused({
+      name: "collector.example.workers.dev",
+      url: COLLECTOR_URL,
+      token: "wrong",
+      stage: Option.none(),
+    });
+    for (const failure of [byStage, byUrl]) {
+      expect(failure._tag).toBe("PreviewTracePullError");
+      expect(failure._tag === "PreviewTracePullError" ? failure.reason : "").toBe(
+        "CollectorUnauthorized",
+      );
+    }
+    expect(byStage.message).toContain("preview-cli deploy preview-2");
+    expect(byUrl.message).toContain("SHALEDB_TRACE_TOKEN");
+    expect(byUrl.message).not.toContain("wrong");
   });
 });
