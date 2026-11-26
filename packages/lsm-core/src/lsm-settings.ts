@@ -18,6 +18,7 @@ const LsmSettingsFields = Schema.Struct({
   compactionOutputSstSize: PositiveInt,
   multipartPartSize: Schema.Int.check(Schema.isGreaterThanOrEqualTo(5 * 1024 * 1024)),
   manifestRefreshInterval: PositiveInt,
+  blockReadHedgeAfterMs: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   compactorPollInterval: PositiveInt,
   compactionBudgetCapacity: PositiveInt,
   compactionLeaseMs: PositiveInt,
@@ -105,6 +106,9 @@ const lsmSettingsCombinationIssues = (settings: LsmSettingsFields) =>
  * - `compactionOutputSstSize`: target size of each compaction output SST.
  * - `multipartPartSize`: multipart upload part size (R2 needs at least 5 MiB except the last).
  * - `manifestRefreshInterval`: how often a reader's cached manifest refreshes.
+ * - `blockReadHedgeAfterMs`: once a block or metadata read through the `BlockServer` has taken
+ *   this long, the reader also reads the bytes straight from the bucket and takes whichever
+ *   answers first. 0: never.
  * - `compactorPollInterval`: how often the compactor's alarm polls the manifest while it has work.
  * - `compactionBudgetCapacity`: most compactions running at once across every database sharing the
  *   compaction budget; groups split it fairly.
@@ -148,6 +152,7 @@ export const DEFAULT_LSM_SETTINGS: LsmSettings = {
   compactionOutputSstSize: 64 * MiB,
   multipartPartSize: 8 * MiB,
   manifestRefreshInterval: 1_000,
+  blockReadHedgeAfterMs: 0,
   compactorPollInterval: 5_000,
   compactionBudgetCapacity: 32,
   compactionLeaseMs: 900_000,
