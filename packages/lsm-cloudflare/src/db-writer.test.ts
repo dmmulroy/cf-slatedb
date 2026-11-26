@@ -490,6 +490,33 @@ describe("DbWriter", () => {
     expect(outcome).toEqual({ flushedSeq: 2, counted: [0, 0], scanned: [0, 0] });
   });
 
+  it("a write interrupted after its rows reached SQLite is still counted, so an alarm flushes it (D74)", async () => {
+    const outcome = await runWithHookedStats(({ writer, memTable, alarm, afterCommit }) =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(10_000);
+        // The row of `a` is in SQLite when the request is interrupted, before `commit` returns.
+        const inserted = yield* Deferred.make<void>();
+        afterCommit.push(
+          Deferred.succeed(inserted, undefined).pipe(
+            Effect.andThen(Effect.yieldNow),
+            Effect.andThen(Effect.yieldNow),
+          ),
+        );
+        const write = yield* Effect.forkChild(writer.write(DB, put("a", "1")));
+        yield* Deferred.await(inserted);
+        yield* Fiber.interrupt(write);
+        const status = yield* writer.status(DB);
+        const scanned = yield* memTable.stats;
+        return {
+          counted: status.unflushedRows,
+          inSqlite: scanned.rowCount,
+          alarm: yield* alarm.scheduled,
+        };
+      }),
+    );
+    expect(outcome).toEqual({ counted: 1, inSqlite: 1, alarm: Option.some(10_000 + 60_000) });
+  });
+
   it("counters a refresh could not settle stay above SQLite until the next flush, which flushes every row (D74)", async () => {
     const outcome = await runWithHookedStats(({ writer, memTable, alarm, commitAfterScan }) =>
       Effect.gen(function* () {

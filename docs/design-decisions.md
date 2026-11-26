@@ -1934,6 +1934,11 @@ of CPU. No soak could show it: their memtables hold a few hundred rows.
   that gave up, or one that failed after the flush was recorded) kept the alarm due, and an alarm
   that found nothing to flush set itself for now again. A flush that writes nothing now rescans
   when the counters still show unflushed rows (none: counters showing nothing are never wrong).
+- **An interrupted write is still counted and still sets its alarm.** A request interrupted
+  after its rows reached SQLite, and before the counters or the alarm were updated, left rows
+  nothing would flush until the next write (found in review of the fix above, with a failing
+  test). The mark, the SQLite commit, and the counters' update are now uninterruptible together,
+  and the alarm is scheduled when the write ends however it ends.
 - **The alarm decides from the counters** `scheduleFlush` set it from, so the two cannot
   disagree, and an alarm costs no scan.
 - **`status` reports the counters**: no scan on a transaction's begin or on a status request.
