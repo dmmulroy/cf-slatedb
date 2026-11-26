@@ -2,6 +2,7 @@ import {
   DatabaseId,
   DEFAULT_DATABASE_OPTIONS,
   dropSstFromManifest,
+  fenceCompactor,
   FULL_KEY_RANGE,
   initialManifest,
   type ReadConsistency,
@@ -363,6 +364,30 @@ describe("DbClient against a Map oracle", () => {
     // 256 rows before emitting any, which read all 40 blocks of this SST.
     expect(outcome.short.blockReads).toBe(2);
     expect(outcome.pastDeletes).toEqual([61, 62, 63]);
+  });
+
+  it("a snapshot is taken at the newest manifest, not at one this reader still holds (D76)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createDatabase;
+        const client = yield* DbClient;
+        const store = yield* ManifestStore;
+        yield* client.put(DB, keyBytes(1), Uint8Array.of(1));
+        yield* client.flush(DB);
+        // A Latest read leaves the flush's manifest in this reader's cache, and vouches for it.
+        yield* client.get(DB, keyBytes(1), latest);
+        const held = (yield* (yield* ManifestReader).loadLatest(DB)).id;
+        // Another commit replaces it (a compaction would): GC's clock for the held manifest
+        // starts now, while the cache goes on serving it to reads.
+        yield* store.update(DB, (manifest) => Result.succeed(fenceCompactor(manifest)));
+        const newest = (yield* (yield* ManifestReader).loadLatest(DB)).id;
+        const snapshot = yield* client.snapshot(DB);
+        return { held, newest, snapshot: snapshot.manifestId, seq: snapshot.snapshotSeq };
+      }),
+    );
+    expect(outcome.newest).toBeGreaterThan(outcome.held);
+    expect(outcome.snapshot).toBe(outcome.newest);
+    expect(outcome.seq).toBe(1);
   });
 
   it("reads a snapshot pinned to a manifest, unaffected by later writes and flushes", async () => {
