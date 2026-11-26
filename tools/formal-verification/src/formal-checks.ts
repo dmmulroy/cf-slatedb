@@ -93,6 +93,12 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
         expect: "LatestSeesAcked",
         timeLimitSeconds: 60,
       },
+      {
+        config: "NoAckedWriteLost.cfg",
+        broken: "trimUnflushed",
+        expect: "NoAckedWriteLost",
+        timeLimitSeconds: 60,
+      },
     ],
   },
   {
@@ -155,7 +161,7 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
     name: "transactions",
     spec: "Transactions.tla",
     runs: [
-      { config: "Transactions.cfg", broken: "none", expect: "pass", timeLimitSeconds: 120 },
+      { config: "Transactions.cfg", broken: "none", expect: "pass", timeLimitSeconds: 240 },
       {
         config: "Transactions.cfg",
         broken: "snapshotOnly",
@@ -164,7 +170,13 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
       },
       {
         config: "Transactions.cfg",
-        broken: "noFlushCheck",
+        broken: "trimWithoutAbort",
+        expect: "Serializable",
+        timeLimitSeconds: 60,
+      },
+      {
+        config: "Transactions.cfg",
+        broken: "noReadHorizonCheck",
         expect: "Serializable",
         timeLimitSeconds: 60,
       },

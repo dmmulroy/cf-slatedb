@@ -155,10 +155,10 @@ export interface IDbClient {
    * no other commit since conflicts (`TransactionConflictError`, retryable; nothing was written).
    * With `SerializableSnapshot` every key it read and range it scanned is checked too.
    *
-   * A transaction that lasts through a whole flush of newer data — from the moment a flush takes
-   * its cut to the moment it commits, at least a second or two on R2 — fails with
-   * `TransactionConflictError` (`SnapshotTooOld`, retryable): its snapshot can no longer be checked
-   * against the writer's memtable. Shorter transactions never see it (D50).
+   * Flushes do not end a transaction: the writer keeps flushed rows for `transactionRetentionMs`
+   * (60 s by default, bounded by `maxRetainedBytes`) and reads come from the manifest the
+   * transaction began at, so its reads and checks stay exact (D58). Only a transaction that outlasts
+   * that retention fails with `TransactionConflictError` (`SnapshotTooOld`, retryable).
    *
    * @returns The body's result, and the receipt when it wrote anything.
    */
@@ -185,22 +185,28 @@ export interface IDbClient {
     DbClientReadError | ChangelogUnavailableError,
     DbReaderServices
   >;
-  /** A transaction's read sequence number: everything committed now. */
+  /** Begins a transaction: its read sequence number (everything committed now) and manifest. */
   readonly beginTransaction: (
     databaseId: DatabaseId,
-  ) => Effect.Effect<SeqNum, DbClientReadError, DbReaderServices>;
-  /** The key's visible row at `readSeq` (a stateless transaction read). */
+  ) => Effect.Effect<TransactionBegin, DbClientReadError, DbReaderServices>;
+  /**
+   * The key's visible row at `readSeq` (a stateless transaction read). With the begin's
+   * `manifestId` the read stays exact across flushes; without it (callers from before D58) a flush
+   * past `readSeq` ends it with `SnapshotTooOld`.
+   */
   readonly getAt: (
     databaseId: DatabaseId,
     key: Uint8Array,
     readSeq: SeqNum,
+    manifestId: Option.Option<ManifestId>,
   ) => Effect.Effect<Option.Option<Row>, DbTransactionError, DbReaderServices>;
-  /** Up to `limit` visible rows in `range` at `readSeq` (a stateless transaction read). */
+  /** Up to `limit` visible rows in `range` at `readSeq` (a stateless transaction read; see getAt). */
   readonly scanAt: (
     databaseId: DatabaseId,
     range: KeyRange,
     readSeq: SeqNum,
     limit: number,
+    manifestId: Option.Option<ManifestId>,
   ) => Effect.Effect<ReadonlyArray<Row>, DbTransactionError, DbReaderServices>;
   /** Commits a transaction's writes if nothing since its `readSeq` conflicts. */
   readonly commitTransaction: (
@@ -231,6 +237,16 @@ export const cutAtSequenceBoundary = (
   if (kept.length > 0) return kept;
   return rows.filter((row) => row.seq === boundary);
 };
+
+/**
+ * Where a transaction reads: everything committed up to `readSeq`, from the manifest that made the
+ * writer's flushed rows durable at begin (`manifestId`) plus the rows the writer still keeps. None
+ * for writer state from before D58.
+ */
+export interface TransactionBegin {
+  readonly readSeq: SeqNum;
+  readonly manifestId: Option.Option<ManifestId>;
+}
 
 /** A transaction in progress (see `IDbClient.transaction`). */
 export interface DbTransaction {
@@ -325,6 +341,7 @@ export const makeDbClient = Effect.gen(function* () {
           snapshotSeq,
           cursor,
           limit: MEMTABLE_PAGE_ROWS,
+          includeRetained: false,
         });
         rows.push(...page.rows);
         snapshotSeq = Option.some(page.snapshotSeq);
@@ -382,23 +399,42 @@ export const makeDbClient = Effect.gen(function* () {
   const beginTransaction = Effect.fn("DbClient.beginTransaction")(function* (
     databaseId: DatabaseId,
   ) {
+    // One read of the writer's bookkeeping: lastSeq and the flushed manifest are consistent.
     const status = yield* writer.status(databaseId);
     yield* Effect.annotateCurrentSpan({
       "database.id": databaseId,
       "transaction.read_seq": status.lastSeq,
+      ...(Option.isSome(status.flushedManifestId)
+        ? { "manifest.id": status.flushedManifestId.value }
+        : {}),
     });
-    return status.lastSeq;
+    return { readSeq: status.lastSeq, manifestId: status.flushedManifestId };
   });
 
   const getAt = Effect.fn("DbClient.getAt")(function* (
     databaseId: DatabaseId,
     key: Uint8Array,
     readSeq: SeqNum,
+    manifestId: Option.Option<ManifestId>,
   ) {
     yield* Effect.annotateCurrentSpan({
       "database.id": databaseId,
       "transaction.read_seq": readSeq,
     });
+    if (Option.isSome(manifestId)) {
+      // The begin manifest plus every row the writer still keeps at or below readSeq: exact while
+      // the manifest covers everything below the writer's retained horizon (D58).
+      const kept = yield* writer.probeAt(databaseId, key, readSeq);
+      return yield* reader
+        .getRow(databaseId, key, {
+          minLastL0Seq: kept.retainedFromSeq,
+          snapshotSeq: Option.some(readSeq),
+          memtable: kept.versions,
+          manifestId,
+          maxLastL0Seq: Option.some(readSeq),
+        })
+        .pipe(Effect.catchTags(expiredIsTooOld(databaseId, readSeq)));
+    }
     const probe = yield* writer.probe(databaseId, key);
     if (probe.flushedSeq > readSeq) return yield* tooOld(databaseId, readSeq);
     const view: ReadView = {
@@ -418,30 +454,36 @@ export const makeDbClient = Effect.gen(function* () {
     range: KeyRange,
     readSeq: SeqNum,
     limit: number,
+    manifestId: Option.Option<ManifestId>,
   ) {
+    const pinned = Option.isSome(manifestId);
     yield* Effect.annotateCurrentSpan({
       "database.id": databaseId,
       "transaction.read_seq": readSeq,
     });
     const rows: Array<Row> = [];
     let cursor = Option.none<MemTableCursor>();
+    let retainedFromSeq = SeqNum.make(0);
     for (;;) {
       const page = yield* writer.scan(databaseId, {
         range,
         snapshotSeq: Option.some(readSeq),
         cursor,
         limit: MEMTABLE_PAGE_ROWS,
+        includeRetained: pinned,
       });
-      if (page.flushedSeq > readSeq) return yield* tooOld(databaseId, readSeq);
+      if (!pinned && page.flushedSeq > readSeq) return yield* tooOld(databaseId, readSeq);
+      // Across pages a trim may raise the horizon: the read needs a manifest past the highest.
+      retainedFromSeq = SeqNum.make(Math.max(retainedFromSeq, page.retainedFromSeq));
       rows.push(...page.rows);
       if (Option.isNone(page.nextCursor)) break;
       cursor = page.nextCursor;
     }
     const view: ReadView = {
-      minLastL0Seq: SeqNum.make(0),
+      minLastL0Seq: pinned ? retainedFromSeq : SeqNum.make(0),
       snapshotSeq: Option.some(readSeq),
       memtable: rows,
-      manifestId: Option.none(),
+      manifestId,
       maxLastL0Seq: Option.some(readSeq),
     };
     return yield* Stream.runCollect(
@@ -491,7 +533,7 @@ export const makeDbClient = Effect.gen(function* () {
     body: (transaction: DbTransaction) => Effect.Effect<A, E, R>,
   ) =>
     Effect.gen(function* () {
-      const readSeq = yield* beginTransaction(databaseId);
+      const { readSeq, manifestId } = yield* beginTransaction(databaseId);
       const mergeOperator = Option.flatMap(
         Option.some(yield* reader.currentManifest(databaseId)),
         (current) =>
@@ -529,7 +571,7 @@ export const makeDbClient = Effect.gen(function* () {
             // A buffered put or delete settles the value (later merges fold onto it): no read.
             const base = buffered(key).some((operation) => operation._tag !== "Merge")
               ? Option.none<Uint8Array>()
-              : yield* Effect.map(getAt(databaseId, key, readSeq), (row) =>
+              : yield* Effect.map(getAt(databaseId, key, readSeq, manifestId), (row) =>
                   Option.flatMap(row, (visible) =>
                     visible.value._tag === "Value"
                       ? Option.some(visible.value.bytes)
@@ -544,7 +586,13 @@ export const makeDbClient = Effect.gen(function* () {
             const touched = operations.filter((operation) =>
               keyRangeContains(range, operation.key),
             );
-            const committed = yield* scanAt(databaseId, range, readSeq, limit + touched.length);
+            const committed = yield* scanAt(
+              databaseId,
+              range,
+              readSeq,
+              limit + touched.length,
+              manifestId,
+            );
             const values = new Map<
               string,
               { key: Uint8Array; value: Option.Option<Uint8Array>; row: Option.Option<Row> }

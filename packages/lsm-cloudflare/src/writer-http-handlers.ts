@@ -15,6 +15,9 @@ export const writerHttpHandlersLayer = HttpApiBuilder.group(WriterHttpApi, "writ
         writer.commitTransaction(params.databaseId, payload),
       )
       .handle("probe", ({ params, payload }) => writer.probe(params.databaseId, payload.key))
+      .handle("probeAt", ({ params, payload }) =>
+        writer.probeAt(params.databaseId, payload.key, payload.readSeq),
+      )
       .handle("scan", ({ params, payload }) => writer.scan(params.databaseId, payload))
       .handle("flush", ({ params }) =>
         writer.flush(params.databaseId).pipe(Effect.map((flushedSeq) => ({ flushedSeq }))),

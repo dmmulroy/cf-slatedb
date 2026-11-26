@@ -44,7 +44,8 @@ describe("CfSlatedbStackConfig", () => {
     ).toBe("weur");
     const config = await resolve("preview-2", {
       CF_SLATEDB_JURISDICTION: "eu",
-      CF_SLATEDB_LSM_SETTINGS: '{"gcMinAge":10000,"compactorPollInterval":1000}',
+      CF_SLATEDB_LSM_SETTINGS:
+        '{"gcMinAge":10000,"compactorPollInterval":1000,"transactionRetentionMs":5000}',
       CF_SLATEDB_TRACE_SAMPLE_RATE: "0.25",
       CF_SLATEDB_TRACE_RETENTION_DAYS: "7",
     });
@@ -53,6 +54,7 @@ describe("CfSlatedbStackConfig", () => {
       ...DEFAULT_LSM_SETTINGS,
       gcMinAge: 10_000,
       compactorPollInterval: 1_000,
+      transactionRetentionMs: 5_000,
     });
     expect(config.telemetry).toEqual({ traceSampleRate: 0.25, traceRetentionDays: 7 });
   });

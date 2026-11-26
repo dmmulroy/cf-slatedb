@@ -45,42 +45,55 @@ the code's words.
 
 ## Coverage record
 
-Files: `packages/lsm-cloudflare/src/db-writer.ts` (`commitTransaction`, `commitBatch`),
-`mem-table.ts` (`writtenAfter`), `db-client.ts` (`beginTransaction`, `getAt`, `scanAt`,
-`transaction`), `db-reader.ts` (`maxLastL0Seq`). Code-level tests that bind the steps to the code:
-`db-transaction.test.ts`: a property test interleaving three transactions with direct writes and
-flushes through the real writer, checking every committed `SerializableSnapshot` transaction read
-the values current at its commit and that `Snapshot` loses no update (shown failing without the
-read-key check, the write-key check, or the flush check); write skew allowed under `Snapshot` and
-refused under `SerializableSnapshot`; `SnapshotTooOld` at read and at commit. `writer.workerd.ts`
-refuses write skew through the public API.
+Files (D58): `packages/lsm-cloudflare/src/db-writer.ts` (`commitTransaction`: `SnapshotTooOld`
+only when `retained_from_seq > readSeq`; `probeAt`; `scan` with `includeRetained`; `status` with
+`flushedManifestId`), `mem-table.ts` (`writtenAfter` over retained and unflushed rows,
+`markFlushed`, `trim`, `retained_from_seq`), `db-client.ts` (`beginTransaction` returning the
+flushed manifest, `getAt`/`scanAt` from it, `transaction`), `db-reader.ts` (the pinned manifest's
+`minLastL0Seq`/`maxLastL0Seq` check). Code-level tests that bind the steps to the code:
+`db-transaction.test.ts`: a property test interleaving three transactions with direct writes,
+flushes, compactions, and the clock moving (3 s retention, a ~120-byte bound, so trims happen while
+transactions are open) through the real writer and executor, checking every committed
+`SerializableSnapshot` transaction read the values current at its commit and that `Snapshot` loses no
+update; exact reads and commits across flushes and a compaction; `SnapshotTooOld` only once trimmed
+(and at the first flush for callers without a manifest id); write skew allowed under `Snapshot` and
+refused under `SerializableSnapshot`. `mem-table.test.ts`: flushes keep rows, trims keep the newest
+flush. Mutations caught: the old flushed-seq check at commit, conflict checks or probes that ignore
+retained rows, the pinned read without its horizon check, a trim of the newest flush, a flush that
+deletes rows. `writer.workerd.ts` refuses write skew through the public API.
 
 ## Bounds and assumptions
 
-- `Transactions.cfg`: 2 keys, 2 transactions (symmetric), 6 commits (~8M distinct states). Two
-  transactions are enough for write skew, lost updates, and the flush race.
+- `Transactions.cfg`: 2 keys, 2 transactions (symmetric), 5 commits (~37M distinct states, ~2 min).
+  Two transactions are enough for write skew, lost updates, and trims racing a transaction; 6 commits
+  exceeds the time limit with the retained horizon added.
+- `Trim` raises `retained_from_seq` to any cut at or below `flushed_seq` (a superset of the retention
+  policy, which keeps the newest flush).
+- A pinned manifest is its `lastL0Seq`: a read takes from it the newest version at or below it, which
+  any compaction of that manifest keeps; pinned manifests are never rewritten, so compaction of the
+  newest manifest changes nothing a transaction observes and is not an action here.
 - Range reads (`readRanges`) are modeled as their keys: `writtenAfter` checks a range by the same
   "row newer than readSeq" query.
-- Reads at `readSeq` are exact here. In the code a read that would need a manifest with data
-  flushed after `readSeq` (which compaction may have collapsed) aborts instead
-  (`maxLastL0Seq`, `SnapshotTooOld`), which is what `Read` models when `flushed > readSeq`.
+- Callers without a manifest id (before D58) keep the old reads (a flush past `readSeq` aborts); the
+  model checks the D58 path, and the commit-time check is the same for both.
 - One writer instance (fencing is `verify-manifest-cas-fencing`).
+- Broken variants: `snapshotOnly` (written keys only), `trimWithoutAbort` (commit skips the
+  horizon check, so a trim past an open transaction hides writes), `noReadHorizonCheck` (reads skip
+  the pinned manifest's horizon check); each fails `Serializable`.
 
 ## Maintenance notes
 
+- D58 (v1 workstream 4): the model now has the retained horizon, trims, and reads from the begin
+  manifest plus rows above the horizon; `noFlushCheck` became `trimWithoutAbort`, and
+  `noReadHorizonCheck` is new. Supersedes the D50 notes below.
 - Checked against `c4ea735` (Phase 10). `db-client.ts` and `db-reader.ts` gained the change feed
   (`changes`, `changelogRows`) and the reader now reads changelog SSTs through `ObjectReader`; the
-  covered functions (`beginTransaction`, `getAt`, `scanAt`, `transaction`, the `maxLastL0Seq` check)
-  did not change, and `vp run verify` passes with both broken variants still failing.
-
-- Checked again for hand-off item 6 (D50): the limit is kept and no covered function changed;
-  `Flush` in the model already interleaves anywhere between `Begin` and `Commit`, which includes the
-  only window that aborts live (a transaction outlasting a whole flush). `vp run verify` passes with
-  both broken variants failing.
+  covered functions did not change.
+- Checked again for hand-off item 6 (D50, superseded by D58): the limit was kept then.
 
 ## Keeping it in step with the code
 
-Sync commit: `c4ea735`. When a covered function changes after it, update the model
+Sync commit: the v1 workstream 4 commit (`transactions exact across flushes`, D58). When a covered function changes after it, update the model
 so each action is still one awaited effect in the code, rerun, and show each invariant still fails on
 a broken variant before moving the sync commit. For drift that skipped this skill, use
 `.agents/skills/maintain-formal-verification-skill/SKILL.md`.

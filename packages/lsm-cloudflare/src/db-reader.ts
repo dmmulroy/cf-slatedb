@@ -191,6 +191,18 @@ export const makeDbReader = Effect.gen(function* () {
             message: `Snapshot manifest ${view.manifestId.value} of database ${databaseId} no longer exists: an unpinned snapshot is kept only for GC's minimum age, and a pinned one until its checkpoint expires or is deleted. Take a new snapshot (pinned, to read for longer) and read again.`,
           });
         }
+        // A transaction's pinned manifest must cover every row the writer no longer keeps, and hold
+        // nothing newer than its snapshot (D58); snapshots set neither bound.
+        if (
+          pinned.value.lastL0Seq < view.minLastL0Seq ||
+          (Option.isSome(view.maxLastL0Seq) && pinned.value.lastL0Seq > view.maxLastL0Seq.value)
+        ) {
+          return yield* new ReaderUnavailableError({
+            databaseId,
+            reason: "SnapshotExpired",
+            message: `Manifest ${view.manifestId.value} of database ${databaseId} no longer covers the read's snapshot together with the writer's kept rows. Read again at a new snapshot.`,
+          });
+        }
         return { id: view.manifestId.value, manifest: pinned.value };
       }
       let current = yield* manifests

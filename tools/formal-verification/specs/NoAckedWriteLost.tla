@@ -5,13 +5,15 @@
 (* Code this models (packages/lsm-cloudflare/src/):                        *)
 (*  - db-writer.ts write: commit rows + last_seq in one SQLite transaction *)
 (*    (MemTable.commit), then acknowledge.                                 *)
-(*  - db-writer.ts flushNow: cut = last_seq; upload rows <= cut as an L0   *)
-(*    SST; ManifestStore.update(commitL0Flush) sets lastL0Seq = cut; only  *)
-(*    then MemTable.truncate(cut) deletes rows <= cut and sets flushed_seq. *)
+(*  - db-writer.ts flushNow: cut = last_seq; upload rows in               *)
+(*    (flushed_seq, cut] as an L0 SST; ManifestStore.updateFrom            *)
+(*    (commitL0Flush) sets lastL0Seq = cut; only then MemTable.markFlushed *)
+(*    sets flushed_seq = cut (rows stay), and a separate MemTable.trim     *)
+(*    deletes flushed rows up to a horizon at or below flushed_seq (D58).  *)
 (*  - db-writer.ts ensureReady (restart after eviction or crash): seed     *)
-(*    last_seq from the manifest and drop rows <= lastL0Seq.               *)
-(*  - db-writer.ts probe: read flushed_seq and the key's versions in one   *)
-(*    SQLite transaction (MemTable.consistently).                          *)
+(*    last_seq from the manifest and record lastL0Seq as flushed.          *)
+(*  - db-writer.ts probe: read flushed_seq and the key's versions above it *)
+(*    in one SQLite transaction (MemTable.consistently).                   *)
 (*  - The Latest read (db-reader.ts, Phase 5): memtable rows from the      *)
 (*    probe, plus SSTs of any manifest whose lastL0Seq >= flushed_seq (a   *)
 (*    cached manifest is refreshed when it is older than that).            *)
@@ -21,19 +23,21 @@
 (*                                                                         *)
 (* Broken selects a deliberately broken variant (must fail):               *)
 (*   "none"                  the code as written                           *)
-(*   "truncateBeforeCommit"  delete rows before the manifest commit        *)
+(*   "truncateBeforeCommit"  advance flushed_seq and trim before the       *)
+(*                           manifest commit                               *)
 (*   "nonAtomicProbe"        read flushed_seq and rows in separate steps   *)
+(*   "trimUnflushed"         a trim deletes rows above flushed_seq         *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
 CONSTANTS MaxWrites, MaxCrashes, MaxReads, Broken
 
-ASSUME Broken \in {"none", "truncateBeforeCommit", "nonAtomicProbe"}
+ASSUME Broken \in {"none", "truncateBeforeCommit", "nonAtomicProbe", "trimUnflushed"}
 
 VARIABLES
   lastSeq,      \* writer_meta.last_seq (durable)
   flushedSeq,   \* writer_meta.flushed_seq (durable)
-  mem,          \* memtable_rows: sequence numbers durable in SQLite
+  mem,          \* memtable_rows: sequence numbers durable in SQLite (retained or unflushed)
   manifests,    \* the manifest chain: each [lastL0Seq, data] (data = seqs in its SSTs)
   acked,        \* acknowledged writes
   wpc, cut, sst,\* writer: "ready" | "uploaded" | "committed" | "down"; the flush in progress
@@ -86,15 +90,23 @@ FlushCommit ==
   /\ wpc' = "committed"
   /\ UNCHANGED <<lastSeq, flushedSeq, mem, acked, cut, sst, crashes>> /\ UNCHANGED readerVars
 
-\* MemTable.truncate(cut): delete rows <= cut and record flushed_seq, in one transaction.
+\* MemTable.markFlushed(cut): record flushed_seq; the rows stay (retained for transactions).
 FlushTruncate ==
   /\ wpc = "committed"
   /\ IF Broken = "truncateBeforeCommit"
-     THEN UNCHANGED <<mem, flushedSeq>>
-     ELSE /\ mem' = {s \in mem : s > cut}
-          /\ flushedSeq' = Max(flushedSeq, cut)
+     THEN UNCHANGED flushedSeq
+     ELSE flushedSeq' = Max(flushedSeq, cut)
   /\ wpc' = "ready"
-  /\ UNCHANGED <<lastSeq, manifests, acked, cut, sst, crashes>> /\ UNCHANGED readerVars
+  /\ UNCHANGED <<lastSeq, mem, manifests, acked, cut, sst, crashes>> /\ UNCHANGED readerVars
+
+\* MemTable.trim: delete flushed rows up to some horizon at or below flushed_seq, any time.
+Trim ==
+  /\ wpc # "down"
+  /\ \E horizon \in 0 .. (IF Broken = "trimUnflushed" THEN lastSeq ELSE flushedSeq) :
+       /\ \E s \in mem : s <= horizon
+       /\ mem' = {s \in mem : s > horizon}
+  /\ UNCHANGED <<lastSeq, flushedSeq, manifests, acked, wpc, cut, sst, crashes>>
+  /\ UNCHANGED readerVars
 
 \* Eviction or crash at any point: volatile flush state is lost; SQLite and R2 survive.
 Crash ==
@@ -105,14 +117,14 @@ Crash ==
   /\ crashes' = crashes + 1
   /\ UNCHANGED <<lastSeq, flushedSeq, mem, manifests, acked>> /\ UNCHANGED readerVars
 
-\* ensureReady after a restart: seed from the manifest; rows <= lastL0Seq are already in L0.
+\* ensureReady after a restart: seed from the manifest; rows <= lastL0Seq are already in L0, so they
+\* are recorded as flushed (and stay until a trim).
 Restart ==
   /\ wpc = "down"
-  /\ mem' = {s \in mem : s > Newest.lastL0Seq}
   /\ flushedSeq' = Max(flushedSeq, Newest.lastL0Seq)
   /\ lastSeq' = Max(lastSeq, Newest.lastL0Seq)
   /\ wpc' = "ready"
-  /\ UNCHANGED <<manifests, acked, cut, sst, crashes>> /\ UNCHANGED readerVars
+  /\ UNCHANGED <<mem, manifests, acked, cut, sst, crashes>> /\ UNCHANGED readerVars
 
 \* A Latest read starts: every write acknowledged before now must be visible to it.
 \* DbWriter.probe reads flushed_seq and the rows in one SQLite transaction.
@@ -121,12 +133,12 @@ Probe ==
   /\ rAcked' = acked
   /\ IF Broken = "nonAtomicProbe"
      THEN /\ rFs' = flushedSeq /\ rpc' = "gotFlushedSeq" /\ UNCHANGED rMem
-     ELSE /\ rFs' = flushedSeq /\ rMem' = mem /\ rpc' = "probed"
+     ELSE /\ rFs' = flushedSeq /\ rMem' = {s \in mem : s > flushedSeq} /\ rpc' = "probed"
   /\ UNCHANGED <<rResult, reads>> /\ UNCHANGED writerVars
 
 ProbeRows ==
   /\ rpc = "gotFlushedSeq" /\ wpc # "down"
-  /\ rMem' = mem /\ rpc' = "probed"
+  /\ rMem' = {s \in mem : s > flushedSeq} /\ rpc' = "probed"
   /\ UNCHANGED <<rAcked, rFs, rResult, reads>> /\ UNCHANGED writerVars
 
 \* The reader uses any manifest that covers flushed_seq: possibly stale, never older than that.
@@ -144,7 +156,7 @@ ReaderReset ==
   /\ UNCHANGED <<rAcked, rFs, rMem, rResult>> /\ UNCHANGED writerVars
 
 Next ==
-  \/ Write \/ FlushUpload \/ FlushCommit \/ FlushTruncate \/ Crash \/ Restart
+  \/ Write \/ FlushUpload \/ FlushCommit \/ FlushTruncate \/ Trim \/ Crash \/ Restart
   \/ Probe \/ ProbeRows \/ ReadManifest \/ ReaderReset
 
 Spec == Init /\ [][Next]_vars

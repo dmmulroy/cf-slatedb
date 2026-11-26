@@ -20,7 +20,12 @@ const readBack = (bindings: Readonly<Record<string, string>>) =>
 
 describe("LsmWorkerSettings bindings", () => {
   it("round-trips the complete settings and the jurisdiction through a Worker's Config reads", async () => {
-    const lsmSettings = { ...DEFAULT_LSM_SETTINGS, gcMinAge: 10_000, l0SstSize: 8 * 1024 * 1024 };
+    const lsmSettings = {
+      ...DEFAULT_LSM_SETTINGS,
+      gcMinAge: 10_000,
+      transactionRetentionMs: 5_000,
+      l0SstSize: 8 * 1024 * 1024,
+    };
     const read = await readBack(
       lsmWorkerSettingsBindings({
         lsmSettings,
@@ -45,8 +50,8 @@ describe("LsmWorkerSettings bindings", () => {
   });
 
   it("still reads the partial overrides that deploys before D55 bound", async () => {
-    const read = await readBack({ CF_SLATEDB_LSM_SETTINGS: '{"gcMinAge":1}' });
-    expect(read.settings).toEqual({ ...DEFAULT_LSM_SETTINGS, gcMinAge: 1 });
+    const read = await readBack({ CF_SLATEDB_LSM_SETTINGS: '{"compactorPollInterval":2000}' });
+    expect(read.settings).toEqual({ ...DEFAULT_LSM_SETTINGS, compactorPollInterval: 2000 });
     expect((await readBack({ CF_SLATEDB_LSM_SETTINGS: "{}" })).settings).toEqual(
       DEFAULT_LSM_SETTINGS,
     );

@@ -616,13 +616,18 @@ export interface TransactionLoad {
   /** Concurrent plain-write loops (100-row batches) that keep the writer flushing. */
   readonly writers: number;
   readonly seconds: number;
+  /** How long each transaction stays open between its first read and the rest (0: none). */
+  readonly holdSeconds: number;
+  /** Flush the database this often while the load runs (0: only flushes the writer takes itself). */
+  readonly flushEverySeconds: number;
 }
 
 /**
  * Runs `SerializableSnapshot` transactions over the stateless HTTP API (begin, two reads, commit)
- * on disjoint keys while plain writes load the same database, and counts how many abort because a
- * flush landed during them (`SnapshotTooOld`, D41/D50). The transactors never conflict with each
- * other or with the writers, so every abort is the flush limit.
+ * on disjoint keys while plain writes load the same database, optionally holding each transaction
+ * open across forced flushes, and counts how many abort with `SnapshotTooOld`. The transactors never
+ * conflict with each other or with the writers, so every such abort is a snapshot the writer could
+ * no longer check (since D58 only one that outlives `transactionRetentionMs`).
  *
  * @returns The report (aborts are counted by reason, not raised), or `MeasurementError` when the
  *   database cannot be created or read back.
@@ -673,13 +678,16 @@ export const measureTransactionAborts = (load: TransactionLoad) =>
             const began = yield* Clock.currentTimeMillis;
             const outcome = yield* Effect.result(
               Effect.gen(function* () {
-                const { readSeq } = yield* client.databases.beginTransaction({
+                const { readSeq, manifestId } = yield* client.databases.beginTransaction({
                   params: { databaseId },
                 });
-                for (const name of ["a", "b"]) {
+                for (const [index, name] of ["a", "b"].entries()) {
+                  if (index === 1 && load.holdSeconds > 0) {
+                    yield* Effect.sleep(`${load.holdSeconds} seconds`);
+                  }
                   yield* client.databases.transactionGet({
                     params: { databaseId },
-                    payload: { key: own(name), readSeq },
+                    payload: { key: own(name), readSeq, manifestId },
                   });
                 }
                 return yield* client.databases.commitTransaction({
@@ -712,7 +720,16 @@ export const measureTransactionAborts = (load: TransactionLoad) =>
         }),
       { concurrency: "unbounded", discard: true },
     );
-    yield* Effect.all([writers, transactors], { concurrency: "unbounded", discard: true });
+    let forcedFlushes = 0;
+    const flusher = Effect.gen(function* () {
+      if (load.flushEverySeconds <= 0) return;
+      while ((yield* Clock.currentTimeMillis) < deadline) {
+        yield* Effect.sleep(`${load.flushEverySeconds} seconds`);
+        const flushed = yield* Effect.result(client.databases.flush({ params: { databaseId } }));
+        if (flushed._tag === "Success") forcedFlushes += 1;
+      }
+    });
+    yield* Effect.all([writers, transactors, flusher], { concurrency: "unbounded", discard: true });
     const status = yield* client.databases
       .status({ params: { databaseId } })
       .pipe(Effect.mapError(failed("status after the load")));
@@ -724,6 +741,7 @@ export const measureTransactionAborts = (load: TransactionLoad) =>
       outcomes: Object.fromEntries(outcomes),
       snapshotTooOldRate: (outcomes.get("SnapshotTooOld") ?? 0) / Math.max(1, total),
       transactionMs: summarize(durations),
-      flushesDuringRun: status.l0Count,
+      forcedFlushes,
+      l0SstsAtEnd: status.l0Count,
     };
   });

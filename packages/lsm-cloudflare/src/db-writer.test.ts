@@ -300,19 +300,20 @@ describe("DbWriter fencing and crash recovery", () => {
         ManifestStore | ManifestReader | ObjectStore | WriterSqlStorage
       >();
       const failTruncate = yield* Ref.make(true);
-      // A memtable whose first truncate "crashes" after the manifest commit.
+      // A memtable whose first record of a flush "crashes" after the manifest commit.
       const crashingMemTable = Layer.effect(
         MemTable,
         Effect.gen(function* () {
           const real = yield* MemTable;
           return MemTable.of({
             ...real,
-            truncate: (cut) =>
-              Ref.getAndSet(failTruncate, false).pipe(
+            markFlushed: (cut, manifestId, flushedAtMs) =>
+              // The start records the fenced manifest's empty cut (0); the flush's is the first above.
+              (cut > 0 ? Ref.getAndSet(failTruncate, false) : Effect.succeed(false)).pipe(
                 Effect.flatMap((fail) =>
                   fail
-                    ? Effect.die(new Error("simulated crash before truncate"))
-                    : real.truncate(cut),
+                    ? Effect.die(new Error("simulated crash before recording the flush"))
+                    : real.markFlushed(cut, manifestId, flushedAtMs),
                 ),
               ),
           });

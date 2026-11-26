@@ -413,7 +413,7 @@ test.provider(
       const txnB = yield* client.databases.beginTransaction({ params: { databaseId: accounts } });
       const seen = yield* client.databases.transactionGet({
         params: { databaseId: accounts },
-        payload: { readSeq: txnA.readSeq, key: bytes("y") },
+        payload: { readSeq: txnA.readSeq, manifestId: txnA.manifestId, key: bytes("y") },
       });
       expect(Option.isSome(seen.row)).toBe(true);
       const commitSkew = (readSeq: typeof txnA.readSeq, key: string) =>

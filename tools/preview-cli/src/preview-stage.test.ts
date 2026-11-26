@@ -119,7 +119,8 @@ describe("deployEnvironment", () => {
     });
     expect(deployEnvironment(shell, { devTimings: true, jurisdiction: "fedramp" })).toEqual({
       PATH: "/bin",
-      CF_SLATEDB_LSM_SETTINGS: '{"gcMinAge":10000,"compactorPollInterval":1000}',
+      CF_SLATEDB_LSM_SETTINGS:
+        '{"gcMinAge":10000,"compactorPollInterval":1000,"transactionRetentionMs":5000}',
       CF_SLATEDB_JURISDICTION: "fedramp",
     });
   });

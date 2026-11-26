@@ -23,6 +23,7 @@ import {
   DbWriter,
   dbWriterLayerWithoutDependencies,
   type MemTableProbe,
+  type MemTableProbeAt,
   type MemTableScanPage,
   type SealReceipt,
   type WriterStatus,
@@ -79,7 +80,13 @@ export interface IWriterClient {
     databaseId: DatabaseId,
     key: Uint8Array,
   ) => Effect.Effect<MemTableProbe, WriterClientError, WriterClientServices>;
-  /** One page of unflushed rows in `range`. */
+  /** A transaction's read of one key at `readSeq`: retained and unflushed versions (D58). */
+  readonly probeAt: (
+    databaseId: DatabaseId,
+    key: Uint8Array,
+    readSeq: SeqNum,
+  ) => Effect.Effect<MemTableProbeAt, WriterClientError, WriterClientServices>;
+  /** One page of rows in `range`: unflushed, or with `includeRetained` every row still kept. */
   readonly scan: (
     databaseId: DatabaseId,
     request: {
@@ -87,6 +94,7 @@ export interface IWriterClient {
       readonly snapshotSeq: Option.Option<SeqNum>;
       readonly cursor: Option.Option<MemTableCursor>;
       readonly limit: number;
+      readonly includeRetained: boolean;
     },
   ) => Effect.Effect<MemTableScanPage, WriterClientError, WriterClientServices>;
   /** Flushes every committed row to L0. @returns The new `flushedSeq`. */
@@ -195,6 +203,17 @@ const writerClientOperations = <E, R>(
         .probe({ params: { databaseId }, payload: { key } })
         .pipe(Effect.catchTags(transport(databaseId, "probe")), Effect.retry(retryRoutable));
     }),
+    probeAt: Effect.fn("WriterClient.probeAt")(function* (
+      databaseId: DatabaseId,
+      key: Uint8Array,
+      readSeq: SeqNum,
+    ) {
+      yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
+      const client = yield* writerHttpClient(databaseId);
+      return yield* client.writer
+        .probeAt({ params: { databaseId }, payload: { key, readSeq } })
+        .pipe(Effect.catchTags(transport(databaseId, "probe")), Effect.retry(retryRoutable));
+    }),
     scan: Effect.fn("WriterClient.scan")(function* (
       databaseId: DatabaseId,
       request: {
@@ -202,6 +221,7 @@ const writerClientOperations = <E, R>(
         readonly snapshotSeq: Option.Option<SeqNum>;
         readonly cursor: Option.Option<MemTableCursor>;
         readonly limit: number;
+        readonly includeRetained: boolean;
       },
     ) {
       yield* Effect.annotateCurrentSpan({ "database.id": databaseId });

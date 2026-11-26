@@ -345,9 +345,19 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `SnapshotExpired` documented. Tests: `database-lifecycle.test.ts` (pinned readable past `gcMinAge`,
   unpinned expired, pinned collected after its lifetime), `writer.workerd.ts` (pin, read, release
   through the public API). Formal: `GcSafety` (`PinnedManifestsComplete`).
-- **Transactions across a flush (known gap, hand-off item 6)** — kept and justified (D50): only a
-  transaction outlasting a whole flush aborts; measured 580/580 commits through a 28.7 s flush
-  (`scenario-cli measure transactions`). Formal: `Transactions` (`Flush` interleaves anywhere).
+- **Transactions across a flush (v1 workstream 4)** — done, exact (D58, supersedes D41/D50). The
+  memtable keeps flushed rows (`retained_from_seq`, `flush_marks`; `markFlushed`, `trim` with
+  `transactionRetentionMs`/`maxRetainedBytes`); Latest paths filter above `flushed_seq`;
+  `DbWriter.probeAt`, `scan` with `includeRetained`, `status.flushedManifestId`;
+  `DbClient.beginTransaction` returns the flushed manifest and `getAt`/`scanAt` read from it; the
+  reader checks a pinned manifest against the retained horizon; the public `transactions/begin`
+  returns `manifestId`, which `get`/`scan` accept (additive). Tests: `db-transaction.test.ts`
+  (property with flushes, compactions, and trims; exact across flushes and a compaction; too old only
+  once trimmed, or at the first flush for callers without a manifest id), `mem-table.test.ts`
+  (flushes keep rows; trims keep the newest flush), mutations caught. Formal: `Transactions`
+  (`trimWithoutAbort`, `noReadHorizonCheck`), `NoAckedWriteLost` (`Trim`, `trimUnflushed`). Live
+  (`preview-1`, production settings): 24/24 transactions held ~21.7 s across 6–7 flushes committed,
+  0 `SnapshotTooOld`.
 - **Data residency** — done, per Stack (D49). `lsm-jurisdiction.ts` (`lsmJurisdiction`,
   `inLsmJurisdiction`, `lsmJurisdictionAtDeclaration`), applied in `lsm-bucket.ts`,
   `trace-collector-worker.ts` (buckets), `writer-client.ts`, `compactor-client.ts`,

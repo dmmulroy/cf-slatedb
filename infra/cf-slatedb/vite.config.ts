@@ -28,9 +28,10 @@ const cfSlatedbViteConfig = defineConfig({
       dev: {
         cache: false,
         // Local dev only: GC may collect what is 10 s old and compactors poll every second, so the
-        // scenario CLI sees compaction and collection within seconds.
+        // scenario CLI sees compaction and collection within seconds; flushed rows stay 5 s for
+        // transactions (it must be shorter than gcMinAge).
         command:
-          'CF_SLATEDB_LSM_SETTINGS=\'{"gcMinAge":10000,"compactorPollInterval":1000}\' alchemy dev --stage dev',
+          'CF_SLATEDB_LSM_SETTINGS=\'{"gcMinAge":10000,"compactorPollInterval":1000,"transactionRetentionMs":5000}\' alchemy dev --stage dev',
       },
       "deploy:preview-1": { cache: false, command: "alchemy deploy --stage preview-1 --yes" },
       "deploy:preview-2": { cache: false, command: "alchemy deploy --stage preview-2 --yes" },

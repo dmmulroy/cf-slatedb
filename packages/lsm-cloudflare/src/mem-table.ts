@@ -2,6 +2,7 @@ import {
   type CollapsedWrite,
   DatabaseId,
   type KeyRange,
+  ManifestId,
   type Row,
   RowValue,
   SeqNum,
@@ -35,14 +36,37 @@ export interface WriterMeta {
   readonly lastSeq: SeqNum;
   /** Newest sequence number committed to the manifest by a flush. */
   readonly flushedSeq: SeqNum;
+  /**
+   * Every row above it is still in SQLite (`retainedFromSeq <= flushedSeq`): flushed rows stay until
+   * a trim, so a transaction can still check them (D58). Writers from before D58 deleted rows on
+   * flush, so for them it equals `flushedSeq`.
+   */
+  readonly retainedFromSeq: SeqNum;
+  /**
+   * The manifest whose commit made `flushedSeq` durable (its `lastL0Seq` is `flushedSeq`), or none
+   * for writer state from before D58 (a transaction then reads the newest manifest instead).
+   */
+  readonly flushedManifestId: Option.Option<ManifestId>;
   /** Newest commit time handed out (the monotonic clock). */
   readonly clockTick: Timestamp;
 }
 
-/** Size and age of the unflushed rows. */
+/**
+ * How long flushed rows stay for transactions to check: rows flushed within `retentionMs` stay,
+ * bounded by `maxRetainedBytes`, and the newest flush's rows always stay.
+ */
+export interface MemTableRetention {
+  readonly nowMs: number;
+  readonly retentionMs: number;
+  readonly maxRetainedBytes: number;
+}
+
+/** Size and age of the unflushed rows (above `flushedSeq`), and the size of the retained ones. */
 export interface MemTableStats {
   readonly unflushedBytes: number;
   readonly rowCount: number;
+  /** Bytes of flushed rows still kept for transactions (`retainedFromSeq < seq <= flushedSeq`). */
+  readonly retainedBytes: number;
   /** Commit time of the oldest unflushed row. */
   readonly oldestCreateTs: Option.Option<Timestamp>;
 }
@@ -102,23 +126,28 @@ export interface IMemTable {
   readonly consistently: <A>(
     read: (meta: WriterMeta) => Effect.Effect<A, MemTableError>,
   ) => Effect.Effect<A, MemTableError>;
-  /** Every version of `key` at or below `snapshotSeq`, newest first. */
+  /** Every version of `key` with `afterSeq < seq <= snapshotSeq`, newest first. */
   readonly versions: (
     key: Uint8Array,
     snapshotSeq: SeqNum,
+    afterSeq: SeqNum,
   ) => Effect.Effect<ReadonlyArray<Row>, MemTableError>;
   /**
-   * Up to `limit` rows in `range` at or below `snapshotSeq`, in key-ascending, sequence-descending
-   * order, after `cursor`.
+   * Up to `limit` rows in `range` with `afterSeq < seq <= snapshotSeq`, in key-ascending,
+   * sequence-descending order, after `cursor`.
    */
   readonly scan: (
     range: KeyRange,
     snapshotSeq: SeqNum,
+    afterSeq: SeqNum,
     cursor: Option.Option<MemTableCursor>,
     limit: number,
   ) => Effect.Effect<ReadonlyArray<Row>, MemTableError>;
-  /** Every row at or below `cut`, in key-ascending, sequence-descending order, paged from SQLite. */
-  readonly rowsUpTo: (cut: SeqNum) => Stream.Stream<Row, MemTableError>;
+  /**
+   * Every row with `afterSeq < seq <= cut`, in key-ascending, sequence-descending order, paged from
+   * SQLite (a flush streams the unflushed rows: `afterSeq` is `flushedSeq`).
+   */
+  readonly rowsUpTo: (afterSeq: SeqNum, cut: SeqNum) => Stream.Stream<Row, MemTableError>;
   /** Up to `limit` rows with `afterSeq < seq <= upToSeq`, in sequence order (changelog and CDC). */
   readonly rowsBySeq: (
     afterSeq: SeqNum,
@@ -126,17 +155,30 @@ export interface IMemTable {
     limit: number,
   ) => Effect.Effect<ReadonlyArray<Row>, MemTableError>;
   /**
-   * Deletes every row at or below `cut` and records it as `flushedSeq`. Call only after the
-   * manifest commit that made those rows durable in R2.
+   * Records `cut` as `flushedSeq` (it never moves back) and, when given, `manifestId` as the manifest
+   * that made it durable, with the flush's time for retention. Deletes nothing: flushed rows stay
+   * until {@link IMemTable.trim}. Call only after the manifest commit that made the rows durable.
    */
-  readonly truncate: (cut: SeqNum) => Effect.Effect<void, MemTableError>;
-  /** Unflushed bytes, row count, and the oldest unflushed commit time. */
+  readonly markFlushed: (
+    cut: SeqNum,
+    manifestId: Option.Option<ManifestId>,
+    flushedAtMs: number,
+  ) => Effect.Effect<void, MemTableError>;
+  /**
+   * Deletes flushed rows that `retention` no longer keeps and raises `retainedFromSeq` past them,
+   * in one SQLite transaction. Never deletes an unflushed row or the newest flush's rows.
+   *
+   * @returns The new `retainedFromSeq`.
+   */
+  readonly trim: (retention: MemTableRetention) => Effect.Effect<SeqNum, MemTableError>;
+  /** Unflushed bytes, row count, the oldest unflushed commit time, and retained bytes. */
   readonly stats: Effect.Effect<MemTableStats, MemTableError>;
   /** Deletes every row and the writer's identity and sequence state (removal of the database). */
   readonly clear: Effect.Effect<void, MemTableError>;
   /**
    * Whether any of `keys`, or any key in `ranges`, has a row with a sequence number above
-   * `afterSeq` (a transaction's conflict check). Uses the `(key, seq)` primary key.
+   * `afterSeq` (a transaction's conflict check), retained or unflushed. Uses the `(key, seq)`
+   * primary key. Exact only while `afterSeq >= retainedFromSeq`.
    */
   readonly writtenAfter: (
     keys: ReadonlyArray<Uint8Array>,
@@ -176,6 +218,8 @@ const MIGRATIONS = [
    ) WITHOUT ROWID`,
   "CREATE INDEX IF NOT EXISTS memtable_rows_by_seq ON memtable_rows (seq)",
   "CREATE TABLE IF NOT EXISTS writer_meta (name TEXT PRIMARY KEY, value) WITHOUT ROWID",
+  // One row per flush: its cut and when it committed, so a trim knows how old flushed rows are.
+  "CREATE TABLE IF NOT EXISTS flush_marks (cut INTEGER PRIMARY KEY, flushed_at INTEGER NOT NULL) WITHOUT ROWID",
 ];
 
 const ROW_COLUMNS = "key, seq, kind, payload, create_ts, expire_ts";
@@ -224,6 +268,12 @@ export const makeMemTable = Effect.gen(function* () {
       value,
     );
 
+  const hasMeta = (name: string) =>
+    Effect.map(
+      sql.exec("SELECT 1 AS present FROM writer_meta WHERE name = ?", name),
+      (rows) => rows.length > 0,
+    );
+
   const meta = Effect.gen(function* () {
     const rows = yield* exec("meta", "SELECT name, value FROM writer_meta").pipe(
       Effect.flatMap((raw) => decodeStoredMeta(raw).pipe(Effect.mapError(invalid("meta")))),
@@ -247,25 +297,45 @@ export const makeMemTable = Effect.gen(function* () {
         : Option.none(),
       lastSeq: SeqNum.make(numeric("last_seq")),
       flushedSeq: SeqNum.make(numeric("flushed_seq")),
+      retainedFromSeq: SeqNum.make(
+        values.has("retained_from_seq")
+          ? Math.min(numeric("retained_from_seq"), numeric("flushed_seq"))
+          : numeric("flushed_seq"),
+      ),
+      flushedManifestId: values.has("flushed_manifest_id")
+        ? Option.some(ManifestId.make(numeric("flushed_manifest_id")))
+        : Option.none(),
       clockTick: Timestamp.make(numeric("clock_tick")),
     } satisfies WriterMeta;
   });
 
+  const rowBytes = `COALESCE(SUM(LENGTH(key) + LENGTH(payload) + ${ROW_OVERHEAD_BYTES}), 0)`;
   const stats = Effect.gen(function* () {
+    const { flushedSeq, retainedFromSeq } = yield* meta;
     const [totals] = yield* exec(
       "stats",
-      `SELECT COUNT(*) AS row_count, COALESCE(SUM(LENGTH(key) + LENGTH(payload) + ${ROW_OVERHEAD_BYTES}), 0) AS bytes FROM memtable_rows`,
+      `SELECT COUNT(*) AS row_count, ${rowBytes} AS bytes FROM memtable_rows WHERE seq > ?`,
+      flushedSeq,
+    );
+    const [retained] = yield* exec(
+      "stats",
+      `SELECT ${rowBytes} AS bytes FROM memtable_rows WHERE seq > ? AND seq <= ?`,
+      retainedFromSeq,
+      flushedSeq,
     );
     const [oldest] = yield* exec(
       "stats",
-      "SELECT create_ts FROM memtable_rows ORDER BY seq LIMIT 1",
+      "SELECT create_ts FROM memtable_rows WHERE seq > ? ORDER BY seq LIMIT 1",
+      flushedSeq,
     );
     const rowCount = totals?.["row_count"];
     const bytes = totals?.["bytes"];
+    const retainedBytes = retained?.["bytes"];
     const createTs = oldest?.["create_ts"];
     return {
       unflushedBytes: typeof bytes === "number" ? bytes : 0,
       rowCount: typeof rowCount === "number" ? rowCount : 0,
+      retainedBytes: typeof retainedBytes === "number" ? retainedBytes : 0,
       oldestCreateTs:
         typeof createTs === "number" ? Option.some(Timestamp.make(createTs)) : Option.none(),
     };
@@ -349,16 +419,17 @@ export const makeMemTable = Effect.gen(function* () {
           WriterSqlError: (error) => Effect.fail(failed("consistently")(error)),
         }),
       ),
-    versions: (key, snapshotSeq) =>
+    versions: (key, snapshotSeq, afterSeq) =>
       selectRows(
         "versions",
-        `SELECT ${ROW_COLUMNS} FROM memtable_rows WHERE key = ? AND seq <= ? ORDER BY seq DESC`,
+        `SELECT ${ROW_COLUMNS} FROM memtable_rows WHERE key = ? AND seq <= ? AND seq > ? ORDER BY seq DESC`,
         key,
         snapshotSeq,
+        afterSeq,
       ),
-    scan: (range, snapshotSeq, cursor, limit) => {
-      const conditions = ["key >= ?", "seq <= ?"];
-      const bindings: Array<SqlValue> = [range.start, snapshotSeq];
+    scan: (range, snapshotSeq, afterSeq, cursor, limit) => {
+      const conditions = ["key >= ?", "seq <= ?", "seq > ?"];
+      const bindings: Array<SqlValue> = [range.start, snapshotSeq, afterSeq];
       if (Option.isSome(range.end)) {
         conditions.push("key < ?");
         bindings.push(range.end.value);
@@ -374,19 +445,21 @@ export const makeMemTable = Effect.gen(function* () {
         limit,
       );
     },
-    rowsUpTo: (cut) =>
+    rowsUpTo: (afterSeq, cut) =>
       Stream.paginate(Option.none<MemTableCursor>(), (cursor) =>
         Effect.gen(function* () {
           const page = Option.isNone(cursor)
             ? yield* selectRows(
                 "rowsUpTo",
-                `SELECT ${ROW_COLUMNS} FROM memtable_rows WHERE seq <= ? ORDER BY key ASC, seq DESC LIMIT ?`,
+                `SELECT ${ROW_COLUMNS} FROM memtable_rows WHERE seq > ? AND seq <= ? ORDER BY key ASC, seq DESC LIMIT ?`,
+                afterSeq,
                 cut,
                 FLUSH_PAGE_ROWS,
               )
             : yield* selectRows(
                 "rowsUpTo",
-                `SELECT ${ROW_COLUMNS} FROM memtable_rows WHERE seq <= ? AND (key > ? OR (key = ? AND seq < ?)) ORDER BY key ASC, seq DESC LIMIT ?`,
+                `SELECT ${ROW_COLUMNS} FROM memtable_rows WHERE seq > ? AND seq <= ? AND (key > ? OR (key = ? AND seq < ?)) ORDER BY key ASC, seq DESC LIMIT ?`,
+                afterSeq,
                 cut,
                 cursor.value.key,
                 cursor.value.key,
@@ -410,19 +483,94 @@ export const makeMemTable = Effect.gen(function* () {
         upToSeq,
         limit,
       ),
-    truncate: Effect.fn("MemTable.truncate")(function* (cut: SeqNum) {
+    markFlushed: Effect.fn("MemTable.markFlushed")(function* (
+      cut: SeqNum,
+      manifestId: Option.Option<ManifestId>,
+      flushedAtMs: number,
+    ) {
       yield* Effect.annotateCurrentSpan({ seq: cut });
       yield* sql
         .transaction(
-          Effect.all([
-            sql.exec("DELETE FROM memtable_rows WHERE seq <= ?", cut),
-            sql.exec(
+          Effect.gen(function* () {
+            const current = yield* meta.pipe(Effect.orDie);
+            if (cut < current.flushedSeq) return;
+            yield* sql.exec(
               "INSERT INTO writer_meta (name, value) VALUES ('flushed_seq', ?) ON CONFLICT (name) DO UPDATE SET value = MAX(value, excluded.value)",
               cut,
-            ),
-          ]),
+            );
+            // Writer state from before D58 deleted every flushed row: its horizon is the old cut.
+            if (!(yield* hasMeta("retained_from_seq"))) {
+              yield* sql.exec(
+                "INSERT INTO writer_meta (name, value) VALUES ('retained_from_seq', ?)",
+                current.flushedSeq,
+              );
+            }
+            if (Option.isSome(manifestId)) {
+              yield* sql.exec(
+                "INSERT INTO writer_meta (name, value) VALUES ('flushed_manifest_id', ?) ON CONFLICT (name) DO UPDATE SET value = excluded.value",
+                manifestId.value,
+              );
+            }
+            if (cut > current.flushedSeq) {
+              yield* sql.exec(
+                "INSERT INTO flush_marks (cut, flushed_at) VALUES (?, ?) ON CONFLICT (cut) DO NOTHING",
+                cut,
+                flushedAtMs,
+              );
+            }
+          }),
         )
-        .pipe(Effect.asVoid, Effect.mapError(failed("truncate")));
+        .pipe(Effect.asVoid, Effect.mapError(failed("markFlushed")));
+    }),
+    trim: Effect.fn("MemTable.trim")(function* (retention: MemTableRetention) {
+      const horizon = yield* sql
+        .transaction(
+          Effect.gen(function* () {
+            const current = yield* meta.pipe(Effect.orDie);
+            const marks = yield* sql.exec(
+              "SELECT cut, flushed_at FROM flush_marks WHERE cut > ? AND cut <= ? ORDER BY cut ASC",
+              current.retainedFromSeq,
+              current.flushedSeq,
+            );
+            const flushes = marks.flatMap((mark) => {
+              const cut = mark["cut"];
+              const at = mark["flushed_at"];
+              return typeof cut === "number" && typeof at === "number" ? [{ cut, at }] : [];
+            });
+            // The newest flush always stays; older ones go once old enough or over the byte bound.
+            let horizon: number = current.retainedFromSeq;
+            const older = flushes.slice(0, -1);
+            const [kept] = yield* sql.exec(
+              `SELECT ${rowBytes} AS bytes FROM memtable_rows WHERE seq > ? AND seq <= ?`,
+              current.retainedFromSeq,
+              current.flushedSeq,
+            );
+            let retainedBytes = typeof kept?.["bytes"] === "number" ? kept["bytes"] : 0;
+            for (const flush of older) {
+              const expired = flush.at <= retention.nowMs - retention.retentionMs;
+              if (!expired && retainedBytes <= retention.maxRetainedBytes) break;
+              const [segment] = yield* sql.exec(
+                `SELECT ${rowBytes} AS bytes FROM memtable_rows WHERE seq > ? AND seq <= ?`,
+                horizon,
+                flush.cut,
+              );
+              retainedBytes -= typeof segment?.["bytes"] === "number" ? segment["bytes"] : 0;
+              horizon = flush.cut;
+            }
+            if (horizon > current.retainedFromSeq) {
+              yield* sql.exec("DELETE FROM memtable_rows WHERE seq <= ?", horizon);
+              yield* sql.exec("DELETE FROM flush_marks WHERE cut <= ?", horizon);
+            }
+            yield* sql.exec(
+              "INSERT INTO writer_meta (name, value) VALUES ('retained_from_seq', ?) ON CONFLICT (name) DO UPDATE SET value = excluded.value",
+              horizon,
+            );
+            return SeqNum.make(horizon);
+          }),
+        )
+        .pipe(Effect.mapError(failed("trim")));
+      yield* Effect.annotateCurrentSpan({ "memtable.retained_from_seq": horizon });
+      return horizon;
     }),
     stats,
     writtenAfter: Effect.fn("MemTable.writtenAfter")(function* (
@@ -460,7 +608,11 @@ export const makeMemTable = Effect.gen(function* () {
     }),
     clear: sql
       .transaction(
-        Effect.all([sql.exec("DELETE FROM memtable_rows"), sql.exec("DELETE FROM writer_meta")]),
+        Effect.all([
+          sql.exec("DELETE FROM memtable_rows"),
+          sql.exec("DELETE FROM writer_meta"),
+          sql.exec("DELETE FROM flush_marks"),
+        ]),
       )
       .pipe(Effect.asVoid, Effect.mapError(failed("clear")), Effect.withSpan("MemTable.clear")),
   });

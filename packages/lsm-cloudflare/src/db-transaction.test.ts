@@ -1,18 +1,24 @@
 import {
+  type CompactionJob,
+  type CompactorEpoch,
   DatabaseId,
   DEFAULT_DATABASE_OPTIONS,
   initialManifest,
-  type SeqNum,
+  planCompactions,
+  type SstHandle,
   type TransactionIsolation,
 } from "@cf-slatedb/lsm-core";
-import { Arbitrary, Effect, Option, Schema } from "effect";
+import { Arbitrary, Effect, Layer, Option, Schema } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
-import { DbClient, dbClientTestLayer } from "./db-client.ts";
+import { CompactionExecutor, makeCompactionExecutor } from "./compaction-executor.ts";
+import { DbClient, dbClientTestLayer, type TransactionBegin } from "./db-client.ts";
 import type { DbReaderServices } from "./db-reader.ts";
 import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
+import { ManifestReader } from "./manifest-reader.ts";
 import { ManifestStore } from "./manifest-store.ts";
+import { sstStoreLayerWithoutDependencies } from "./sst-store.ts";
 
 const DB = DatabaseId.make("orders");
 const key = (n: number) => Uint8Array.of(0x6b, n);
@@ -21,13 +27,61 @@ const byte = (value: Option.Option<Uint8Array>) =>
 const smallInt = (minimum: number, maximum: number) =>
   Arbitrary.schema(Schema.Int.check(Schema.isBetween({ minimum, maximum })));
 
-const provide = <A, E>(program: Effect.Effect<A, E, DbClient | ManifestStore | DbReaderServices>) =>
-  program.pipe(
-    Effect.scoped,
-    Effect.provide(dbClientTestLayer({ blockSize: 64 })),
-    Effect.provide(lsmTestRuntimeContextLayer),
-    Effect.provide(TestClock.layer()),
+/**
+ * The client and an executor over one bucket. Flushed rows stay 3 s (the test clock) and at most
+ * ~120 bytes, so trims happen while transactions are open (D58).
+ */
+const testLayer = (settings: Parameters<typeof dbClientTestLayer>[0]) =>
+  Layer.effect(CompactionExecutor, makeCompactionExecutor).pipe(
+    Layer.provide(sstStoreLayerWithoutDependencies),
+    Layer.provideMerge(dbClientTestLayer({ blockSize: 64, ...settings })),
   );
+
+type TestServices =
+  | CompactionExecutor
+  | DbClient
+  | ManifestStore
+  | ManifestReader
+  | DbReaderServices;
+
+const provideWith =
+  (settings: Parameters<typeof dbClientTestLayer>[0]) =>
+  <A, E>(program: Effect.Effect<A, E, TestServices>) =>
+    program.pipe(
+      Effect.scoped,
+      Effect.provide(testLayer(settings)),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.provide(TestClock.layer()),
+    );
+
+const provide = provideWith({ transactionRetentionMs: 3_000, maxRetainedBytes: 120 });
+
+/** Runs one compaction job the way the Workflow does. */
+const runJob = (job: CompactionJob, compactorEpoch: CompactorEpoch) =>
+  Effect.gen(function* () {
+    const executor = yield* CompactionExecutor;
+    const prepared = yield* executor.prepare(DB, compactorEpoch, job);
+    const outputs: Array<SstHandle> = [];
+    let start = Option.none<Uint8Array>();
+    do {
+      const step = yield* executor.writeOutput(prepared, start);
+      outputs.push(...Option.toArray(step.output));
+      start = step.resumeFrom;
+    } while (Option.isSome(start));
+    return yield* executor.commit(prepared, outputs);
+  });
+
+/** Compacts L0 (and the sorted run) when there is anything to compact. */
+const compact = Effect.gen(function* () {
+  const { manifest } = yield* (yield* ManifestReader).loadLatest(DB);
+  const [job] = planCompactions(manifest, [], {
+    minCompactionSources: 2,
+    maxCompactionSources: 8,
+    includeSizeThreshold: 1_000_000,
+    maxConcurrentCompactions: 1,
+  });
+  if (job !== undefined) yield* runJob(job, manifest.compactorEpoch);
+});
 
 const createDatabase = Effect.gen(function* () {
   yield* (yield* ManifestStore).initialize(
@@ -44,10 +98,12 @@ type Step =
   | { readonly _tag: "Write"; readonly txn: number; readonly key: number; readonly value: number }
   | { readonly _tag: "Commit"; readonly txn: number }
   | { readonly _tag: "Direct"; readonly key: number; readonly value: number }
-  | { readonly _tag: "Flush" };
+  | { readonly _tag: "Flush" }
+  | { readonly _tag: "Compact" }
+  | { readonly _tag: "Tick" };
 
 const stepArbitrary: Arbitrary.Arbitrary<Step> = Arbitrary.all({
-  kind: smallInt(0, 19),
+  kind: smallInt(0, 21),
   txn: smallInt(0, 2),
   key: smallInt(0, 2),
   value: smallInt(1, 250),
@@ -58,20 +114,22 @@ const stepArbitrary: Arbitrary.Arbitrary<Step> = Arbitrary.all({
     if (kind <= 14) return { _tag: "Write", txn, key, value };
     if (kind <= 17) return { _tag: "Commit", txn };
     if (kind === 18) return { _tag: "Direct", key, value };
-    return { _tag: "Flush" };
+    if (kind === 19) return { _tag: "Flush" };
+    if (kind === 20) return { _tag: "Compact" };
+    return { _tag: "Tick" };
   }),
 );
 
-interface Running {
-  readonly readSeq: SeqNum;
+interface Running extends TransactionBegin {
   readonly startedAt: number;
   readonly reads: Map<number, number | undefined>;
   readonly writes: Map<number, number>;
 }
 
 /**
- * Runs a random interleaving of transactions (through the stateless primitives), direct writes, and
- * flushes against an oracle that applies commits in commit order.
+ * Runs a random interleaving of transactions (through the stateless primitives, with the begin
+ * manifest), direct writes, flushes, compactions, and the clock moving (so the writer trims flushed
+ * rows), against an oracle that applies commits in commit order.
  */
 const checkSchedule = (isolation: TransactionIsolation) => (steps: ReadonlyArray<Step>) =>
   provide(
@@ -88,7 +146,7 @@ const checkSchedule = (isolation: TransactionIsolation) => (steps: ReadonlyArray
           case "Begin":
             if (!running.has(step.txn)) {
               running.set(step.txn, {
-                readSeq: yield* client.beginTransaction(DB),
+                ...(yield* client.beginTransaction(DB)),
                 startedAt: clock,
                 reads: new Map(),
                 writes: new Map(),
@@ -98,7 +156,9 @@ const checkSchedule = (isolation: TransactionIsolation) => (steps: ReadonlyArray
           case "Read": {
             const txn = running.get(step.txn);
             if (txn === undefined || txn.writes.has(step.key)) break;
-            const row = yield* Effect.result(client.getAt(DB, key(step.key), txn.readSeq));
+            const row = yield* Effect.result(
+              client.getAt(DB, key(step.key), txn.readSeq, txn.manifestId),
+            );
             if (row._tag === "Failure") {
               if (row.failure._tag !== "TransactionConflictError") return false;
               running.delete(step.txn);
@@ -160,7 +220,13 @@ const checkSchedule = (isolation: TransactionIsolation) => (steps: ReadonlyArray
             break;
           case "Flush":
             yield* client.flush(DB);
-            yield* TestClock.adjust("2 seconds");
+            yield* TestClock.adjust("1 second");
+            break;
+          case "Compact":
+            yield* compact;
+            break;
+          case "Tick":
+            yield* TestClock.adjust("1 second");
         }
       }
       return true;
@@ -201,7 +267,7 @@ describe("transactions", () => {
           // Both read both keys, then each writes a different one.
           const t1 = yield* client.beginTransaction(DB);
           const t2 = yield* client.beginTransaction(DB);
-          const commit = (readSeq: SeqNum, k: number) =>
+          const commit = ({ readSeq }: TransactionBegin, k: number) =>
             Effect.result(
               client.commitTransaction(DB, {
                 readSeq,
@@ -264,32 +330,105 @@ describe("transactions", () => {
     expect(outcome.three).toEqual(Option.none());
   });
 
-  it("refuses a transaction whose snapshot was flushed past, at read and at commit", async () => {
+  it("reads and commits exactly across flushes and a compaction, from its begin manifest", async () => {
     const outcome = await Effect.runPromise(
-      provide(
+      provideWith({ transactionRetentionMs: 60_000 })(
         Effect.gen(function* () {
           yield* createDatabase;
           const client = yield* DbClient;
           yield* client.put(DB, key(1), Uint8Array.of(1));
-          const readSeq = yield* client.beginTransaction(DB);
+          const begin = yield* client.beginTransaction(DB);
+          // Newer writes, flushed and compacted while the transaction is open.
+          yield* client.put(DB, key(1), Uint8Array.of(7));
+          yield* client.flush(DB);
           yield* client.put(DB, key(2), Uint8Array.of(2));
           yield* client.flush(DB);
-          const read = yield* Effect.flip(client.getAt(DB, key(1), readSeq));
+          yield* compact;
+          const read = yield* client.getAt(DB, key(1), begin.readSeq, begin.manifestId);
+          const scanned = yield* client.scanAt(
+            DB,
+            { start: key(0), end: Option.some(key(9)) },
+            begin.readSeq,
+            10,
+            begin.manifestId,
+          );
+          // It read key 1, which changed since: a serializable commit refuses, as it must.
+          const conflict = yield* Effect.flip(
+            client.commitTransaction(DB, {
+              readSeq: begin.readSeq,
+              isolation: "SerializableSnapshot",
+              batch: { operations: [{ _tag: "Delete", key: key(9) }] },
+              readKeys: [key(1)],
+              readRanges: [],
+            }),
+          );
+          // One that read only untouched keys commits, though data it never saw was flushed.
+          const committed = yield* client.commitTransaction(DB, {
+            readSeq: begin.readSeq,
+            isolation: "SerializableSnapshot",
+            batch: { operations: [{ _tag: "Delete", key: key(9) }] },
+            readKeys: [key(5)],
+            readRanges: [],
+          });
+          return {
+            read: Option.map(read, (row) => row.value),
+            scanned: scanned.map((row) => row.key[1]),
+            conflict:
+              conflict._tag === "TransactionConflictError" ? conflict.reason : conflict._tag,
+            committed: committed.seq > begin.readSeq,
+          };
+        }),
+      ),
+    );
+    expect(Option.map(outcome.read, (value) => value._tag === "Value" && value.bytes[0])).toEqual(
+      Option.some(1),
+    );
+    expect(outcome.scanned).toEqual([1]);
+    expect(outcome.conflict).toBe("ReadConflict");
+    expect(outcome.committed).toBe(true);
+  });
+
+  it("ends a transaction only once its rows are trimmed, and old callers at the first flush", async () => {
+    const outcome = await Effect.runPromise(
+      provideWith({ transactionRetentionMs: 1_000 })(
+        Effect.gen(function* () {
+          yield* createDatabase;
+          const client = yield* DbClient;
+          yield* client.put(DB, key(1), Uint8Array.of(1));
+          const begin = yield* client.beginTransaction(DB);
+          yield* client.put(DB, key(2), Uint8Array.of(2));
+          yield* client.flush(DB);
+          // Within retention: exact with the manifest; a caller without it (before D58) is too old.
+          const kept = yield* client.getAt(DB, key(1), begin.readSeq, begin.manifestId);
+          const legacy = yield* Effect.flip(client.getAt(DB, key(1), begin.readSeq, Option.none()));
+          // Past retention, a later flush trims the rows after readSeq: too old, at read and commit.
+          yield* TestClock.adjust("2 seconds");
+          yield* client.put(DB, key(3), Uint8Array.of(3));
+          yield* client.flush(DB);
+          const read = yield* Effect.flip(
+            client.getAt(DB, key(1), begin.readSeq, begin.manifestId),
+          );
           const commit = yield* Effect.flip(
             client.commitTransaction(DB, {
-              readSeq,
+              readSeq: begin.readSeq,
               isolation: "Snapshot",
               batch: { operations: [{ _tag: "Delete", key: key(9) }] },
               readKeys: [],
               readRanges: [],
             }),
           );
-          return [read, commit].map((error) =>
-            error._tag === "TransactionConflictError" ? error.reason : error._tag,
-          );
+          return {
+            kept: Option.isSome(kept),
+            errors: [legacy, read, commit].map((error) =>
+              error._tag === "TransactionConflictError" ? error.reason : error._tag,
+            ),
+          };
         }),
       ),
     );
-    expect(outcome).toEqual(["SnapshotTooOld", "SnapshotTooOld"]);
+    expect(outcome).toEqual({
+      kept: true,
+      errors: ["SnapshotTooOld", "SnapshotTooOld", "SnapshotTooOld"],
+    });
   });
 });

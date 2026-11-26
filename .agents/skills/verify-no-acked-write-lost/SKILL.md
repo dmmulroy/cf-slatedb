@@ -74,6 +74,13 @@ them. The `nonAtomicProbe` variant reproduces it.
 
 ## Maintenance notes
 
+- D58 (v1 workstream 4): a flush no longer deletes rows. `MemTable.markFlushed` records
+  `flushed_seq` after the manifest commit (the model's `FlushTruncate`), and a separate `Trim`
+  deletes flushed rows up to a horizon at or below `flushed_seq` at any time. The `Latest` probe
+  reads only rows above `flushed_seq`, and a restart records the manifest's `lastL0Seq` as flushed
+  without deleting. New broken variant `trimUnflushed` fails `NoAckedWriteLost`;
+  `truncateBeforeCommit` (advance and trim before the commit) and `nonAtomicProbe` still fail.
+
 - Checked against the v1 workstream 2 commit (D56). `DbWriter.flushNow` and `DbWriter.seal` commit
   through `ManifestStore.updateFrom` from the writer's own view: still one manifest commit between
   the upload and the truncate, which may internally reload and retry (as `update` did); a refused
@@ -93,7 +100,7 @@ them. The `nonAtomicProbe` variant reproduces it.
 
 ## Keeping it in step with the code
 
-Sync commit: the v1 workstream 2 commit (`fast manifest commits`, D56). When a covered function changes after it, update the model so
+Sync commit: the v1 workstream 4 commit (`transactions exact across flushes`, D58). When a covered function changes after it, update the model so
 each action is still one awaited effect in the code, rerun, and show each invariant still fails on a
 broken variant before moving the sync commit. For drift that skipped this skill, use
 `.agents/skills/maintain-formal-verification-skill/SKILL.md`.

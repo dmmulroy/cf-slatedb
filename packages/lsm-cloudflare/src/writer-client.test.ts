@@ -56,6 +56,7 @@ describe("WriterClient over the writer HTTP API", () => {
         snapshotSeq: Option.none(),
         cursor: Option.none(),
         limit: 1,
+        includeRetained: false,
       });
       const changes = yield* client.changes(A, SeqNum.make(0), 10);
       const flushed = yield* client.flush(A);

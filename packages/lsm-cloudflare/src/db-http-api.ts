@@ -89,15 +89,31 @@ export const ForkDatabaseRequest = Schema.Struct({
   range: KeyRange,
 });
 
-/** Schema for a transaction's read: a key at the transaction's read sequence number. */
+/**
+ * Schema for the start of a transaction: its read sequence number and, when the database reports
+ * one, the manifest its reads come from (`manifestId`, from `transactions/begin`; pass it to every
+ * read so they stay exact across flushes, D58).
+ */
+export const TransactionBeginResponse = Schema.Struct({
+  readSeq: SeqNum,
+  manifestId: Schema.OptionFromOptionalKey(ManifestId),
+});
+
+/**
+ * Schema for a transaction's read: a key at the transaction's read sequence number, from its begin
+ * manifest when given. Without `manifestId` a flush past `readSeq` ends the read with
+ * `SnapshotTooOld`.
+ */
 export const TransactionGetRequest = Schema.Struct({
   readSeq: SeqNum,
+  manifestId: Schema.OptionFromOptionalKey(ManifestId),
   key: Schema.Uint8ArrayFromBase64,
 });
 
-/** Schema for a transaction's scan: a range at the transaction's read sequence number. */
+/** Schema for a transaction's scan: a range at the transaction's read sequence number (see get). */
 export const TransactionScanRequest = Schema.Struct({
   readSeq: SeqNum,
+  manifestId: Schema.OptionFromOptionalKey(ManifestId),
   range: KeyRange,
   limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 1000 })),
 });
@@ -262,7 +278,7 @@ export class DbHttpApiGroup extends HttpApiGroup.make("databases")
   .add(
     HttpApiEndpoint.post("beginTransaction", "/databases/:databaseId/transactions/begin", {
       params: DatabaseParams,
-      success: Schema.Struct({ readSeq: SeqNum }),
+      success: TransactionBeginResponse,
       error: DB_PUBLIC_ERRORS,
     }).annotateMerge(
       OpenApi.annotations({

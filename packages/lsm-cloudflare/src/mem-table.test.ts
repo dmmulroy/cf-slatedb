@@ -1,8 +1,10 @@
 import {
   type CollapsedWrite,
   FULL_KEY_RANGE,
+  ManifestId,
   type Row,
   rowOrder,
+  RowValue,
   SeqNum,
   Timestamp,
 } from "@cf-slatedb/lsm-core";
@@ -100,20 +102,26 @@ describe("MemTable on SQLite", () => {
         const expected = yield* commitAll(batches);
         if (Option.isNone(expected)) return false;
         const all = expected.value;
-        const streamed = yield* Stream.runCollect(memTable.rowsUpTo(SeqNum.make(batches.length)));
+        const streamed = yield* Stream.runCollect(
+          memTable.rowsUpTo(SeqNum.make(0), SeqNum.make(batches.length)),
+        );
         // Paginated scan with a small page, at a snapshot in the middle.
         const snapshot = SeqNum.make(Math.ceil(batches.length / 2));
         const scanned: Array<Row> = [];
         let cursor = Option.none<MemTableCursor>();
         for (;;) {
-          const page = yield* memTable.scan(FULL_KEY_RANGE, snapshot, cursor, 3);
+          const page = yield* memTable.scan(FULL_KEY_RANGE, snapshot, SeqNum.make(0), cursor, 3);
           scanned.push(...page);
           const last = page[page.length - 1];
           if (page.length < 3 || last === undefined) break;
           cursor = Option.some({ key: last.key, seq: last.seq });
         }
         const firstKey = all[0]?.key ?? new Uint8Array();
-        const versions = yield* memTable.versions(firstKey, SeqNum.make(batches.length));
+        const versions = yield* memTable.versions(
+          firstKey,
+          SeqNum.make(batches.length),
+          SeqNum.make(0),
+        );
         const meta = yield* memTable.meta;
         return (
           streamed.map(rowSignature).join("|") === all.map(rowSignature).join("|") &&
@@ -134,28 +142,72 @@ describe("MemTable on SQLite", () => {
     );
   });
 
-  it("truncates exactly the rows at or below a cut and records it as flushed", async () => {
+  it("records a cut as flushed without deleting rows, and the Latest queries see only rows above it", async () => {
     await check((batches) =>
       Effect.gen(function* () {
         const memTable = yield* MemTable;
         const expected = yield* commitAll(batches);
         if (Option.isNone(expected)) return false;
         const cut = SeqNum.make(Math.floor(batches.length / 2));
-        yield* memTable.truncate(cut);
-        const remaining = yield* Stream.runCollect(memTable.rowsUpTo(SeqNum.make(batches.length)));
-        const stats = yield* memTable.stats;
+        const last = SeqNum.make(batches.length);
+        yield* memTable.markFlushed(cut, Option.some(ManifestId.make(5)), 1_000);
         const meta = yield* memTable.meta;
-        const bySeq = yield* memTable.rowsBySeq(cut, SeqNum.make(batches.length), 10_000);
-        const want = expected.value.filter((row) => row.seq > cut);
+        const unflushed = yield* Stream.runCollect(memTable.rowsUpTo(meta.flushedSeq, last));
+        const kept = yield* Stream.runCollect(memTable.rowsUpTo(meta.retainedFromSeq, last));
+        const stats = yield* memTable.stats;
+        const bySeq = yield* memTable.rowsBySeq(cut, last, 10_000);
+        const above = expected.value.filter((row) => row.seq > cut);
         return (
-          remaining.map(rowSignature).join("|") === want.map(rowSignature).join("|") &&
-          stats.rowCount === want.length &&
-          bySeq.length === want.length &&
+          unflushed.map(rowSignature).join("|") === above.map(rowSignature).join("|") &&
+          // Flushed rows stay for transactions until a trim (D58).
+          kept.length === expected.value.length &&
+          stats.rowCount === above.length &&
+          bySeq.length === above.length &&
           bySeq.every((row, index) => index === 0 || (bySeq[index - 1]?.seq ?? 0) <= row.seq) &&
-          meta.flushedSeq === cut
+          meta.flushedSeq === cut &&
+          meta.retainedFromSeq === 0 &&
+          Option.contains(meta.flushedManifestId, ManifestId.make(5))
         );
       }),
     );
+  });
+
+  it("trims flushed rows past retention or the byte bound, never the newest flush or unflushed rows", async () => {
+    const outcome = await Effect.gen(function* () {
+      const memTable = yield* MemTable;
+      const row = (n: number) => ({
+        key: Uint8Array.of(n),
+        value: RowValue.Value({ bytes: new Uint8Array(100) }),
+        ttlMillis: Option.none(),
+      });
+      // Three flushes at 0 s, 10 s, and 20 s, then one unflushed row.
+      for (const [index, at] of [0, 10_000, 20_000].entries()) {
+        yield* memTable.commit([row(index)], Timestamp.make(at));
+        yield* memTable.markFlushed(
+          SeqNum.make(index + 1),
+          Option.some(ManifestId.make(index + 2)),
+          at,
+        );
+      }
+      yield* memTable.commit([row(9)], Timestamp.make(21_000));
+      const within = yield* memTable.trim({
+        nowMs: 21_000,
+        retentionMs: 15_000,
+        maxRetainedBytes: 10_000,
+      });
+      const aged = yield* memTable.trim({
+        nowMs: 21_000,
+        retentionMs: 5_000,
+        maxRetainedBytes: 10_000,
+      });
+      const all = yield* memTable.trim({ nowMs: 99_000, retentionMs: 0, maxRetainedBytes: 0 });
+      const meta = yield* memTable.meta;
+      const left = yield* Stream.runCollect(memTable.rowsUpTo(SeqNum.make(0), SeqNum.make(4)));
+      // A writer from before D58 deleted flushed rows: its horizon reads as flushedSeq.
+      return { within, aged, all, retained: meta.retainedFromSeq, left: left.map((r) => r.seq) };
+    }).pipe(Effect.provide(memTableTestLayer), Effect.runPromise);
+    // 15 s keeps the flushes at 10 s and 20 s; 5 s keeps only 20 s; nothing drops the newest flush.
+    expect(outcome).toEqual({ within: 1, aged: 2, all: 2, retained: 2, left: [3, 4] });
   });
 
   it("rolls back a failed commit, keeping the sequence number unassigned", async () => {

@@ -234,9 +234,11 @@ const measureTransactionsCommand = Command.make(
     transactors: Flag.Int("transactors").pipe(Flag.withDefault(4)),
     writers: Flag.Int("writers").pipe(Flag.withDefault(4)),
     seconds: Flag.Int("seconds").pipe(Flag.withDefault(150)),
+    holdSeconds: Flag.Int("hold-seconds").pipe(Flag.withDefault(0)),
+    flushEverySeconds: Flag.Int("flush-every-seconds").pipe(Flag.withDefault(0)),
   },
   ({ stage, ...load }) => runMeasurement(stage, measureTransactionAborts(load)),
-).pipe(Command.withDescription("How often a flush aborts a transaction (SnapshotTooOld, D50)"));
+).pipe(Command.withDescription("How often a transaction aborts as too old across flushes (D58)"));
 
 const measureManifestCasCommand = Command.make(
   "manifest-cas",

@@ -74,11 +74,24 @@ export interface MemTableProbe {
   readonly flushedSeq: SeqNum;
 }
 
+/**
+ * What a transaction read at `readSeq` learns from the writer about one key: every version still in
+ * SQLite (retained or unflushed) at or below `readSeq`, and the horizon below which rows are gone.
+ */
+export interface MemTableProbeAt {
+  /** The key's versions with `retainedFromSeq < seq <= readSeq`, newest first. */
+  readonly versions: ReadonlyArray<Row>;
+  /** Rows at or below it are gone from SQLite: the read needs a manifest at or past it. */
+  readonly retainedFromSeq: SeqNum;
+}
+
 /** One page of a memtable scan. */
 export interface MemTableScanPage {
   readonly rows: ReadonlyArray<Row>;
   readonly snapshotSeq: SeqNum;
   readonly flushedSeq: SeqNum;
+  /** Rows at or below it are gone from SQLite (see `WriterMeta.retainedFromSeq`). */
+  readonly retainedFromSeq: SeqNum;
   /** Where the next page starts, or none on the last page. */
   readonly nextCursor: Option.Option<MemTableCursor>;
 }
@@ -97,6 +110,10 @@ export interface WriterStatus {
   readonly writerEpoch: WriterEpoch;
   readonly lastSeq: SeqNum;
   readonly flushedSeq: SeqNum;
+  /** Every row above it is still in SQLite for transactions to check (D58). */
+  readonly retainedFromSeq: SeqNum;
+  /** The manifest that made `flushedSeq` durable, or none for writer state from before D58. */
+  readonly flushedManifestId: Option.Option<ManifestId>;
   readonly unflushedBytes: number;
   readonly unflushedRows: number;
   readonly l0Count: number;
@@ -143,7 +160,19 @@ export interface IDbWriter {
     databaseId: DatabaseId,
     key: Uint8Array,
   ) => Effect.Effect<MemTableProbe, DbWriterError, RuntimeContext>;
-  /** One page of unflushed rows in `range` at `snapshotSeq` (default: newest). */
+  /**
+   * A transaction's read of one key at `readSeq`: its retained and unflushed versions at or below
+   * `readSeq`, with the retained horizon read atomically (D58).
+   */
+  readonly probeAt: (
+    databaseId: DatabaseId,
+    key: Uint8Array,
+    readSeq: SeqNum,
+  ) => Effect.Effect<MemTableProbeAt, DbWriterError, RuntimeContext>;
+  /**
+   * One page of rows in `range` at `snapshotSeq` (default: newest): unflushed rows, or with
+   * `includeRetained` (a transaction's scan) every row still in SQLite.
+   */
   readonly scan: (
     databaseId: DatabaseId,
     request: {
@@ -151,6 +180,7 @@ export interface IDbWriter {
       readonly snapshotSeq: Option.Option<SeqNum>;
       readonly cursor: Option.Option<MemTableCursor>;
       readonly limit: number;
+      readonly includeRetained: boolean;
     },
   ) => Effect.Effect<MemTableScanPage, DbWriterError, RuntimeContext>;
   /** Flushes every committed row to L0 now. @returns The new `flushedSeq`. */
@@ -344,12 +374,16 @@ export const makeDbWriter = Effect.gen(function* () {
           yield* memTable
             .seed({ seq: fenced.manifest.lastL0Seq, clockTick: fenced.manifest.lastL0ClockTick })
             .pipe(Effect.mapError(unavailable(databaseId, "start")));
-          // Rows at or below lastL0Seq are already in L0: a crash hit between commit and truncate.
-          if (fenced.manifest.lastL0Seq > 0) {
-            yield* memTable
-              .truncate(fenced.manifest.lastL0Seq)
-              .pipe(Effect.mapError(unavailable(databaseId, "start")));
-          }
+          // Rows at or below lastL0Seq are already in L0 (a crash may have hit between the commit
+          // and recording it): record them as flushed, by the fenced manifest, and keep them for
+          // transactions like any flushed rows (D58).
+          yield* memTable
+            .markFlushed(
+              fenced.manifest.lastL0Seq,
+              Option.some(fenced.id),
+              yield* Clock.currentTimeMillis,
+            )
+            .pipe(Effect.mapError(unavailable(databaseId, "start")));
           yield* refreshUnflushedBytes(databaseId);
           const ready: WriterPhase = {
             _tag: "Ready",
@@ -429,7 +463,7 @@ export const makeDbWriter = Effect.gen(function* () {
               owner: databaseId,
               kind: "Compacted",
               objectKey: (id) => sstKey(databaseId, id),
-              rows: memTable.rowsUpTo(cut),
+              rows: memTable.rowsUpTo(meta.flushedSeq, cut),
             })
             .pipe(
               Effect.catchTags({
@@ -439,8 +473,10 @@ export const makeDbWriter = Effect.gen(function* () {
               }),
             );
           if (Option.isNone(written)) {
-            // Nothing at or below the cut (already truncated): just record it.
-            yield* memTable.truncate(cut).pipe(Effect.mapError(unavailable(databaseId, "flush")));
+            // No row in (flushedSeq, cut] (sequence numbers without rows): just record it.
+            yield* memTable
+              .markFlushed(cut, Option.none(), yield* Clock.currentTimeMillis)
+              .pipe(Effect.mapError(unavailable(databaseId, "flush")));
             return { flushedSeq: cut, committed: nothingCommitted };
           }
           const changelog = Option.isSome(options.changelog)
@@ -476,10 +512,20 @@ export const makeDbWriter = Effect.gen(function* () {
                 error._tag === "WriterFencedError" ? markFenced(databaseId, error) : Effect.void,
               ),
             );
-          // Delete only after the manifest commit: a crash before this line leaves rows that the next
-          // start drops (they are in L0), or that a later flush writes again with the same sequence
-          // numbers, which merging deduplicates.
-          yield* memTable.truncate(cut).pipe(Effect.mapError(unavailable(databaseId, "flush")));
+          // Recorded only after the manifest commit: a crash before this line leaves rows the next
+          // start records as flushed (they are in L0), or that a later flush writes again with the
+          // same sequence numbers, which merging deduplicates. The rows stay for transactions until
+          // a trim, which never removes the newest flush (D58).
+          yield* memTable
+            .markFlushed(cut, Option.some(committed.id), yield* Clock.currentTimeMillis)
+            .pipe(Effect.mapError(unavailable(databaseId, "flush")));
+          yield* memTable
+            .trim({
+              nowMs: yield* Clock.currentTimeMillis,
+              retentionMs: settings.transactionRetentionMs,
+              maxRetainedBytes: settings.maxRetainedBytes,
+            })
+            .pipe(Effect.mapError(unavailable(databaseId, "flush")));
           yield* Ref.update(phase, (current) =>
             current._tag === "Ready" ? { ...current, manifest: committed } : current,
           );
@@ -660,11 +706,11 @@ export const makeDbWriter = Effect.gen(function* () {
       const meta = yield* memTable.meta.pipe(
         Effect.mapError(unavailable(databaseId, "transaction")),
       );
-      // Every write after readSeq must still be in the memtable to be checked.
-      if (meta.flushedSeq > commit.readSeq || commit.readSeq > meta.lastSeq) {
+      // Every write after readSeq must still be in SQLite (retained or unflushed) to be checked.
+      if (meta.retainedFromSeq > commit.readSeq || commit.readSeq > meta.lastSeq) {
         return yield* conflict(
           "SnapshotTooOld",
-          `Data newer than the transaction's reads (sequence number ${commit.readSeq}) has been flushed in database ${databaseId}, so its snapshot can no longer be checked. Begin a new transaction and run it again; nothing was written.`,
+          `Database ${databaseId} no longer keeps every write after the transaction's reads (sequence number ${commit.readSeq}), so its snapshot can no longer be checked: it ran longer than the writer keeps flushed rows. Begin a new transaction and run it again; nothing was written.`,
         );
       }
       const writtenAfter = (keys: ReadonlyArray<Uint8Array>, ranges: ReadonlyArray<KeyRange>) =>
@@ -697,7 +743,10 @@ export const makeDbWriter = Effect.gen(function* () {
     // Read flushedSeq and the versions atomically: a flush truncating in between would hide rows.
     const { meta, versions } = yield* memTable
       .consistently((meta) =>
-        Effect.map(memTable.versions(key, meta.lastSeq), (versions) => ({ meta, versions })),
+        Effect.map(memTable.versions(key, meta.lastSeq, meta.flushedSeq), (versions) => ({
+          meta,
+          versions,
+        })),
       )
       .pipe(Effect.mapError(unavailable(databaseId, "probe")));
     yield* Effect.annotateCurrentSpan({
@@ -708,6 +757,28 @@ export const makeDbWriter = Effect.gen(function* () {
     return { versions, snapshotSeq: meta.lastSeq, flushedSeq: meta.flushedSeq };
   });
 
+  const probeAt = Effect.fn("DbWriter.probeAt")(function* (
+    databaseId: DatabaseId,
+    key: Uint8Array,
+    readSeq: SeqNum,
+  ) {
+    yield* Effect.annotateCurrentSpan({
+      "database.id": databaseId,
+      "transaction.read_seq": readSeq,
+    });
+    yield* ensureReady(databaseId);
+    // The horizon and the rows atomically: a trim in between would hide rows.
+    const { meta, versions } = yield* memTable
+      .consistently((meta) =>
+        Effect.map(memTable.versions(key, readSeq, meta.retainedFromSeq), (versions) => ({
+          meta,
+          versions,
+        })),
+      )
+      .pipe(Effect.mapError(unavailable(databaseId, "probe")));
+    return { versions, retainedFromSeq: meta.retainedFromSeq };
+  });
+
   const scan = Effect.fn("DbWriter.scan")(function* (
     databaseId: DatabaseId,
     request: {
@@ -715,6 +786,7 @@ export const makeDbWriter = Effect.gen(function* () {
       readonly snapshotSeq: Option.Option<SeqNum>;
       readonly cursor: Option.Option<MemTableCursor>;
       readonly limit: number;
+      readonly includeRetained: boolean;
     },
   ) {
     yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
@@ -725,7 +797,13 @@ export const makeDbWriter = Effect.gen(function* () {
       .consistently((meta) => {
         const snapshotSeq = Option.getOrElse(request.snapshotSeq, () => meta.lastSeq);
         return Effect.map(
-          memTable.scan(request.range, snapshotSeq, request.cursor, limit),
+          memTable.scan(
+            request.range,
+            snapshotSeq,
+            request.includeRetained ? meta.retainedFromSeq : meta.flushedSeq,
+            request.cursor,
+            limit,
+          ),
           (rows) => ({
             meta,
             snapshotSeq,
@@ -739,6 +817,7 @@ export const makeDbWriter = Effect.gen(function* () {
       rows,
       snapshotSeq,
       flushedSeq: meta.flushedSeq,
+      retainedFromSeq: meta.retainedFromSeq,
       nextCursor:
         rows.length === limit && last !== undefined
           ? Option.some({ key: last.key, seq: last.seq })
@@ -763,7 +842,11 @@ export const makeDbWriter = Effect.gen(function* () {
     const { meta, rows } = yield* memTable
       .consistently((meta) =>
         Effect.map(
-          memTable.rowsBySeq(afterSeq, meta.lastSeq, Math.max(1, Math.min(limit, 1000))),
+          memTable.rowsBySeq(
+            SeqNum.make(Math.max(afterSeq, meta.flushedSeq)),
+            meta.lastSeq,
+            Math.max(1, Math.min(limit, 1000)),
+          ),
           (rows) => ({
             meta,
             rows,
@@ -787,6 +870,8 @@ export const makeDbWriter = Effect.gen(function* () {
       writerEpoch: ready.writerEpoch,
       lastSeq: meta.lastSeq,
       flushedSeq: meta.flushedSeq,
+      retainedFromSeq: meta.retainedFromSeq,
+      flushedManifestId: meta.flushedManifestId,
       unflushedBytes: stats.unflushedBytes,
       unflushedRows: stats.rowCount,
       l0Count: ready.manifest.manifest.l0.length,
@@ -931,6 +1016,7 @@ export const makeDbWriter = Effect.gen(function* () {
     write,
     commitTransaction,
     probe,
+    probeAt,
     scan,
     flush,
     changes,

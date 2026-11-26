@@ -18,7 +18,11 @@ export const CF_SLATEDB_STACK_NAME = "CfSlatedb";
  * dev`, so scenarios see compaction and collection within seconds. Without the flag a preview runs
  * the production defaults, so its measurements are honest.
  */
-export const PREVIEW_DEV_TIMINGS = { gcMinAge: 10_000, compactorPollInterval: 1_000 } as const;
+export const PREVIEW_DEV_TIMINGS = {
+  gcMinAge: 10_000,
+  compactorPollInterval: 1_000,
+  transactionRetentionMs: 5_000,
+} as const;
 
 /** Schema for a preview's data-residency jurisdiction: `none` leaves it unrestricted. */
 export const PreviewJurisdiction = Schema.Literals(["none", "eu", "fedramp"]);

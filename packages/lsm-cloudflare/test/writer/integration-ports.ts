@@ -29,6 +29,7 @@ export const INTEGRATION_WORKER_SETTINGS: LsmWorkerSettingsSource = Effect.succe
     maxL0Age: 2000,
     compactorPollInterval: 500,
     gcMinAge: 1000,
+    transactionRetentionMs: 500,
   },
   jurisdiction: Option.none(),
   bucketLocation: Option.none(),

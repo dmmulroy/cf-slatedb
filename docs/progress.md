@@ -65,6 +65,14 @@ hand-off is below.
   **Live (`preview-1`, production settings):** write pause median 2.7 s (4 writers), 3.1 s (16),
   from 13–16 s; 0 failed writes; split ~2 s. Model: `SealSplit`'s seal takes the holds. 11/11
   scenarios locally and on `preview-1`.
+- **4. Transactions exact across flushes (D58, supersedes D41/D50).** The writer keeps flushed rows
+  (`retained_from_seq`) until a separate trim (60 s, 64 MiB, never the newest flush); transactions
+  begin with the flushed manifest and read it plus the kept rows; a commit aborts as too old only
+  if its rows were trimmed. Additive public `manifestId` on `transactions/begin`, `get`, and `scan`;
+  old callers and old writer state keep the previous behavior. Models: `Transactions` rewritten
+  (new broken variants `trimWithoutAbort`, `noReadHorizonCheck`), `NoAckedWriteLost` with `Trim`
+  (`trimUnflushed`). **Live (`preview-1`, production settings):** 24/24 transactions held ~21.7 s
+  across 6–7 flushes committed, 0 `SnapshotTooOld`. 11/11 scenarios locally.
 
 ## Remaining-work log
 

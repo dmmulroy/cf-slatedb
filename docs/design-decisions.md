@@ -407,6 +407,8 @@ small sharded API.
 
 ## D41. Transactions are valid until data newer than their reads is flushed (narrowed by D50)
 
+**Superseded by D58** (transactions keep exact reads and checks across flushes).
+
 The writer's conflict check reads only its memtable (an indexed SQLite query per key or range:
 `MemTable.writtenAfter`), which holds exactly the rows newer than `flushed_seq`. A transaction reads
 at `readSeq` (the writer's `last_seq` when it began) and commits only if `flushed_seq <= readSeq`
@@ -596,6 +598,8 @@ with it still decode — Schema ignores the unknown field — and the next manif
 fork inheritance needs nothing.
 
 ## D50. Transactions keep the flush limit: only a transaction that outlasts a whole flush aborts
+
+**Superseded by D58** (transactions keep exact reads and checks across flushes).
 
 Hand-off item 6 asked to let a transaction's conflict check read rows flushed after its snapshot from
 L0, or justify keeping D41's limit. It is kept, because live measurement shows the limit is far
@@ -883,3 +887,55 @@ Measured on `preview-1` with production settings, `measure split-pause`, three r
 |      16 | 1.8–2.0 s | 2.6 / 3.1 / 3.4 s (median 3.1 s)        |             0 |
 
 Target: a write pause p50 ≤ 6 s with zero failed writes. Met.
+
+## D58. Transactions are exact across flushes: the writer keeps flushed rows, reads pin the begin manifest
+
+Supersedes D41's flush limit and D50. A transaction used to abort with `SnapshotTooOld` once a flush
+deleted rows newer than its read sequence number from the writer's SQLite. After that, neither its
+reads nor its commit check could be exact. Long or slow transactions hit it, and users had to learn
+the limit.
+
+- **The writer keeps flushed rows.** The memtable gains `retained_from_seq ≤ flushed_seq`: every row
+  above it is still in SQLite. A flush still writes only rows in `(flushed_seq, cut]`, then
+  `markFlushed` records `flushed_seq = cut`, the committing manifest's id (`flushed_manifest_id`),
+  and a flush mark (cut, time) in one SQLite transaction. It deletes nothing.
+- **A separate, atomic trim.** It deletes flushed rows older than `transactionRetentionMs` (new;
+  default 60 s, and it must be shorter than `gcMinAge` or 0, enforced by `LsmSettings`). It is bounded
+  by `maxRetainedBytes` (new; default 64 MiB), never removes the newest flush, and raises
+  `retained_from_seq` past what it removed. It runs after each flush.
+- **Latest paths are unchanged.** The probe, Latest scans, the change feed, unflushed bytes,
+  backpressure, and flush streaming read only rows above `flushed_seq`.
+- **Begin** returns `readSeq` and `manifestId` (the flushed manifest, whose `lastL0Seq` is
+  `flushed_seq`), read in one SQLite statement. On the public API this is an additive `manifestId` in
+  the `transactions/begin` response, accepted as an optional field by `transactions/get` and
+  `transactions/scan`.
+- **Reads at `readSeq`** take the writer's rows in `(retained_from_seq, readSeq]` (`probeAt`;
+  `scan` with `includeRetained`) and the pinned begin manifest. The reader refuses
+  (`SnapshotExpired`, surfaced as `SnapshotTooOld`) when that manifest's `lastL0Seq <
+  retained_from_seq`, since the rows in between are then gone from both. GC keeps a superseded
+  manifest for `gcMinAge`, which is longer than the retention.
+- **Commit** aborts with `SnapshotTooOld` only if `retained_from_seq > readSeq`. Otherwise
+  `writtenAfter` checks every row above `readSeq`, retained or unflushed.
+- **Restarts keep retained rows.** On restart the writer records the fenced manifest's `lastL0Seq` as
+  flushed (with that manifest's id) instead of deleting rows.
+- **Old callers and old state keep working.** Clients without `manifestId` keep the pre-D58 reads (a
+  flush past `readSeq` aborts them). Writer state from before D58, without `retained_from_seq` or
+  `flushed_manifest_id`, reads its horizon as `flushed_seq` (its old flushes deleted those rows), and
+  its begin returns no manifest until its next flush.
+
+Cost: SQLite holds the retained rows, at most `maxRetainedBytes` plus the newest flush (up to
+`l0SstSize`). A flush writes no more rows than before; the trim's deletes happen after the flush,
+outside the commit lock. `dev` and preview `--dev-timings` set `transactionRetentionMs` to 5 s
+(their `gcMinAge` is 10 s); the integration test uses 0.5 s against 1 s.
+
+Models: `Transactions.tla` was rewritten with the retained horizon, nondeterministic trims, and
+reads from the begin manifest plus retained rows. Its broken variants `trimWithoutAbort` and
+`noReadHorizonCheck` fail `Serializable`, and `snapshotOnly` still does. Bounds went from 6 commits
+to 5 (37M states). A pinned manifest is modeled by its `lastL0Seq`, which is what any compaction of
+it preserves for a read. In `NoAckedWriteLost.tla` a flush now advances `flushed_seq` and a separate
+`Trim` deletes, with the Latest probe reading above `flushed_seq`. `LatestSeesAcked` holds, and the
+new `trimUnflushed` variant fails `NoAckedWriteLost`.
+
+Measured on `preview-1` with production settings: 4 transactors held each transaction open ~21.7 s
+between its reads while 4 writers loaded the database and it was flushed every 3 s (23 flushes).
+24/24 committed, 0 `SnapshotTooOld`.

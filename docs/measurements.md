@@ -208,6 +208,24 @@ intermediate variants were measured and discarded: concurrent forks each taking 
 (create-if-absent ~0.8–1.1 s instead of ~0.3 s), which stretched every commit; the design now has
 as few commits on the pause as it can.
 
+## Transactions held open across flushes (v1 workstream 4, D58)
+
+`measure transactions` with each transaction held open between its first and second read, while
+plain writes load the database and a flusher forces a flush every 3 s. `preview-1`, production
+settings (`transactionRetentionMs` 60 s, `maxRetainedBytes` 64 MiB).
+
+```sh
+node tools/scenario-cli/src/scenario-cli.ts measure transactions --stage preview-1 --transactors 4 --writers 4 --seconds 120 --hold-seconds 20 --flush-every-seconds 3
+```
+
+| Transactions | Committed | `SnapshotTooOld` | Transaction p50 / max | Forced flushes |
+| -----------: | --------: | ---------------: | --------------------- | -------------: |
+|           24 |        24 |                0 | 21.7 s / 22.9 s       |             23 |
+
+**Reading.** Every transaction spanned 6–7 flushes and committed. Before D58 each would have
+aborted at its first flush, since it outlasted a whole flush (D50). A transaction now aborts as too
+old only if it outlives the writer's retention (60 s by default) or the retained-bytes bound.
+
 ## Live checks
 
 | Check                                       | Result                         | How                                                                                                                                                                                                                                                                                                                                                                                             |

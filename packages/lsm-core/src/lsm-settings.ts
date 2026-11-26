@@ -26,6 +26,8 @@ const LsmSettingsFields = Schema.Struct({
   l1DataCacheBytes: PositiveInt,
   l1MetaCacheBytes: PositiveInt,
   l1GroupCacheShare: Schema.Number.check(Schema.isBetween({ minimum: 0.01, maximum: 1 })),
+  transactionRetentionMs: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  maxRetainedBytes: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
 });
 
 /** Every setting, each valid on its own. */
@@ -49,6 +51,7 @@ interface LsmSettingsCombinationRule {
  * - A memtable must be able to reach `l0SstSize` before backpressure refuses writes, or writes stall
  *   until `maxL0Age` flushes.
  * - A compaction's budget lease must outlive the compactor's poll interval, which renews it.
+ * - Flushed rows kept for transactions must not outlive the manifests those transactions read.
  */
 const LSM_SETTINGS_COMBINATION_RULES: ReadonlyArray<LsmSettingsCombinationRule> = [
   {
@@ -61,6 +64,13 @@ const LSM_SETTINGS_COMBINATION_RULES: ReadonlyArray<LsmSettingsCombinationRule> 
     holds: (settings) => settings.l0SstSize <= settings.maxUnflushedBytes,
     message:
       "maxUnflushedBytes must be at least l0SstSize, or writes are refused before a flush starts",
+  },
+  {
+    field: "transactionRetentionMs",
+    holds: (settings) =>
+      settings.transactionRetentionMs === 0 || settings.transactionRetentionMs < settings.gcMinAge,
+    message:
+      "transactionRetentionMs must be shorter than gcMinAge: a transaction reads the manifest it began at, which GC keeps only for gcMinAge",
   },
   {
     field: "compactionLeaseMs",
@@ -103,6 +113,9 @@ const lsmSettingsCombinationIssues = (settings: LsmSettingsFields) =>
  *   stats) a reader isolate keeps in its L1 cache, counted as stored on R2.
  * - `l1GroupCacheShare`: the fraction of each L1 cache one `budgetGroup` may hold; under pressure the
  *   group holding the most gives up its least recently used entries first.
+ * - `transactionRetentionMs`, `maxRetainedBytes`: how long, and up to how many bytes, a writer keeps
+ *   flushed rows so transactions that span flushes can still be checked exactly; the newest flush's
+ *   rows always stay (D58). Must be shorter than `gcMinAge` (or 0).
  *
  * Settings that only make sense together are checked together (`LSM_SETTINGS_COMBINATION_RULES`), so
  * a deployment with a contradictory combination fails to decode instead of misbehaving later.
@@ -141,4 +154,6 @@ export const DEFAULT_LSM_SETTINGS: LsmSettings = {
   l1DataCacheBytes: 32 * MiB,
   l1MetaCacheBytes: 16 * MiB,
   l1GroupCacheShare: 0.5,
+  transactionRetentionMs: 60_000,
+  maxRetainedBytes: 64 * MiB,
 };

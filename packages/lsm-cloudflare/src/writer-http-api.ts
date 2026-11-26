@@ -1,6 +1,7 @@
 import {
   CheckpointId,
   DatabaseId,
+  ManifestId,
   DatabaseSealedError,
   KeyOutOfRangeError,
   KeyRange,
@@ -39,12 +40,25 @@ export const ProbeResponse = Schema.Struct({
   flushedSeq: SeqNum,
 });
 
-/** Schema for a memtable scan request: one page of unflushed rows in `range`. */
+/** Schema for a transaction's probe of one key at its read sequence number. */
+export const ProbeAtRequest = Schema.Struct({ key: Schema.Uint8ArrayFromBase64, readSeq: SeqNum });
+
+/** Schema for a transaction's probe response (see `MemTableProbeAt`). */
+export const ProbeAtResponse = Schema.Struct({
+  versions: Schema.Array(RowSchema),
+  retainedFromSeq: SeqNum,
+});
+
+/**
+ * Schema for a memtable scan request: one page of rows in `range`, unflushed only or, with
+ * `includeRetained` (a transaction's scan), every row still in SQLite.
+ */
 export const MemTableScanRequest = Schema.Struct({
   range: KeyRange,
   snapshotSeq: Schema.OptionFromNullOr(SeqNum),
   cursor: Schema.OptionFromNullOr(MemTableCursorSchema),
   limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 1000 })),
+  includeRetained: Schema.Boolean,
 });
 
 /** Schema for one page of a memtable scan (see `MemTableScanPage`). */
@@ -52,6 +66,7 @@ export const MemTableScanResponse = Schema.Struct({
   rows: Schema.Array(RowSchema),
   snapshotSeq: SeqNum,
   flushedSeq: SeqNum,
+  retainedFromSeq: SeqNum,
   nextCursor: Schema.OptionFromNullOr(MemTableCursorSchema),
 });
 
@@ -99,6 +114,8 @@ export const WriterStatusResponse = Schema.Struct({
   writerEpoch: WriterEpoch,
   lastSeq: SeqNum,
   flushedSeq: SeqNum,
+  retainedFromSeq: SeqNum,
+  flushedManifestId: Schema.OptionFromNullOr(ManifestId),
   unflushedBytes: Schema.Number,
   unflushedRows: Schema.Number,
   l0Count: Schema.Number,
@@ -145,6 +162,14 @@ export class WriterHttpApiGroup extends HttpApiGroup.make("writer")
       params: DatabaseParams,
       payload: ProbeRequest,
       success: ProbeResponse,
+      error: WRITER_ERRORS,
+    }),
+  )
+  .add(
+    HttpApiEndpoint.post("probeAt", "/databases/:databaseId/probe-at", {
+      params: DatabaseParams,
+      payload: ProbeAtRequest,
+      success: ProbeAtResponse,
       error: WRITER_ERRORS,
     }),
   )
