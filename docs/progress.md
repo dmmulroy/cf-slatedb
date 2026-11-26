@@ -243,6 +243,17 @@ hand-off is below.
   - **Verified.** `vp run ready` exit 0, `vp run verify` exit 0 (28/28), 13/13 scenarios locally
     and on `preview-3` (`--dev-timings`), 5-minute soaks passing on `preview-2` and `preview-3`
     for each arm. Thirty-five mutations of the new code are each caught by a test.
+- **Production telemetry reads (release review finding).** `trace-cli pull`/`tail` and
+  `scenario-cli measure health`/`latency` resolved their stage only through `preview-cli`, so
+  nothing could read production's spans, tail records, or health. Each now also takes
+  `--collector-url <url>` (the `traceCollectorUrl` output) with the token in
+  `SHALEDB_TRACE_TOKEN`, and fails before any request without a token, or with both or neither
+  forms. `preview-cli trace-token <stage>` (any live stage, `production` included) writes only the
+  collector token into a pipe or command substitution and refuses a terminal; `deploy` still
+  accepts the three previews alone. A pull resumes from any cursor in the store for the same
+  collector URL, so the two forms never store an export twice. `measure` pulls by URL with the
+  token in the trace CLI's environment. `docs/operations.md` shows the production and preview
+  forms side by side. Not yet tried against a live collector.
 
 ## Remaining-work log
 

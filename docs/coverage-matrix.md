@@ -290,7 +290,11 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   (`lsm-telemetry.ts`), `lsmWorkerCompatibility` (`lsm-stage.ts`), `tools/trace-cli/src/
   preview-trace-pull.ts` (`pull --stage`, `tail --stage`), `preview-cli collector`. Tests:
   `preview-trace-pull.test.ts` (JSON and protobuf exports across pages, repeated pulls download
-  nothing twice, a refused token). Live (`preview-1`): API Worker → writer DO trees complete, DO
+  nothing twice, one collector named by stage then by URL stored once, a refused token for each
+  form). Production form: `--collector-url` with `SHALEDB_TRACE_TOKEN` on `trace-cli pull|tail`
+  (`trace-collector-option.ts`, `trace-collector-option.test.ts`) and `scenario-cli measure
+  health|latency` (`measurement-collector-option.ts` and its test); `preview-cli trace-token`
+  (`traceCollectorToken`, `traceTokenRefusal`; `preview-stage.test.ts`). Live (`preview-1`): API Worker → writer DO trees complete, DO
   alarm spans arrive, 10/10 probe traces complete, unauthenticated reads `401`. D46, D47.
 - **Live checks and §12 measurements (hand-off item 4)** — done. Scenarios `block-cache`
   (Workers Cache `HIT` on `BlockServer` through a second Worker; `cache.l2.status` on `BlockSource`
