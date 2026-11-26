@@ -2,6 +2,7 @@ import {
   DatabaseId,
   DEFAULT_DATABASE_OPTIONS,
   type KeyRange,
+  ManifestId,
   manifestSstHandles,
 } from "@shaledb/lsm-core";
 import { Clock, Context, Effect, Layer, Option, Ref } from "effect";
@@ -29,8 +30,8 @@ import { DurableObjectAlarm, durableObjectAlarmTestLayer } from "./durable-objec
 import { GarbageCollector, makeGarbageCollector } from "./garbage-collector.ts";
 import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
 import { ManifestReader } from "./manifest-reader.ts";
-import { databasePrefix } from "./object-keys.ts";
-import { ObjectStore } from "./object-store.ts";
+import { databasePrefix, manifestKey, manifestPrefix } from "./object-keys.ts";
+import { ObjectStore, ObjectStoreUnavailableError, objectStoreTestLayer } from "./object-store.ts";
 import { sstStoreLayerWithoutDependencies } from "./sst-store.ts";
 
 const SOURCE = DatabaseId.make("orders");
@@ -41,6 +42,58 @@ const text = (value: Uint8Array) => new TextDecoder().decode(value);
 const SPLIT = bytes("d");
 const LEFT_RANGE: KeyRange = { start: new Uint8Array(0), end: Option.some(SPLIT) };
 const RIGHT_RANGE: KeyRange = { start: SPLIT, end: Option.none() };
+
+/**
+ * Faults injected into the bucket, none by default: a `get` that finds nothing (an object deleted
+ * meanwhile), a `get` that fails, and a create-if-absent that fails (R2 unavailable after retries).
+ */
+interface StoreFaultRules {
+  readonly hideGet: (key: string) => boolean;
+  readonly failGet: (key: string) => boolean;
+  readonly failCreate: (key: string, body: string) => boolean;
+}
+
+const NO_STORE_FAULTS: StoreFaultRules = {
+  hideGet: () => false,
+  failGet: () => false,
+  failCreate: () => false,
+};
+
+/** The current fault rules. */
+class StoreFaults extends Context.Service<StoreFaults, Ref.Ref<StoreFaultRules>>()(
+  "test/StoreFaults",
+) {}
+
+const storeFaultsLayer = Layer.effect(StoreFaults, Ref.make(NO_STORE_FAULTS));
+
+/** An in-memory bucket that applies `StoreFaults` to manifest reads and creates. */
+const faultyObjectStoreLayer = Layer.effect(
+  ObjectStore,
+  Effect.gen(function* () {
+    const faults = yield* StoreFaults;
+    const inner = Context.get(yield* Layer.build(objectStoreTestLayer), ObjectStore);
+    const rules = Ref.get(faults);
+    const injected = (operation: "get" | "putIfAbsent", key: string) =>
+      new ObjectStoreUnavailableError({ operation, key, message: "injected R2 failure" });
+    return ObjectStore.of({
+      ...inner,
+      get: (key) =>
+        Effect.gen(function* () {
+          const rule = yield* rules;
+          if (rule.failGet(key)) return yield* injected("get", key);
+          if (rule.hideGet(key)) return Option.none();
+          return yield* inner.get(key);
+        }),
+      putIfAbsent: (key, body) =>
+        Effect.gen(function* () {
+          const rule = yield* rules;
+          if (rule.failCreate(key, new TextDecoder().decode(body)))
+            return yield* injected("putIfAbsent", key);
+          return yield* inner.putIfAbsent(key, body);
+        }),
+    });
+  }),
+);
 
 /** Lifecycle, client, executor, in-process launcher, budget, and stores over one bucket. */
 const testLayer = Layer.mergeAll(
@@ -58,7 +111,13 @@ const testLayer = Layer.mergeAll(
       Layer.provide(sstStoreLayerWithoutDependencies),
     ),
   ),
-  Layer.provideMerge(dbClientTestLayer({ blockSize: 64 })),
+  Layer.provideMerge(
+    dbClientTestLayer(
+      { blockSize: 64 },
+      faultyObjectStoreLayer.pipe(Layer.provide(storeFaultsLayer)),
+    ),
+  ),
+  Layer.provideMerge(storeFaultsLayer),
 );
 
 type TestServices = Layer.Success<typeof testLayer> | DbReaderServices;
@@ -146,6 +205,42 @@ const readAtSnapshot = (databaseId: DatabaseId, key: string, snapshot: DbSnapsho
   });
 
 const HOUR = 3_600_000;
+
+/** The source's checkpoints and the fork's external references, as one value to compare. */
+const holdsAndRefs = Effect.gen(function* () {
+  const reader = yield* ManifestReader;
+  return {
+    holds: (yield* reader.loadLatest(SOURCE)).manifest.checkpoints.length,
+    refs: (yield* reader.loadLatest(LEFT)).manifest.externalRefs.length,
+  };
+});
+
+/**
+ * The source with two flushed keys, forked into `LEFT` (the caller's checkpoint deleted), and the
+ * fork's rewrite done. Returns the fork's compactor, whose collection is due gcMinAge later.
+ */
+const forkAndRewrite = Effect.gen(function* () {
+  const lifecycle = yield* DatabaseLifecycle;
+  const client = yield* DbClient;
+  yield* lifecycle.create(SOURCE, {
+    keyRange: Option.none(),
+    databaseOptions: DEFAULT_DATABASE_OPTIONS,
+  });
+  for (const key of ["a", "b"]) yield* client.put(SOURCE, bytes(key), bytes(key.toUpperCase()));
+  yield* client.flush(SOURCE);
+  const checkpoint = yield* lifecycle.createCheckpoint(SOURCE, {
+    name: Option.none(),
+    lifetimeMs: Option.none(),
+  });
+  yield* lifecycle.forkRange({
+    source: SOURCE,
+    checkpointId: checkpoint.id,
+    range: LEFT_RANGE,
+    forkId: LEFT,
+  });
+  yield* lifecycle.deleteCheckpoint(SOURCE, checkpoint.id);
+  return yield* compactorOf(LEFT);
+});
 
 const valuesIn = (databaseId: DatabaseId) =>
   Effect.gen(function* () {
@@ -464,6 +559,71 @@ describe("DatabaseLifecycle", () => {
     expect(outcome.middleReleased).toEqual({ onOwner: 0, middleRefs: 0 });
     expect(outcome.middleValues).toEqual(["a=A", "b=B"]);
     expect(outcome.grandchildValues).toEqual(["a=A", "b=B"]);
+  });
+
+  it("releases nothing while a manifest the fork's collection keeps cannot be loaded (D77)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const reader = yield* ManifestReader;
+        const gc = yield* GarbageCollector;
+        const faults = yield* StoreFaults;
+        const left = yield* forkAndRewrite;
+        const rewriteId = (yield* reader.loadLatest(LEFT)).id;
+        // The manifests before the rewrite are young: GC keeps them, and they name the source's
+        // SSTs. Their objects vanish between GC's listing and its loads (as if deleted meanwhile).
+        const beforeRewrite = new Set(
+          Array.from({ length: rewriteId - 1 }, (_, index) =>
+            manifestKey(LEFT, ManifestId.make(index + 1)),
+          ),
+        );
+        yield* Ref.set(faults, { ...NO_STORE_FAULTS, hideGet: (key) => beforeRewrite.has(key) });
+        yield* gc.collect(LEFT);
+        const whileMissing = yield* holdsAndRefs;
+        // Their loads fail instead: the collection fails, and releases nothing either.
+        yield* Ref.set(faults, { ...NO_STORE_FAULTS, failGet: (key) => beforeRewrite.has(key) });
+        const failed = yield* Effect.flip(gc.collect(LEFT));
+        const whileFailing = yield* holdsAndRefs;
+        // Storage answers again; gcMinAge after the rewrite the fork's due collection releases.
+        yield* Ref.set(faults, NO_STORE_FAULTS);
+        yield* TestClock.adjust(HOUR);
+        yield* left.runDue;
+        return { whileMissing, failed: failed._tag, whileFailing, after: yield* holdsAndRefs };
+      }),
+    );
+    expect(outcome.whileMissing).toEqual({ holds: 1, refs: 1 });
+    expect(outcome.failed).toBe("GarbageCollectorUnavailableError");
+    expect(outcome.whileFailing).toEqual({ holds: 1, refs: 1 });
+    expect(outcome.after).toEqual({ holds: 0, refs: 0 });
+  });
+
+  it("finishes a release interrupted between its two steps at the next collection (D77)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const gc = yield* GarbageCollector;
+        const faults = yield* StoreFaults;
+        yield* forkAndRewrite;
+        yield* TestClock.adjust(HOUR);
+        // The fork's manifest without its reference cannot be written: the collection stops after
+        // removing the source's checkpoint, as a crash between the two steps would.
+        yield* Ref.set(faults, {
+          ...NO_STORE_FAULTS,
+          failCreate: (key, body) =>
+            key.startsWith(manifestPrefix(LEFT)) && body.includes(`"externalRefs":[]`),
+        });
+        const failed = yield* Effect.flip(gc.collect(LEFT));
+        const interrupted = yield* holdsAndRefs;
+        yield* Ref.set(faults, NO_STORE_FAULTS);
+        yield* gc.collect(LEFT);
+        const finished = yield* holdsAndRefs;
+        yield* lifecycle.remove(SOURCE);
+        return { failed: failed._tag, interrupted, finished };
+      }),
+    );
+    expect(outcome.failed).toBe("GarbageCollectorUnavailableError");
+    // The source's checkpoint went first; the fork's reference is still there to retry from.
+    expect(outcome.interrupted).toEqual({ holds: 0, refs: 1 });
+    expect(outcome.finished).toEqual({ holds: 0, refs: 0 });
   });
 
   it("removing a fork releases its hold on the source", async () => {
