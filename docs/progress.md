@@ -630,6 +630,14 @@ retained.
 
 ## Findings
 
+- A transaction's begin manifest is the writer's last flush manifest (`flushed_manifest_id`). A
+  compaction replaces it within seconds, and on a database idle for `gcMinAge` after a compaction,
+  with its writer still up, GC collects it: every transaction read then fails with `SnapshotTooOld`,
+  and every retry gets the same manifest until the next flush. Liveness only; nothing is read
+  wrongly. Found while checking `docs/invariants.md` (2026-11-26), reproduced in a unit test, not yet
+  fixed. Also: an unpinned snapshot is guaranteed half of `gcMinAge` from when it is taken, not the
+  full hour `DbClient.snapshot`'s doc and the OpenAPI description say.
+
 - Effect's HTTP server middleware records `client.address` (the caller's IP) and
   `user_agent.original` on server spans. They reach the trace store on live stages. They are not
   keys, values, or secrets, but they are personal data; before a production deploy, drop them
