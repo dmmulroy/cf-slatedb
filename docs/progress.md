@@ -266,6 +266,17 @@ hand-off is below.
     `packages/lsm-cloudflare`. Each new test fails on the code before or under a named mutation
     (`/tmp/shale-work/agents/review/REPORT-2.md`). `vp run ready` and `vp run verify` are left
     to integration.
+- **Production telemetry reads (release review finding).** `trace-cli pull`/`tail` and
+  `scenario-cli measure health`/`latency` resolved their stage only through `preview-cli`, so
+  nothing could read production's spans, tail records, or health. Each now also takes
+  `--collector-url <url>` (the `traceCollectorUrl` output) with the token in
+  `SHALEDB_TRACE_TOKEN`, and fails before any request without a token, or with both or neither
+  forms. `preview-cli trace-token <stage>` (any live stage, `production` included) writes only the
+  collector token into a pipe or command substitution and refuses a terminal; `deploy` still
+  accepts the three previews alone. A pull resumes from any cursor in the store for the same
+  collector URL, so the two forms never store an export twice. `measure` pulls by URL with the
+  token in the trace CLI's environment. `docs/operations.md` shows the production and preview
+  forms side by side. Not yet tried against a live collector.
 
 ## Remaining-work log
 

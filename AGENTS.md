@@ -99,6 +99,7 @@ node tools/trace-cli/src/trace-cli.ts diff <a> <b>   # compare two traces
 node tools/trace-cli/src/trace-cli.ts assert <file.json>  # declarative trace checks
 node tools/trace-cli/src/trace-cli.ts pull --stage preview-1  # download a preview's spans
 node tools/trace-cli/src/trace-cli.ts tail --stage preview-1  # follow a preview's spans live
+node tools/trace-cli/src/trace-cli.ts pull --collector-url <url>  # any live stage; token in SHALEDB_TRACE_TOKEN
 ```
 
 On live preview stages every Worker and Durable Object exports to the stage's `TraceCollector`

@@ -1,5 +1,5 @@
 import { DEFAULT_LSM_SETTINGS } from "@shaledb/lsm-core";
-import { Effect, Option } from "effect";
+import { Effect, Option, Schema } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
@@ -7,11 +7,16 @@ import {
   deployJurisdiction,
   describeBoundLsmSettings,
   destroyCommand,
+  LIVE_STAGES,
   PREVIEW_DEV_TIMINGS,
+  PREVIEW_STAGES,
+  PreviewStage,
   parseStateRead,
   previewOutputs,
   previewSecret,
   previewWorkerBindings,
+  traceCollectorToken,
+  traceTokenRefusal,
 } from "./preview-stage.ts";
 
 const outputs = {
@@ -207,5 +212,48 @@ describe("previewWorkerBindings", () => {
       describeBoundLsmSettings(JSON.stringify({ ...DEFAULT_LSM_SETTINGS, gcMinAge: 10_000 })),
     ).toBe("complete, differs: gcMinAge=10000");
     expect(describeBoundLsmSettings("{}")).toBe("partial: {}");
+  });
+});
+
+describe("trace-token", () => {
+  // What `vp run @shaledb/infra#state:read -r Shaledb/production` holds on a deployed production:
+  // the collector token, and no state-held access token (D64).
+  const productionRecords = new Map<string, unknown>([
+    [
+      "Shaledb/production/TraceCollectorToken",
+      { resourceType: "Alchemy.Random", attr: { text: { __redacted__: "c".repeat(64) } } },
+    ],
+  ]);
+
+  it("reads production's trace collector token, which deploy's stage list never accepts", async () => {
+    expect(LIVE_STAGES).toContain("production");
+    expect(PREVIEW_STAGES).not.toContain("production");
+    // `deploy`'s argument is the preview literals alone.
+    expect(Schema.is(PreviewStage)("production")).toBe(false);
+    const token = await traceCollectorToken(productionRecords, "production").pipe(
+      Effect.runPromise,
+    );
+    expect(token).toBe("c".repeat(64));
+  });
+
+  it("names how to put a missing token right for production and for a preview", async () => {
+    const missing = (stage: "production" | "preview-2") =>
+      traceCollectorToken(new Map(), stage).pipe(Effect.flip, Effect.runPromise);
+    const production = await missing("production");
+    expect(production.reason).toBe("StateRecordMissing");
+    expect(production.message).toContain("Shaledb/production/TraceCollectorToken");
+    expect(production.message).toContain('docs/operations.md, "Deploying"');
+    expect(production.message).not.toContain("preview-cli deploy");
+    const preview = await missing("preview-2");
+    expect(preview.message).toContain("preview-cli deploy preview-2");
+  });
+
+  it("writes the token only where it does not stay on a screen", () => {
+    expect(traceTokenRefusal("production", false)).toEqual(Option.none());
+    const refusal = traceTokenRefusal("production", true);
+    expect(Option.isSome(refusal)).toBe(true);
+    expect(Option.getOrElse(refusal, () => "")).toContain(
+      'export SHALEDB_TRACE_TOKEN="$(node tools/preview-cli/src/preview-cli.ts trace-token production)"',
+    );
   });
 });

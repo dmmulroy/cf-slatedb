@@ -151,11 +151,66 @@ stores them in the stage's trace bucket (D63):
 
 The telemetry probe Worker, a test tool, is not deployed to production.
 
+### Reading a stage's telemetry
+
+The read-only tools name a stage's collector in one of two ways:
+
+- **Production, or any live stage:** `--collector-url <url>`, with the collector's token in
+  `SHALEDB_TRACE_TOKEN`. The URL is the `traceCollectorUrl` output the deploy prints.
+- **A preview:** `--stage <preview-n>`. The preview CLI reads the URL and token from state.
+
+The collector token is separate from the access tokens. It reads spans and tail records only,
+not databases. It is held in the stage's Alchemy state, and `preview-cli trace-token <stage>`
+reads it (any live stage, `production` included). That command writes the token only into a pipe
+or a command substitution. It refuses a terminal, so the token never shows on screen. Put the token
+in the environment this way, so it is not typed and not in shell history:
+
+```sh
+export SHALEDB_TRACE_TOKEN="$(node tools/preview-cli/src/preview-cli.ts trace-token production)"
+export SHALEDB_TRACE_COLLECTOR_URL="https://…workers.dev"  # traceCollectorUrl, from the deploy
+```
+
+`SHALEDB_TRACE_COLLECTOR_URL` is only a shell variable for the commands below; the tools read the
+URL from `--collector-url`.
+
+In fish: `set -gx SHALEDB_TRACE_TOKEN (node tools/preview-cli/src/preview-cli.ts trace-token production)`.
+`trace-token` reads state with the Alchemy profile's credentials, like `preview-cli status`. The
+tools fail before any request when `SHALEDB_TRACE_TOKEN` is missing or empty, or when a command
+names both `--stage` and `--collector-url`, or neither.
+
+To bring a stage's spans into the local trace store, where `list`, `show`, `grep`, `stats`, and
+`assert` read them:
+
+```sh
+# production
+node tools/trace-cli/src/trace-cli.ts pull --collector-url "$SHALEDB_TRACE_COLLECTOR_URL" --since-minutes 60
+node tools/trace-cli/src/trace-cli.ts tail --collector-url "$SHALEDB_TRACE_COLLECTOR_URL"
+# a preview
+node tools/trace-cli/src/trace-cli.ts pull --stage preview-1 --since-minutes 60
+node tools/trace-cli/src/trace-cli.ts tail --stage preview-1
+```
+
+A pull resumes where the store's last pull from the same collector URL stopped, whichever form
+named it, so nothing is stored twice. Without `--since-minutes` a fresh store pulls everything the
+collector holds (up to 14 days). To keep production's spans apart from a preview's, pass the same
+`--store <dir>` to `pull` and to the commands that read them.
+
 ## What to watch
 
-`node tools/scenario-cli/src/scenario-cli.ts measure health --stage <stage> --minutes 60` summarizes
-a stage from its tail records and spans. It prints `healthy: false` and an `issues` list when any of
-the conditions below holds.
+`measure health` summarizes a stage from its tail records and spans. It reads only the stage's
+trace collector, so it needs no access token:
+
+```sh
+# production
+node tools/scenario-cli/src/scenario-cli.ts measure health --collector-url "$SHALEDB_TRACE_COLLECTOR_URL" --minutes 60
+# a preview
+node tools/scenario-cli/src/scenario-cli.ts measure health --stage preview-1 --minutes 60
+```
+
+It prints `healthy: false` and an `issues` list when any of the conditions below holds.
+`measure latency` takes the same two forms and reports server-side latency per operation over
+`--minutes` (default 15). Each keeps its spans in `.traces/measure/<name>`: the preview's name, or
+the collector URL's host for `--collector-url`, so production and a preview never share a store.
 
 | Signal                       | Where                                                                                            | Act when                                                                                    |
 | ---------------------------- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
@@ -166,7 +221,7 @@ the conditions below holds.
 | Corrupted SSTs               | `lsm_compaction_corrupt_ssts`; `compaction.corrupt_ssts` on `Compactor.poll`; `GET …/compaction` | Any: follow the corruption runbook                                                          |
 | Upload integrity             | `lsm_object_part_integrity_retries`, `lsm_object_parts_unverified`                               | Retries: transient, unless frequent. Any unverified part on R2: parts are no longer checked |
 | Garbage collection           | `GarbageCollector.collect` and `MaintenanceSweep.sweepPage` errors                               | Repeated failures: storage unreachable or a manifest unreadable                             |
-| Error spans                  | `trace-cli grep --error`                                                                         | A new name in the top errors                                                                |
+| Error spans                  | `trace-cli grep --error`, after a `pull`                                                         | A new name in the top errors                                                                |
 
 Expected errors that are not trouble: `DatabaseSealedError` (a stale router's write to a sealed
 shard; the router retries), `TransactionConflictError`, and `DatabaseAlreadyExists` on create.

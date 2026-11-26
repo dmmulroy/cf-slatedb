@@ -8,7 +8,9 @@
  * `run --stage <preview-n> all` runs them against a deployed preview instead: its URLs and access
  * token come from the preview CLI, and its spans are pulled from the stage's trace collector before
  * each trace assertion. Deploy the preview with `--dev-timings` first: the scenarios expect
- * compaction and GC within seconds.
+ * compaction and GC within seconds. `measure health` and `measure latency` read only a stage's trace
+ * collector, so they also take `--collector-url <url>` with the token in `SHALEDB_TRACE_TOKEN`, the
+ * form that works for production.
  */
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
 import { spawnSync } from "node:child_process";
@@ -34,6 +36,11 @@ import {
   measureWriterMemory,
   measureWrites,
 } from "./measurements.ts";
+import {
+  type MeasurementCollectorOptions,
+  selectMeasurementCollector,
+  TRACE_TOKEN_VARIABLE,
+} from "./measurement-collector-option.ts";
 import { smoke } from "./smoke.ts";
 import { soak } from "./soak.ts";
 import { ScenarioStack, type ScenarioFailure } from "./scenario.ts";
@@ -316,10 +323,45 @@ const measureWorkflowBurstCommand = Command.make(
   ({ stage, databases }) => runMeasurement(stage, measureWorkflowBurst(databases)),
 ).pipe(Command.withDescription("Many compaction Workflows started at once (D61)"));
 
+/**
+ * The flags of the measurements that read only a stage's trace collector (`health`, `latency`):
+ * a preview by `--stage`, or any live stage, production included, by `--collector-url`.
+ */
+const telemetryFlags = {
+  stage: Flag.String("stage").pipe(
+    Flag.withDescription("Preview stage to measure (preview-1, preview-2, preview-3)"),
+    Flag.optional,
+  ),
+  collectorUrl: Flag.String("collector-url").pipe(
+    Flag.withDescription(
+      `Trace collector URL of any live stage (production: its traceCollectorUrl output), instead of --stage; the token is read from ${TRACE_TOKEN_VARIABLE}`,
+    ),
+    Flag.optional,
+  ),
+};
+
+/**
+ * Runs a measurement that reads only the stage's tail records and spans, so it needs no API URL or
+ * access token: just the collector `options` name, checked before any request.
+ */
+const runTelemetryMeasurement = <A, E>(
+  options: MeasurementCollectorOptions,
+  measurement: Effect.Effect<A, E, MeasurementCollector>,
+) =>
+  Effect.gen(function* () {
+    const selection = yield* selectMeasurementCollector(options, process.env);
+    const collector =
+      selection._tag === "Stage"
+        ? collectorLayer(selection.stage)
+        : Layer.succeed(MeasurementCollector, selection.collector);
+    const result = yield* measurement.pipe(Effect.provide(collector));
+    yield* Console.log(JSON.stringify(result, null, 2));
+  });
+
 const measureHealthCommand = Command.make(
   "health",
-  { stage: measureStage, minutes: Flag.Int("minutes").pipe(Flag.withDefault(60)) },
-  ({ stage, minutes }) => runMeasurement(stage, measureHealth(minutes)),
+  { ...telemetryFlags, minutes: Flag.Int("minutes").pipe(Flag.withDefault(60)) },
+  ({ minutes, ...options }) => runTelemetryMeasurement(options, measureHealth(minutes)),
 ).pipe(
   Command.withDescription(
     "A live stage's health from its tail records and spans: limits hit, refused writes, flushes, L0 backlog, corruption, GC (D63)",
@@ -328,8 +370,8 @@ const measureHealthCommand = Command.make(
 
 const measureLatencyCommand = Command.make(
   "latency",
-  { stage: measureStage, minutes: Flag.Int("minutes").pipe(Flag.withDefault(15)) },
-  ({ stage, minutes }) => runMeasurement(stage, measureLatency(minutes)),
+  { ...telemetryFlags, minutes: Flag.Int("minutes").pipe(Flag.withDefault(15)) },
+  ({ minutes, ...options }) => runTelemetryMeasurement(options, measureLatency(minutes)),
 ).pipe(
   Command.withDescription(
     "Server-side latency and block reads per operation over the last minutes, from a live stage's spans (D67)",

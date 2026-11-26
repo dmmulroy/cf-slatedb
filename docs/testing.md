@@ -49,7 +49,8 @@ measurement. Record results in
 
 A preview's spans go to its own `TraceCollector` Worker. Run `node tools/trace-cli/src/trace-cli.ts
 pull --stage <stage>` (or `tail --stage <stage>`) to bring them into the local trace store before
-`assert`, `show`, or `stats`. Live Workers export after the response (D5), so pull a few seconds
+`assert`, `show`, or `stats`. Production's are read with `--collector-url` instead
+([`operations.md`](operations.md), "Reading a stage's telemetry"). Live Workers export after the response (D5), so pull a few seconds
 after the requests a check asserts on.
 
 ## Faithful local substitutes

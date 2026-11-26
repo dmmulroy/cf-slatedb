@@ -136,7 +136,7 @@ const ShaledbStack = Alchemy.Stack(
       blockServerWorkerName: blocks.workerName,
       /** URL of the telemetry probe Worker (local and preview stages only). */
       ...(Option.isSome(probe) ? { probeUrl: probe.value.url } : {}),
-      /** OTLP receiver of a live stage's spans, read by `trace-cli pull --stage <stage>`. */
+      /** OTLP receiver of a live stage's spans, read by `trace-cli pull` (`--stage` or `--collector-url`). */
       ...(Option.isSome(traces) ? { traceCollectorUrl: traces.value.url } : {}),
     };
   }).pipe(Effect.provide(shaledbStackLayer)),

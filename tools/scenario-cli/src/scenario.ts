@@ -148,13 +148,19 @@ const PROCESS_STARTED_AT = Date.now();
 
 /**
  * Runs Node with `nodeArgs` in its own process without blocking this one; returns its exit status,
- * its output (when `captureStdout`), and its error output. Interrupting the effect kills the
- * process and waits for it to exit, so a read cut off by a time budget stops reading.
+ * its output (when `captureStdout`), and its error output. `environment` is added to this
+ * process's environment for the child. Interrupting the effect kills the process and waits for it
+ * to exit, so a read cut off by a time budget stops reading.
  */
-export const runNodeProcess = (nodeArgs: ReadonlyArray<string>, captureStdout: boolean) =>
+export const runNodeProcess = (
+  nodeArgs: ReadonlyArray<string>,
+  captureStdout: boolean,
+  environment: Readonly<Record<string, string>> = {},
+) =>
   Effect.callback<{ readonly status: number; readonly stdout: string; readonly stderr: string }>(
     (resume) => {
       const child = spawn(process.execPath, nodeArgs, {
+        env: { ...process.env, ...environment },
         stdio: ["ignore", captureStdout ? "pipe" : "ignore", "pipe"],
       });
       const stdout: Array<Buffer> = [];
@@ -179,9 +185,14 @@ export const runNodeProcess = (nodeArgs: ReadonlyArray<string>, captureStdout: b
 /**
  * Runs the trace CLI in its own process without blocking this one (a long `pull` must not stall a
  * soak's other fibers); returns its exit status and error output. Interrupting it kills the process.
+ * `environment` is added to this process's environment for the child (a token, which must not go
+ * in `args`).
  */
-export const runTraceCliAsync = (args: ReadonlyArray<string>) =>
-  Effect.map(runNodeProcess([TRACE_CLI, ...args], false), ({ status, stderr }) => ({
+export const runTraceCliAsync = (
+  args: ReadonlyArray<string>,
+  environment: Readonly<Record<string, string>> = {},
+) =>
+  Effect.map(runNodeProcess([TRACE_CLI, ...args], false, environment), ({ status, stderr }) => ({
     status,
     stderr,
   }));
