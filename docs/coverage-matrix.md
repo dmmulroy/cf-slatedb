@@ -27,7 +27,9 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   (`CompactionWorkflow`: `prepare`, `output-<n>`, `commit` steps; results encoded with Schema),
   `compaction-job.ts` (`runCompactionJob`, discard outcomes), `compaction-executor.ts`,
   `compactor-worker.ts`; writers wake compactors (`compaction-trigger.ts`, `compactor-client.ts`).
-  Tests: `compactor.test.ts` (fence-once, idle, fencing, shared budget), `compaction-executor.test.ts`
+  Tests: `compactor.test.ts` (fence-once, idle, fencing, shared budget; D78: concurrent first
+  wakes share one fence-in, no state write over a newer epoch or a requested collection, a fenced
+  compactor fences in again on wake and alarm), `compaction-executor.test.ts`
   (oracle property across flushes and compactions, key-ordered outputs, bottom deletes, inputs
   changed, fenced), `writer.workerd.ts` (four flushes → compactor wake → Workflow → commit, reads at
   every consistency, span assertions). D33–D36.

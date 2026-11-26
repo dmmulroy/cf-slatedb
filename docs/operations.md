@@ -157,16 +157,16 @@ The telemetry probe Worker, a test tool, is not deployed to production.
 a stage from its tail records and spans. It prints `healthy: false` and an `issues` list when any of
 the conditions below holds.
 
-| Signal                       | Where                                                                                            | Act when                                                                                    |
-| ---------------------------- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
-| Invocations that hit a limit | Tail records: outcome `exceededCpu`, `exceededMemory`, `exception`                               | Any. CPU limits are 30 s (API, writers) and 60 s (compactor); see `docs/measurements.md`    |
-| Writes stalled               | `DbWriter.write` errors with `WriteStalledError`; public `WriteStalled` (503)                    | Sustained: L0 is not draining (compaction backlog or corruption) or a writer is overloaded  |
-| Flush duration               | `DbWriter.flush` span duration                                                                   | p99 above about 30 s, or rising                                                             |
-| Compaction backlog           | `manifest.l0_ssts` on `Compactor.poll`                                                           | Near `l0MaxSsts` (16), where writes stall                                                   |
-| Corrupted SSTs               | `lsm_compaction_corrupt_ssts`; `compaction.corrupt_ssts` on `Compactor.poll`; `GET …/compaction` | Any: follow the corruption runbook                                                          |
-| Upload integrity             | `lsm_object_part_integrity_retries`, `lsm_object_parts_unverified`                               | Retries: transient, unless frequent. Any unverified part on R2: parts are no longer checked |
-| Garbage collection           | `GarbageCollector.collect` and `MaintenanceSweep.sweepPage` errors                               | Repeated failures: storage unreachable or a manifest unreadable                             |
-| Error spans                  | `trace-cli grep --error`                                                                         | A new name in the top errors                                                                |
+| Signal                       | Where                                                                                            | Act when                                                                                                                             |
+| ---------------------------- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Invocations that hit a limit | Tail records: outcome `exceededCpu`, `exceededMemory`, `exception`                               | Any. CPU limits are 30 s (API, writers) and 60 s (compactor); see `docs/measurements.md`                                             |
+| Writes stalled               | `DbWriter.write` errors with `WriteStalledError`; public `WriteStalled` (503)                    | Sustained: L0 is not draining (compaction backlog or corruption) or a writer is overloaded                                           |
+| Flush duration               | `DbWriter.flush` span duration                                                                   | p99 above about 30 s, or rising                                                                                                      |
+| Compaction backlog           | `manifest.l0_ssts` on `Compactor.poll`; `compactor.fenced`, `compactor.refenced` on its spans    | Near `l0MaxSsts` (16), where writes stall. A fenced compactor fences in again on its next wake (D78); one that stays fenced is a bug |
+| Corrupted SSTs               | `lsm_compaction_corrupt_ssts`; `compaction.corrupt_ssts` on `Compactor.poll`; `GET …/compaction` | Any: follow the corruption runbook                                                                                                   |
+| Upload integrity             | `lsm_object_part_integrity_retries`, `lsm_object_parts_unverified`                               | Retries: transient, unless frequent. Any unverified part on R2: parts are no longer checked                                          |
+| Garbage collection           | `GarbageCollector.collect` and `MaintenanceSweep.sweepPage` errors                               | Repeated failures: storage unreachable or a manifest unreadable                                                                      |
+| Error spans                  | `trace-cli grep --error`                                                                         | A new name in the top errors                                                                                                         |
 
 Expected errors that are not trouble: `DatabaseSealedError` (a stale router's write to a sealed
 shard; the router retries), `TransactionConflictError`, and `DatabaseAlreadyExists` on create.

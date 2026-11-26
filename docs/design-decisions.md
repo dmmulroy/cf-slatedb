@@ -320,7 +320,7 @@ The compactor notices finished jobs on its next poll rather than by a callback.
 
 The compactor fences in (`compactorEpoch + 1`) on its first wake and keeps the epoch in Durable
 Object storage, so jobs it started stay valid across evictions; only a different compactor fences
-it. Its alarm polls every `compactorPollInterval` while jobs run or wait for budget, and stops
+it (D78: a fenced compactor now fences in again on its next start). Its alarm polls every `compactorPollInterval` while jobs run or wait for budget, and stops
 otherwise. Writers wake it after a flush leaves at least `minCompactionSources` L0 SSTs, and again
 when a write stalls on `l0MaxSsts`. `CompactionBudget` is a global Durable Object (`compaction-budget`
 ledger: fair share among groups holding or waiting for leases, leases renewed on each poll and
@@ -1791,7 +1791,10 @@ idle compactor took 5.4 to 9.2 s to reach its handler, which then ran 0.3 to 0.5
 flush that wrote its SST in 5.4 s and committed in 0.5 s took 12.8 s. The wake is now
 `BackgroundWork` (the Durable Object's `waitUntil`), as a fork's has been since D57. A lost wake
 is repeated by the next flush that leaves enough L0 SSTs, and a write refused for L0 backlog
-wakes the compactor the same way.
+wakes the compactor the same way. Correction (D78): a wake no longer serialized by the flush lock
+can reach a cold compactor while the previous wake is still fencing in. Two fence-ins then left
+the compactor fenced by itself, so its database never compacted again. D78 makes the fence-in
+single-flight.
 
 **SST blocks are encoded a chunk of rows at a time.** `SstStore.write` made one stream per row.
 Mapping each chunk of rows to the blocks it closes took a 60 MB flush from 1.93 s to 1.60 s in
@@ -1883,3 +1886,107 @@ flush). Both are once per flush.
 
 **Model.** `NoAckedWriteLost` and `SealSplit` are indifferent to when a flush is scheduled; no
 step changed (the skills record it).
+
+## D78. One compactor fence-in per start, state written by read-modify-write, and a fenced compactor fences in again
+
+**Found live.** `measure manifest-cas --stage preview-3` (30 small flushes back to back) on the
+final code failed with `WriteStalled`. Database `ms-cas-mwy5ujbj` had 16 L0 SSTs at 2026-11-26
+23:05 UTC and was still stuck twelve minutes later. Its compaction status was
+`{"compactorEpoch":1,"running":[],"fenced":true}`, while the manifest's compactor epoch was 2 (the
+spans: `agents/compactorfence/evidence/timeline.txt`).
+
+**What happened** (`compactor.ts` before this change):
+
+1. Flush 4 woke the cold compactor. Since D73 the wake is background work, so flush 5 woke it
+   again 0.65 s later, while the first wake was still inside `ensureState`.
+2. `ensureState` had no lock. Both wakes found no state, and both committed `fenceCompactor`:
+   epochs 1 and 2 (manifests 8 and 9).
+3. The first wake stored epoch 1 and set the alarm. Its poll loaded manifest 8 (epoch 1) and
+   started a compaction for epoch 1. Meanwhile the second wake stored epoch 2.
+4. The poll ended by writing back `{...state, running}` from the state it had read at its start,
+   which overwrote epoch 2 with epoch 1.
+5. The job found epoch 2 in the manifest and was discarded. The next poll saw
+   `manifest.compactorEpoch !== state.compactorEpoch` and stored `fenced: true`.
+6. A fenced compactor was terminal. `wake` skipped the poll, `runAlarm` returned at once, and
+   `dropSst` refused. There is one compactor Durable Object per database, so no newer compactor
+   existed to take over. The database stopped compacting, and once it reached `l0MaxSsts` every
+   write was refused.
+
+Before D73 a flush awaited the wake under its flush lock, which hid the race for flushes. Other
+callers could reach it all along: the maintenance sweep, `requestCollection`, `dropSst`, and the
+stalled-write wake. A Durable Object's input gate does not serialize two requests across a
+manifest commit on R2.
+
+**The rules.**
+
+- **One fence-in per start.** `ensureState` runs under `startLock`, so concurrent first callers
+  share one `fenceCompactor` commit. The lock order is written where the locks are declared:
+  `planLock`, then `collectionLock` (never held with the others), then `startLock` (an SST drop
+  takes it under `planLock`), then `stateLock`.
+- **Every state write is a read-modify-write.** `updateState` applies a function to the stored
+  state and writes the result under `stateLock`, around no other I/O. Each field has owners (see
+  `CompactorState`):
+  - A poll writes `running` and `corruptSsts` onto the current state, and only brings
+    `collectionDueAt` forward.
+  - It writes nothing over a newer epoch; its jobs carry the old epoch, are discarded, and have
+    their leases released.
+  - A collection sets `collectionDueAt` from its report only if no request moved it while the
+    collection ran.
+  - `requestCollection`, the alarm's retry, and an SST drop change only their own field.
+- **A fenced compactor fences in again.** `fenced: true` is SlateDB's compactor process that
+  exited on `Fenced`; SlateDB's next compactor start fences in with a new epoch. Here the next
+  start is the next `wake`, `requestCollection`, `dropSst`, or alarm.
+  - It commits `fenceCompactor` again and releases the old epoch's leases.
+  - It keeps the corruption reports and the collection due time.
+  - `commitCompaction`'s epoch check discards the old epoch's jobs, so "no fenced compactor
+    commits" still holds: every commit carries its job's epoch.
+- **No ping-pong.** No guard against two instances fencing each other is needed. Only this Durable
+  Object fences in for its database, and the runtime runs at most one instance of it, sharing one
+  storage. A newer epoch it did not store therefore means its own state was lost or overwritten,
+  and fencing in again is the repair. Each re-fence needs a stored `fenced: true`, which only a
+  poll that saw a newer epoch writes, so re-fences are bounded by those polls.
+- **The compaction status** (`GET /v1/databases/{id}/compaction`) keeps its shape. `fenced` can
+  now be true only between the poll that saw a newer epoch and the next start.
+- **Revival.** A database already stuck, like the one above, recovers on its next start: a wake
+  from the next flush or the stalled-write wake, the sweep's request, or an operator's drop.
+
+**Rejected.**
+
+- **Clearing the state on fencing, so the next wake starts fresh.** That would lose corruption
+  reports and the collection due time.
+- **A compare-and-set on the stored epoch only at the poll's write.** It fixes the one proven site
+  but not the class. `collectionDueAt` was also lost when `requestCollection` or a collection
+  stored it during a poll, and D77 relies on requested collections.
+- **Making the wake synchronous again in the flush.** That would bring back D73's flush times, and
+  the other callers would still race.
+
+**Tests** (`compactor.test.ts`; every gate is a `Deferred` in a wrapped manifest store, reader, or
+collector, not a sleep):
+
+- **Two overlapping cold wakes.** On the code before, the test ends in the live state: two
+  fence-ins, manifest epoch 2, stored epoch 1, `fenced`, and L0 at 4 after three more wakes. Now
+  there is one fence-in, and the compaction commits.
+- **A poll that ran across a fence-in** stores nothing over the newer epoch.
+- **A collection requested during a poll**, and one requested during a collection, are still due
+  afterwards.
+- **A stored `fenced: true` with an older epoch** fences in again on a wake (epoch 3; the
+  compaction commits), and again from the alarm alone (epoch 5), keeping the collection due time.
+- **Six mutations, all caught:** the start lock removed, the poll's due time taken from its
+  starting state, the poll's whole starting state written back, a collection overwriting a request,
+  no re-fence on wake, and no re-fence from the alarm.
+
+**The same pattern elsewhere.** These are the first-call initializers that write to R2 or a
+manifest, checked against two concurrent first calls:
+
+- **`DbWriter.startWriter`** runs under `initLock` and re-reads the phase inside it.
+- **`DatabaseLifecycle.create`** is a create-if-absent of manifest 1, so exactly one succeeds
+  (also measured live with `create-race`).
+- **`CompactionBudget` and `ShardDirectory`** do their read-modify-write under a lock, with no
+  other I/O inside it.
+- **`MaintenanceSweep`** is a cron, not a Durable Object. Its cursor is a plain object, and two
+  overlapping runs visit the same page twice, which is harmless (each visit is idempotent).
+
+**Model.** `ManifestCasFencing.tla` already treats each fence-in as a compactor with its own epoch,
+and a compactor that fences in again is one more of those. The overwritten epoch was in the
+compactor's own Durable Object state, not in the manifest, so it is a property of that state, and
+the tests check it. No step changed; reran, and every broken variant fails (the skill records it).
