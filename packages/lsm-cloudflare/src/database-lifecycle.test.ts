@@ -163,6 +163,72 @@ const valuesIn = (databaseId: DatabaseId) =>
   });
 
 describe("DatabaseLifecycle", () => {
+  it("a transaction begun before a seal cannot commit after it, in the source or its successors", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const client = yield* DbClient;
+        yield* lifecycle.create(SOURCE, {
+          keyRange: Option.none(),
+          databaseOptions: DEFAULT_DATABASE_OPTIONS,
+        });
+        yield* client.put(SOURCE, bytes("a"), bytes("A"));
+        // The transaction reads "a" and will write "b" (left) and "x" (right).
+        const begin = yield* client.beginTransaction(SOURCE);
+        const read = yield* client.getAt(SOURCE, bytes("a"), begin.readSeq, begin.manifestId);
+        // The split: seal, one checkpoint, a fork per successor.
+        yield* lifecycle.seal(SOURCE, [LEFT, RIGHT], false);
+        const checkpoint = yield* lifecycle.createCheckpoint(SOURCE, {
+          name: Option.some("split"),
+          lifetimeMs: Option.none(),
+        });
+        for (const [forkId, range] of [
+          [LEFT, LEFT_RANGE],
+          [RIGHT, RIGHT_RANGE],
+        ] as const) {
+          yield* lifecycle.forkRange({
+            source: SOURCE,
+            checkpointId: checkpoint.id,
+            range,
+            forkId,
+          });
+        }
+        const commit = yield* Effect.flip(
+          client.commitTransaction(SOURCE, {
+            readSeq: begin.readSeq,
+            isolation: "SerializableSnapshot",
+            batch: {
+              operations: [
+                { _tag: "Put", key: bytes("b"), value: bytes("T"), ttlMillis: Option.none() },
+                { _tag: "Put", key: bytes("x"), value: bytes("T"), ttlMillis: Option.none() },
+              ],
+            },
+            readKeys: [bytes("a")],
+            readRanges: [],
+          }),
+        );
+        return {
+          read: Option.map(read, (row) =>
+            row.value._tag === "Value" ? text(row.value.bytes) : "",
+          ),
+          commit: commit._tag,
+          successors: commit._tag === "DatabaseSealedError" ? commit.successors : [],
+          source: yield* valuesIn(SOURCE),
+          left: yield* valuesIn(LEFT),
+          right: yield* valuesIn(RIGHT),
+        };
+      }),
+    );
+    expect(outcome).toEqual({
+      read: Option.some("A"),
+      commit: "DatabaseSealedError",
+      successors: [LEFT, RIGHT],
+      source: ["a=A"],
+      left: ["a=A"],
+      right: [],
+    });
+  });
+
   it("seals, forks a split, rewrites, releases the forks' holds gcMinAge later, then removes the source", async () => {
     const outcome = await run(
       Effect.gen(function* () {

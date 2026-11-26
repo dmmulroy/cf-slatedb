@@ -7,6 +7,7 @@ import {
   initialManifest,
   planCompactions,
   type Row,
+  SeqNum,
   type SstHandle,
   type TransactionIsolation,
 } from "@shaledb/lsm-core";
@@ -17,7 +18,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { backgroundWorkTestLayer } from "./background-work.ts";
 import { CompactionExecutor, makeCompactionExecutor } from "./compaction-executor.ts";
 import { DbClient, dbClientTestLayer, type TransactionBegin } from "./db-client.ts";
-import type { DbReaderServices } from "./db-reader.ts";
+import { DbReader, type DbReaderServices } from "./db-reader.ts";
 import { GarbageCollector, garbageCollectorLayerWithoutDependencies } from "./garbage-collector.ts";
 import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
 import { ManifestReader } from "./manifest-reader.ts";
@@ -49,6 +50,7 @@ const testLayer = (settings: Parameters<typeof dbClientTestLayer>[0]) =>
 type TestServices =
   | CompactionExecutor
   | DbClient
+  | DbReader
   | ManifestStore
   | ManifestReader
   | ObjectStore
@@ -559,6 +561,46 @@ describe("transactions", () => {
       ),
     );
     expect(outcome).toEqual({ replaced: 2, read: 1, scanned: [1, 2] });
+  });
+
+  it("a transaction read whose writer is ahead of every manifest the reader can load is retryable, not too old (D76)", async () => {
+    const outcome = await Effect.runPromise(
+      provide(
+        Effect.gen(function* () {
+          yield* createDatabase;
+          const client = yield* DbClient;
+          yield* client.put(DB, key(1), Uint8Array.of(1));
+          yield* client.flush(DB);
+          const begin = yield* client.beginTransaction(DB);
+          // A writer that reports rows kept only above sequence number 2 while the newest
+          // manifest the reader finds, even after a refresh, ends at 1: the newest is below the
+          // read's lower bound and the begin manifest is too. Nothing was flushed past the
+          // read's snapshot, so the read must be retried, not ended as too old.
+          const nextSeq = SeqNum.make(begin.readSeq + 1);
+          const read = yield* Effect.flip(
+            (yield* DbReader).getRow(DB, key(1), {
+              minLastL0Seq: nextSeq,
+              snapshotSeq: Option.some(nextSeq),
+              memtable: [],
+              manifestId: begin.manifestId,
+              maxLastL0Seq: Option.some(nextSeq),
+              freshness: "Recent",
+              manifestHint: Option.none(),
+            }),
+          );
+          return {
+            readSeq: begin.readSeq,
+            error: read._tag,
+            reason: read._tag === "ReaderUnavailableError" ? read.reason : undefined,
+          };
+        }),
+      ),
+    );
+    expect(outcome).toEqual({
+      readSeq: 1,
+      error: "ReaderUnavailableError",
+      reason: "StorageUnavailable",
+    });
   });
 
   it("ends a transaction only once its rows are trimmed, and old callers at the first flush", async () => {
