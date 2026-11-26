@@ -224,18 +224,20 @@ export const SCAN_READ_AHEAD_BLOCKS = 8;
  * time.
  *
  * @param limit - Rows the scan wants; none: all, which reads ahead fully.
+ * @param sstRowCount - The SST's rows (its metadata's `footer.rowCount`).
+ * @param sstBlockCount - The SST's data blocks (its metadata's `index.length`).
  */
 export const scanFirstReadAheadBlocks = (
   limit: Option.Option<number>,
-  sst: { readonly rowCount: number; readonly blockCount: number },
+  sstRowCount: number,
+  sstBlockCount: number,
 ): number => {
   if (Option.isNone(limit)) return SCAN_READ_AHEAD_BLOCKS;
-  const rowsPerBlock = Math.max(1, sst.rowCount / Math.max(1, sst.blockCount));
+  const rowsPerBlock = Math.max(1, sstRowCount / Math.max(1, sstBlockCount));
   return Math.max(1, Math.min(SCAN_READ_AHEAD_BLOCKS, Math.ceil(limit.value / rowsPerBlock) + 1));
 };
 
 /** Constructs the reader over the contextual manifest cache, manifest reader, and block cache. */
-
 export const makeDbReader = Effect.gen(function* () {
   const manifests = yield* ManifestCache;
   const reader = yield* ManifestReader;
@@ -487,10 +489,7 @@ export const makeDbReader = Effect.gen(function* () {
           );
         // First the blocks the scan's limit is likely to need, then, only if the merge asks for
         // more, the rest.
-        const first = scanFirstReadAheadBlocks(limit, {
-          rowCount: meta.footer.rowCount,
-          blockCount: meta.index.length,
-        });
+        const first = scanFirstReadAheadBlocks(limit, meta.footer.rowCount, meta.index.length);
         return readAhead(indexes.slice(0, first), first).pipe(
           Stream.concat(
             Stream.suspend(() => readAhead(indexes.slice(first), SCAN_READ_AHEAD_BLOCKS)),

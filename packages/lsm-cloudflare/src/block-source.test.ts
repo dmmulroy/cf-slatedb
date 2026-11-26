@@ -1,8 +1,15 @@
-import { Effect, Fiber, Result } from "effect";
+import { DatabaseId, SstId } from "@shaledb/lsm-core";
+import { ConfigProvider, Effect, Fiber, Layer, Option, Result } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
-import { hedgedBlockRead } from "./block-source.ts";
+import { BlockSource, hedgeBlockSource, hedgedBlockRead } from "./block-source.ts";
+import { lsmConfigurationTestLayer } from "./lsm-configuration.ts";
+import { LSM_JURISDICTION_SETTING } from "./lsm-jurisdiction.ts";
+import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
+import { sstKey } from "./object-keys.ts";
+import { ObjectReader } from "./object-reader.ts";
+import { ObjectStore, objectStoreTestLayer } from "./object-store.ts";
 
 const run = <A, E>(effect: Effect.Effect<A, E>) =>
   effect.pipe(Effect.provide(TestClock.layer()), Effect.runPromise);
@@ -119,5 +126,111 @@ describe("hedgedBlockRead", () => {
     );
     expect(answer).toBe("server");
     expect(log).toEqual(["server started"]);
+  });
+});
+
+/** A fork's reader asks for a block of an SST its source database owns. */
+const SOURCE = DatabaseId.make("orders-source");
+const SST = SstId.make("01JD0000000000000000000AAA");
+const SST_BYTES = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+
+/**
+ * Reads `offset`/`length` of the source's SST as `block` and as `meta` through
+ * `hedgeBlockSource` over a `BlockServer` that never answers, with `jurisdiction` bound and
+ * `hedgeAfterMs` configured, advancing the test clock by `waitMs`.
+ *
+ * @returns What each read answered within `waitMs` (none: still waiting), and how many range
+ *   reads reached the bucket.
+ */
+const readThroughUnansweredBlockServer = (options: {
+  readonly jurisdiction: string;
+  readonly hedgeAfterMs: number;
+  readonly waitMs: number;
+}) =>
+  Effect.gen(function* () {
+    const store = yield* ObjectStore;
+    yield* store.put(sstKey(SOURCE, SST), SST_BYTES);
+    let bucketReads = 0;
+    const countingReader = ObjectReader.of({
+      get: store.get,
+      // Counted when the read runs, not when the hedge builds it.
+      getRange: (key, range) =>
+        Effect.suspend(() => {
+          bucketReads++;
+          return store.getRange(key, range);
+        }),
+    });
+    const unanswered = BlockSource.of({
+      block: () => Effect.never,
+      meta: () => Effect.never,
+      purge: () => Effect.succeed(true),
+    });
+    const source = yield* hedgeBlockSource(unanswered).pipe(
+      Effect.provideService(ObjectReader, countingReader),
+      Effect.provide(lsmConfigurationTestLayer({ blockReadHedgeAfterMs: options.hedgeAfterMs })),
+      Effect.provideService(
+        ConfigProvider.ConfigProvider,
+        ConfigProvider.fromUnknown({ [LSM_JURISDICTION_SETTING]: options.jurisdiction }),
+      ),
+    );
+    const block = yield* Effect.forkChild(Effect.scoped(source.block(SOURCE, SST, 2, 4)));
+    const meta = yield* Effect.forkChild(Effect.scoped(source.meta(SOURCE, SST, 0, 8)));
+    yield* TestClock.adjust(options.waitMs);
+    const answered = (fiber: Fiber.Fiber<Uint8Array, unknown>) =>
+      Effect.sync(() => {
+        const exit = fiber.pollUnsafe();
+        return exit !== undefined && exit._tag === "Success"
+          ? Option.some([...exit.value])
+          : Option.none<ReadonlyArray<number>>();
+      });
+    return {
+      block: yield* answered(block),
+      meta: yield* answered(meta),
+      bucketReads,
+    };
+  }).pipe(
+    Effect.provide(Layer.merge(objectStoreTestLayer, lsmTestRuntimeContextLayer)),
+    Effect.provide(TestClock.layer()),
+    Effect.runPromise,
+  );
+
+describe("hedgeBlockSource", () => {
+  it("answers block and metadata reads from the source's SST in the bucket once the hedge delay has passed", async () => {
+    const early = await readThroughUnansweredBlockServer({
+      jurisdiction: "none",
+      hedgeAfterMs: 50,
+      waitMs: 49,
+    });
+    expect(early).toEqual({ block: Option.none(), meta: Option.none(), bucketReads: 0 });
+    const late = await readThroughUnansweredBlockServer({
+      jurisdiction: "none",
+      hedgeAfterMs: 50,
+      waitMs: 50,
+    });
+    expect(late).toEqual({
+      block: Option.some([3, 4, 5, 6]),
+      meta: Option.some([...SST_BYTES]),
+      bucketReads: 2,
+    });
+  });
+
+  it("never reads the bucket with a hedge delay of 0", async () => {
+    const outcome = await readThroughUnansweredBlockServer({
+      jurisdiction: "none",
+      hedgeAfterMs: 0,
+      waitMs: 60_000,
+    });
+    expect(outcome).toEqual({ block: Option.none(), meta: Option.none(), bucketReads: 0 });
+  });
+
+  it("never reads the bucket in a Stack restricted to a jurisdiction, however slow the BlockServer is", async () => {
+    for (const jurisdiction of ["eu", "fedramp"]) {
+      const outcome = await readThroughUnansweredBlockServer({
+        jurisdiction,
+        hedgeAfterMs: 50,
+        waitMs: 60_000,
+      });
+      expect(outcome).toEqual({ block: Option.none(), meta: Option.none(), bucketReads: 0 });
+    }
   });
 });

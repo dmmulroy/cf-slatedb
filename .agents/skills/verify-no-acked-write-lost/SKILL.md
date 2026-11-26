@@ -93,6 +93,15 @@ past its snapshot filtered out the newer version and no longer found the older o
 
 ## Maintenance notes
 
+- D74, review fix: the three counters are one value with a generation number; a commit advances
+  it when it starts and when it ends (adding its row in that step), and the refresh at the end of
+  a flush installs its scan only when no commit ran during it, otherwise scans again, three times
+  at most, then keeps counters that are above SQLite. A flush that writes nothing rescans counters
+  that still show rows. All of this decides when a flush is scheduled, never what a flush, a
+  commit, or a probe does: `flushThen` still takes its cut from `memTable.meta`, a commit's rows
+  are durable before it is acknowledged, and reads never use the counters. The models do not model
+  flush scheduling (a flush may happen at any step), so no model step changed.
+
 - D74: `DbWriter.write` now advances three in-memory counters (unflushed bytes with the formula
   SQLite sums, unflushed rows, the oldest commit time), and `runAlarm` and `status` read them
   instead of scanning the memtable. That changes when a flush is scheduled and what a status

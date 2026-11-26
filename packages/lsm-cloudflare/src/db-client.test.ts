@@ -301,20 +301,17 @@ describe("DbClient against a Map oracle", () => {
   });
 
   it("sizes a scan's first read-ahead from its limit and the SST's rows per block (D72)", () => {
-    const sst = (rowCount: number, blockCount: number) => ({ rowCount, blockCount });
     // No limit: everything is wanted, so read ahead fully.
-    expect(scanFirstReadAheadBlocks(Option.none(), sst(10_000, 100))).toBe(SCAN_READ_AHEAD_BLOCKS);
+    expect(scanFirstReadAheadBlocks(Option.none(), 10_000, 100)).toBe(SCAN_READ_AHEAD_BLOCKS);
     // 100 rows at 130 rows per block: one block, and one more for a range starting mid-block.
-    expect(scanFirstReadAheadBlocks(Option.some(100), sst(13_000, 100))).toBe(2);
+    expect(scanFirstReadAheadBlocks(Option.some(100), 13_000, 100)).toBe(2);
     // 100 rows at 16 rows per block (1 KB values in 16 KiB blocks): seven blocks and one more.
-    expect(scanFirstReadAheadBlocks(Option.some(100), sst(1_600, 100))).toBe(8);
+    expect(scanFirstReadAheadBlocks(Option.some(100), 1_600, 100)).toBe(8);
     // A full page of 1,000 small rows: capped.
-    expect(scanFirstReadAheadBlocks(Option.some(1000), sst(13_000, 100))).toBe(
-      SCAN_READ_AHEAD_BLOCKS,
-    );
-    expect(scanFirstReadAheadBlocks(Option.some(1), sst(13_000, 100))).toBe(2);
+    expect(scanFirstReadAheadBlocks(Option.some(1000), 13_000, 100)).toBe(SCAN_READ_AHEAD_BLOCKS);
+    expect(scanFirstReadAheadBlocks(Option.some(1), 13_000, 100)).toBe(2);
     // Degenerate metadata never asks for less than one block or more than the cap.
-    expect(scanFirstReadAheadBlocks(Option.some(100), sst(0, 0))).toBe(SCAN_READ_AHEAD_BLOCKS);
+    expect(scanFirstReadAheadBlocks(Option.some(100), 0, 0)).toBe(SCAN_READ_AHEAD_BLOCKS);
   });
 
   it("a short scan reads only the blocks its limit needs, and reads on when rows turn out hidden (D72)", async () => {

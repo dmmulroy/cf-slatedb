@@ -109,7 +109,9 @@ const lsmSettingsCombinationIssues = (settings: LsmSettingsFields) =>
  * - `blockReadHedgeAfterMs`: once a block or metadata read through the `BlockServer` has taken
  *   this long, the reader also reads the bytes straight from the bucket and takes whichever
  *   answers first. 0: never. 50 ms: Workers Cache answers nine reads in ten faster than that, so
- *   about a fifth of reads are hedged, and the slowest take 100 ms instead of 450 (D72).
+ *   about a fifth of reads are hedged, and the slowest take 100 ms instead of 450 (D72). No effect
+ *   in a Stack restricted to a jurisdiction: its `BlockServer` has no Workers Cache, so both reads
+ *   take the same road to the same bucket, and readers there never hedge.
  * - `compactorPollInterval`: how often the compactor's alarm polls the manifest while it has work.
  * - `compactionBudgetCapacity`: most compactions running at once across every database sharing the
  *   compaction budget; groups split it fairly.

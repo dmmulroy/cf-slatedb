@@ -243,6 +243,21 @@ hand-off is below.
   - **Verified.** `vp run ready` exit 0, `vp run verify` exit 0 (28/28), 13/13 scenarios locally
     and on `preview-3` (`--dev-timings`), 5-minute soaks passing on `preview-2` and `preview-3`
     for each arm. Thirty-five mutations of the new code are each caught by a test.
+- **Review of D67 and D69 to D74 (branch `proto/review`).** The review agent checked the day's
+  changes against the standards (no defect found) and then fixed what it found.
+  - **D74, the writer's counters.** The counter refresh at the end of a flush installs its scan
+    only if no commit ran during it. Before, a commit landing between the scan and the install
+    could lose its row from the counters and leave it with no alarm. A flush that writes
+    nothing settles counters that still show unflushed rows.
+  - **D72, hedged reads.** No hedging in a restricted Stack (`eu` measurements: 90% of block
+    reads hedged, 2% won). D72 is corrected: the losing read is interrupted, and hedging has a
+    connection-queue limit.
+  - **Tests and small fixes.** New tests cover the hedged source's wiring and `ensureReady`'s
+    fast path. D70's "always fits" sentence is corrected, along with three standards points.
+  - **Verified.** `vp check` and `vp test run` exit 0 in `packages/lsm-core` and
+    `packages/lsm-cloudflare`. Each new test fails on the code before or under a named mutation
+    (`/tmp/shale-work/agents/review/REPORT-2.md`). `vp run ready` and `vp run verify` are left
+    to integration.
 
 ## Remaining-work log
 

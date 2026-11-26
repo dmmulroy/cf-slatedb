@@ -43,6 +43,14 @@ export const lsmJurisdiction: Effect.Effect<Option.Option<LsmJurisdiction>> = Co
   Effect.orDie,
 );
 
+/**
+ * Whether a Stack with this jurisdiction serves blocks through Workers Cache. Workers Cache keeps
+ * bytes in data centers anywhere, so a Stack restricted to a jurisdiction runs its `BlockServer`
+ * without it (D49), and readers there do not hedge `BlockServer` reads with bucket reads (D72).
+ */
+export const lsmStackHasWorkersCache = (jurisdiction: Option.Option<LsmJurisdiction>): boolean =>
+  Option.isNone(jurisdiction);
+
 const decodeJurisdictionText = Schema.decodeUnknownOption(LsmJurisdictionSetting);
 
 /**
