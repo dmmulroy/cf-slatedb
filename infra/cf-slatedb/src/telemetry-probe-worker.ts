@@ -5,7 +5,7 @@ import {
   inLsmJurisdiction,
   isLocalLsmStage,
   lsmJurisdiction,
-  lsmAccessGateForStage,
+  lsmAccessGateFrom,
   lsmWorkerCompatibility,
   ObjectStore,
   objectStoreLayer,
@@ -16,6 +16,7 @@ import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Clock, Effect, Option, Schema } from "effect";
 import { HttpClientRequest, HttpServerRequest, HttpServerResponse } from "effect/http";
 
+import { cfSlatedbAccessTokens } from "./cf-slatedb-access-tokens.ts";
 import { cfSlatedbWorkerSettings } from "./cf-slatedb-stack-config.ts";
 import { cfSlatedbTelemetry } from "./cf-slatedb-telemetry.ts";
 
@@ -200,7 +201,7 @@ const decodeR2ProbeRegion = Schema.decodeUnknownOption(R2ProbeRegion);
  */
 export class TelemetryProbeWorker extends Cloudflare.Worker<
   TelemetryProbeWorker,
-  { readonly fetch: HttpEffect },
+  { readonly fetch: HttpEffect<RuntimeContext> },
   TelemetryProbeServer | R2ProbeServer
 >()("TelemetryProbeWorker") {}
 
@@ -218,7 +219,7 @@ export const telemetryProbeWorkerLayer = TelemetryProbeWorker.make(
     const r2Probes = yield* R2ProbeServer;
     const jurisdiction = yield* lsmJurisdiction;
     const withEventTelemetryFlush = yield* eventTelemetryFlushForStage;
-    const withAccessGate = yield* lsmAccessGateForStage;
+    const withAccessGate = yield* lsmAccessGateFrom(cfSlatedbAccessTokens);
     // The probe addresses its Durable Object in the Stack's jurisdiction, like the engine Workers.
     yield* bindLsmWorkerSettings(cfSlatedbWorkerSettings);
     return {

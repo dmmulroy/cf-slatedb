@@ -17,7 +17,11 @@ import { defineConfig } from "vite-plus";
  * `destroy:preview-<n>` tears a preview down. Agents never run them (the deployment guard blocks
  * `alchemy destroy`); `preview-cli destroy-command <stage>` prints the command for Dillon.
  *
- * There is no production task: deploying production needs Dillon's approval.
+ * `plan:production` and `deploy:production` plan and deploy the `production` stage: production
+ * names, a retained LSM bucket, 10% trace sampling, no probe Worker. Nothing runs them until Dillon's
+ * go-ahead (P6, `docs/release-v1.md`). The deploy first checks that both access-token secrets exist
+ * (`tokens check production`); create them once with `tokens ensure production` and store the
+ * tokens it prints.
  */
 const cfSlatedbViteConfig = defineConfig({
   test: {
@@ -36,9 +40,18 @@ const cfSlatedbViteConfig = defineConfig({
       "deploy:preview-1": { cache: false, command: "alchemy deploy --stage preview-1 --yes" },
       "deploy:preview-2": { cache: false, command: "alchemy deploy --stage preview-2 --yes" },
       "deploy:preview-3": { cache: false, command: "alchemy deploy --stage preview-3 --yes" },
+      "plan:production": { cache: false, command: "alchemy plan --stage production" },
+      "deploy:production": {
+        cache: false,
+        command:
+          "node src/access-tokens-cli.ts check production && alchemy deploy --stage production --yes",
+      },
       "destroy:preview-1": { cache: false, command: "alchemy destroy --stage preview-1 --yes" },
       "destroy:preview-2": { cache: false, command: "alchemy destroy --stage preview-2 --yes" },
       "destroy:preview-3": { cache: false, command: "alchemy destroy --stage preview-3 --yes" },
+      // A live stage's access tokens in the account's Secrets Store (D64): `ensure <stage>` or
+      // `rotate <stage> <A|B>`. Prints new tokens once.
+      tokens: { cache: false, command: "node src/access-tokens-cli.ts" },
       // Read-only: prints the Cloudflare state store's records under a path (`CfSlatedb/<stage>`).
       "state:read": {
         cache: false,

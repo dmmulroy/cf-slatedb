@@ -229,7 +229,13 @@ export class DbHttpApiGroup extends HttpApiGroup.make("databases")
       params: DatabaseParams,
       success: WriterStatusResponse,
       error: DB_PUBLIC_ERRORS,
-    }).annotateMerge(OpenApi.annotations({ summary: "Read the writer's status" })),
+    }).annotateMerge(
+      OpenApi.annotations({
+        summary: "Read the writer's status",
+        description:
+          "The writer's epoch, its last and flushed sequence numbers, what is unflushed, the newest manifest's L0 SST count, and whether the database is sealed.",
+      }),
+    ),
   )
   .add(
     HttpApiEndpoint.get("compaction", "/databases/:databaseId/compaction", {
@@ -290,7 +296,13 @@ export class DbHttpApiGroup extends HttpApiGroup.make("databases")
       params: Schema.Struct({ databaseId: DatabaseId, checkpointId: CheckpointId }),
       success: HttpApiSchema.NoContent,
       error: DB_PUBLIC_ERRORS,
-    }).annotateMerge(OpenApi.annotations({ summary: "Delete a checkpoint" })),
+    }).annotateMerge(
+      OpenApi.annotations({
+        summary: "Delete a checkpoint",
+        description:
+          "Releases a checkpoint (its id comes from the create or list response), so GC may collect what only it kept. Deleting one that does not exist succeeds.",
+      }),
+    ),
   )
   .add(
     HttpApiEndpoint.post("seal", "/databases/:databaseId/seal", {
@@ -352,7 +364,13 @@ export class DbHttpApiGroup extends HttpApiGroup.make("databases")
       payload: TransactionGetRequest,
       success: GetResponse,
       error: DB_PUBLIC_ERRORS,
-    }).annotateMerge(OpenApi.annotations({ summary: "Read a key in a transaction" })),
+    }).annotateMerge(
+      OpenApi.annotations({
+        summary: "Read a key in a transaction",
+        description:
+          "Reads a key as of the transaction's `readSeq` and `manifestId` (both from `transactions/begin`). Send the keys read to `transactions/commit` as `readKeys`.",
+      }),
+    ),
   )
   .add(
     HttpApiEndpoint.post("transactionScan", "/databases/:databaseId/transactions/scan", {
@@ -360,7 +378,13 @@ export class DbHttpApiGroup extends HttpApiGroup.make("databases")
       payload: TransactionScanRequest,
       success: Schema.Struct({ rows: Schema.Array(RowSchema) }),
       error: DB_PUBLIC_ERRORS,
-    }).annotateMerge(OpenApi.annotations({ summary: "Scan a range in a transaction" })),
+    }).annotateMerge(
+      OpenApi.annotations({
+        summary: "Scan a range in a transaction",
+        description:
+          "Scans a key range as of the transaction's `readSeq` and `manifestId` (both from `transactions/begin`), at most `limit` rows. Send the range to `transactions/commit` as one of `readRanges`.",
+      }),
+    ),
   )
   .add(
     HttpApiEndpoint.post("commitTransaction", "/databases/:databaseId/transactions/commit", {

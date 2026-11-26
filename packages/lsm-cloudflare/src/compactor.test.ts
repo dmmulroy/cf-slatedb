@@ -427,4 +427,25 @@ describe("Compactor", () => {
     expect(outcome.blockedL0).toBe(5);
     expect(outcome.values).toEqual([true, true, false, true, true]);
   });
+
+  it("does not run on compactor state a newer format wrote (D64)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createWithL0(ORDERS, 4);
+        const { compactor, fire, cell } = yield* startCompactor;
+        yield* compactor.wake(ORDERS);
+        const state = Option.getOrThrow(yield* cell.get);
+        yield* cell.set({ ...state, formatVersion: 2 });
+        const woken = yield* Effect.flip(compactor.wake(ORDERS));
+        yield* fire;
+        const jobs = yield* Ref.get(yield* CompactionLauncherRecord);
+        const after = yield* (yield* ManifestReader).loadLatest(ORDERS);
+        return { woken, jobs: jobs.size, l0: after.manifest.l0.length };
+      }),
+    );
+    expect(outcome.woken._tag).toBe("CompactorUnavailableError");
+    expect(outcome.woken.message).toContain("written by a newer cf-slatedb (format 2");
+    // Its alarm compacts nothing.
+    expect([outcome.jobs, outcome.l0]).toEqual([0, 4]);
+  });
 });

@@ -1255,3 +1255,85 @@ before the SST, or drop it) instead of "recompact its inputs", which no tool doe
   span carries the method and status and none of the four caller attributes. Before the fix it
   failed (three spans carried them). Across a whole local run (6,193 spans), only allowed keys
   appear and no span is exported twice.
+
+## D64. Production readiness: rotatable tokens, production tasks, a checked-in contract, format versions
+
+**Rotatable access tokens (P1).** Each live stage has two token slots, A and B. Each slot is a
+Secrets Store secret in the account's `default_secrets_store`, named
+`CF_SLATEDB_<STAGE>_ACCESS_TOKEN_<SLOT>`.
+
+- **Binding.** The Stack binds both slots to the API, GC, shard-router, and probe Workers by
+  reference (`Secret.lookup`). Alchemy never writes their values. Its `Secret` resource would write
+  its stored value back whenever it reconciled, silently undoing a rotation, so the values live
+  outside Alchemy state.
+- **The gate** (`lsmAccessGateFrom` over an `LsmAccessTokenSource` the Stack supplies, as D55 made
+  it supply settings) does the following:
+  - reads the slots at runtime and re-reads them every 30 s;
+  - keeps a value it read before when a read fails, and stays closed when it has read none;
+  - accepts a request presenting any accepted token, comparing against each in time that depends
+    only on the lengths.
+- **Previews** also keep their state-held token. `preview-cli token` and the scenarios use it.
+  Production has no readable token: its tokens are printed once, when created or rotated.
+- **`vp run @cf-slatedb/infra#tokens`** manages the slots with the Alchemy profile's credentials:
+  - `ensure <stage>` creates the missing slots; `preview-cli deploy` runs it first.
+  - `check <stage>` fails unless both slots exist. The production deploy runs it, so a
+    production token is never created inside a deploy's log.
+  - `rotate <stage> <A|B>` replaces one slot's token.
+- **Live check on `preview-1`.** A rotated token was accepted and a junk one refused. Right after a
+  second rotation, both the old and the new token were accepted, which is the 30 s refresh window.
+  After 35 s the old token got 401 and the new one passed, and the state-held token kept working
+  throughout.
+
+**Production tasks.** `plan:production` and `deploy:production` (infra, no cache) plan and deploy
+the `production` stage. They give it:
+
+- production names, including the retained `cf-slatedb` bucket;
+- 10% sampling;
+- no probe Worker (D62);
+- a trace collector, with 14-day expiry (D63).
+
+A test pins production's resolved configuration, and the stage helpers keep the probe and the
+state-held token out of production. Nothing runs these tasks until P6.
+
+**A checked-in contract.**
+
+- **Generation.** `vp run generate:openapi` writes `docs/openapi/cf-slatedb-v1.json` from
+  `DbHttpApi`, then completes it in `db-openapi.ts` with what the contract's schemas cannot carry.
+- **Examples.** Every operation's examples are typed as decoded values and encoded through the
+  schemas they exemplify, so they conform by construction. They cover every parameter, request,
+  and success response, plus error examples per status.
+- **Where examples live.** Effect drops `examples` annotations on schemas with transformations
+  (base64 bytes, `Option` from null), and the typed OpenAPI model has no example field on media
+  types or parameters. The examples therefore go in the JSON Schema `examples` keyword of each
+  schema, which the open `JsonSchema` type allows, with no widening or assertion.
+- **Also completed:** the bearer scheme, `x-request-id` on every response (the request middleware
+  and the gate set it on all of them), and the local server URL only. No production hostname is
+  invented.
+- **The test** checks that the generated spec equals the checked-in one, so a contract change
+  without regenerating fails `vp run ready`. It also checks that every operation has a summary and
+  a description and that everything a caller sends has an example.
+- **Descriptions** were added where four operations lacked them.
+- **`docs/api-compatibility.md`** states what `/v1` promises: additive changes only within `/v1`.
+
+**Format versions.** Two pieces of stored data carry a format version:
+
+- **The manifest:** `MANIFEST_FORMAT_VERSION`, with older manifests decoding as 1.
+- **The compactor state:** `COMPACTOR_STATE_FORMAT_VERSION`.
+
+`ManifestReader`'s single decode point refuses a manifest whose format is newer than the code's,
+with `StoredManifestInvalid`, naming the format. Every write starts from a load or from an
+already-checked view, so code never rewrites newer data in an older format. A compactor on newer
+state refuses to wake and its alarm does nothing.
+
+A real manifest written by v1 workstream 1's code, read back from `preview-1`'s bucket, is checked
+in as a fixture. It decodes as format 1 with no dropped SSTs, and writing it again keeps everything
+it held. Tests show that a format-2 manifest is refused for reads and writes, with nothing written,
+and that a compactor on format-2 state compacts nothing. Removing either check fails its test.
+
+**Documentation and cleanup.**
+
+- **`README.md`:** what cf-slatedb is, a quick start, the API, and the repository layout.
+- **`docs/operations.md`:** now covers deploying, rolling back, tokens, data residency, GC and
+  removal, and capacity, alongside the telemetry, watch list, and corruption runbook.
+- **Removed:** `lsmAccessGateForStage`, which described the gate as a preview stand-in for
+  Cloudflare Access.

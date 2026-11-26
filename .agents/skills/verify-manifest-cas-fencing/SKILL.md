@@ -122,6 +122,11 @@ a flush commits from its own view with one create and no `ManifestReader.loadLat
 
 ## Maintenance notes
 
+- D64 (v1 workstream 9): `decodeStoredManifest`, the reader's single decode point, refuses a
+  manifest whose `formatVersion` is newer than the code's (`StoredManifestInvalid`). That is one
+  more way a load fails before any write; the CAS and fencing steps are unchanged. No model step
+  changed.
+
 - D62 (v1 workstream 7): one more manifest edit, `dropSstFromManifest`, committed by
   `ManifestStore.update` (reload and reapply on conflict) from the compactor, under its planning
   lock; it changes no epoch, so fencing is unaffected. A compaction that read a dropped L0 SST fails

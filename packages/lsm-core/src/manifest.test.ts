@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { Option, Result, Schema } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -29,6 +31,7 @@ import {
   releasableExternalRefs,
   initialManifest,
   Manifest,
+  MANIFEST_FORMAT_VERSION,
   MAX_DROPPED_SST_HISTORY,
   ManifestJson,
   removeCheckpoint,
@@ -95,6 +98,23 @@ describe("Manifest JSON", () => {
     expect(Schema.encodeSync(ManifestJson)(decoded)).toBe(
       Schema.encodeSync(ManifestJson)(manifest),
     );
+  });
+
+  it("decodes a manifest older code wrote, as format 1 with no dropped SSTs (D64)", () => {
+    // Written by cf-slatedb at v1 workstream 1 (before format versions and droppedSsts), read back
+    // from preview-1's bucket.
+    const written = readFileSync(
+      new URL("./fixtures/manifest-written-by-workstream-1.json", import.meta.url),
+      "utf8",
+    );
+    const decoded = Schema.decodeSync(ManifestJson)(written);
+    expect([decoded.formatVersion, decoded.droppedSsts]).toEqual([1, []]);
+    expect([decoded.l0.length, decoded.sortedRuns.length]).toEqual([1, 1]);
+    // Writing it again records the format; everything it held is kept.
+    const rewritten = JSON.parse(Schema.encodeSync(ManifestJson)(decoded));
+    expect(rewritten.formatVersion).toBe(MANIFEST_FORMAT_VERSION);
+    const original = JSON.parse(written);
+    for (const key of Object.keys(original)) expect(rewritten[key]).toEqual(original[key]);
   });
 
   it("decodes manifests written with the per-database jurisdiction option, ignoring it (D49)", () => {

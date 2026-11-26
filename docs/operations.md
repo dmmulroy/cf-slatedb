@@ -1,12 +1,134 @@
 # Operations
 
-How to run cf-slatedb in production. Workstream 9 of [`handoff-v1.md`](handoff-v1.md) completes
-this document (deploy, rollback, token rotation, jurisdiction, GC and removal, capacity). The
-corruption runbook is from workstream 7 (D62); telemetry and what to watch are from workstream 8
-(D63).
+How to run cf-slatedb in production: deploying, rolling back, access tokens, data residency,
+garbage collection and removal, capacity, telemetry, what to watch, and the corruption runbook.
 
 Every endpoint below is on the API Worker under `/v1` and needs the stage's token
 (`Authorization: Bearer <token>`).
+
+## Deploying
+
+Production is the `production` stage of the `CfSlatedb` Stack. It gets:
+
+- the LSM bucket named `cf-slatedb`, retained if the Stack is destroyed;
+- 10% trace sampling;
+- no probe Worker;
+- the measured CPU limits: 30 s for the API Worker and its writers, 60 s for the compactor.
+
+Every Worker is bound its complete settings on every deploy (D55).
+
+1. **Once, before the first deploy:** create the two access tokens and store them in your secret
+   manager. They are printed only here.
+
+   ```sh
+   vp run @cf-slatedb/infra#tokens ensure production
+   ```
+
+2. **Review the plan:**
+
+   ```sh
+   vp run @cf-slatedb/infra#plan:production
+   ```
+
+3. **Deploy:**
+
+   ```sh
+   vp run @cf-slatedb/infra#deploy:production
+   ```
+
+   It first checks that both token secrets exist, and refuses otherwise.
+
+Settings come from the deploy's environment. All are optional; defaults are in
+`infra/cf-slatedb/src/cf-slatedb-stack-config.ts`:
+
+| Variable                                               | Default (production)   | What it sets                                                                                       |
+| ------------------------------------------------------ | ---------------------- | -------------------------------------------------------------------------------------------------- |
+| `CF_SLATEDB_LSM_SETTINGS`                              | none (engine defaults) | JSON overrides of engine settings. Invalid combinations refuse the plan                            |
+| `CF_SLATEDB_JURISDICTION`                              | `none`                 | `eu` or `fedramp` restricts every bucket, Durable Object, and the Workflow. Fixed per installation |
+| `CF_SLATEDB_BUCKET_LOCATION`                           | `auto`                 | R2 location hint for the LSM bucket (unrestricted Stacks). Fixed per installation                  |
+| `CF_SLATEDB_TRACE_SAMPLE_RATE`                         | `0.1`                  | Fraction of traces kept                                                                            |
+| `CF_SLATEDB_TRACE_RETENTION_DAYS`                      | `14`                   | Days traces and tail records are kept                                                              |
+| `CF_SLATEDB_API_CPU_MS`, `CF_SLATEDB_COMPACTOR_CPU_MS` | `30000`, `60000`       | CPU limit per invocation                                                                           |
+
+The API's URL is the API Worker's `workers.dev` URL, printed as `apiUrl` when the deploy finishes.
+
+## Rolling back
+
+Redeploy the previous commit with the same task. Durable Objects (writers, compactors, the shard
+directory) and everything in R2 are untouched by a redeploy:
+
+- writes acknowledged before it are in each writer's SQLite or in R2;
+- the new code reads both.
+
+The manifest and the compactor state carry a format version (D64). Code refuses data written in a
+newer format rather than rewrite it. A rollback across a release that raised a format therefore
+stops on those databases with `StoredDataInvalid`, naming the version to deploy, and damages
+nothing. Roll forward again to recover. v1 is format 1, the format of all data written so far.
+
+## Access tokens
+
+The API, GC, and shard-router Workers accept a request that presents either of the stage's two
+tokens as `Authorization: Bearer <token>`. Each token is a Secrets Store secret
+(`CF_SLATEDB_<STAGE>_ACCESS_TOKEN_A` and `_B` in the account's `default_secrets_store`). Workers
+read the secrets at runtime and re-read them every 30 s, so a rotation needs no deploy.
+
+To replace a token without downtime:
+
+1. Move every caller to the slot you keep, say B.
+2. Rotate the slot you replace:
+
+   ```sh
+   vp run @cf-slatedb/infra#tokens rotate production A
+   ```
+
+   It prints the new token. Within 30 s, Workers accept it and stop accepting the old one.
+
+3. Next time, rotate B after moving callers to A.
+
+Preview stages also accept the token `preview-cli token <stage>` prints. Production has no such
+token. Cloudflare Access may be put in front of the Workers too; the gate stays.
+
+## Data residency
+
+The jurisdiction is chosen once per installation (P2: none). With `eu` or `fedramp`, every
+bucket, Durable Object, and the compaction Workflow is created in that jurisdiction, and Workers
+Cache is not used for blocks. Changing it later creates new, empty resources: move to it by
+creating a new installation and forking or copying databases into it.
+
+## Garbage collection and removal
+
+- **Collection.** Each database's compactor collects its own garbage from its alarm, `gcMinAge` (1
+  hour) after a compaction. That garbage is replaced SSTs and manifests no reader may still hold
+  (D60).
+- **The sweep.** A cron every 5 minutes runs a paged maintenance sweep of 50 databases. It removes
+  what deleted databases left behind, wakes forks' compactors, and asks for collection where
+  manifests piled up.
+- **Collect now:** `POST /v1/gc/databases/<id>` on the GC Worker.
+- **Removing a database:** `DELETE /v1/databases/<id>`. It fails with `DatabaseHasDependents`
+  while forks still read its SSTs. Remove them first, or wait until their compactions have
+  rewritten what they read.
+
+## Capacity
+
+Measured on preview stages with production settings ([`measurements.md`](measurements.md)):
+
+| What                            | Measured                                                           |
+| ------------------------------- | ------------------------------------------------------------------ |
+| One writer, 1,000-row batches   | ~15,000 rows/s; p50 latency ~1 s                                   |
+| One writer, 100-row batches     | ~6,500 rows/s; p50 latency ~105 ms                                 |
+| Unflushed data per writer       | 256 MiB (`maxUnflushedBytes`); then `WriteStalled` until a flush   |
+| L0 SSTs before writes stall     | 16 (`l0MaxSsts`)                                                   |
+| Manifest commit (one CAS)       | p50 ~357 ms beside the bucket; ~550 ms from Europe; ~1 s from APAC |
+| Small flush                     | p50 ~709 ms                                                        |
+| 60 MiB flush                    | ~1 s CPU (max ~4 s), ~14 s wall                                    |
+| Compaction step (64 MiB output) | ~10 s CPU (max ~18 s)                                              |
+| Split (seal and fork)           | writes pause ~3 s                                                  |
+| Transactions held open          | at least 60 s (`transactionRetentionMs`) across flushes            |
+| Concurrent compactions          | 200 at once completed in 16 s                                      |
+| GC sweep                        | 50 databases per run, ~160 ms CPU                                  |
+
+Throughput per database is one writer's. A workload that needs more uses more databases, for
+example with range sharding.
 
 ## Telemetry
 

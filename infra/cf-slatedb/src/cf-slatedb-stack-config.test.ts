@@ -32,7 +32,17 @@ describe("CfSlatedbStackConfig", () => {
       limits: { apiCpuMs: 30_000, compactorCpuMs: 60_000 },
     });
     expect((await resolve("dev", {})).access.mode).toBe("Open");
-    expect((await resolve("production", {})).telemetry.traceSampleRate).toBe(0.1);
+    // Production's decided defaults (P2–P5): no jurisdiction, R2 places the bucket, the default
+    // engine settings, 10% of traces kept for 14 days, bearer tokens, measured CPU limits.
+    expect(await resolve("production", {})).toEqual({
+      stage: "production",
+      jurisdiction: "none",
+      bucketLocation: "auto",
+      lsmSettings: DEFAULT_LSM_SETTINGS,
+      telemetry: { traceSampleRate: 0.1, traceRetentionDays: 14 },
+      access: { mode: "BearerToken" },
+      limits: { apiCpuMs: 30_000, compactorCpuMs: 60_000 },
+    });
     // Blank is unset: a shell's `VAR=` must not bind an empty value.
     expect((await resolve("preview-1", { CF_SLATEDB_JURISDICTION: " " })).jurisdiction).toBe(
       "none",

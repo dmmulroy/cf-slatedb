@@ -265,6 +265,35 @@ describe("ManifestStore", () => {
     expect(ids).toEqual([1, 1, 2]);
   });
 
+  it("refuses to read, or write over, a manifest a newer format wrote (D64)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* initialize;
+        const objects = yield* ObjectStore;
+        // Manifest 2, as a later cf-slatedb would write it: format 2, with a field this one lacks.
+        const current = Option.getOrThrow(yield* objects.get(manifestKey(DB, ManifestId.make(1))));
+        const newer = JSON.parse(new TextDecoder().decode(current));
+        newer.formatVersion = 2;
+        newer.somethingNew = { introducedIn: 2 };
+        yield* objects.putIfAbsent(
+          manifestKey(DB, ManifestId.make(2)),
+          new TextEncoder().encode(JSON.stringify(newer)),
+        );
+        const read = yield* Effect.flip((yield* ManifestReader).loadLatest(DB));
+        const written = yield* Effect.flip(
+          (yield* ManifestStore).update(DB, flushEdit(1, WriterEpoch.make(0))),
+        );
+        const third = yield* objects.get(manifestKey(DB, ManifestId.make(3)));
+        return { read, written, third };
+      }),
+    );
+    for (const error of [outcome.read, outcome.written]) {
+      expect(error._tag).toBe("ManifestReadError");
+      expect(error.message).toContain("written by a newer cf-slatedb (format 2");
+    }
+    expect(outcome.third).toEqual(Option.none());
+  });
+
   it("propagates an edit's own failure without writing", async () => {
     const outcome = await run(
       Effect.gen(function* () {

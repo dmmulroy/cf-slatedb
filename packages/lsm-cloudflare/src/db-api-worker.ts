@@ -20,7 +20,7 @@ import { workerBackgroundWorkLayer } from "./background-work.ts";
 import { DbClient, dbClientLayerWithoutDependencies } from "./db-client.ts";
 import { dbHttpRouterLayer } from "./db-http-handlers.ts";
 import { dbReaderLayer } from "./db-reader.ts";
-import { lsmAccessGateForStage } from "./lsm-access-gate.ts";
+import { lsmAccessGateFrom, type LsmAccessTokenSource } from "./lsm-access-gate.ts";
 import { lsmWorkerCompatibility } from "./lsm-stage.ts";
 import { lsmConfigurationLayer } from "./lsm-configuration.ts";
 import { bindLsmWorkerSettings, type LsmWorkerSettingsSource } from "./lsm-worker-settings.ts";
@@ -52,6 +52,11 @@ export interface DbApiWorkerOptions<R = never> {
    * deploy (`bindLsmWorkerSettings`, D55). The Stack owns where they come from.
    */
   readonly settings: LsmWorkerSettingsSource<R>;
+  /**
+   * The access tokens its gate accepts (D64): the Stack's rotatable tokens, or
+   * `lsmStageAccessTokens` for a stage's single state-held one.
+   */
+  readonly accessTokens: LsmAccessTokenSource<R>;
   /** Tail Workers attached to the Worker (`noLsmTailConsumers` locally). */
   readonly tailConsumers: LsmWorkerTailConsumers<R>;
   /**
@@ -78,7 +83,7 @@ export class DbApiWorker extends Cloudflare.Worker<
  * Builds the API Worker: binds the LSM bucket read-write and the `BlockServer` service, hosts
  * `WriterServer`, and serves the public API. Reads run here, in the caller's isolate; writes and
  * `Latest` probes go to the writer. On live stages every request needs the stage's access token
- * (`lsmAccessGateForStage`).
+ * (`lsmAccessGateFrom`, D64).
  */
 export const dbApiWorkerLayer = <R = never>(options: DbApiWorkerOptions<R>) =>
   DbApiWorker.make(
@@ -94,7 +99,7 @@ export const dbApiWorkerLayer = <R = never>(options: DbApiWorkerOptions<R>) =>
     Effect.gen(function* () {
       yield* WriterServer;
       const withEventTelemetryFlush = yield* eventTelemetryFlushForStage;
-      const withAccessGate = yield* lsmAccessGateForStage;
+      const withAccessGate = yield* lsmAccessGateFrom(options.accessTokens);
       const writer = yield* WriterClient;
       const lifecycle = yield* DatabaseLifecycle;
       const client = yield* DbClient;

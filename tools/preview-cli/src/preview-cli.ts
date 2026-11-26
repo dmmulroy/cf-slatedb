@@ -181,6 +181,22 @@ const deploy = Command.make(
       yield* Console.error(
         `Deploying ${CF_SLATEDB_STACK_NAME} to ${stage} with ${devTimings ? "dev" : "production"} timings, jurisdiction ${residency} (vp run ${deployTask(stage)})`,
       );
+      // The Workers bind the stage's two Secrets Store token slots (D64): create any that are
+      // missing first. Previews also keep their state-held token, which `token` prints.
+      const tokens = yield* Effect.sync(() =>
+        spawnSync("vp", ["run", "@cf-slatedb/infra#tokens", "ensure", stage], {
+          cwd: REPO_ROOT,
+          env,
+          stdio: ["ignore", 2, 2],
+        }),
+      );
+      if (tokens.status !== 0) {
+        return yield* new PreviewCliError({
+          stage,
+          reason: "DeployFailed",
+          message: `Creating ${stage}'s access-token secrets failed (exit ${String(tokens.status ?? tokens.signal)}); its log is above. Run the same command again: it is safe to repeat.`,
+        });
+      }
       const result = yield* Effect.sync(() =>
         // The task's own output goes to stderr, so stdout carries only this command's result.
         spawnSync("vp", ["run", deployTask(stage)], {

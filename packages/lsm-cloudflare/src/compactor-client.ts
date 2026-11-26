@@ -193,6 +193,7 @@ export const compactorClientTestLayer = Layer.effect(
       wake: (databaseId) =>
         Ref.update(record, (calls) => ({ ...calls, woken: [...calls.woken, databaseId] })).pipe(
           Effect.as({
+            formatVersion: 1,
             databaseId,
             compactorEpoch: CompactorEpoch.make(0),
             running: [],

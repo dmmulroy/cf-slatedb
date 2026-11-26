@@ -1,4 +1,10 @@
-import { type DatabaseId, Manifest, ManifestId, ManifestJson } from "@cf-slatedb/lsm-core";
+import {
+  type DatabaseId,
+  Manifest,
+  MANIFEST_FORMAT_VERSION,
+  ManifestId,
+  ManifestJson,
+} from "@cf-slatedb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Context, Data, Effect, Layer, Option, Result, Schema } from "effect";
 
@@ -125,16 +131,25 @@ export const decodeStoredManifest = (
         ),
     }),
     Effect.flatMap((manifest) =>
-      manifest.databaseId === databaseId
-        ? Effect.succeed(manifest)
-        : Effect.fail(
+      manifest.formatVersion > MANIFEST_FORMAT_VERSION
+        ? Effect.fail(
             new ManifestReadError({
               databaseId,
               manifestId: Option.some(manifestId),
               reason: "StoredManifestInvalid",
-              message: `Manifest ${manifestId} under database ${databaseId}'s prefix names database ${manifest.databaseId}. An operator must restore it.`,
+              message: `Manifest ${manifestId} of database ${databaseId} was written by a newer cf-slatedb (format ${manifest.formatVersion}; this version reads up to format ${MANIFEST_FORMAT_VERSION}), so this version neither reads nor writes it. Deploy that version or a later one.`,
             }),
-          ),
+          )
+        : manifest.databaseId === databaseId
+          ? Effect.succeed(manifest)
+          : Effect.fail(
+              new ManifestReadError({
+                databaseId,
+                manifestId: Option.some(manifestId),
+                reason: "StoredManifestInvalid",
+                message: `Manifest ${manifestId} under database ${databaseId}'s prefix names database ${manifest.databaseId}. An operator must restore it.`,
+              }),
+            ),
     ),
   );
 

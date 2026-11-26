@@ -185,6 +185,13 @@ export const DroppedSst = Schema.Struct({
 /** An SST an operator removed from the manifest. */
 export type DroppedSst = typeof DroppedSst.Type;
 
+/**
+ * The newest manifest format this code reads and writes (D64). A change older code cannot read
+ * (a field whose absence would change what it does) raises it; additive fields that older code may
+ * ignore do not. Manifests written before format versions decode as 1.
+ */
+export const MANIFEST_FORMAT_VERSION = 1;
+
 /** How many dropped SSTs a manifest remembers, newest last; older entries fall off. */
 export const MAX_DROPPED_SST_HISTORY = 32;
 
@@ -204,9 +211,11 @@ export const MAX_DROPPED_SST_HISTORY = 32;
  * so an SST that is uploaded but not yet committed is never deleted out from under its commit.
  *
  * `droppedSsts` records SSTs an operator removed (D62), newest last; manifests written before it
- * decode with none.
+ * decode with none. `formatVersion` is the format it was written in ({@link MANIFEST_FORMAT_VERSION});
+ * code refuses to read, and so to write over, a newer one (D64).
  */
 export class Manifest extends Schema.Class<Manifest>("Manifest")({
+  formatVersion: Schema.Int.pipe(Schema.withDecodingDefaultKey(Effect.succeed(1))),
   databaseId: DatabaseId,
   writerEpoch: WriterEpoch,
   compactorEpoch: CompactorEpoch,
@@ -238,6 +247,7 @@ export const initialManifest = (
   },
 ): Manifest =>
   new Manifest({
+    formatVersion: MANIFEST_FORMAT_VERSION,
     databaseId,
     writerEpoch: WriterEpoch.make(0),
     compactorEpoch: CompactorEpoch.make(0),
@@ -412,6 +422,7 @@ export const sealedSuccessors = (manifest: Manifest): Option.Option<ReadonlyArra
 /** A copy of `manifest` with some fields replaced (`Schema.Class` instances cannot be spread). */
 export const replaceManifestFields = (manifest: Manifest, fields: Partial<Manifest>): Manifest =>
   new Manifest({
+    formatVersion: fields.formatVersion ?? manifest.formatVersion,
     databaseId: fields.databaseId ?? manifest.databaseId,
     writerEpoch: fields.writerEpoch ?? manifest.writerEpoch,
     compactorEpoch: fields.compactorEpoch ?? manifest.compactorEpoch,
@@ -828,6 +839,7 @@ export const forkManifest = (
   const restrict = (handles: ReadonlyArray<SstHandle>) =>
     handles.flatMap((handle) => Option.toArray(forkHandle(handle, source, forkRange)));
   return new Manifest({
+    formatVersion: MANIFEST_FORMAT_VERSION,
     databaseId: fork.databaseId,
     writerEpoch: WriterEpoch.make(0),
     compactorEpoch: CompactorEpoch.make(0),

@@ -9,7 +9,8 @@
     "verify": "vp run @cf-slatedb/tools-formal-verification#verify",
     "trace": "node tools/trace-cli/src/trace-cli.ts",
     "scenario": "node tools/scenario-cli/src/scenario-cli.ts",
-    "preview": "node tools/preview-cli/src/preview-cli.ts"
+    "preview": "node tools/preview-cli/src/preview-cli.ts",
+    "generate:openapi": "node packages/lsm-cloudflare/src/generate-db-openapi.ts && vp fmt docs/openapi"
   },
   "devDependencies": {
     "@types/node": "catalog:",

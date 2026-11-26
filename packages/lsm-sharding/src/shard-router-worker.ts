@@ -5,7 +5,8 @@ import {
   DatabaseLifecycle,
   dbServicesLayer,
   eventTelemetryFlushForStage,
-  lsmAccessGateForStage,
+  lsmAccessGateFrom,
+  type LsmAccessTokenSource,
   lsmHttpServerLayer,
   lsmWorkerCompatibility,
   type LsmWorkerSettingsSource,
@@ -270,6 +271,11 @@ export interface ShardRouterWorkerOptions<R = never> {
    * deploy (`bindLsmWorkerSettings`). The Stack owns where they come from.
    */
   readonly settings: LsmWorkerSettingsSource<R>;
+  /**
+   * The access tokens its gate accepts (D64): the Stack's rotatable tokens, or
+   * `lsmStageAccessTokens` for a stage's single state-held one.
+   */
+  readonly accessTokens: LsmAccessTokenSource<R>;
   readonly devPort: number;
 }
 
@@ -296,7 +302,7 @@ export const shardRouterWorkerLayer = <R = never>(options: ShardRouterWorkerOpti
     Effect.gen(function* () {
       yield* ShardDirectoryServer;
       const withEventTelemetryFlush = yield* eventTelemetryFlushForStage;
-      const withAccessGate = yield* lsmAccessGateForStage;
+      const withAccessGate = yield* lsmAccessGateFrom(options.accessTokens);
       const context = yield* Effect.context<
         ShardRouter | ShardSplit | ShardDirectory | DatabaseLifecycle
       >();

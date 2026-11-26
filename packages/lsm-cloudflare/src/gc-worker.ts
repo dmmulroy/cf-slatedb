@@ -15,7 +15,7 @@ import {
   garbageCollectorLayerWithoutDependencies,
 } from "./garbage-collector.ts";
 import { GcHttpApi } from "./gc-http-api.ts";
-import { lsmAccessGateForStage } from "./lsm-access-gate.ts";
+import { lsmAccessGateFrom, type LsmAccessTokenSource } from "./lsm-access-gate.ts";
 import { lsmConfigurationLayer } from "./lsm-configuration.ts";
 import { bindLsmWorkerSettings, type LsmWorkerSettingsSource } from "./lsm-worker-settings.ts";
 import { lsmHttpServerLayer } from "./lsm-http-server.ts";
@@ -98,6 +98,11 @@ export interface GcWorkerOptions<R = never> {
    * deploy (`bindLsmWorkerSettings`, D55). The Stack owns where they come from.
    */
   readonly settings: LsmWorkerSettingsSource<R>;
+  /**
+   * The access tokens its gate accepts (D64): the Stack's rotatable tokens, or
+   * `lsmStageAccessTokens` for a stage's single state-held one.
+   */
+  readonly accessTokens: LsmAccessTokenSource<R>;
   readonly devPort: number;
   /** Cron expression for collecting every database (`gcInterval` in cron form). */
   readonly schedule: string;
@@ -131,7 +136,7 @@ export const gcWorkerLayer = <R = never>(options: GcWorkerOptions<R>) =>
       const compactors = yield* CompactorClient;
       const sweep = yield* MaintenanceSweep;
       const withEventTelemetryFlush = yield* eventTelemetryFlushForStage;
-      const withAccessGate = yield* lsmAccessGateForStage;
+      const withAccessGate = yield* lsmAccessGateFrom(options.accessTokens);
       // One page per run: the cost of a run is bounded whatever the number of databases.
       yield* Cloudflare.Workers.cron(options.schedule, () =>
         withEventTelemetryFlush(sweep.sweepPage(MAINTENANCE_SWEEP_PAGE_DATABASES)),

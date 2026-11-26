@@ -1,5 +1,6 @@
 import { gcWorkerLayer } from "@cf-slatedb/lsm-cloudflare";
 
+import { cfSlatedbAccessTokens } from "./cf-slatedb-access-tokens.ts";
 import { cfSlatedbTailConsumers, cfSlatedbTelemetry } from "./cf-slatedb-telemetry.ts";
 import { cfSlatedbWorkerSettings } from "./cf-slatedb-stack-config.ts";
 
@@ -12,6 +13,7 @@ export const cfSlatedbGcWorkerLayer = gcWorkerLayer({
   telemetry: cfSlatedbTelemetry,
   tailConsumers: cfSlatedbTailConsumers,
   settings: cfSlatedbWorkerSettings,
+  accessTokens: cfSlatedbAccessTokens,
   devPort: GC_DEV_PORT,
   schedule: "*/5 * * * *",
 });

@@ -5,18 +5,18 @@
 **v1 for production** ([`docs/handoff-v1.md`](handoff-v1.md)): ten workstreams, then the release
 checklist and Dillon's go-ahead (P6). The decisions asked of Dillon are under "Open questions".
 
-| Workstream                                | Status      | Commit               |
-| ----------------------------------------- | ----------- | -------------------- |
-| 1. The Stack owns its configuration       | done        | `012bdb5`            |
-| 2. Fast manifest commits                  | done        | `774ed7b`            |
-| 3. Splits pause briefly, never fail       | done        | `393758c`            |
-| 4. Transactions exact across flushes      | done        | `5f2850b`, `5df4099` |
-| 5. GC and maintenance that scale          | done        | `e06f3eb`            |
-| 6. Writer throughput and limits           | done        | `308defd`            |
-| 7. Corruption: prevent, detect, repair    | done        | `2cb5116`            |
-| 8. Production telemetry                   | done        | this commit          |
-| 9. Production readiness                   | next        |                      |
-| 10. Soak, release checklist, the go-ahead | not started |                      |
+| Workstream                                | Status | Commit               |
+| ----------------------------------------- | ------ | -------------------- |
+| 1. The Stack owns its configuration       | done   | `012bdb5`            |
+| 2. Fast manifest commits                  | done   | `774ed7b`            |
+| 3. Splits pause briefly, never fail       | done   | `393758c`            |
+| 4. Transactions exact across flushes      | done   | `5f2850b`, `5df4099` |
+| 5. GC and maintenance that scale          | done   | `e06f3eb`            |
+| 6. Writer throughput and limits           | done   | `308defd`            |
+| 7. Corruption: prevent, detect, repair    | done   | `2cb5116`            |
+| 8. Production telemetry                   | done   | `62eab3d`            |
+| 9. Production readiness                   | done   | this commit          |
+| 10. Soak, release checklist, the go-ahead | next   |                      |
 
 The previous round (all ten build phases and `docs/handoff.md`'s seven items) is complete; its
 hand-off is below.
@@ -147,6 +147,20 @@ hand-off is below.
   - **First attempt, fixed.** It overrode `Telemetry` inside the init context, which never reaches
     Alchemy's bridge. The local scenario caught it.
   - **Results.** 13/13 scenarios pass locally and on `preview-1`.
+- **9. Production readiness (D64).**
+  - **Tokens.** Each live stage has two rotatable tokens in the account's Secrets Store. Workers
+    bind them by reference and re-read them every 30 s, and the `tokens` task ensures, checks, and
+    rotates them. Previews keep their state token as well. Rotation was verified live on
+    `preview-1`.
+  - **Production tasks.** `plan:production` and `deploy:production` exist, and the deploy refuses
+    without tokens. Nothing has run them.
+  - **Contract.** The OpenAPI spec is checked in, generated with examples conforming by
+    construction, the bearer scheme, and `x-request-id`. A test fails on drift.
+  - **Compatibility and formats.** The `/v1` compatibility policy is written down. Format versions
+    are on the manifest and the compactor state; newer data is refused, never rewritten. A real
+    workstream 1 manifest is checked in as a fixture.
+  - **Documentation.** `README.md` is new and `docs/operations.md` is complete. The dead preview
+    gate is removed.
 
 ## Remaining-work log
 

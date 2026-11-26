@@ -1,3 +1,4 @@
+import { lsmStageAccessTokens } from "../../src/lsm-access-gate.ts";
 import { Effect } from "effect";
 
 import { BlockServerWorker } from "../../src/block-server-worker.ts";
@@ -19,6 +20,7 @@ const writerTestApiLayer = dbApiWorkerLayer({
   main: import.meta.url,
   telemetry: lsmOtlpTelemetry(INTEGRATION_OTLP_BASE_URL),
   settings: INTEGRATION_WORKER_SETTINGS,
+  accessTokens: lsmStageAccessTokens,
   cpuLimitMs: Effect.succeed(30_000),
   tailConsumers: noLsmTailConsumers,
   devPort: INTEGRATION_PORTS.api,

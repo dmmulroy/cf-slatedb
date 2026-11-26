@@ -256,7 +256,7 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   (`tools/scenario-cli/src/measurements.ts`) with `CpuTailWorker` CPU records. Results:
   `docs/measurements.md`. D48.
 - **Access gate on live stages' public Workers** — done. `lsm-access-gate.ts`
-  (`LsmAccessToken`, `lsmAccessGateForStage`), applied by `db-api-worker.ts`, `gc-worker.ts`,
+  (`LsmAccessToken`, `lsmAccessGateForStage`, replaced by `lsmAccessGateFrom` in D64), applied by `db-api-worker.ts`, `gc-worker.ts`,
   `shard-router-worker.ts`, and the telemetry probe. Test: `lsm-access-gate.test.ts`. Live:
   `preview-1` answers `401` without the token and serves the API with it. D44.
 - **The Stack owns its configuration (v1 workstream 1)** — done (D55). `CfSlatedbStackConfig`
@@ -417,6 +417,24 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
     `docs/operations.md`.
   - **Tests.** `lsm-trace-policy.test.ts`, `lsm-worker-settings.test.ts`,
     `preview-stage.test.ts`, and the `redaction` scenario.
+- **Production readiness (v1 workstream 9)** — done (D64).
+  - **Tokens.** `lsmAccessGateFrom`, `lsmAccessGateOver`, `LsmAccessTokenSource`, and
+    `lsmStageAccessTokens` (`lsm-access-gate.ts`). In infra: `cfSlatedbAccessTokens`
+    (Secrets Store slots by `Secret.lookup`, plus the state token on previews), and
+    `access-token-store.ts` with `access-tokens-cli.ts` (the `tokens` task: `ensure`, `check`,
+    `rotate`).
+  - **Production tasks.** `plan:production` and `deploy:production`.
+  - **Contract.** `db-openapi.ts`, `generate-db-openapi.ts`, `docs/openapi/cf-slatedb-v1.json`
+    (`vp run generate:openapi`), and `docs/api-compatibility.md`.
+  - **Format versions.** `MANIFEST_FORMAT_VERSION` with the `formatVersion` field, the check in
+    `decodeStoredManifest`, and `COMPACTOR_STATE_FORMAT_VERSION`.
+  - **Documentation.** `README.md` and `docs/operations.md`.
+  - **Tests.** `lsm-access-gate.test.ts` (rotation, refresh, closed when unreadable),
+    `cf-slatedb-stack-config.test.ts` (production's configuration), and
+    `cf-slatedb-access-tokens.test.ts`. Also `db-openapi.test.ts` (checked in as generated,
+    examples, scheme, headers), `manifest.test.ts` (the workstream 1 fixture),
+    `manifest-store.test.ts` (newer format refused), and `compactor.test.ts` (newer state idle).
+  - **Live.** Rotation on `preview-1`.
 - **Routed reads see writes across a split (stale maps)** — done (D59). `DbWriter.probe`/`scan`
   report `sealedSuccessors`; `ReadOptions.refuseSealed` (`db-client.ts`); `ShardRouter` gets route
   through `withRouting` and scans resume shard by shard (`scanFrom`). Test: `sharding.test.ts` (a

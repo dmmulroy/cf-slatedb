@@ -41,6 +41,7 @@ const empty = initialManifest(DB, {
 
 const withLsm = (l0: ReadonlyArray<SstHandle>, sortedRuns: ReadonlyArray<SortedRun>): Manifest =>
   new Manifest({
+    formatVersion: 1,
     databaseId: empty.databaseId,
     writerEpoch: empty.writerEpoch,
     compactorEpoch: empty.compactorEpoch,

@@ -1,0 +1,51 @@
+{
+  "databaseId": "ms-cas-mwwt61e7",
+  "writerEpoch": 1,
+  "compactorEpoch": 1,
+  "lastL0Seq": 30,
+  "lastL0ClockTick": 1795652608138,
+  "l0": [
+    {
+      "id": "01M8AKRR63J55KV3ANHHDEH9C6",
+      "firstKey": "dzAwMC0wMDAwMDAyOS0wMDAwMA==",
+      "lastKey": "dzAwMC0wMDAwMDAyOS0wMDAwOQ==",
+      "sizeBytes": 1647,
+      "rowCount": 10,
+      "metaOffset": 1240,
+      "metaLength": 407,
+      "owner": null,
+      "view": null
+    }
+  ],
+  "sortedRuns": [
+    {
+      "id": 0,
+      "ssts": [
+        {
+          "id": "01M8AKS0AY8TMQ6YGK758TW0KB",
+          "firstKey": "dzAwMC0wMDAwMDAwMC0wMDAwMA==",
+          "lastKey": "dzAwMC0wMDAwMDAyOC0wMDAwOQ==",
+          "sizeBytes": 36994,
+          "rowCount": 290,
+          "metaOffset": 35873,
+          "metaLength": 1121,
+          "owner": null,
+          "view": null
+        }
+      ]
+    }
+  ],
+  "checkpoints": [],
+  "keyRange": null,
+  "state": {
+    "_tag": "Open"
+  },
+  "externalRefs": [],
+  "changelog": [],
+  "options": {
+    "mergeOperator": null,
+    "budgetGroup": null,
+    "changelog": null
+  },
+  "gcSstBoundary": 1795653903599
+}

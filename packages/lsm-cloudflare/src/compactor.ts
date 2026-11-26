@@ -70,6 +70,8 @@ export type CorruptSst = typeof CorruptSst.Type;
  * state written before D60: none until the next compaction or request).
  */
 export const CompactorState = Schema.Struct({
+  /** The format it was written in ({@link COMPACTOR_STATE_FORMAT_VERSION}); 1 when absent (D64). */
+  formatVersion: Schema.Int.pipe(Schema.withDecodingDefaultKey(Effect.succeed(1))),
   databaseId: DatabaseId,
   compactorEpoch: CompactorEpoch,
   running: Schema.Array(RunningCompaction),
@@ -77,6 +79,12 @@ export const CompactorState = Schema.Struct({
   corruptSsts: Schema.Array(CorruptSst).pipe(Schema.withDecodingDefaultKey(Effect.succeed([]))),
   collectionDueAt: Schema.OptionFromOptionalKey(Timestamp),
 });
+
+/**
+ * The newest compactor-state format this code reads and writes (D64). A compactor refuses to run on
+ * state a newer version wrote, instead of rewriting it in an older format.
+ */
+export const COMPACTOR_STATE_FORMAT_VERSION = 1;
 
 /** A compactor's durable state; also its status. */
 export type CompactorState = typeof CompactorState.Type;
@@ -311,12 +319,24 @@ export const makeCompactor = Effect.gen(function* () {
 
   const holder = (state: CompactorState, jobId: string) => `${state.databaseId}/${jobId}`;
 
+  /** Refuses state a newer cf-slatedb wrote: this one would rewrite it in an older format. */
+  const checkFormat = (state: CompactorState) =>
+    state.formatVersion <= COMPACTOR_STATE_FORMAT_VERSION
+      ? Effect.void
+      : Effect.fail(
+          new CompactorUnavailableError({
+            databaseId: state.databaseId,
+            message: `The compactor state of database ${state.databaseId} was written by a newer cf-slatedb (format ${state.formatVersion}; this version reads up to format ${COMPACTOR_STATE_FORMAT_VERSION}), so this version does not compact it. Deploy that version or a later one.`,
+          }),
+        );
+
   /** The state, fencing in first when this compactor has none. */
   const ensureState = (databaseId: DatabaseId) =>
     Effect.gen(function* () {
       const existing = yield* cell.get;
       if (Option.isSome(existing)) {
         yield* checkDatabase(existing.value, databaseId);
+        yield* checkFormat(existing.value);
         return existing.value;
       }
       const fenced = yield* manifests
@@ -328,6 +348,7 @@ export const makeCompactor = Effect.gen(function* () {
           }),
         );
       const state: CompactorState = {
+        formatVersion: COMPACTOR_STATE_FORMAT_VERSION,
         databaseId,
         compactorEpoch: fenced.manifest.compactorEpoch,
         running: [],
@@ -562,6 +583,11 @@ export const makeCompactor = Effect.gen(function* () {
   const runAlarm = Effect.gen(function* () {
     const before = yield* cell.get;
     if (Option.isNone(before) || before.value.fenced) return;
+    if (before.value.formatVersion > COMPACTOR_STATE_FORMAT_VERSION) {
+      return yield* Effect.logError(
+        `The compactor of database ${before.value.databaseId} is idle: its state was written by a newer cf-slatedb (format ${before.value.formatVersion}). Deploy that version or a later one.`,
+      );
+    }
     const now = yield* Clock.currentTimeMillis;
     const { databaseId, collectionDueAt } = before.value;
     if (Option.isSome(collectionDueAt) && collectionDueAt.value <= now) {

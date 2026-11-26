@@ -1,5 +1,6 @@
 import { dbApiWorkerLayer } from "@cf-slatedb/lsm-cloudflare";
 
+import { cfSlatedbAccessTokens } from "./cf-slatedb-access-tokens.ts";
 import { cfSlatedbTailConsumers, cfSlatedbTelemetry } from "./cf-slatedb-telemetry.ts";
 import { cfSlatedbApiCpuLimit, cfSlatedbWorkerSettings } from "./cf-slatedb-stack-config.ts";
 
@@ -14,6 +15,7 @@ export const cfSlatedbApiWorkerLayer = dbApiWorkerLayer({
   main: import.meta.url,
   telemetry: cfSlatedbTelemetry,
   settings: cfSlatedbWorkerSettings,
+  accessTokens: cfSlatedbAccessTokens,
   cpuLimitMs: cfSlatedbApiCpuLimit,
   tailConsumers: cfSlatedbTailConsumers,
   devPort: DB_API_DEV_PORT,
