@@ -985,8 +985,37 @@ wall-time limits and silently stop partway.
   converges after a second, commit-free collection.
 - **One collection per database at a time.** The compactor serializes collections with a lock, and
   the operator's "collect now" (`POST /v1/gc/databases/:id`) runs on the compactor
-  (`Compactor.collect`). That keeps `GcSafety.tla`'s one-collection-at-a-time assumption true by
-  construction. Collections still interleave with compaction commits, which the model already covers.
+  (`Compactor.collect`). That keeps `GcSafety.tla`'s one-collection-at-a-time assumption true for
+  every collection the compactor runs. Collections still interleave with compaction commits, which
+  the model already covers.
+- **Two collections at once are still possible, and safe** (found in review, D83). The sweep calls
+  `GarbageCollector.collect` itself, outside the compactor's lock, for a database whose newest
+  manifest it could not load (`loadLatest` failing for any reason, not only a missing manifest);
+  if the collection's own load then succeeds, it runs beside the compactor's. Take an earlier run
+  X and a later run Y of one database:
+  1. **Neither moves a boundary back.** `gcSstBoundary` only rises (`advanceGcSstBoundary`), and
+     `gc/manifest.boundary` is a version CAS that never lowers (`advanceManifestBoundary`). Each run
+     deletes SSTs created before `min(its own committed manifest's gcSstBoundary, its cutoff)`.
+  2. **What a run retains covers every newer manifest.** Each run plans from its own committed
+     manifest `C`, and retains every manifest at or after `C`. A manifest committed later names `C`'s
+     SSTs or SSTs uploaded since, and an upload created before the run's SST boundary cannot be
+     committed after it (`SstBelowGcBoundaryError`). So any SST a run may delete that a newer
+     manifest names is named by `C`, which the run holds in memory.
+  3. **A retained manifest can vanish only by a later run's judgment.** A collection deletes a
+     manifest only after moving `gc/manifest.boundary` past it, and only when it judged it
+     deletable: superseded at least `gcMinAge` ago, and pinned by no checkpoint of its own
+     committed manifest. When X finds a retained manifest gone at or below the boundary, Y deleted
+     it, and every SST that manifest alone names is one Y deletes as well, since Y does not retain
+     the manifest. X then deletes nothing Y retains: Y's retained manifests at or after X's `C` are
+     covered by (2), and the older ones were stored when X listed, so X loaded them too.
+  4. **Anything else stops the run.** A retained manifest gone above the boundary was deleted by
+     something other than a collection (only removing the database may). The run then fails with
+     `GarbageCollectorUnavailableError` before it deletes anything (`GarbageCollector.collect`).
+
+  `GcSafety.tla` still has one collection; the argument above is checked by unit tests
+  (`garbage-collector.test.ts`): two collections stopped at the listing and at the deletes by gates,
+  and the guard in (4).
+
 - **The cron is a paged maintenance sweep** (`MaintenanceSweep.sweepPage`, 50 databases per run,
   position in `maintenance/sweep.cursor`, listing with `startAfter`). It handles only what has no
   actor of its own:

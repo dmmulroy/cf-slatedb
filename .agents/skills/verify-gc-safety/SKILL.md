@@ -111,6 +111,15 @@ moment ago counted as old and its SSTs could be deleted under a reader. `ownUplo
 
 ## Maintenance notes
 
+- D83 (review): `GarbageCollector.collect` now re-reads `gc/manifest.boundary` when a retained
+  manifest it listed cannot be loaded, and fails before deleting anything when that manifest is
+  above the boundary (deleted by something other than a collection). One at or below it was
+  deleted by a concurrent, later collection and is skipped, as before. The model still has one
+  collection: two at once (the sweep collects outside the compactor's lock when it cannot load a
+  database's manifest) are argued in D60 and covered by `garbage-collector.test.ts`'s gated
+  tests, not by a model step. Reran `gc-safety`: all seven runs as expected, `GcSafety.cfg`
+  27,408,658 states, unchanged.
+
 - D77: a fork's hold on its source is released by the fork's own collection
   (`GarbageCollector.collect`), once no manifest it keeps (the newest, the pinned ones, and those
   superseded less than `gcMinAge` ago) names another database's SST; the compactor's idle poll no
