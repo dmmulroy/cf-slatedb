@@ -562,6 +562,7 @@ export const makeDbClient = Effect.gen(function* () {
     const rows: Array<Row> = [];
     let cursor = Option.none<MemTableCursor>();
     let retainedFromSeq = SeqNum.make(0);
+    let flushedSeq = SeqNum.make(0);
     for (;;) {
       const page = yield* writer.scan(databaseId, {
         range,
@@ -573,12 +574,15 @@ export const makeDbClient = Effect.gen(function* () {
       if (!pinned && page.flushedSeq > readSeq) return yield* tooOld(databaseId, readSeq);
       // Across pages a trim may raise the horizon: the read needs a manifest past the highest.
       retainedFromSeq = SeqNum.make(Math.max(retainedFromSeq, page.retainedFromSeq));
+      flushedSeq = SeqNum.make(Math.max(flushedSeq, page.flushedSeq));
       rows.push(...page.rows);
       if (Option.isNone(page.nextCursor)) break;
       cursor = page.nextCursor;
     }
     const view: ReadView = {
-      minLastL0Seq: pinned ? retainedFromSeq : SeqNum.make(0),
+      // Without a begin manifest the pages hold only unflushed rows, so the manifest must hold
+      // every flushed one: a cached manifest from before the last flush would miss its rows.
+      minLastL0Seq: pinned ? retainedFromSeq : flushedSeq,
       snapshotSeq: Option.some(readSeq),
       memtable: rows,
       manifestId,

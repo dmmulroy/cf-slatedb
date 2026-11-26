@@ -1,4 +1,5 @@
 import {
+  FULL_KEY_RANGE,
   type CompactionJob,
   type CompactorEpoch,
   DatabaseId,
@@ -388,6 +389,37 @@ describe("transactions", () => {
     expect(outcome.scanned).toEqual([1]);
     expect(outcome.conflict).toBe("ReadConflict");
     expect(outcome.committed).toBe(true);
+  });
+
+  it("a scan by a caller that sends no begin manifest reads rows flushed since the reader cached its manifest", async () => {
+    const outcome = await Effect.runPromise(
+      provide(
+        Effect.gen(function* () {
+          yield* createDatabase;
+          const client = yield* DbClient;
+          yield* client.put(DB, key(1), Uint8Array.of(1));
+          // The reader caches the manifest from before any flush.
+          yield* client.get(DB, key(1), {
+            consistency: { _tag: "Flushed" },
+            snapshot: Option.none(),
+            refuseSealed: false,
+          });
+          // The transaction begins, then the row is flushed: the writer's pages for a caller that
+          // sends no begin manifest (one from before D58) no longer hold it.
+          const begin = yield* client.beginTransaction(DB);
+          yield* client.flush(DB);
+          const scanned = yield* client.scanAt(
+            DB,
+            FULL_KEY_RANGE,
+            begin.readSeq,
+            10,
+            Option.none(),
+          );
+          return scanned.map((row) => row.key);
+        }),
+      ),
+    );
+    expect(outcome).toEqual([key(1)]);
   });
 
   it("ends a transaction only once its rows are trimmed, and old callers at the first flush", async () => {
