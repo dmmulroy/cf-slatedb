@@ -8091,7 +8091,7 @@
             }
           }
         },
-        "description": "Returns committed changes after `afterSeq` in sequence order (flushed ones from the changelog, then unflushed ones), never splitting a batch. Continue from `nextAfterSeq`. Requires the database's changelog; fails with ChangelogUnavailable when it is disabled or the changes were dropped by retention.",
+        "description": "Returns committed changes after `afterSeq` in sequence order (flushed ones from the changelog, then unflushed ones), never splitting a batch. Continue from `nextAfterSeq`. Requires the database's changelog; fails with ChangelogUnavailable when it is disabled or the changes were dropped by retention. A fork or split successor's feed starts at its fork point: changes up to it are in the source's feed, and an earlier `afterSeq` fails with ChangelogUnavailable (Expired). To follow a database through a split, read the sealed source's feed until a page returns no rows, then read each successor's feed with `afterSeq` set to the source's `lastSeq` from its status.",
         "summary": "Read the change feed"
       }
     }

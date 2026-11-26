@@ -211,7 +211,12 @@ export const MAX_DROPPED_SST_HISTORY = 32;
  * so an SST that is uploaded but not yet committed is never deleted out from under its commit.
  *
  * `droppedSsts` records SSTs an operator removed (D62), newest last; manifests written before it
- * decode with none. `formatVersion` is the format it was written in ({@link MANIFEST_FORMAT_VERSION});
+ * decode with none.
+ *
+ * `changelogAfterSeq` says what the change feed can prove it holds (D80): `changelog` has every
+ * change with a sequence number above it, up to `lastL0Seq`. Retention raises it past what it
+ * prunes, and a fork starts it at the fork point. Manifests written before it decode with none;
+ * read it through {@link changelogAfterSeqOf}. `formatVersion` is the format it was written in ({@link MANIFEST_FORMAT_VERSION});
  * code refuses to read, and so to write over, a newer one (D64).
  */
 export class Manifest extends Schema.Class<Manifest>("Manifest")({
@@ -231,7 +236,35 @@ export class Manifest extends Schema.Class<Manifest>("Manifest")({
   options: DatabaseOptions,
   gcSstBoundary: Timestamp,
   droppedSsts: Schema.Array(DroppedSst).pipe(Schema.withDecodingDefaultKey(Effect.succeed([]))),
+  changelogAfterSeq: Schema.OptionFromOptionalKey(SeqNum),
 }) {}
+
+/**
+ * The sequence number after which the manifest's changelog holds every change, up to `lastL0Seq`
+ * (D80).
+ *
+ * **Details**
+ *
+ * A manifest written before D80, or rewritten by older code that did not know the field, has
+ * none. It then reads as the oldest kept entry's `firstSeq - 1`, or `lastL0Seq` when no entry is
+ * kept. That is never below the true value: every change at or below it that the changelog lacks
+ * was pruned, or belongs to a fork's source. So the default only answers `Expired` more often,
+ * never with a silent gap.
+ */
+export const changelogAfterSeqOf = (manifest: Manifest): SeqNum =>
+  Option.getOrElse(manifest.changelogAfterSeq, () => {
+    const firstSeqs = manifest.changelog.map((entry) => entry.firstSeq);
+    return firstSeqs.length === 0
+      ? manifest.lastL0Seq
+      : SeqNum.make(Math.max(0, Math.min(...firstSeqs) - 1));
+  });
+
+/**
+ * Whether the manifest's changelog holds every change after `afterSeq` up to its `lastL0Seq`: the
+ * one rule the change feed answers by (D80). When it does not, the feed answers `Expired`.
+ */
+export const changelogHoldsChangesAfter = (manifest: Manifest, afterSeq: SeqNum): boolean =>
+  afterSeq >= changelogAfterSeqOf(manifest);
 
 /** Codec for a manifest object's body: JSON via `Schema.fromJsonString(Manifest)`. */
 export const ManifestJson = Schema.fromJsonString(Manifest);
@@ -263,6 +296,7 @@ export const initialManifest = (
     options: options.databaseOptions,
     gcSstBoundary: Timestamp.make(0),
     droppedSsts: [],
+    changelogAfterSeq: Option.some(SeqNum.make(0)),
   });
 
 /** Every SST handle the manifest references: L0 newest first, then each sorted run. */
@@ -438,6 +472,7 @@ export const replaceManifestFields = (manifest: Manifest, fields: Partial<Manife
     options: fields.options ?? manifest.options,
     gcSstBoundary: fields.gcSstBoundary ?? manifest.gcSstBoundary,
     droppedSsts: fields.droppedSsts ?? manifest.droppedSsts,
+    changelogAfterSeq: fields.changelogAfterSeq ?? manifest.changelogAfterSeq,
   });
 
 // ---------------------------------------------------------------------------------------------
@@ -783,12 +818,22 @@ export const removeExternalRef = (manifest: Manifest, ref: ExternalRef): Manifes
       })
     : manifest;
 
-/** Drops changelog entries created before `cutoff`; the same manifest when none are that old. */
+/**
+ * Drops changelog entries created before `cutoff`, and raises `changelogAfterSeq` past the newest
+ * change they held, so the feed answers `Expired` for what they held (D80); the same manifest when
+ * none are that old.
+ */
 export const pruneChangelog = (manifest: Manifest, cutoff: Timestamp): Manifest => {
   const kept = manifest.changelog.filter((entry) => entry.createdAt >= cutoff);
-  return kept.length === manifest.changelog.length
-    ? manifest
-    : replaceManifestFields(manifest, { changelog: kept });
+  if (kept.length === manifest.changelog.length) return manifest;
+  const dropped = manifest.changelog.filter((entry) => entry.createdAt < cutoff);
+  const afterSeq = SeqNum.make(
+    Math.max(changelogAfterSeqOf(manifest), ...dropped.map((entry) => entry.lastSeq)),
+  );
+  return replaceManifestFields(manifest, {
+    changelog: kept,
+    changelogAfterSeq: Option.some(afterSeq),
+  });
 };
 
 /**
@@ -858,6 +903,8 @@ export const forkManifest = (
     gcSstBoundary: Timestamp.make(0),
     // A fork starts its own repair history.
     droppedSsts: [],
+    // Changes up to the fork point belong to the source's feed (D80).
+    changelogAfterSeq: Option.some(checkpointManifest.lastL0Seq),
   });
 };
 

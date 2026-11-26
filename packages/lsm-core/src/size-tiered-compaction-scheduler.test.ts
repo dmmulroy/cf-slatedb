@@ -57,6 +57,7 @@ const withLsm = (l0: ReadonlyArray<SstHandle>, sortedRuns: ReadonlyArray<SortedR
     options: DEFAULT_DATABASE_OPTIONS,
     gcSstBoundary: Timestamp.make(0),
     droppedSsts: [],
+    changelogAfterSeq: Option.none(),
   });
 
 const smallInt = (minimum: number, maximum: number) =>

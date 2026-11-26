@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 
-import { Option, Result, Schema } from "effect";
+import { Arbitrary, Option, Result, Schema } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
@@ -14,10 +14,13 @@ import {
   WriterEpoch,
 } from "./ids.ts";
 import { FULL_KEY_RANGE, keyRangeContains } from "./key-range.ts";
+import { assertProperty } from "./lsm-core-arbitraries.ts";
 import { encodeUlid } from "./ulid.ts";
 import {
   addCheckpoint,
   advanceGcSstBoundary,
+  changelogAfterSeqOf,
+  changelogHoldsChangesAfter,
   commitCompaction,
   commitL0Flush,
   type CompactionJob,
@@ -34,6 +37,7 @@ import {
   MANIFEST_FORMAT_VERSION,
   MAX_DROPPED_SST_HISTORY,
   ManifestJson,
+  pruneChangelog,
   removeCheckpoint,
   replaceManifestFields,
   sealManifest,
@@ -477,5 +481,105 @@ describe("holdForSuccessors", () => {
     expect(Result.getOrThrow(again)).toBe(held);
     const removed = Result.getOrThrow(markRemoved(empty));
     expect(Result.isFailure(holdForSuccessors(removed, options))).toBe(true);
+  });
+});
+
+describe("changelog coverage (D80)", () => {
+  /** A flush at `cut` whose changelog SST holds rows `firstSeq..lastSeq`, created at `at`. */
+  const flushWithChangelog = (
+    manifest: Manifest,
+    n: number,
+    rows: { readonly firstSeq: number; readonly lastSeq: number; readonly cut: number },
+  ) =>
+    Result.getOrThrow(
+      commitL0Flush(manifest, {
+        writerEpoch: manifest.writerEpoch,
+        sst: handle(n, n, n + 1),
+        lastSeq: SeqNum.make(rows.cut),
+        clockTick: Timestamp.make(n),
+        changelog: Option.some({
+          sst: handle(1000 + n, 0, 1),
+          firstSeq: SeqNum.make(rows.firstSeq),
+          lastSeq: SeqNum.make(rows.lastSeq),
+          createdAt: Timestamp.make(n),
+        }),
+      }),
+    );
+
+  it("starts at 0, rises past what retention prunes, and starts a fork at its fork point", () => {
+    const first = flushWithChangelog(empty, 1, { firstSeq: 1, lastSeq: 3, cut: 3 });
+    const second = flushWithChangelog(first, 2, { firstSeq: 4, lastSeq: 5, cut: 6 });
+    const prunedFirst = pruneChangelog(second, Timestamp.make(2));
+    const prunedAll = pruneChangelog(second, Timestamp.make(3));
+    const fork = forkManifest(second, {
+      databaseId: DatabaseId.make("orders-a"),
+      checkpointId: CheckpointId.make("01JD0000000000000000000CP1"),
+      range: FULL_KEY_RANGE,
+    });
+    expect(
+      [empty, second, prunedFirst, prunedAll, fork].map((manifest) =>
+        changelogAfterSeqOf(manifest),
+      ),
+    ).toEqual([0, 0, 3, 5, 6]);
+    // The boundary itself is held; one below it is not.
+    expect(changelogHoldsChangesAfter(prunedFirst, SeqNum.make(3))).toBe(true);
+    expect(changelogHoldsChangesAfter(prunedFirst, SeqNum.make(2))).toBe(false);
+  });
+
+  it("reads a manifest without the field (older code, or a rollback's rewrite) on the safe side", () => {
+    const written = readFileSync(
+      new URL("./fixtures/manifest-written-by-workstream-1.json", import.meta.url),
+      "utf8",
+    );
+    const decoded = Schema.decodeSync(ManifestJson)(written);
+    expect(decoded.changelogAfterSeq).toEqual(Option.none());
+    // No entry kept: nothing below lastL0Seq is provably held.
+    expect(changelogAfterSeqOf(decoded)).toBe(decoded.lastL0Seq);
+    assertProperty(
+      Arbitrary.array(
+        Arbitrary.all({
+          rows: Arbitrary.schema(Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 3 }))),
+          gap: Arbitrary.schema(Schema.Boolean),
+          prune: Arbitrary.schema(Schema.Boolean),
+        }),
+        { maxLength: 12 },
+      ),
+      (steps) => {
+        let manifest = empty;
+        let cut = 0;
+        for (const [n, step] of steps.entries()) {
+          // A flush of `rows` sequence numbers, the first possibly without a row.
+          const firstSeq = cut + 1 + (step.gap ? 1 : 0);
+          const nextCut = cut + 1 + (step.gap ? 1 : 0) + step.rows;
+          manifest =
+            step.rows === 0
+              ? Result.getOrThrow(
+                  commitL0Flush(manifest, {
+                    writerEpoch: manifest.writerEpoch,
+                    sst: handle(n + 1, 0, 1),
+                    lastSeq: SeqNum.make(nextCut),
+                    clockTick: Timestamp.make(n + 1),
+                    changelog: Option.none(),
+                  }),
+                )
+              : flushWithChangelog(manifest, n + 1, {
+                  firstSeq,
+                  lastSeq: nextCut,
+                  cut: nextCut,
+                });
+          cut = nextCut;
+          if (step.prune) manifest = pruneChangelog(manifest, Timestamp.make(n + 1));
+          const explicit = changelogAfterSeqOf(manifest);
+          const derived = changelogAfterSeqOf(
+            replaceManifestFields(manifest, { changelogAfterSeq: Option.none() }),
+          );
+          // The default is never below what the field says, and the field never claims a
+          // change no kept entry holds.
+          const claimsTooMuch = manifest.changelog.some((entry) => entry.firstSeq <= explicit);
+          if (derived < explicit || claimsTooMuch) return false;
+        }
+        return true;
+      },
+    );
   });
 });
