@@ -224,6 +224,64 @@ describe("MemTable on SQLite", () => {
     expect(outcome).toEqual({ within: 1, aged: 2, all: 2, retained: 2, left: [3, 4] });
   });
 
+  it("trims a flush exactly retentionMs old, and keeps rows exactly at maxRetainedBytes (D127)", async () => {
+    // Three flushed rows of 1 + 100 + 32 bytes (key, value, overhead) at 0 s, 10 s, and 20 s.
+    const trimmedTo = (retention: {
+      nowMs: number;
+      retentionMs: number;
+      maxRetainedBytes: number;
+    }) =>
+      Effect.gen(function* () {
+        const memTable = yield* MemTable;
+        for (const [index, at] of [0, 10_000, 20_000].entries()) {
+          yield* memTable.commit(
+            [
+              {
+                key: Uint8Array.of(index),
+                value: RowValue.Value({ bytes: new Uint8Array(100) }),
+                ttlMillis: Option.none(),
+              },
+            ],
+            Timestamp.make(at),
+          );
+          yield* memTable.markFlushed(
+            SeqNum.make(index + 1),
+            Option.some(ManifestId.make(index + 2)),
+            at,
+          );
+        }
+        return yield* memTable.trim(retention);
+      }).pipe(Effect.provide(memTableTestLayer), Effect.runPromise);
+    const long = 1_000_000;
+    expect([
+      // The flush at 10 s is exactly 10 s old at 20 s: trimmed, with the one before it.
+      await trimmedTo({ nowMs: 20_000, retentionMs: 10_000, maxRetainedBytes: long }),
+      await trimmedTo({ nowMs: 19_999, retentionMs: 10_000, maxRetainedBytes: long }),
+      // 399 bytes retained: a bound of 399 keeps them all, 398 drops the oldest flush.
+      await trimmedTo({ nowMs: 20_000, retentionMs: long, maxRetainedBytes: 399 }),
+      await trimmedTo({ nowMs: 20_000, retentionMs: long, maxRetainedBytes: 398 }),
+    ]).toEqual([2, 1, 0, 1]);
+  });
+
+  it("seeds only upward, and a stale smaller flush cut never moves the flushed manifest back (D127)", async () => {
+    const outcome = await Effect.gen(function* () {
+      const memTable = yield* MemTable;
+      yield* memTable.seed({ seq: SeqNum.make(10), clockTick: Timestamp.make(500) });
+      // A lower floor (an older manifest) changes nothing: sequence numbers are never reused.
+      yield* memTable.seed({ seq: SeqNum.make(4), clockTick: Timestamp.make(100) });
+      const seeded = yield* memTable.meta;
+      yield* memTable.markFlushed(SeqNum.make(12), Option.some(ManifestId.make(7)), 1_000);
+      // A flush cut below the recorded one (a late, older flush) is ignored whole.
+      yield* memTable.markFlushed(SeqNum.make(11), Option.some(ManifestId.make(5)), 2_000);
+      const flushed = yield* memTable.meta;
+      return {
+        seeded: [seeded.lastSeq, seeded.flushedSeq, seeded.clockTick],
+        flushed: [flushed.flushedSeq, Option.getOrNull(flushed.flushedManifestId)],
+      };
+    }).pipe(Effect.provide(memTableTestLayer), Effect.runPromise);
+    expect(outcome).toEqual({ seeded: [10, 10, 500], flushed: [12, 7] });
+  });
+
   it("rolls back a failed commit, keeping the sequence number unassigned", async () => {
     const outcome = await Effect.gen(function* () {
       const memTable = yield* MemTable;
