@@ -350,7 +350,7 @@ hand-off is below.
   - **Pinned:** the Bloom filter's stored bits, the SST footer's seq bounds, and the documented
     limits and defaults.
   - **`BlockServer`:** every error answer is `no-store` (D118).
-  - **Verified:** `vp check` exit 0. `vp test run` exit 0 in `packages/lsm-core` (140 tests) and
+  - **Verified:** `vp check` exit 0. `vp test run` exit 0 in `packages/lsm-core` (141 tests) and
     `packages/lsm-cloudflare` (247 tests).
   - **Not run:** workerd, scenarios, previews, TLC (no protocol code changed).
 
