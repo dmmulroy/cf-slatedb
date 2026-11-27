@@ -56,6 +56,16 @@ Expected: six `✓` lines.
   `database-lifecycle.test.ts`), the changelog option disabled, and SSTs pruned between the
   manifest read and the SST read (a `ReaderUnavailableError`, not a gap).
 
+## Deeper search
+
+Not registered in `formal-checks.ts`. Run one at a time, niced, as for any spec (see
+`verify-writer-object`'s "Deeper search" for the command):
+
+- `ChangeFeedSearch.cfg`: 6 sequence numbers, 3 lost responses, 2 restarts, 3 prunes, `limit` 3.
+  No error: 715,221 distinct states, depth 33, 17 s with one worker (2026-11-26).
+- `ChangeFeedSearchLarge.cfg`: 8 sequence numbers, 4 lost responses, 3 restarts, 4 prunes.
+  No error: 9,153,728 distinct states, depth 44, 306 s with one worker (2026-11-26).
+
 ## Maintenance notes
 
 - D113 (this model): found while placing its labels, as a failing test first. A flush commit

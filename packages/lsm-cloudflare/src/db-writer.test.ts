@@ -20,6 +20,7 @@ import {
   Option,
   Ref,
   Result,
+  Scope,
   Tracer,
 } from "effect";
 import { TestClock } from "effect/testing";
@@ -1364,16 +1365,19 @@ describe("DbWriter's flush alarm set from two writes at once (D102)", () => {
       yield* createDatabase();
       const shared = yield* Effect.context<ManifestStore | ManifestReader | ObjectStore>();
       const inner = yield* Effect.provide(DurableObjectAlarm, durableObjectAlarmTestLayer);
-      // The first `scheduled` read after arming waits until `release`: the first write's
-      // scheduler has read "no alarm" while the second write's runs.
-      const armed = yield* Ref.make(false);
+      // The second `scheduled` read after arming (the first is the commit's own, D131) finds the
+      // alarm just fired, reads "no alarm", and waits until `release`: the first write's
+      // scheduler has read "no alarm" while the second write runs.
+      const armed = yield* Ref.make(0);
       const reading = yield* Deferred.make<void>();
       const release = yield* Deferred.make<void>();
       const alarm = DurableObjectAlarm.of({
         ...inner,
         scheduled: Effect.gen(function* () {
+          const reads = yield* Ref.getAndUpdate(armed, (count) => Math.max(0, count - 1));
+          if (reads === 1) yield* inner.cancel;
           const value = yield* inner.scheduled;
-          if (yield* Ref.getAndSet(armed, false)) {
+          if (reads === 1) {
             yield* Deferred.succeed(reading, undefined);
             yield* Deferred.await(release);
           }
@@ -1398,15 +1402,14 @@ describe("DbWriter's flush alarm set from two writes at once (D102)", () => {
       const writer = Context.get(context, DbWriter);
       yield* TestClock.adjust("10 seconds");
       // A small write: its scheduler wants the age limit, and is held after reading the alarm.
-      yield* Ref.set(armed, true);
+      yield* Ref.set(armed, 2);
       const small = yield* Effect.forkChild(writer.write(DB, put("a", "1")));
       yield* Deferred.await(reading);
-      // A write that brings the unflushed bytes over l0SstSize: its scheduler wants now. It is
-      // committed before the held scheduler goes on.
+      // A write that brings the unflushed bytes over l0SstSize: its scheduler wants now. Without
+      // serialized scheduling it commits and schedules before the held scheduler goes on; with
+      // it, it waits for that scheduler.
       const large = yield* Effect.forkChild(writer.write(DB, put("b", "x".repeat(8_192))));
-      yield* Effect.repeat(writer.status(DB), {
-        until: (status) => status.unflushedRows === 2,
-      });
+      yield* Effect.forEach(Array.from({ length: 200 }), () => Effect.yieldNow, { discard: true });
       yield* Deferred.succeed(release, undefined);
       yield* Fiber.join(small);
       yield* Fiber.join(large);
@@ -1761,5 +1764,135 @@ describe("DbWriter changelog after a flush commit whose response was lost (D113)
       if (next !== undefined) expect(next[0]).toBeGreaterThan(last ?? 0);
     }
     expect(entries.length).toBeGreaterThan(0);
+  });
+});
+
+describe("DbWriter alarm set before a commit's rows reach SQLite (D131)", () => {
+  /**
+   * A writer whose `MemTable.commit` can be armed to commit and then never return (the object is
+   * evicted right after the SQLite commit) or to fail, and a way to build the next instance of the
+   * object over the same SQLite storage and the same alarm.
+   */
+  const evictionHarness = Effect.gen(function* () {
+    yield* createDatabase();
+    const shared = yield* Effect.context<ManifestStore | ManifestReader | ObjectStore>();
+    const alarmContext = yield* Layer.build(durableObjectAlarmTestLayer);
+    const alarm = Context.get(alarmContext, DurableObjectAlarm);
+    const reached = yield* Deferred.make<void>();
+    const mode = yield* Ref.make<"normal" | "evictAfterCommit" | "fail">("normal");
+    const writerOver = (gated: boolean) =>
+      Effect.gen(function* () {
+        const base = Context.get(yield* Layer.build(memTableLayerWithoutDependencies), MemTable);
+        const memTable = MemTable.of({
+          ...base,
+          commit: (writes, createTs) =>
+            Effect.gen(function* () {
+              const current = gated ? yield* Ref.get(mode) : "normal";
+              if (current === "fail") {
+                return yield* Effect.fail(
+                  new MemTableError({
+                    operation: "commit",
+                    reason: "StorageUnavailable",
+                    message: "Test: the commit failed.",
+                  }),
+                );
+              }
+              const seq = yield* base.commit(writes, createTs);
+              if (current === "evictAfterCommit") {
+                yield* Deferred.succeed(reached, undefined);
+                return yield* Effect.never;
+              }
+              return seq;
+            }),
+        });
+        return yield* Layer.build(
+          dbWriterLayerWithoutDependencies.pipe(
+            Layer.provide(sstStoreLayerWithoutDependencies),
+            Layer.provide(Layer.succeed(MemTable, memTable)),
+            Layer.provide([
+              Layer.succeedContext(alarmContext),
+              compactionTriggerTestLayer,
+              backgroundWorkTestLayer,
+              lsmConfigurationTestLayer(),
+            ]),
+            Layer.provide(Layer.succeedContext(shared)),
+          ),
+        ).pipe(Effect.map((context) => Context.get(context, DbWriter)));
+      });
+    return { alarm, reached, mode, writerOver };
+  });
+
+  const runHarness = <A, E>(
+    program: Effect.Effect<
+      A,
+      E,
+      RuntimeContext | Scope.Scope | ManifestStore | ManifestReader | ObjectStore | WriterSqlStorage
+    >,
+  ) =>
+    program.pipe(
+      Effect.scoped,
+      Effect.provide(Layer.merge(manifestStoreTestLayer, writerSqlStorageTestLayer)),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.provide(TestClock.layer()),
+      Effect.runPromise,
+    );
+
+  // Found by the WriterObject model (D109, AlarmCovers): before D131 a write evicted between its
+  // SQLite commit and its scheduleFlush left a durable row with no alarm, flushed only when a
+  // later request happened to start the writer again.
+  it("a write evicted right after its SQLite commit still has an alarm, and the next instance flushes it", async () => {
+    const outcome = await runHarness(
+      Effect.gen(function* () {
+        const { alarm, reached, mode, writerOver } = yield* evictionHarness;
+        const first = yield* writerOver(true);
+        yield* Ref.set(mode, "evictAfterCommit");
+        // The request never answers: the object is gone after the commit, no finalizer runs.
+        yield* Effect.forkDetach(first.write(DB, put("a", "1")));
+        yield* Deferred.await(reached);
+        const scheduled = yield* alarm.scheduled;
+        // The next instance of the object, over the same SQLite storage and alarm.
+        const next = yield* writerOver(false);
+        yield* alarm.cancel;
+        yield* next.runAlarm;
+        yield* TestClock.adjust("61 seconds");
+        yield* alarm.cancel;
+        yield* next.runAlarm;
+        const status = yield* next.status(DB);
+        return {
+          alarmAfterEviction: Option.isSome(scheduled),
+          flushedSeq: status.flushedSeq,
+          durable: Object.fromEntries((yield* durableValues).values),
+        };
+      }),
+    );
+    expect(outcome).toEqual({ alarmAfterEviction: true, flushedSeq: 1, durable: { a: "1" } });
+  });
+
+  it("an alarm set for a write that then failed fires once, flushes nothing, and is not set again", async () => {
+    const outcome = await runHarness(
+      Effect.gen(function* () {
+        const { alarm, mode, writerOver } = yield* evictionHarness;
+        const writer = yield* writerOver(true);
+        yield* Ref.set(mode, "fail");
+        const failed = yield* Effect.result(writer.write(DB, put("a", "1")));
+        const scheduled = yield* alarm.scheduled;
+        yield* TestClock.adjust("61 seconds");
+        // The platform clears the alarm when it fires.
+        yield* alarm.cancel;
+        yield* writer.runAlarm;
+        return {
+          write: Result.isSuccess(failed) ? "acknowledged" : failed.failure._tag,
+          alarmBefore: Option.isSome(scheduled),
+          alarmAfter: Option.isSome(yield* alarm.scheduled),
+          lastSeq: (yield* writer.status(DB)).lastSeq,
+        };
+      }),
+    );
+    expect(outcome).toEqual({
+      write: "WriterUnavailableError",
+      alarmBefore: true,
+      alarmAfter: false,
+      lastSeq: 0,
+    });
   });
 });

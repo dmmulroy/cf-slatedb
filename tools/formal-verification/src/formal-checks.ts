@@ -428,7 +428,25 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
     name: "writer-object",
     spec: "WriterObject.tla",
     runs: [
-      { config: "WriterObjectSeal.cfg", broken: "none", expect: "pass", timeLimitSeconds: 240 },
+      { config: "WriterObjectSeal.cfg", broken: "none", expect: "pass", timeLimitSeconds: 360 },
+      {
+        config: "WriterObjectSeal.cfg",
+        broken: "alarmAfterCommit",
+        expect: "AlarmCovers",
+        timeLimitSeconds: 60,
+      },
+      {
+        config: "WriterObjectSeal.cfg",
+        broken: "alarmBeforeMark",
+        expect: "AlarmCovers",
+        timeLimitSeconds: 60,
+      },
+      {
+        config: "WriterObjectSeal.cfg",
+        broken: "schedulerIgnoresCommit",
+        expect: "AlarmCovers",
+        timeLimitSeconds: 60,
+      },
       {
         config: "WriterObjectSeal.cfg",
         broken: "sealKeepsPhase",
@@ -527,6 +545,26 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
         broken: "lostResponseReexport",
         expect: "pass",
         timeLimitSeconds: 60,
+      },
+    ],
+  },
+  {
+    name: "paged-scan",
+    spec: "PagedScan.tla",
+    runs: [
+      { config: "PagedScanLatest.cfg", broken: "none", expect: "pass", timeLimitSeconds: 180 },
+      {
+        config: "PagedScanLatest.cfg",
+        broken: "restartAfterRows",
+        expect: "LatestPageAtSnapshot",
+        timeLimitSeconds: 60,
+      },
+      { config: "PagedScanTxn.cfg", broken: "none", expect: "pass", timeLimitSeconds: 180 },
+      {
+        config: "PagedScanTxn.cfg",
+        broken: "pageRangesOnly",
+        expect: "PhantomRefused",
+        timeLimitSeconds: 90,
       },
     ],
   },

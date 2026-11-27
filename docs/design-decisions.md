@@ -5290,3 +5290,87 @@ limit. That is D98's limit, not this one's; it is left to D98's owner.
     `MAX_BATCH_BYTES`, which equals `MAX_MEMTABLE_PAGE_BYTES`, counted the same way, so a
     first batch alone never passes the bound. No consumer stalls.
   - **The row limit with `>`.** `DbClient.changes` cuts again at the limit.
+
+## D131. A commit makes sure an alarm exists before its rows reach SQLite
+
+**The gap (D109).** A write evicted after its SQLite commit and before its `scheduleFlush` left a
+durable row with no alarm. The row waited for the next request to start the writer. A database
+with no further request kept it unflushed for good. `WriterObject`'s `AlarmCovers` excepted those
+rows (`orphans`).
+
+**The rule.** The invariant is now unconditional: an unflushed row always has an alarm.
+
+- **A commit makes sure an alarm exists before its rows reach SQLite**
+  (`ensureAlarmBeforeCommit`, under `scheduleLock`). When none is scheduled, it sets one at
+  `maxL0Age` from now. An eviction after the commit then finds the alarm, which starts the writer
+  again; the start's `scheduleFlush` covers every row it counts.
+- **The check comes after the commit's mark, inside the uninterruptible region.**
+- **`scheduleFlush` keeps an alarm when a commit is under way and no row is counted.**
+
+The two last rules are needed together. With the check before the mark, an alarm already
+scheduled could fire between the check and the commit. Its run counts no row and sets no alarm;
+an eviction after the commit then leaves the row with none. The model finds it
+(`alarmBeforeMark`). After the mark, a run that ends between the check and the commit sees
+`committing` and keeps an alarm. A run that ended before the mark is seen by the check, which
+finds no alarm and sets one.
+
+**An alarm for a commit that failed.** It fires once. Its run finds the counters empty, flushes
+nothing, and sets no alarm (D74, D102), so it does not loop. An idle object is woken once, and an
+evicted one runs one start (a fence-in) for it. The test "an alarm set for a write that then
+failed fires once, flushes nothing, and is not set again" checks it.
+
+**The same order elsewhere.**
+
+- A transaction commit goes through `commitBatch`, so it gets the same check.
+- The seal's final flush commits no row to SQLite. An eviction after its manifest commit starts
+  a sealed writer, which records the manifest's `lastL0Seq` as flushed and needs no alarm.
+- `MemTable.commit` is the only place rows reach SQLite.
+
+**Cost.** One `getAlarm` per commit, and one `setAlarm` when no alarm exists (the first write
+after a flush emptied the memtable, at most once per `maxL0Age`). No memtable scan (D61).
+
+**Tests** (`db-writer.test.ts`, "DbWriter alarm set before a commit's rows reach SQLite (D131)"):
+
+- A write whose commit lands and whose object then goes, with no finalizer run: the alarm
+  exists, and the next instance, over the same SQLite storage and alarm, flushes the row. On the
+  code before, no alarm exists.
+- A write whose commit fails: the alarm fires once and is not set again.
+
+**Mutations: 1 of 2 caught by tests.** Caught: the check removed. Missed: `scheduleFlush`
+ignoring a commit under way. It needs an alarm run to end between the check and the commit and
+an eviction right after, which no test reaches. The model catches it
+(`schedulerIgnoresCommit` fails `AlarmCovers`).
+
+D102's gated two-scheduler test now holds the scheduler's own read, the second after the
+commit's check. It still fails without `scheduleFlush`'s lock (mutation caught).
+
+**Model.** `WriterObject`: `AlarmCovers` has no exception. `alarmAfterCommit` (the order before)
+`alarmBeforeMark`, and `schedulerIgnoresCommit` fail it. `WriterObjectSeal.cfg` passes with
+4,949,012 states.
+
+## D116. Paged scans are model-checked: Latest segments, budget-limited pages, and transaction pages with the phantom rule
+
+**Why.** D93's and D125's paging rules were checked by oracle property tests on the code
+(`scan-oracle.property.test.ts`), but by no model. The formal report listed them as unchecked.
+
+**The model.** `PagedScan.tla` (`paged-scan`, skill `verify-paged-scan`). Writes, flushes,
+trims, and GC of old manifests can happen between any two steps of a scanner.
+
+- **A `Latest` scanner** reads pages from its start with a budget, one key per segment. The
+  first writer page fixes the snapshot. Each segment merges with a stored manifest within D70's
+  bounds. A flush that overtakes it restarts the scan from its start before any row was
+  returned, and ends the page with `resumeFrom` after.
+- **A transaction scanner** reads pages at one `readSeq`, then commits with its read range.
+
+**Properties.**
+
+| Property                                                                                                         | Config                | Broken value that fails it                                           |
+| ---------------------------------------------------------------------------------------------------------------- | --------------------- | -------------------------------------------------------------------- |
+| `LatestPageAtSnapshot`: each page is the database at its snapshot over `[start, resumeFrom)`                     | `PagedScanLatest.cfg` | `restartAfterRows` (a page overtaken after rows starts again)        |
+| `TxnPagesAtReadSeq`, `TxnPagesComplete`: the pages are exactly the database at `readSeq`                         | `PagedScanTxn.cfg`    | none planted                                                         |
+| `PhantomRefused`: a write after `readSeq` to any key of the scanned range, absent or present, refuses the commit | `PagedScanTxn.cfg`    | `pageRangesOnly` (the commit names only the keys its pages returned) |
+
+**What writing it showed.** `scanUnflushed`'s `restart()` goes back to the range's start, not to
+the overtaken segment, and it must. A first draft that resumed at the overtaken segment failed
+`LatestPageAtSnapshot`. An earlier key examined at the old snapshot had found nothing, and
+returned nothing, but had a value at the new one.

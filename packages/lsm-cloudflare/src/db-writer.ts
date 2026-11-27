@@ -435,6 +435,12 @@ export const makeDbWriter = Effect.gen(function* () {
       }
     });
 
+  /** An alarm at `maxL0Age` from now unless one is scheduled. Run under `scheduleLock`. */
+  const keepAlarm = Effect.gen(function* () {
+    if (Option.isSome(yield* alarm.scheduled)) return;
+    yield* alarm.scheduleAt((yield* Clock.currentTimeMillis) + settings.maxL0Age);
+  });
+
   /**
    * Schedules the flush alarm for when the oldest unflushed row reaches `maxL0Age`, or now once
    * `l0SstSize` bytes are unflushed. Reads only the in-memory counters: no memtable scan per write
@@ -447,7 +453,12 @@ export const makeDbWriter = Effect.gen(function* () {
     scheduleLock.withPermits(1)(
       Effect.gen(function* () {
         const counters = yield* Ref.get(unflushed);
-        if (Option.isNone(counters.oldest)) return;
+        if (Option.isNone(counters.oldest)) {
+          // A commit is under way: its rows may reach SQLite after these counters were read, so
+          // an alarm must stay (D131).
+          if (counters.committing) yield* keepAlarm;
+          return;
+        }
         const now = yield* Clock.currentTimeMillis;
         const due =
           counters.bytes >= settings.l0SstSize ? now : counters.oldest.value + settings.maxL0Age;
@@ -455,6 +466,15 @@ export const makeDbWriter = Effect.gen(function* () {
         if (Option.isNone(scheduled) || scheduled.value > due) yield* alarm.scheduleAt(due);
       }),
     );
+
+  /**
+   * Makes sure an alarm exists before a commit's rows reach SQLite (D131): when none is scheduled,
+   * one at `maxL0Age` from now. The object may be evicted after its SQLite commit and before
+   * `scheduleFlush`; this alarm then starts the writer again, and the start schedules the flush
+   * of every row it finds. An alarm set for a commit that then fails finds nothing due and is
+   * not set again (D74, D102).
+   */
+  const ensureAlarmBeforeCommit = scheduleLock.withPermits(1)(keepAlarm);
 
   /**
    * Starts the writer for `databaseId` once per instance: fences in with a new writer epoch, seeds
@@ -909,6 +929,10 @@ export const makeDbWriter = Effect.gen(function* () {
                   generation: current.generation + 1,
                   committing: true,
                 }));
+                // Before the rows are durable, and after the mark: an eviction between the commit
+                // and `scheduleFlush` must not leave rows with no alarm, and an alarm run that
+                // ends between this and the commit sees the mark and keeps an alarm (D131).
+                yield* ensureAlarmBeforeCommit;
                 const exit = yield* Effect.exit(memTable.commit(writes, createTs));
                 yield* Ref.update(unflushed, (current) => {
                   const ended = {

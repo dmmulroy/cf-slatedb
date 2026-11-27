@@ -31,10 +31,10 @@ batch gets one sequence number; all of it is visible, or none.
   (`fenceWriter`), and a flush from an older epoch is refused at its manifest commit
   (`commitL0Flush`, `WriterFencedError`). A refusal marks only the phase it was made from as
   fenced: a writer that started again in the same object meanwhile keeps serving (D115).
-- An acknowledged write has a flush alarm, or a flush running, whatever request is interrupted
-  and whenever the object is evicted (`Effect.ensuring(scheduleFlush)`, D74b, D102). One gap: a
-  write evicted between its SQLite commit and its `scheduleFlush` was never acknowledged, and its
-  row waits for the next request to the object (D109).
+- Every row in SQLite above `flushed_seq` has a flush alarm, whatever request is interrupted and
+  whenever the object is evicted: a commit makes sure an alarm exists before its rows reach
+  SQLite (D131), and `Effect.ensuring(scheduleFlush)` sets the flush's time after it (D74b,
+  D102). `WriterObject.tla` checks it (`AlarmCovers`).
 
 | Enforced by                                                                      | Checked by                                                                                                                                                                                                                                           |
 | -------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -128,6 +128,8 @@ catches a phantom anywhere in a range only if `readRanges` names the whole range
 just the part the pages returned. A regular scan's pages are each their own read at their own
 time, and a routed scan's pages are not one snapshot across shards. Each page of any scan ends at
 its limit or at its examined-bytes budget, and its `resumeFrom` names where the next starts.
+`PagedScan.tla` checks both surfaces and the phantom rule (`LatestPageAtSnapshot`,
+`TxnPagesAtReadSeq`, `PhantomRefused`, D116).
 
 **A fixed point fixes which writes are visible, not the time TTLs are judged at.** A snapshot
 (pinned or not), a transaction's `readSeq`, and a fork's checkpoint each fix the set of writes a
