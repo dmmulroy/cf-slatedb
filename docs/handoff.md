@@ -77,8 +77,9 @@ scripts/allowlist-shaledb-deploys.sh   adds this Stack to the pi deployment guar
    credentials; `.env*` and `.alchemy/` are gitignored.
 8. If this machine runs pi with the Cloudflare deployment guard, Dillon runs
    `scripts/allowlist-shaledb-deploys.sh` once. It allowlists stages `dev`, `preview-1`,
-   `preview-2`, `preview-3` and makes the repository exempt from the guard, except that
-   `alchemy destroy` is always blocked. Never edit the guard's policy file yourself.
+   `preview-2`, `preview-3` and makes the repository exempt from the guard, except that an
+   `alchemy destroy` typed directly is always blocked (a `vp run` task that runs it is not:
+   `docs/release-v1.md`, section 10). Never edit the guard's policy file yourself.
 
 ## Rules that still apply
 

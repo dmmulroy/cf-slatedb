@@ -44,8 +44,11 @@ State at commit `cb405ff` (2026-11-25):
    `node tools/preview-cli/src/preview-cli.ts status`: it must list `preview-1` and `preview-2`.
    Never commit credentials.
 6. If pi's Cloudflare deployment guard runs on this machine, Dillon runs
-   `scripts/allowlist-shaledb-deploys.sh` once (stages `dev`, `preview-1..3`; `alchemy destroy`
-   stays blocked). It does **not** allow `production`; see "Production".
+   `scripts/allowlist-shaledb-deploys.sh` once (stages `dev`, `preview-1..3`). After it, the guard
+   blocks only an `alchemy destroy` typed directly in a command; it does not resolve `vp run` tasks
+   in this repository or its worktrees, so `destroy:preview-<n>` and `deploy:production` are not
+   blocked (`docs/release-v1.md`, section 10). Its stage list does **not** keep agents off
+   `production`; see "Production".
 7. Traits: `.pi/mcp.json` configures the traits checker (needs `TYPESAFE_API_KEY` and a Claude Code
    login). It is a probabilistic per-chunk classifier: read its findings against
    `.agents/traits/*.md`; don't chase every one.

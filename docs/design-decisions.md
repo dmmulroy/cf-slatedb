@@ -501,7 +501,9 @@ A preview's engine settings are the production defaults. `deploy --dev-timings` 
 short GC and compactor timings (`SHALEDB_LSM_SETTINGS`); the CLI drops any value of that variable
 inherited from the shell, so only the flag decides, and a later deploy without the flag restores the
 defaults. `destroy-command <stage>` prints `vp run @shaledb/infra#destroy:<stage>` for Dillon;
-the deployment guard blocks agents from running `alchemy destroy`.
+agents never run it, by instruction. (The deployment guard blocks a directly typed `alchemy
+destroy`, but not this `vp run` task in an allowlisted repository; corrected in D105, see
+`docs/release-v1.md` section 10.)
 
 ## D46. Live stages send spans to their own TraceCollector Worker; the trace CLI pulls them
 
@@ -4050,21 +4052,47 @@ it. Every stored record decodes with unknown keys ignored, and the next write of
 The rule (`docs/operations.md`, "Rolling back") is that a field whose loss changes behavior raises
 the record's format, which older code refuses (D64).
 
-| Record          | Fields added since `f3b2ad2`                                     | Older code reading it                                                                       | Newer code reading older                                     |
-| --------------- | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
-| manifest        | `changelogAfterSeq`, and earlier `droppedSsts`                   | drops them on its next commit; `changelogAfterSeqOf` then reads on the safe side (D80 test) | `withDecodingDefaultKey` and `OptionFromOptionalKey` (tests) |
-| compactor state | `lastProgressAt` (D94); earlier `corruptSsts`, `collectionDueAt` | drops them; a running job falls back to `startedAt`                                         | decodes (`stored-format-fixtures.test.ts`)                   |
-| shard map       | none                                                             | n/a                                                                                         | n/a                                                          |
-| writer SQLite   | no schema change since D58                                       | n/a                                                                                         | n/a                                                          |
+The two older commits that matter:
 
-The brief also named a manifest removal time, `recentCompactionJobIds`, checkpoint and changelog
-caps, and `PendingSplit.startedAt`. None of them is a stored field at the integration head: the
-caps are limits in code, and the others do not exist. They are not in the fixtures.
+- **`f3b2ad2`:** the last soaked commit.
+- **`c3807f7`:** what the previews run.
+
+Their schemas differ from today's only in the fields below (`git diff <commit> -- manifest.ts
+compactor.ts shard-map.ts`). The tests rebuild them from today's schemas without those fields and
+run them against today's fixtures (`manifest-format-fixtures.test.ts`,
+`stored-format-fixtures.test.ts`).
+
+| Record          | Field (decision)                             | Missing at | Older code reads it and rewrites it                                                                                                                                                                                                                        | Today's code reads what it wrote                                                                                                                               | Test                                                     |
+| --------------- | -------------------------------------------- | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| manifest        | `changelogAfterSeq` (D80)                    | `f3b2ad2`  | decodes; its next commit drops it                                                                                                                                                                                                                          | `changelogAfterSeqOf` reads the safe side: `Expired` more often, never a gap                                                                                   | fixtures test (f3b2ad2 schema); `manifest.test.ts` (D80) |
+| manifest        | `recentCompactionJobIds` (D103)              | both       | decodes; its next commit drops it                                                                                                                                                                                                                          | `[]`: a compaction commit retried after the rollback reports `Discarded`, as before D103, and loses nothing                                                    | fixtures test (both schemas)                             |
+| manifest        | `Removed.removedAt`, `Removed.cleared` (D91) | both       | decodes `{ "_tag": "Removed" }`. Older `markRemoved` returns a removed manifest unchanged, so it is not rewritten by a remove. Older edits that D91 made no-ops on a removed head (compaction commit, seal, GC preparation) could rewrite it without them. | no `removedAt` reads as removed when read: the tombstone stays `gcMinAge` longer. No `cleared` reads as false: the sweep clears it again, which is idempotent. | fixtures test (both schemas, removed fixture)            |
+| compactor state | `lastProgressAt` (D94)                       | both       | decodes; its next write drops it                                                                                                                                                                                                                           | `None`: the job is judged from `startedAt`, as state written before D94 is                                                                                     | `stored-format-fixtures.test.ts`                         |
+| shard map       | none since either commit                     | n/a        | n/a                                                                                                                                                                                                                                                        | n/a                                                                                                                                                            | `shard-map-format.test.ts` (round trip)                  |
+| writer SQLite   | no schema change since D58                   | n/a        | n/a                                                                                                                                                                                                                                                        | n/a                                                                                                                                                            | —                                                        |
+
+**What older code does with a tombstone** (read, not tested: the older code itself cannot run here).
+
+- **At `c3807f7` and `f3b2ad2`, the maintenance sweep skips a `Removed` head**
+  (`maintenance-sweep.ts`, `state._tag === "Removed"` → `Nothing`). So a tombstone is not finished
+  while rolled back.
+- **A remove retried there deletes every object under `db/<id>/`, the tombstone too**
+  (`database-lifecycle.ts`, the delete loop after `markRemoved`). That is the behavior D91 fixed:
+  while rolled back, a commit from a view loaded before the removal can bring that database back.
+- **Readers there do not answer `DatabaseNotFound` for a `Removed` head** (`ManifestReader.loadLive`
+  came with D91). A read of a removed database then fails on its deleted SSTs instead.
+
+None of this loses an acknowledged write of a live database. The roll-forward finishes every
+tombstone.
+
+**`PendingSplit.startedAt`** (D101) is not a stored field at `e2dc1d7`. D101 records why: the
+directory's `beginSplit` (audit-do) does not stamp it. The shard map is unchanged.
 
 **Fixtures.**
 
-- `manifest-v1-release-shape.json`, `compactor-state-v1-release-shape.json`, and
-  `shard-map-v1-release-shape.json` hold every field set. Their tests require that decoding and
+- `manifest-v1-release-shape.json` (sealed), `manifest-v1-release-removed.json` (removed, with
+  `removedAt` and `cleared`), `compactor-state-v1-release-shape.json`, and
+  `shard-map-v1-release-shape.json` hold every stored field set. Their tests require that decoding and
   re-encoding gives the same JSON, so the next change to a record fails until someone decides what
   older code does with it.
 - A further test shows today's code dropping an unknown field, which is why the format rule

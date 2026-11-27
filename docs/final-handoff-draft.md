@@ -128,8 +128,10 @@ PENDING(d90), PENDING(d102), PENDING(d103): D90 and D91, D102, and D103 merged, 
 
 ## Destroying what is left on Cloudflare (Dillon runs these; agents never do)
 
-Run these in your own terminal, not through an agent. The deployment guard blocks
-`alchemy destroy` for agents whatever its allowlist says. Each command needs Alchemy logged in to
+Run these in your own terminal, not through an agent. The deployment guard blocks an
+`alchemy destroy` an agent types directly, whatever its allowlist says, but in this allowlisted
+repository it does not resolve `vp run` tasks, so it would not stop an agent running these
+(`docs/release-v1.md`, section 10). Keep agents off them by instruction. Each command needs Alchemy logged in to
 account `99459fce09d9a9eec83befd957af4ec5`; live stacks keep their state in that account's
 Cloudflare state store (D43).
 
@@ -210,7 +212,9 @@ the `Shaledb` stacks, which have their own state.
 
 What could make it fail:
 
-- **The guard, if run through an agent.** The guard blocks `alchemy destroy` for agents always.
+- **The guard, if run through an agent.** The guard blocks a directly typed `alchemy destroy` for
+  agents always, but not a `vp run @shaledb/infra#destroy:<stage>` task in this repository: it does
+  not resolve package tasks in an allowlisted repository (`docs/release-v1.md`, section 10).
   Its allowlist names `/Users/dmmulroy/Code/personal/cf-slatedb/infra/cf-slatedb/alchemy.run.ts`,
   which no longer exists in the main checkout, so the guard skips that entry. That entry is only
   relevant if you allowlist the old worktree. In your own terminal the guard does not run.

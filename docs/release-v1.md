@@ -754,7 +754,8 @@ Alchemy's Cloudflare profile.
      allowlisted, the guard exempts the whole repository and every worktree of it, matched by the
      shared git directory (`isAllowlistedRepositoryWorkingDirectory` in `policy.ts`;
      `destructiveOnly` in `evaluate.ts`). Only `alchemy destroy` and
-     `wrangler delete` stay blocked there. So after the script runs, an agent in this repository can
+     `wrangler delete` named directly in a command stay blocked there; through a `vp run` task they
+     are not (next point). So after the script runs, an agent in this repository can
      run `deploy:production` whether or not `production` is listed. The real gates are your
      instruction and `deploy:production` refusing to run without the token secrets.
    - **Only a destroy named directly stays blocked.** In an exempt repository the guard checks
