@@ -723,10 +723,13 @@ export const makeDbClient = Effect.gen(function* () {
         const flushed =
           afterSeq < unflushed.flushedSeq
             ? yield* reader.changelogRows(databaseId, afterSeq, unflushed.flushedSeq, count)
-            : [];
+            : { rows: [], complete: true };
+        // A flushed part cut at its bound (D93) ends the page: appending the unflushed rows after
+        // it would skip the flushed changes between them.
+        if (!flushed.complete) return flushed.rows;
         // The memtable holds exactly the rows above flushedSeq (truncate and flushed_seq commit
         // together), so the two parts neither overlap nor leave a gap.
-        return [...flushed, ...unflushed.rows];
+        return [...flushed.rows, ...unflushed.rows];
       });
     // One row past the limit shows whether the page's last batch continues.
     let fetched = yield* fetch(limit + 1);

@@ -380,3 +380,50 @@ describe("change feed pages (D93)", () => {
     expect(outcome).toEqual({ seq: 1, rows: 1500, next: 1 });
   });
 });
+
+describe("change feed pages of flushed changes (D93)", () => {
+  it("bounds the flushed part by bytes at a batch boundary, and never skips the changes after it", async () => {
+    const outcome = await Effect.runPromise(
+      provide(
+        Effect.gen(function* () {
+          yield* create(true);
+          const client = yield* DbClient;
+          // Two batches of four 1,000 KiB values (about 4 MB each) and one of four 100 KiB values,
+          // flushed; then one unflushed. The bound falls inside the third batch.
+          const batch = (first: number, valueBytes = 1000 * 1024) =>
+            client.write(DB, {
+              operations: Array.from({ length: 4 }, (_, index) => ({
+                _tag: "Put" as const,
+                key: Uint8Array.of(first + index),
+                value: new Uint8Array(valueBytes),
+                ttlMillis: Option.none(),
+              })),
+            });
+          yield* batch(0);
+          yield* batch(4);
+          yield* batch(8, 100 * 1024);
+          yield* client.flush(DB);
+          yield* TestClock.adjust("2 seconds");
+          yield* client.put(DB, Uint8Array.of(99), Uint8Array.of(1));
+          const pages: Array<{ readonly seqs: ReadonlyArray<number>; readonly next: number }> = [];
+          let cursor = SeqNum.make(0);
+          for (let page = 0; page < 10; page++) {
+            const read = yield* client.changes(DB, cursor, 1000);
+            if (read.rows.length === 0) break;
+            pages.push({
+              seqs: [...new Set(read.rows.map((row) => row.seq))],
+              next: read.nextAfterSeq,
+            });
+            cursor = read.nextAfterSeq;
+          }
+          return pages;
+        }),
+      ),
+    );
+    // About 8 MB per page, whole batches only; the unflushed change follows the last flushed one.
+    expect(outcome).toEqual([
+      { seqs: [1, 2], next: 2 },
+      { seqs: [3, 4], next: 4 },
+    ]);
+  });
+});
