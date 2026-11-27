@@ -31,7 +31,9 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   wakes share one fence-in, no state write over a newer epoch or a requested collection, a fenced
   compactor fences in again on wake and alarm), `compaction-executor.test.ts`
   (oracle property across flushes and compactions, key-ordered outputs, bottom deletes, inputs
-  changed, fenced), `writer.workerd.ts` (four flushes → compactor wake → Workflow → commit, reads at
+  changed, fenced; D86: the `prepare` step result of the largest planned merge fits Workflows'
+  1 MiB, and a later step of a job whose inputs left the manifest is discarded),
+  `writer.workerd.ts` (four flushes → compactor wake → Workflow → commit, reads at
   every consistency, span assertions). D33–D36.
 - **Readers in any Worker; `Latest`/`AtLeast` through the writer** — done. `db-reader.ts` runs
   in the caller's isolate; `db-client.ts` builds `Latest` views from the writer's probe. Trace: the

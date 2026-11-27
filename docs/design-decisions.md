@@ -2770,3 +2770,40 @@ snapshot scan, and a transaction read. Three mutations fail it.
 
 These hold by reading the code (`resolveVisibleRow`, `retainKeyVersions`, `DbWriter.commitBatch`,
 the executor's `prepare`). No code changed for them.
+
+## D86. A compaction's `prepare` step records its inputs' ids, not their handles
+
+**Found by the Workflow audit.** Cloudflare Workflows store a step's result only up to 1 MiB
+(the Workflows limits page: "Maximum non-stream step result per step"). `prepare` returned every
+input `SstHandle`. A handle carries the SST's first and last keys, each up to 16 KiB (`MAX_KEY_BYTES`).
+
+- **The case the test builds.** The scheduler merges eight sorted runs that are within
+  `includeSizeThreshold` of each other: eight runs of 8 GiB in 128 SSTs of 64 MiB, with 1 KiB keys.
+  That `prepare` result encodes to 2,973,046 bytes.
+- **The effect.** `prepare` fails on every retry. The Workflow ends errored, the compactor plans the
+  same job again, and that merge never runs. Sorted runs then pile up, which raises read
+  amplification. A fork's full rewrite holds every SST of the fork, so a large fork never releases
+  its source.
+- **With 32-byte keys** the limit is reached at about 3,500 input SSTs.
+
+**The rule.** `PreparedCompaction` records `inputIds`: each input level's SST ids, newest first.
+Each output step reads the handles by id from the newest manifest (`resolvePreparedInputs`). An SST
+id names one immutable object and the one handle a manifest holds for it, so these are the handles
+`prepare` resolved. When the newest manifest no longer holds every input id, the step fails with
+`CompactionInputsChangedError` and the job is discarded. The commit would refuse that job anyway;
+now it stops before it writes more outputs. The same merge's ids encode to about 40 KB, so a job can
+hold about 26,000 input SSTs before the limit.
+
+**At deploy.** A Workflow instance in flight holds a `prepare` result in the old format. Its next
+step fails to decode it, the instance ends errored, and the compactor plans the job again. Its
+outputs so far are orphans that GC removes after `gcMinAge`, as for any discarded job.
+
+**Cost.** One manifest load per output step (the `LATEST` hint and GC's boundary, then the newest
+manifest). Before, each step loaded nothing.
+
+**Tests** (`compaction-executor.test.ts`):
+
+- **The largest planned merge's `prepare` result fits in 1 MiB.** It fails on the code before, at
+  2,973,046 bytes.
+- **An output step of a job whose inputs another compaction replaced is discarded.** The mutation
+  that ignores a missing id fails it.
