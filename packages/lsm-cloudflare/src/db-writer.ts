@@ -30,6 +30,7 @@ import {
 } from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import {
+  Cause,
   Clock,
   Context,
   Effect,
@@ -543,6 +544,10 @@ export const makeDbWriter = Effect.gen(function* () {
       }),
     );
 
+  /** Whether two successor lists name the same databases in the same order. */
+  const sameSuccessors = (left: ReadonlyArray<DatabaseId>, right: ReadonlyArray<DatabaseId>) =>
+    left.length === right.length && left.every((id, index) => id === right[index]);
+
   const sealedError = (databaseId: DatabaseId, successors: ReadonlyArray<DatabaseId>) =>
     new DatabaseSealedError({
       databaseId,
@@ -693,18 +698,16 @@ export const makeDbWriter = Effect.gen(function* () {
     Effect.gen(function* () {
       const rows = Stream.paginate(afterSeq, (from) =>
         memTable.rowsBySeq(from, cut, 1024).pipe(
-          Effect.map((page) => {
-            const last = page[page.length - 1];
+          Effect.map(({ rows, complete }) => {
+            const last = rows[rows.length - 1];
+            // A page holds whole batches (D93), so the next one starts after its last sequence.
             return [
-              page,
-              page.length === 1024 && last !== undefined ? Option.some(last.seq) : Option.none(),
+              rows,
+              !complete && last !== undefined ? Option.some(last.seq) : Option.none(),
             ] as const;
           }),
         ),
-      ).pipe(
-        // Rows sharing the last sequence of a page continue on the next page by key order.
-        Stream.filter((row) => row.seq > afterSeq),
-      );
+      ).pipe(Stream.filter((row) => row.seq > afterSeq));
       const written = yield* ssts
         .write({
           owner: databaseId,
@@ -866,16 +869,16 @@ export const makeDbWriter = Effect.gen(function* () {
     });
     const conflict = (reason: TransactionConflictError["reason"], message: string) =>
       Effect.fail(new TransactionConflictError({ databaseId, reason, message }));
+    const tooOld = conflict(
+      "SnapshotTooOld",
+      `Database ${databaseId} no longer keeps every write after the transaction's reads (sequence number ${commit.readSeq}), so its snapshot can no longer be checked: it ran longer than the writer keeps flushed rows. Begin a new transaction and run it again; nothing was written.`,
+    );
+    const readMeta = memTable.meta.pipe(Effect.mapError(unavailable(databaseId, "transaction")));
     const check = Effect.gen(function* () {
-      const meta = yield* memTable.meta.pipe(
-        Effect.mapError(unavailable(databaseId, "transaction")),
-      );
+      const meta = yield* readMeta;
       // Every write after readSeq must still be in SQLite (retained or unflushed) to be checked.
       if (meta.retainedFromSeq > commit.readSeq || commit.readSeq > meta.lastSeq) {
-        return yield* conflict(
-          "SnapshotTooOld",
-          `Database ${databaseId} no longer keeps every write after the transaction's reads (sequence number ${commit.readSeq}), so its snapshot can no longer be checked: it ran longer than the writer keeps flushed rows. Begin a new transaction and run it again; nothing was written.`,
-        );
+        return yield* tooOld;
       }
       const writtenAfter = (keys: ReadonlyArray<Uint8Array>, ranges: ReadonlyArray<KeyRange>) =>
         memTable
@@ -897,6 +900,10 @@ export const makeDbWriter = Effect.gen(function* () {
           `Another commit wrote a key this transaction read in database ${databaseId} after the transaction began, so committing it would not be serializable. Begin a new transaction and run it again; nothing was written.`,
         );
       }
+      // A flush's trim takes no commit lock, so one may have run between the horizon check and
+      // the queries above and deleted rows they needed (D84). Trims only raise the horizon: if it
+      // is still at or below readSeq, every row the queries looked for was there.
+      if ((yield* readMeta).retainedFromSeq > commit.readSeq) return yield* tooOld;
     });
     return yield* commitBatch(databaseId, commit.batch, check);
   });
@@ -963,7 +970,7 @@ export const makeDbWriter = Effect.gen(function* () {
     const ready = yield* ensureReady(databaseId);
     const limit = Math.max(1, Math.min(request.limit, 1000));
     // One page is read atomically with flushedSeq; across pages the reader takes the largest one.
-    const { meta, snapshotSeq, rows } = yield* memTable
+    const { meta, snapshotSeq, rows, complete } = yield* memTable
       .consistently((meta) => {
         const snapshotSeq = Option.getOrElse(request.snapshotSeq, () => meta.lastSeq);
         return Effect.map(
@@ -974,10 +981,11 @@ export const makeDbWriter = Effect.gen(function* () {
             request.cursor,
             limit,
           ),
-          (rows) => ({
+          (page) => ({
             meta,
             snapshotSeq,
-            rows,
+            rows: page.rows,
+            complete: page.complete,
           }),
         );
       })
@@ -990,8 +998,9 @@ export const makeDbWriter = Effect.gen(function* () {
       retainedFromSeq: meta.retainedFromSeq,
       flushedManifestId: meta.flushedManifestId,
       sealedSuccessors: ready.sealed,
+      // A page ends at its row limit or its byte bound (D93): either way the next resumes after it.
       nextCursor:
-        rows.length === limit && last !== undefined
+        !complete && last !== undefined
           ? Option.some({ key: last.key, seq: last.seq })
           : Option.none(),
     };
@@ -1019,9 +1028,9 @@ export const makeDbWriter = Effect.gen(function* () {
             meta.lastSeq,
             Math.max(1, Math.min(limit, 1000)),
           ),
-          (rows) => ({
+          (page) => ({
             meta,
-            rows,
+            rows: page.rows,
           }),
         ),
       )
@@ -1066,6 +1075,11 @@ export const makeDbWriter = Effect.gen(function* () {
     return yield* commitLock.withPermits(1)(
       Effect.gen(function* () {
         const ready = yield* ensureReady(databaseId);
+        // A seal names its successors once: a repeat with the same ones is a retry and succeeds;
+        // one naming others is refused with the recorded ones (D95).
+        if (Option.isSome(ready.sealed) && !sameSuccessors(ready.sealed.value, successors)) {
+          return yield* Effect.fail(sealedError(databaseId, ready.sealed.value));
+        }
         if (Option.isSome(ready.sealed) && !holdForSuccessors) {
           const meta = yield* memTable.meta.pipe(Effect.mapError(unavailable(databaseId, "seal")));
           return { flushedSeq: meta.flushedSeq, successorHolds: [] };
@@ -1129,7 +1143,19 @@ export const makeDbWriter = Effect.gen(function* () {
           flushedSeq,
           successorHolds: holdForSuccessors ? successorHoldsOf(sealed.manifest, successors) : [],
         };
-      }),
+      }).pipe(
+        // A seal that does not return may still have committed (its caller hung up, or the read
+        // after the create-if-absent failed): the manifest may be sealed, with a new writer epoch,
+        // while this writer still believes it is open. Forget the phase while the commit lock is
+        // still held, so the next request starts again from the manifest and sees the seal (D85).
+        Effect.onExit((exit) =>
+          exit._tag === "Success"
+            ? Effect.void
+            : Ref.update(phase, (current): WriterPhase =>
+                current._tag === "Ready" ? { _tag: "Uninitialized" } : current,
+              ),
+        ),
+      ),
     );
   });
 
@@ -1178,6 +1204,16 @@ export const makeDbWriter = Effect.gen(function* () {
     }).pipe(Effect.exit);
     if (outcome._tag === "Failure") {
       const current = yield* Ref.get(phase);
+      // A database that no longer exists (removed, its writer's state not yet deleted) has nothing
+      // to flush: retrying every second would wake the object forever (D85).
+      const gone = Cause.findErrorOption(outcome.cause).pipe(
+        Option.exists((error) => error._tag === "DatabaseNotFoundError"),
+      );
+      if (gone) {
+        return yield* Effect.logWarning(
+          "Writer alarm found its database gone; it stops until the removal deletes its state.",
+        ).pipe(Effect.annotateLogs({ "database.id": id }));
+      }
       if (current._tag !== "Fenced") {
         const now = yield* Clock.currentTimeMillis;
         yield* alarm.scheduleAt(now + FLUSH_RETRY_MILLIS);

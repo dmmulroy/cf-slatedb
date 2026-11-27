@@ -369,52 +369,6 @@ export const makeDbClient = Effect.gen(function* () {
       } satisfies ReadView;
     });
 
-  /** The memtable rows of a `Latest` scan: every page at one snapshot, and the largest `flushedSeq`. */
-  const scanView = (databaseId: DatabaseId, range: KeyRange, options: ReadOptions) =>
-    Effect.gen(function* () {
-      if (Option.isSome(options.snapshot)) return snapshotView(options.snapshot.value);
-      if (yield* coveredByManifest(databaseId, options.consistency)) {
-        return options.consistency._tag === "AtLeast"
-          ? { ...FLUSHED_VIEW, minLastL0Seq: options.consistency.seq }
-          : FLUSHED_VIEW;
-      }
-      const rows: Array<Row> = [];
-      let cursor = Option.none<MemTableCursor>();
-      let snapshotSeq = Option.none<SeqNum>();
-      let flushedSeq = SeqNum.make(0);
-      let manifestHint = Option.none<ManifestId>();
-      for (;;) {
-        const page = yield* writer.scan(databaseId, {
-          range,
-          snapshotSeq,
-          cursor,
-          limit: MEMTABLE_PAGE_ROWS,
-          includeRetained: false,
-        });
-        yield* refuseIfSealed(databaseId, options, page.sealedSuccessors);
-        rows.push(...page.rows);
-        snapshotSeq = Option.some(page.snapshotSeq);
-        if (page.flushedSeq > flushedSeq) {
-          flushedSeq = page.flushedSeq;
-          manifestHint = page.flushedManifestId;
-        }
-        if (Option.isNone(page.nextCursor)) break;
-        cursor = page.nextCursor;
-      }
-      return {
-        minLastL0Seq: flushedSeq,
-        snapshotSeq,
-        memtable: rows,
-        manifestId: Option.none(),
-        // As for a point read. A flush between two pages also ends here: the later pages then
-        // miss rows that only a manifest flushed past the snapshot holds.
-        maxLastL0Seq: snapshotSeq,
-        // The writer said which rows are flushed: any cached manifest holding them will do (D67).
-        freshness: "Covering",
-        manifestHint,
-      } satisfies ReadView;
-    });
-
   /**
    * Whether a read that asked the writer found only a manifest flushed past the snapshot the
    * writer gave it (see {@link ReadView.maxLastL0Seq}): the read asks the writer again. A read at
@@ -452,24 +406,184 @@ export const makeDbClient = Effect.gen(function* () {
     }
   });
 
+  /**
+   * A `Latest` scan (or an `AtLeast` one the manifest does not cover) over the writer's unflushed
+   * rows, pulled a page at a time as the scan needs them (D93).
+   *
+   * **Details**
+   *
+   * The scan runs in segments. Each reads writer pages for the rest of the range, at the snapshot
+   * the first page fixed, until the rows hold a second key or the range ends. The segment is then
+   * the keys before the last key read, so every version of each of its keys is in hand, and it
+   * merges with one manifest between the bounds D70 sets: at least the largest `flushed_seq` of
+   * every page so far, at most the snapshot. The next segment starts at that last key. Memory is
+   * one segment: a page (1,000 rows within `MAX_MEMTABLE_PAGE_BYTES`), plus the versions of one
+   * key that span pages. A scan that has its rows stops reading pages.
+   *
+   * A flush that overtakes the scan between pages leaves no manifest between the bounds. Before
+   * any row was returned the scan starts again at a new snapshot, as before D93. After rows were
+   * returned it cannot, without mixing two snapshots: it fails, retryably, with `resumeFrom`, the
+   * first key it did not return. The public scan fails the whole page, and the caller repeats it.
+   */
+  const scanUnflushed = (
+    databaseId: DatabaseId,
+    range: KeyRange,
+    options: ScanReadOptions,
+  ): Stream.Stream<Row, DbClientReadError, DbReaderServices> =>
+    Stream.unwrap(
+      Effect.sync(() => {
+        let attempt = 1;
+        let emitted = 0;
+        let start = range.start;
+        let snapshotSeq = Option.none<SeqNum>();
+        let flushedSeq = SeqNum.make(0);
+        let manifestHint = Option.none<ManifestId>();
+        let done = false;
+        const restart = () => {
+          start = range.start;
+          snapshotSeq = Option.none();
+          flushedSeq = SeqNum.make(0);
+          manifestHint = Option.none();
+        };
+        const remaining = () => Option.map(options.limit, (limit) => Math.max(0, limit - emitted));
+        /** One segment: its writer rows and its key range. */
+        const readSegment = Effect.gen(function* () {
+          const rows: Array<Row> = [];
+          let cursor = Option.none<MemTableCursor>();
+          let complete = false;
+          for (;;) {
+            const page = yield* writer.scan(databaseId, {
+              range: { start, end: range.end },
+              snapshotSeq,
+              cursor,
+              limit: MEMTABLE_PAGE_ROWS,
+              includeRetained: false,
+            });
+            yield* refuseIfSealed(databaseId, options, page.sealedSuccessors);
+            rows.push(...page.rows);
+            snapshotSeq = Option.some(page.snapshotSeq);
+            if (page.flushedSeq > flushedSeq) {
+              flushedSeq = page.flushedSeq;
+              manifestHint = page.flushedManifestId;
+            }
+            if (Option.isNone(page.nextCursor)) {
+              complete = true;
+              break;
+            }
+            cursor = page.nextCursor;
+            const [first] = rows;
+            const last = rows[rows.length - 1];
+            if (
+              first !== undefined &&
+              last !== undefined &&
+              !Bytes.Equivalence(first.key, last.key)
+            )
+              break;
+          }
+          if (complete) return { rows, segment: { start, end: range.end }, next: Option.none() };
+          // The last key read may have more versions on the next page: it opens the next segment.
+          const lastKey = rows[rows.length - 1]?.key ?? start;
+          return {
+            rows: rows.filter((row) => Bytes.Order(row.key, lastKey) < 0),
+            segment: { start, end: Option.some(lastKey) },
+            next: Option.some(lastKey),
+          };
+        });
+        const segments: Stream.Stream<Row, DbClientReadError, DbReaderServices> = Stream.suspend(
+          () =>
+            done || Option.exists(remaining(), (left) => left === 0)
+              ? Stream.empty
+              : Stream.unwrap(
+                  Effect.map(readSegment, ({ rows, segment, next }) => {
+                    const view: ReadView = {
+                      minLastL0Seq: flushedSeq,
+                      snapshotSeq,
+                      memtable: rows,
+                      manifestId: Option.none(),
+                      // As for a point read (D70): a manifest past the snapshot may have compacted
+                      // away a version it needs, and one below the largest flushedSeq lacks rows.
+                      maxLastL0Seq: snapshotSeq,
+                      // The writer said which rows are flushed: any cached manifest holding them
+                      // will do (D67).
+                      freshness: "Covering",
+                      manifestHint,
+                    };
+                    const segmentStart = start;
+                    return reader.scan(databaseId, segment, view, { limit: remaining() }).pipe(
+                      Stream.tap(() =>
+                        Effect.sync(() => {
+                          emitted++;
+                        }),
+                      ),
+                      Stream.catchTags({
+                        ReaderUnavailableError: (error) => {
+                          if (!flushedPastSnapshot(options, error)) return Stream.fail(error);
+                          if (emitted > 0) {
+                            return Stream.fail(
+                              new ReaderUnavailableError({
+                                databaseId,
+                                reason: "StorageUnavailable",
+                                message: `Database ${databaseId} was flushed during the scan after it had returned rows, so the rest cannot be read at the same snapshot. Resume the scan from resumeFrom (the next range start).`,
+                                resumeFrom: segmentStart,
+                              }),
+                            );
+                          }
+                          if (attempt >= LATEST_READ_ATTEMPTS) {
+                            return Stream.fail(overtakenByFlushes(databaseId));
+                          }
+                          attempt++;
+                          restart();
+                          return segments;
+                        },
+                      }),
+                      Stream.concat(
+                        Stream.suspend(() => {
+                          if (Option.isNone(next)) done = true;
+                          else start = next.value;
+                          return segments;
+                        }),
+                      ),
+                    );
+                  }),
+                ),
+        );
+        return segments;
+      }),
+    );
+
   const scan = (databaseId: DatabaseId, range: KeyRange, options: ScanReadOptions) => {
     // The reader checks the manifest before it emits a row, so asking again repeats no row.
-    const attempt = (number: number): Stream.Stream<Row, DbClientReadError, DbReaderServices> =>
-      Stream.unwrap(
-        Effect.map(scanView(databaseId, range, options), (view) =>
-          reader.scan(databaseId, range, view, { limit: options.limit }),
-        ),
-      ).pipe(
+    const fromManifest = (
+      number: number,
+      view: ReadView,
+    ): Stream.Stream<Row, DbClientReadError, DbReaderServices> =>
+      reader.scan(databaseId, range, view, { limit: options.limit }).pipe(
         Stream.catchTags({
           ReaderUnavailableError: (error) =>
             !flushedPastSnapshot(options, error)
               ? Stream.fail(error)
               : number >= LATEST_READ_ATTEMPTS
                 ? Stream.fail(overtakenByFlushes(databaseId))
-                : attempt(number + 1),
+                : fromManifest(number + 1, view),
         }),
       );
-    return attempt(1).pipe(
+    const stream: Stream.Stream<Row, DbClientReadError, DbReaderServices> = Stream.unwrap(
+      Effect.gen(function* () {
+        if (Option.isSome(options.snapshot)) {
+          return fromManifest(1, snapshotView(options.snapshot.value));
+        }
+        if (yield* coveredByManifest(databaseId, options.consistency)) {
+          return fromManifest(
+            1,
+            options.consistency._tag === "AtLeast"
+              ? { ...FLUSHED_VIEW, minLastL0Seq: options.consistency.seq }
+              : FLUSHED_VIEW,
+          );
+        }
+        return scanUnflushed(databaseId, range, options);
+      }),
+    );
+    return stream.pipe(
       Stream.withSpan("DbClient.scan", {
         attributes: { "database.id": databaseId, "read.consistency": options.consistency._tag },
       }),

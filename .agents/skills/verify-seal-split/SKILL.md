@@ -66,6 +66,16 @@ views and ranges), `writer.workerd.ts` (the same split through the public API).
 
 ## Maintenance notes
 
+- D85: the model's `Seal` is one step that also updates the writer, so it cannot express a seal
+  whose manifest commit landed while the writer never saw the answer (its caller hung up, or the
+  read after the create failed). The code then kept believing it was open and acknowledged writes
+  the seal's epoch had already fenced: an acknowledged write in no successor. Now a seal that does
+  not return forgets the writer's phase while still holding the commit lock, and the next request
+  starts again from the manifest. `db-writer.test.ts` covers the seal interrupted after its
+  commit, the writer evicted after it, and the seal interrupted before it (the database stays
+  open and writable). No model step changed. Reran: every check passes, and every broken variant
+  fails.
+
 - D77: a successor's hold on the sealed database is now released by the successor's own
   collection, `gcMinAge` after its rewrite, instead of by its compactor's next idle poll. The
   holds still come from the seal's commit and the forks still read from them; only how long the
@@ -93,7 +103,7 @@ views and ranges), `writer.workerd.ts` (the same split through the public API).
 
 ## Keeping it in step with the code
 
-Sync commit: the D77 commit (a fork releases its hold from its own collection); before it the v1 workstream 3 commit (`splits pause briefly`, D57). When a covered function changes after it, update the model
+Sync commit: the D84/D85 commit (`fix(writer)`: a seal that does not return forgets the writer's phase); before it the D77 commit (a fork releases its hold from its own collection). When a covered function changes after it, update the model
 so each action is still one awaited effect in the code, rerun, and show each invariant still fails on
 a broken variant before moving the sync commit. For drift that skipped this skill, use
 `.agents/skills/maintain-formal-verification-skill/SKILL.md`.

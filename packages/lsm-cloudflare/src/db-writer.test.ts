@@ -3,12 +3,13 @@ import {
   DEFAULT_DATABASE_OPTIONS,
   initialManifest,
   type KeyRange,
+  markRemoved,
   type Row,
   SeqNum,
   type WriteBatch,
 } from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
-import { Context, Deferred, Effect, Fiber, Layer, Option, Ref, Tracer } from "effect";
+import { Context, Deferred, Effect, Fiber, Layer, Option, Ref, Result, Tracer } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -113,6 +114,8 @@ interface HookedStatsWriter {
   readonly afterCommit: Array<Effect.Effect<void>>;
   /** Queues a hook that commits `batch` through the writer, as a concurrent request would. */
   readonly commitAfterScan: (batch: WriteBatch) => void;
+  /** Effects run, one per call and in order, right before `MemTable.writtenAfter` queries. */
+  readonly beforeWrittenAfter: Array<Effect.Effect<void>>;
 }
 
 /**
@@ -124,11 +127,13 @@ const runWithHookedStats = <A, E>(
   body: (
     writer: HookedStatsWriter,
   ) => Effect.Effect<A, E, DbWriter | MemTable | DurableObjectAlarm | RuntimeContext>,
+  overrides: Parameters<typeof lsmConfigurationTestLayer>[0] = {},
 ) =>
   Effect.gen(function* () {
     yield* createDatabase();
     const afterScan: Array<Effect.Effect<void, MemTableError>> = [];
     const afterCommit: Array<Effect.Effect<void>> = [];
+    const beforeWrittenAfter: Array<Effect.Effect<void>> = [];
     const hookedMemTable = Layer.effect(
       MemTable,
       Effect.map(MemTable, (memTable) =>
@@ -137,6 +142,11 @@ const runWithHookedStats = <A, E>(
           stats: Effect.tap(memTable.stats, () => afterScan.shift() ?? Effect.void),
           commit: (writes, createTs) =>
             Effect.tap(memTable.commit(writes, createTs), () => afterCommit.shift() ?? Effect.void),
+          writtenAfter: (keys, ranges, afterSeq) =>
+            Effect.andThen(
+              Effect.suspend(() => beforeWrittenAfter.shift() ?? Effect.void),
+              memTable.writtenAfter(keys, ranges, afterSeq),
+            ),
         }),
       ),
     ).pipe(
@@ -153,7 +163,7 @@ const runWithHookedStats = <A, E>(
           durableObjectAlarmTestLayer,
           compactionTriggerTestLayer,
           backgroundWorkTestLayer,
-          lsmConfigurationTestLayer(),
+          lsmConfigurationTestLayer(overrides),
         ),
       ).pipe(Layer.provide(Layer.succeedContext(shared))),
     );
@@ -166,9 +176,15 @@ const runWithHookedStats = <A, E>(
         writer.write(DB, batch).pipe(Effect.asVoid, Effect.orDie, Effect.provide(runtime)),
       );
     };
-    return yield* body({ writer, memTable, alarm, afterScan, afterCommit, commitAfterScan }).pipe(
-      Effect.provide(context),
-    );
+    return yield* body({
+      writer,
+      memTable,
+      alarm,
+      afterScan,
+      afterCommit,
+      commitAfterScan,
+      beforeWrittenAfter,
+    }).pipe(Effect.provide(context));
   }).pipe(
     Effect.scoped,
     Effect.provide(manifestStoreTestLayer),
@@ -850,5 +866,245 @@ describe("DbWriter fencing and crash recovery", () => {
     expect([outcome.status.unflushedRows, outcome.status.lastSeq]).toEqual([0, 2]);
     expect(Object.fromEntries(outcome.durable.values)).toEqual({ a: "1", b: "2", c: "3" });
     expect(outcome.durable.manifest.lastL0Seq).toBe(3);
+  });
+});
+
+describe("DbWriter transaction commit across a trim (D84)", () => {
+  it("a trim between the commit's horizon check and its conflict query cannot hide a conflicting write", async () => {
+    const outcome = await runWithHookedStats(
+      ({ writer, beforeWrittenAfter }) =>
+        Effect.gen(function* () {
+          yield* writer.write(DB, put("k", "1"));
+          yield* writer.flush(DB);
+          // The transaction reads k at seq 1; another commit then writes k (seq 2), and it flushes.
+          const begin = yield* writer.status(DB);
+          yield* writer.write(DB, put("k", "2"));
+          yield* writer.flush(DB);
+          yield* TestClock.adjust("2 seconds");
+          yield* writer.write(DB, put("other", "3"));
+          // A flush lands while the commit checks (the flush's R2 response arrives while the
+          // commit's fiber yields): its trim deletes flushed rows up to seq 2.
+          const runtime = yield* Effect.context<RuntimeContext>();
+          beforeWrittenAfter.push(
+            writer.flush(DB).pipe(Effect.asVoid, Effect.orDie, Effect.provide(runtime)),
+          );
+          const committed = yield* Effect.result(
+            writer.commitTransaction(DB, {
+              readSeq: begin.lastSeq,
+              isolation: "Snapshot",
+              batch: put("k", "from the transaction"),
+              readKeys: [],
+              readRanges: [],
+            }),
+          );
+          const after = yield* writer.status(DB);
+          return {
+            readSeq: begin.lastSeq,
+            retainedFromSeq: after.retainedFromSeq,
+            committed: Result.isSuccess(committed)
+              ? "committed"
+              : committed.failure._tag === "TransactionConflictError"
+                ? committed.failure.reason
+                : committed.failure._tag,
+          };
+        }),
+      { transactionRetentionMs: 1_000 },
+    );
+    // The trim passed the transaction's read sequence number, so the write at seq 2 can no longer
+    // be checked: the commit must be refused, never accepted over it (a lost update).
+    expect(outcome.retainedFromSeq).toBeGreaterThan(outcome.readSeq);
+    expect(outcome.committed).toBe("SnapshotTooOld");
+  });
+});
+
+/**
+ * Seals with the seal's manifest commit held at `gate`: `"afterCommit"` lets the create land and
+ * then never answers (the caller hung up during the read after it), `"beforeCommit"` never sends
+ * it. The seal's fiber is then interrupted. With `restart`, the object is evicted at that point
+ * and a new writer starts on the same SQLite storage.
+ */
+const sealInterrupted = (gate: "beforeCommit" | "afterCommit", restart: boolean) =>
+  Effect.gen(function* () {
+    yield* createDatabase();
+    const store = yield* ManifestStore;
+    const shared = yield* Effect.context<ManifestStore | ManifestReader | ObjectStore>();
+    const reached = yield* Deferred.make<void>();
+    const armed = yield* Ref.make(false);
+    const gatedStore = ManifestStore.of({
+      ...store,
+      updateFrom: (view, edit) =>
+        Effect.gen(function* () {
+          const hold = yield* Ref.getAndSet(armed, false);
+          if (hold && gate === "beforeCommit") {
+            yield* Deferred.succeed(reached, undefined);
+            return yield* Effect.never;
+          }
+          const result = yield* store.updateFrom(view, edit);
+          if (hold) {
+            yield* Deferred.succeed(reached, undefined);
+            return yield* Effect.never;
+          }
+          return result;
+        }),
+    });
+    const newWriter = () =>
+      Layer.build(
+        dbWriterLayerWithoutDependencies.pipe(
+          Layer.provide(sstStoreLayerWithoutDependencies),
+          Layer.provide(memTableLayerWithoutDependencies),
+          Layer.provide([
+            durableObjectAlarmTestLayer,
+            compactionTriggerTestLayer,
+            backgroundWorkTestLayer,
+            lsmConfigurationTestLayer(),
+          ]),
+          Layer.provide(Layer.succeedContext(shared.pipe(Context.add(ManifestStore, gatedStore)))),
+        ),
+      ).pipe(Effect.map((context) => Context.get(context, DbWriter)));
+    const writer = yield* newWriter();
+    yield* writer.write(DB, put("a", "before the seal"));
+    yield* Ref.set(armed, true);
+    const seal = yield* Effect.forkChild(writer.seal(DB, [], false));
+    yield* Deferred.await(reached);
+    yield* Fiber.interrupt(seal);
+    const next = restart ? yield* newWriter() : writer;
+    const manifestState = (yield* (yield* ManifestReader).loadLatest(DB)).manifest.state._tag;
+    const late = yield* Effect.result(next.write(DB, put("b", "after the seal attempt")));
+    const flushed = yield* Effect.result(next.flush(DB));
+    const durable = yield* durableValues;
+    return {
+      manifestState,
+      late: Result.isSuccess(late) ? "acknowledged" : late.failure._tag,
+      flushed: Result.isSuccess(flushed) ? "flushed" : flushed.failure._tag,
+      durable: Object.fromEntries(durable.values),
+    };
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(Layer.merge(manifestStoreTestLayer, writerSqlStorageTestLayer)),
+    Effect.provide(lsmTestRuntimeContextLayer),
+    Effect.provide(TestClock.layer()),
+    Effect.runPromise,
+  );
+
+describe("DbWriter seal whose commit outcome it never saw (D85)", () => {
+  // An acknowledged write after the seal would be in no successor of a split, and its writer,
+  // fenced by the seal's epoch, could never flush it.
+  it("a seal interrupted after its manifest commit landed refuses every later write", async () => {
+    expect(await sealInterrupted("afterCommit", false)).toEqual({
+      manifestState: "Sealed",
+      late: "DatabaseSealedError",
+      flushed: "flushed",
+      durable: { a: "before the seal" },
+    });
+  });
+
+  it("a writer evicted after its seal's commit landed starts sealed", async () => {
+    expect(await sealInterrupted("afterCommit", true)).toEqual({
+      manifestState: "Sealed",
+      late: "DatabaseSealedError",
+      flushed: "flushed",
+      durable: { a: "before the seal" },
+    });
+  });
+
+  it("a seal interrupted before its manifest commit leaves the database open and writable", async () => {
+    expect(await sealInterrupted("beforeCommit", false)).toEqual({
+      manifestState: "Open",
+      late: "acknowledged",
+      flushed: "flushed",
+      durable: { a: "before the seal", b: "after the seal attempt" },
+    });
+  });
+});
+
+describe("DbWriter alarm for a database that is gone (D85)", () => {
+  it("a restarted writer whose database was removed before its state was deleted stops setting its alarm", async () => {
+    const outcome = await Effect.gen(function* () {
+      yield* createDatabase();
+      const shared = yield* Effect.context<ManifestStore | ManifestReader | ObjectStore>();
+      // One alarm and one SQLite storage, kept across the restart, as a Durable Object keeps them.
+      const alarm = yield* Effect.provide(DurableObjectAlarm, durableObjectAlarmTestLayer);
+      const newWriter = () =>
+        Layer.build(
+          dbWriterLayerWithoutDependencies.pipe(
+            Layer.provide(sstStoreLayerWithoutDependencies),
+            Layer.provide(memTableLayerWithoutDependencies),
+            Layer.provide([
+              Layer.succeed(DurableObjectAlarm, alarm),
+              compactionTriggerTestLayer,
+              backgroundWorkTestLayer,
+              lsmConfigurationTestLayer(),
+            ]),
+            Layer.provide(Layer.succeedContext(shared)),
+          ),
+        ).pipe(Effect.map((context) => Context.get(context, DbWriter)));
+      const before = yield* newWriter();
+      yield* before.write(DB, put("a", "unflushed"));
+      const set = yield* alarm.scheduled;
+      // Removal marks the manifest removed; the step that deletes the writer's state never runs
+      // (the removal was interrupted), and the object restarts.
+      yield* (yield* ManifestStore).update(DB, (manifest) => markRemoved(manifest));
+      const after = yield* newWriter();
+      const fired = [];
+      for (let firing = 0; firing < 3; firing++) {
+        yield* alarm.cancel;
+        yield* after.runAlarm;
+        fired.push(Option.isSome(yield* alarm.scheduled));
+      }
+      return { set: Option.isSome(set), fired };
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(Layer.merge(manifestStoreTestLayer, writerSqlStorageTestLayer)),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.provide(TestClock.layer()),
+      Effect.runPromise,
+    );
+    // Retrying every second would wake the object forever; nothing it holds can be flushed.
+    expect(outcome).toEqual({ set: true, fired: [false, false, false] });
+  });
+});
+
+describe("DbWriter seal of a sealed database (D95)", () => {
+  it("a seal naming other successors fails with the recorded ones; the same successors again succeed", async () => {
+    const LEFT = DatabaseId.make("orders-a");
+    const RIGHT = DatabaseId.make("orders-b");
+    const OTHER = DatabaseId.make("orders-c");
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createDatabase();
+        const writer = yield* DbWriter;
+        yield* writer.write(DB, put("a", "1"));
+        yield* writer.seal(DB, [LEFT, RIGHT], true);
+        const attempt = (successors: ReadonlyArray<DatabaseId>, holds: boolean) =>
+          Effect.map(Effect.result(writer.seal(DB, successors, holds)), (result) =>
+            Result.isSuccess(result)
+              ? "sealed"
+              : result.failure._tag === "DatabaseSealedError"
+                ? `DatabaseSealedError:${result.failure.successors.join(",")}`
+                : result.failure._tag,
+          );
+        const other = yield* attempt([OTHER], false);
+        const otherWithHolds = yield* attempt([OTHER], true);
+        const same = yield* attempt([LEFT, RIGHT], false);
+        const sameWithHolds = yield* attempt([LEFT, RIGHT], true);
+        const manifest = (yield* (yield* ManifestReader).loadLatest(DB)).manifest;
+        return {
+          other,
+          otherWithHolds,
+          same,
+          sameWithHolds,
+          successors: manifest.state._tag === "Sealed" ? manifest.state.successors : [],
+          holders: manifest.checkpoints.flatMap((checkpoint) => Option.toArray(checkpoint.holder)),
+        };
+      }),
+    );
+    expect(outcome).toEqual({
+      other: "DatabaseSealedError:orders-a,orders-b",
+      otherWithHolds: "DatabaseSealedError:orders-a,orders-b",
+      same: "sealed",
+      sameWithHolds: "sealed",
+      successors: ["orders-a", "orders-b"],
+      holders: ["orders-a", "orders-b"],
+    });
   });
 });

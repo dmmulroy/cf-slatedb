@@ -12,6 +12,7 @@ import { Arbitrary, Effect, Layer, Option, Schema, Stream } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  MAX_MEMTABLE_PAGE_BYTES,
   MEMTABLE_FLUSH_PAGE_QUERIES,
   MemTable,
   memTableLayerWithoutDependencies,
@@ -117,10 +118,16 @@ describe("MemTable on SQLite", () => {
         const scanned: Array<Row> = [];
         let cursor = Option.none<MemTableCursor>();
         for (;;) {
-          const page = yield* memTable.scan(FULL_KEY_RANGE, snapshot, SeqNum.make(0), cursor, 3);
+          const { rows: page, complete } = yield* memTable.scan(
+            FULL_KEY_RANGE,
+            snapshot,
+            SeqNum.make(0),
+            cursor,
+            3,
+          );
           scanned.push(...page);
           const last = page[page.length - 1];
-          if (page.length < 3 || last === undefined) break;
+          if (complete || last === undefined) break;
           cursor = Option.some({ key: last.key, seq: last.seq });
         }
         const firstKey = all[0]?.key ?? new Uint8Array();
@@ -162,7 +169,7 @@ describe("MemTable on SQLite", () => {
         const unflushed = yield* Stream.runCollect(memTable.rowsUpTo(meta.flushedSeq, last));
         const kept = yield* Stream.runCollect(memTable.rowsUpTo(meta.retainedFromSeq, last));
         const stats = yield* memTable.stats;
-        const bySeq = yield* memTable.rowsBySeq(cut, last, 10_000);
+        const { rows: bySeq } = yield* memTable.rowsBySeq(cut, last, 10_000);
         const above = expected.value.filter((row) => row.seq > cut);
         return (
           unflushed.map(rowSignature).join("|") === above.map(rowSignature).join("|") &&
@@ -260,5 +267,77 @@ describe("MemTable on SQLite", () => {
     );
     for (const plan of [plans.first, plans.next]) expect(plan).not.toContain("TEMP B-TREE");
     expect(plans.next).toContain("PRIMARY KEY");
+  });
+});
+
+describe("MemTable pages are bounded by bytes (D93)", () => {
+  const MiB = 1024 * 1024;
+  /** One batch per row: `count` puts of `valueBytes` each, keys 0..count-1. */
+  const commitLarge = (count: number, valueBytes: number, rowsPerBatch = 1) =>
+    Effect.gen(function* () {
+      const memTable = yield* MemTable;
+      for (let first = 0; first < count; first += rowsPerBatch) {
+        const writes: Array<CollapsedWrite> = [];
+        for (let index = first; index < Math.min(count, first + rowsPerBatch); index++) {
+          writes.push({
+            key: Uint8Array.of(index >> 8, index & 0xff),
+            value: RowValue.Value({ bytes: new Uint8Array(valueBytes) }),
+            ttlMillis: Option.none(),
+          });
+        }
+        yield* memTable.commit(writes, Timestamp.make(0));
+      }
+    });
+  const bytesOf = (rows: ReadonlyArray<Row>) =>
+    rows.reduce(
+      (sum, row) =>
+        sum + row.key.length + (row.value._tag === "Value" ? row.value.bytes.length : 0),
+      0,
+    );
+
+  it("cuts a scan page and a change feed page at the byte bound, and a flush streams every row", async () => {
+    const outcome = await Effect.gen(function* () {
+      const memTable = yield* MemTable;
+      // 20 rows of 1 MiB: 20 MiB, against an 8 MiB page.
+      yield* commitLarge(20, MiB);
+      const scanPage = yield* memTable.scan(
+        FULL_KEY_RANGE,
+        SeqNum.make(20),
+        SeqNum.make(0),
+        Option.none(),
+        1000,
+      );
+      const feedPage = yield* memTable.rowsBySeq(SeqNum.make(0), SeqNum.make(20), 1000);
+      const flushed = yield* Stream.runCollect(memTable.rowsUpTo(SeqNum.make(0), SeqNum.make(20)));
+      return {
+        scan: [scanPage.rows.length, scanPage.complete, bytesOf(scanPage.rows)],
+        feed: [feedPage.rows.length, feedPage.complete, bytesOf(feedPage.rows)],
+        flushed: flushed.length,
+      };
+    }).pipe(Effect.provide(memTableTestLayer), Effect.runPromise);
+    expect(outcome.scan[0]).toBe(7);
+    expect(outcome.scan[1]).toBe(false);
+    expect(outcome.scan[2]).toBeLessThanOrEqual(MAX_MEMTABLE_PAGE_BYTES);
+    expect(outcome.feed).toEqual(outcome.scan);
+    expect(outcome.flushed).toBe(20);
+  });
+
+  it("cuts a change feed page only between batches, and returns one batch larger than the page whole", async () => {
+    const outcome = await Effect.gen(function* () {
+      const memTable = yield* MemTable;
+      // Batches of 3 rows of 1 MiB; the 8 MiB bound falls inside the third batch.
+      yield* commitLarge(12, MiB, 3);
+      const byBytes = yield* memTable.rowsBySeq(SeqNum.make(0), SeqNum.make(4), 1000);
+      // A row limit of 2 falls inside the first batch of 3: the page is that whole batch.
+      const byRows = yield* memTable.rowsBySeq(SeqNum.make(0), SeqNum.make(4), 2);
+      return {
+        byBytes: [byBytes.rows.map((row) => row.seq), byBytes.complete],
+        byRows: [byRows.rows.map((row) => row.seq), byRows.complete],
+      };
+    }).pipe(Effect.provide(memTableTestLayer), Effect.runPromise);
+    expect(outcome).toEqual({
+      byBytes: [[1, 1, 1, 2, 2, 2], false],
+      byRows: [[1, 1, 1], false],
+    });
   });
 });

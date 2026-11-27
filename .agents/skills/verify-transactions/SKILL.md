@@ -85,6 +85,23 @@ deletes rows. `writer.workerd.ts` refuses write skew through the public API.
 
 ## Maintenance notes
 
+- D84: `Commit(t)` is one atomic step in the model: the horizon check and the conflict queries see
+  the same SQLite state. In the code they were separate statements outside any SQLite
+  transaction, and a flush's trim (which takes no commit lock) could run between them and delete
+  rows above `readSeq`, so the conflict query missed a write: a lost update. Now
+  `commitTransaction` re-reads `retained_from_seq` after the queries and aborts with
+  `SnapshotTooOld` if it passed `readSeq`.
+  - **Why the atomic step matches the code again.** A trim only raises the horizon. If the horizon
+    after the queries is still at or below `readSeq`, no trim in between deleted a row they looked
+    for, so they saw what one atomic read would have seen. If it passed `readSeq`, the code aborts,
+    as the model's step does when the trim comes first.
+  - **Why not `MemTable.consistently`.** It is atomic in production (`transactionSync`), but the
+    test storage runs it as a savepoint that another fiber can interleave, so no unit test could
+    show it; the re-read is proven by `db-writer.test.ts` ("a trim between the commit's horizon
+    check and its conflict query …") and two mutations.
+  - No model step changed. Reran: pass in 239.8 s of the 240 s limit (36,915,507 states), and
+    every broken variant fails. The limit needs raising before the model grows.
+
 - D83 (review of D76): `Read` chose only between the begin manifest and `flushed`, but the
   reader's "newest" is its cached manifest, which may be older than the begin manifest, between
   it and the newest, or a flush's manifest committed before `flushed_seq` recorded it. `Read` now
@@ -141,7 +158,7 @@ deletes rows. `writer.workerd.ts` refuses write skew through the public API.
 
 ## Keeping it in step with the code
 
-Sync commit: the D70–D74 commit (`fix(read)`, `fix(writer)`, and `perf`: the snapshot bound, the newest-version flush, the read and flush path changes, the writer's counters). When a covered function changes after it, update the model
+Sync commit: the D84/D85 commit (`fix(writer)`: the conflict check re-reads the horizon, a seal that does not return forgets the writer's phase). When a covered function changes after it, update the model
 so each action is still one awaited effect in the code, rerun, and show each invariant still fails on
 a broken variant before moving the sync commit. For drift that skipped this skill, use
 `.agents/skills/maintain-formal-verification-skill/SKILL.md`.

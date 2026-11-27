@@ -29,7 +29,8 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `compactor-worker.ts`; writers wake compactors (`compaction-trigger.ts`, `compactor-client.ts`).
   Tests: `compactor.test.ts` (fence-once, idle, fencing, shared budget; D78: concurrent first
   wakes share one fence-in, no state write over a newer epoch or a requested collection, a fenced
-  compactor fences in again on wake and alarm), `compaction-executor.test.ts`
+  compactor fences in again on wake and alarm; D94: a job unseen for `compactionLeaseMs` is
+  finished), `compaction-executor.test.ts`
   (oracle property across flushes and compactions, key-ordered outputs, bottom deletes, inputs
   changed, fenced; D97: a step whose rows are all dropped ends after a bounded input and
   writes nothing; D96: a job running longer than `gcMinAge` keeps its outputs through a
@@ -79,7 +80,8 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 ## §4 Read path
 
 - **`Flushed`, `AtLeast(seq)`, `Latest` (probe + `flushedSeq`)** — done. `read-consistency.ts`
-  (lsm-core), `DbClient.pointView`/`scanView`, `DbReader.manifestFor` (refresh when older than
+  (lsm-core), `DbClient.pointView`/`scanUnflushed` (D93: a `Latest` scan pages lazily by segment;
+  `db-client-scan.test.ts`), `DbReader.manifestFor` (refresh when older than
   `flushedSeq`/`seq`). Tests: `db-client.test.ts` (Map-oracle property at every consistency;
   staleness bound, shown failing without the refresh), `writer.workerd.ts`. Formal:
   `NoAckedWriteLost` (`LatestSeesAcked`) (D29).
@@ -100,7 +102,7 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
     fails).
   - **Live.** `docs/measurements.md` ("Read latency").
 - **A read never uses a manifest flushed past its snapshot** — done (D70). `ReadView.maxLastL0Seq`
-  set to the writer's snapshot by `DbClient.pointView` and `scanView`; `DbClient.getRow` and `scan`
+  set to the writer's snapshot by `DbClient.pointView` and `scanUnflushed`; `DbClient.getRow` and `scan`
   ask the writer again on `SnapshotExpired` (`LATEST_READ_ATTEMPTS`); `DbClient.scanAt` without a
   begin manifest requires the largest `flushedSeq` of its pages. Tests: `db-client.test.ts` (a
   writer overtaken after it answers: get, scan, a scan between its pages, giving up as
@@ -266,7 +268,9 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `/v1/databases/:id/transactions/{begin,get,scan,commit}`. Tests: `db-transaction.test.ts`
   (serializability-in-commit-order property for `SerializableSnapshot` and no-lost-update property
   for `Snapshot` over interleavings with direct writes and flushes; write skew; own writes;
-  `SnapshotTooOld`; each shown failing on its mutation), `writer.workerd.ts` (write skew refused
+  `SnapshotTooOld`; each shown failing on its mutation), `db-writer.test.ts` (D84: a trim between
+  the horizon check and the conflict query cannot hide a write; D85: a seal interrupted after or
+  before its commit, and a writer evicted after it), `writer.workerd.ts` (write skew refused
   through the public API). Formal: `Transactions` (check 6).
 
 ## §9 Effect audit and private gaps

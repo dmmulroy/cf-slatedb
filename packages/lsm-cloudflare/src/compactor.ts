@@ -37,6 +37,11 @@ export const RunningCompaction = Schema.Struct({
   job: CompactionJob,
   budgetGroup: Schema.String,
   startedAt: Timestamp,
+  /**
+   * When a progress read last said the job may still commit; absent until the first one (and in
+   * state written before D94): then `startedAt`.
+   */
+  lastProgressAt: Schema.OptionFromOptionalKey(Timestamp),
 });
 
 /** One running compaction. */
@@ -492,17 +497,40 @@ export const makeCompactor = Effect.gen(function* () {
         manifestHolds(latest.manifest, corrupt.sstId),
       );
       for (const job of state.running) {
-        const progress = yield* launcher.progress(job.jobId).pipe(
+        const read = yield* launcher.progress(job.jobId).pipe(
+          Effect.map(Option.some),
           Effect.catchTags({
             CompactionLauncherUnavailableError: () =>
-              Effect.succeed<CompactionJobProgress>({ _tag: "Running" }),
+              Effect.succeed(Option.none<CompactionJobProgress>()),
           }),
         );
-        if (progress._tag === "Running") {
+        const readAt = Timestamp.make(yield* Clock.currentTimeMillis);
+        if (Option.exists(read, (progress) => progress._tag === "Running")) {
+          running.push({ ...job, lastProgressAt: Option.some(readAt) });
+          yield* Effect.ignore(budget.acquire(job.budgetGroup, holder(state, job.jobId)));
+          continue;
+        }
+        // Unreadable: kept, unless no read has said it may still commit for `compactionLeaseMs`
+        // (a purged or unknown Workflow instance reads as unreachable for good). Then it is
+        // finished with no outcome: its lease and sources are freed, and if it does commit later,
+        // `commitCompaction`'s exact-inputs check refuses it once another job took them (D94).
+        const lastSeen = Option.getOrElse(job.lastProgressAt, () => job.startedAt);
+        if (Option.isNone(read) && readAt - lastSeen < settings.compactionLeaseMs) {
           running.push(job);
           yield* Effect.ignore(budget.acquire(job.budgetGroup, holder(state, job.jobId)));
           continue;
         }
+        if (Option.isNone(read)) {
+          yield* Effect.logWarning(
+            `Compaction job ${job.jobId} of database ${databaseId} has not been seen running for ${settings.compactionLeaseMs} ms; the compactor treats it as finished and frees its sources.`,
+          );
+          yield* Effect.annotateCurrentSpan({ "compaction.job_abandoned": job.jobId });
+        }
+        const progress: CompactionJobProgress = Option.getOrElse(read, () => ({
+          _tag: "Finished" as const,
+          outcome: Option.none(),
+        }));
+        if (progress._tag === "Running") continue;
         yield* Effect.ignore(budget.release(holder(state, job.jobId)));
         const found = Option.filter(progress.outcome, (outcome) => outcome._tag === "Corrupted");
         if (
@@ -568,6 +596,7 @@ export const makeCompactor = Effect.gen(function* () {
           job,
           budgetGroup: group,
           startedAt,
+          lastProgressAt: Option.none(),
         });
       }
       // A finished job left garbage (its inputs, older manifests): collectable after gcMinAge.
