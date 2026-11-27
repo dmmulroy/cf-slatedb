@@ -344,6 +344,14 @@ hand-off is below.
 
 ## Remaining-work log
 
+- **D111, D113 (formal audit, 2026-11-26).** Liveness: `TransactionsLive.cfg` (`EveryTxnCommits`;
+  `beforeD76` fails) and `NoAckedWriteLostLive.cfg` (`EventuallyFlushed`; `noWake` fails), with
+  `WriterObject`'s two. `verify.ts no-acked-write-lost` exit 0 (7 runs); `transactions`: 6 of 7
+  as expected, `Transactions.cfg` none timed out at 420 s with `TLC_WORKERS=2` under load (14.4M
+  of its 40.6M states; with `Live = FALSE` the new actions are disabled, so its state space is
+  unchanged): to be rerun with all workers. D113: the change feed repeats changes after a flush
+  commit whose response was lost; an `it.fails` test in `db-writer.test.ts` records it, unfixed.
+
 - **D109 (formal audit, 2026-11-26).** New model `WriterObject.tla`: the writer Durable Object at
   await granularity, four configs, 14 runs (`writer-object`), skill `verify-writer-object`. Each of
   D74b (both halves), D84, D85, D102, D74's loop, and D115 is a `Broken` value failing its

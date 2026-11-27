@@ -12,6 +12,11 @@ description: "Model-check that shaledb's SerializableSnapshot transactions admit
   writer's commit lock, so committing in that order is a serial order: the history is serializable.
   Harm if broken: two transactions each act on a state the other changed (write skew, lost
   update), and the database ends in a state no serial order produces.
+- **EveryTxnCommits** (liveness, `TransactionsLive.cfg`, D111): a transaction that is retried
+  after each abort eventually commits. Writes are finite, so conflicts with real writes end, and
+  `SnapshotTooOld` must end too: a database that stays warm after GC collected the flush's own
+  manifest the writer still names must not refuse every retry (D76). Harm if broken: a client
+  retrying as told never succeeds.
 
 ## Run it
 
@@ -20,11 +25,13 @@ node tools/formal-verification/src/verify.ts transactions   # about 30 seconds
 vp run verify                                               # every formal check
 ```
 
-Expected: five `✓` lines. The code as written passes. `snapshotOnly` (the commit checks written
+Expected: seven `✓` lines. The code as written passes both configs. `snapshotOnly` (the commit checks written
 keys only, which is `Snapshot` isolation) and `trimWithoutAbort` (the commit skips the
 `retained_from_seq` check, so a trim past an open transaction hides its writes) fail
 `Serializable`. `noReadHorizonCheck` (a read accepts a manifest below `retained_from_seq`) and
 `noReadUpperBound` (a read accepts a manifest flushed past `readSeq`) fail `ReadsAtBegin`.
+`beforeD76` (a read uses only the begin manifest) fails `EveryTxnCommits` in `TransactionsLive.cfg`
+(183,324 states, about 15 s with 2 workers).
 
 ## Read a result
 
@@ -84,6 +91,17 @@ deletes rows. `writer.workerd.ts` refuses write skew through the public API.
   the pinned manifest's horizon check); each fails `Serializable`.
 
 ## Maintenance notes
+
+- D111 (liveness): `Live = TRUE` (`TransactionsLive.cfg`, two transactions, two keys, `MaxSeq` 3,
+  no symmetry) replaces `Read` with `LiveRead`, which decides as `DbReader.manifestFor` does: the
+  newest manifest (lastL0Seq `flushed`) when it fits, else the begin manifest when it is stored
+  and fits, else `SnapshotTooOld`. `Collect` deletes a flush's own manifest (a compaction
+  replaced it; the newest is always stored); `Retry` begins again after an abort. Each
+  transaction reads one key, writes one, and commits; `LiveSpec` is weakly fair to each
+  transaction's steps only. `Transactions.cfg` sets `Live = FALSE` and is unchanged.
+  `beforeD76` reproduces D76: the begin manifest is the writer's flushed manifest, collected,
+  and every retry gets it again. Checked against the code at `523fd04`: `Begin`, `Commit` (with
+  D84's re-read), `Trim`, and the read rule still match; no drift.
 
 - D84: `Commit(t)` is one atomic step in the model: the horizon check and the conflict queries see
   the same SQLite state. In the code they were separate statements outside any SQLite

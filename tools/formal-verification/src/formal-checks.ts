@@ -123,6 +123,13 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
         expect: "LatestSeesAcked",
         timeLimitSeconds: 60,
       },
+      { config: "NoAckedWriteLostLive.cfg", broken: "none", expect: "pass", timeLimitSeconds: 120 },
+      {
+        config: "NoAckedWriteLostLive.cfg",
+        broken: "noWake",
+        expect: "EventuallyFlushed",
+        timeLimitSeconds: 60,
+      },
     ],
   },
   {
@@ -221,6 +228,13 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
         config: "Transactions.cfg",
         broken: "noReadUpperBound",
         expect: "ReadsAtBegin",
+        timeLimitSeconds: 60,
+      },
+      { config: "TransactionsLive.cfg", broken: "none", expect: "pass", timeLimitSeconds: 120 },
+      {
+        config: "TransactionsLive.cfg",
+        broken: "beforeD76",
+        expect: "EveryTxnCommits",
         timeLimitSeconds: 60,
       },
     ],

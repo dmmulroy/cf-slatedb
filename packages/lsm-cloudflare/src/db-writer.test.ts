@@ -1609,3 +1609,67 @@ describe("DbWriter flush fenced by its own writer's restart (D115)", () => {
     });
   });
 });
+
+describe("DbWriter changelog after a flush commit whose response was lost (D113)", () => {
+  // A flush's manifest commit lands and its response is lost (the read of GC's boundary after
+  // the create fails), so flushed_seq is not recorded. The next flush exports its changelog from
+  // the old flushed_seq again: two entries then hold the same changes, and the feed, which reads
+  // every entry above afterSeq in turn, delivers them twice.
+  // `it.fails` until the owners fix D113: it then fails, and becomes `it`.
+  it.fails("no two changelog entries hold the same sequence number", async () => {
+    const entries = await Effect.gen(function* () {
+      yield* createDatabase({ changelog: true });
+      const store = yield* ManifestStore;
+      const shared = yield* Effect.context<ManifestStore | ManifestReader | ObjectStore>();
+      const armed = yield* Ref.make(false);
+      const lossyStore = ManifestStore.of({
+        ...store,
+        updateFrom: (view, edit) =>
+          Effect.gen(function* () {
+            const result = yield* store.updateFrom(view, edit);
+            if (yield* Ref.getAndSet(armed, false)) {
+              return yield* Effect.fail(
+                new ManifestWriteError({
+                  databaseId: DB,
+                  reason: "StorageUnavailable",
+                  message: "the response after the create was lost",
+                }),
+              );
+            }
+            return result;
+          }),
+      });
+      const writer = yield* Layer.build(
+        dbWriterLayerWithoutDependencies.pipe(
+          Layer.provide(sstStoreLayerWithoutDependencies),
+          Layer.provide(memTableLayerWithoutDependencies),
+          Layer.provide([
+            durableObjectAlarmTestLayer,
+            compactionTriggerTestLayer,
+            backgroundWorkTestLayer,
+            lsmConfigurationTestLayer(),
+          ]),
+          Layer.provide(Layer.succeedContext(shared.pipe(Context.add(ManifestStore, lossyStore)))),
+        ),
+      ).pipe(Effect.map((context) => Context.get(context, DbWriter)));
+      yield* writer.write(DB, put("a", "1"));
+      yield* Ref.set(armed, true);
+      yield* Effect.result(writer.flush(DB));
+      yield* writer.write(DB, put("b", "2"));
+      yield* writer.flush(DB);
+      const latest = yield* (yield* ManifestReader).loadLatest(DB);
+      return latest.manifest.changelog.map((entry) => [entry.firstSeq, entry.lastSeq]);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(Layer.merge(manifestStoreTestLayer, writerSqlStorageTestLayer)),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.provide(TestClock.layer()),
+      Effect.runPromise,
+    );
+    for (const [index, [, last]] of entries.entries()) {
+      const next = entries[index + 1];
+      if (next !== undefined) expect(next[0]).toBeGreaterThan(last ?? 0);
+    }
+    expect(entries.length).toBeGreaterThan(0);
+  });
+});

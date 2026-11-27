@@ -29,12 +29,17 @@ batch gets one sequence number; all of it is visible, or none.
   when the oldest unflushed row is `maxL0Age` (60 s) old, or on request.
 - Only one writer flushes for a database. A writer fences in with a new epoch when it starts
   (`fenceWriter`), and a flush from an older epoch is refused at its manifest commit
-  (`commitL0Flush`, `WriterFencedError`).
+  (`commitL0Flush`, `WriterFencedError`). A refusal marks only the phase it was made from as
+  fenced: a writer that started again in the same object meanwhile keeps serving (D115).
+- An acknowledged write has a flush alarm, or a flush running, whatever request is interrupted
+  and whenever the object is evicted (`Effect.ensuring(scheduleFlush)`, D74b, D102). One gap: a
+  write evicted between its SQLite commit and its `scheduleFlush` was never acknowledged, and its
+  row waits for the next request to the object (D109).
 
-| Enforced by                                                                      | Checked by                                                                                                                                                                               |
-| -------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `DbWriter.commitBatch` under the commit lock; `MemTable.commit` (`mem-table.ts`) | `db-writer.test.ts`, `mem-table.test.ts`; `NoAckedWriteLost.tla` (`Write`, `Crash`, `Restart`)                                                                                           |
-| `fenceWriter`, `commitL0Flush`'s epoch check (`lsm-core/src/manifest.ts`)        | `db-writer.test.ts` ("a stale writer cannot commit after a newer writer starts, and its SST stays unreferenced"); `ManifestCasFencing.tla` (`NoStaleCommit`; `noWriterEpochCheck` fails) |
+| Enforced by                                                                      | Checked by                                                                                                                                                                                                                                           |
+| -------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DbWriter.commitBatch` under the commit lock; `MemTable.commit` (`mem-table.ts`) | `db-writer.test.ts`, `mem-table.test.ts`; `NoAckedWriteLost.tla` (`Write`, `Crash`, `Restart`); `WriterObject.tla` at await granularity (`NoAckedWriteLost`, `AlarmCovers`, `AckedFlushed`)                                                          |
+| `fenceWriter`, `commitL0Flush`'s epoch check (`lsm-core/src/manifest.ts`)        | `db-writer.test.ts` ("a stale writer cannot commit after a newer writer starts, and its SST stays unreferenced"); `ManifestCasFencing.tla` (`NoStaleCommit`; `noWriterEpochCheck` fails); `WriterObject.tla` (`NeverSelfFenced`; `beforeD115` fails) |
 
 ## A write is flushed
 

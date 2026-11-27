@@ -40,7 +40,7 @@ node tools/formal-verification/src/verify.ts writer-object   # about 4 minutes w
 TLC_WORKERS=2 nice -n 15 node tools/formal-verification/src/verify.ts writer-object
 ```
 
-Expected: fourteen `✓` lines.
+Expected: thirteen `✓` lines.
 
 | Config | `Broken` | Expected |
 | --- | --- | --- |

@@ -29,8 +29,11 @@ node tools/formal-verification/src/verify.ts no-acked-write-lost   # about 3 sec
 vp run verify                                                      # every formal check
 ```
 
-Expected: five `✓` lines. The code as written passes; `truncateBeforeCommit` and `trimUnflushed`
+Expected: seven `✓` lines. The code as written passes; `truncateBeforeCommit` and `trimUnflushed`
 fail `NoAckedWriteLost`; `nonAtomicProbe` and `noSnapshotUpperBound` fail `LatestSeesAcked`.
+`NoAckedWriteLostLive.cfg` (D111) checks **EventuallyFlushed**, every acknowledged write
+eventually in the newest manifest (readable at `Flushed`): the code passes (281,716 states), and
+`noWake` (nothing starts an evicted writer again: no alarm, no request) fails it.
 
 ## Read a result
 
@@ -92,6 +95,14 @@ past its snapshot filtered out the newer version and no longer found the older o
   `db-client.test.ts` covers it.
 
 ## Maintenance notes
+
+- D111 (liveness): `LiveSpec` is weakly fair to the flush's three steps and to `Restart`; writes,
+  compactions, trims, and reads are never forced. `noWake` drops the fairness of `Restart`.
+  Whether the alarm is set at all, through interruption, eviction, and failures, is
+  `WriterObject`'s (`AlarmCovers`, `AckedFlushed`, D109). Checked against the code at `523fd04`:
+  `Write`, `FlushUpload` (`keepReachableVersions`), `FlushCommit`, `FlushTruncate`
+  (`markFlushed`), `Trim`, `Restart` (`seed` + `markFlushed(lastL0Seq)`), `Probe`
+  (`consistently`), and `ReadManifest` still match; D115 changed no step here.
 
 - D93: a `Latest` scan no longer reads every unflushed page before it merges. It reads pages a
   segment at a time (`DbClient` `scanUnflushed`). Every segment uses the scan's one snapshot and

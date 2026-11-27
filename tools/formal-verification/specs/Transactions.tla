@@ -50,10 +50,11 @@
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
-CONSTANTS Keys, Txns, MaxSeq, Broken
+CONSTANTS Keys, Txns, MaxSeq, Broken, Live
 
 ASSUME Broken \in {"none", "snapshotOnly", "trimWithoutAbort", "noReadHorizonCheck",
-                   "noReadUpperBound"}
+                   "noReadUpperBound", "beforeD76"}
+ASSUME Live \in BOOLEAN
 
 Init0 == "init"
 Direct == "direct"
@@ -69,9 +70,11 @@ VARIABLES
   pinned,     \* each transaction's begin manifest, by its lastL0Seq
   reads,      \* each transaction's reads: a set of <<key, value>>
   writes,     \* each transaction's written keys
-  okAtCommit  \* for each committed transaction: its reads equal the values at its commit
+  okAtCommit, \* for each committed transaction: its reads equal the values at its commit
+  gone        \* Live: the flushes (by lastL0Seq) whose own manifest GC deleted
 
-vars == <<seq, flushed, retained, versions, state, readSeq, pinned, reads, writes, okAtCommit>>
+vars == <<seq, flushed, retained, versions, state, readSeq, pinned, reads, writes, okAtCommit,
+          gone>>
 
 Init ==
   /\ seq = 0 /\ flushed = 0 /\ retained = 0
@@ -82,6 +85,7 @@ Init ==
   /\ reads = [t \in Txns |-> {}]
   /\ writes = [t \in Txns |-> {}]
   /\ okAtCommit = [t \in Txns |-> TRUE]
+  /\ gone = {}
 
 \* The newest of a set of versions (each set read here holds the seq-0 version or is non-empty).
 Newest(vs) == CHOOSE v \in vs : \A w \in vs : w.seq <= v.seq
@@ -95,7 +99,7 @@ Begin(t) ==
   /\ state' = [state EXCEPT ![t] = "active"]
   /\ readSeq' = [readSeq EXCEPT ![t] = seq]
   /\ pinned' = [pinned EXCEPT ![t] = flushed]
-  /\ UNCHANGED <<seq, flushed, retained, versions, reads, writes, okAtCommit>>
+  /\ UNCHANGED <<seq, flushed, retained, versions, reads, writes, okAtCommit, gone>>
 
 \* A manifest, by its lastL0Seq m, serves a read of t when it holds every row SQLite dropped and
 \* was not flushed past the read's snapshot.
@@ -112,6 +116,7 @@ Fits(t, m) ==
 \* deleted it; refusing is always safe, so the model allows it whenever the begin manifest does
 \* not fit).
 Read(t, k) ==
+  /\ ~Live
   /\ state[t] = "active" /\ k \notin writes[t]
   /\ \/ \E m \in 0 .. seq :
           /\ Fits(t, m)
@@ -122,13 +127,14 @@ Read(t, k) ==
      \/ /\ ~Fits(t, pinned[t])
         /\ state' = [state EXCEPT ![t] = "aborted"]
         /\ UNCHANGED reads
-  /\ UNCHANGED <<seq, flushed, retained, versions, readSeq, pinned, writes, okAtCommit>>
+  /\ UNCHANGED <<seq, flushed, retained, versions, readSeq, pinned, writes, okAtCommit, gone>>
 
 Write(t, k) ==
   /\ state[t] = "active"
+  /\ Live => (reads[t] # {} /\ writes[t] = {})
   /\ writes' = [writes EXCEPT ![t] = @ \cup {k}]
   /\ UNCHANGED <<seq, flushed, retained, versions, state, readSeq, pinned, reads,
-                 okAtCommit>>
+                 okAtCommit, gone>>
 
 ReadKeys(t) == {r[1] : r \in reads[t]}
 
@@ -143,41 +149,89 @@ Commit(t) ==
          conflict == \E k \in checked : InSqliteAfter(k, readSeq[t])
      IN IF tooOld \/ conflict
           THEN /\ state' = [state EXCEPT ![t] = "aborted"]
-               /\ UNCHANGED <<seq, versions, okAtCommit>>
+               /\ UNCHANGED <<seq, versions, okAtCommit, gone>>
           ELSE /\ okAtCommit' = [okAtCommit EXCEPT ![t] = \A r \in reads[t] : Current(r[1]) = r[2]]
                /\ seq' = seq + 1
                /\ versions' = [k \in Keys |->
                     IF k \in writes[t] THEN versions[k] \cup {[seq |-> seq + 1, value |-> t]}
                     ELSE versions[k]]
                /\ state' = [state EXCEPT ![t] = "committed"]
-  /\ UNCHANGED <<flushed, retained, readSeq, pinned, reads, writes>>
+  /\ UNCHANGED <<flushed, retained, readSeq, pinned, reads, writes, gone>>
 
 \* A plain put: a one-write transaction with no reads.
 DirectWrite(k) ==
   /\ seq < MaxSeq
+  \* Live: leave each transaction a sequence number to commit with
+  /\ Live => seq + Cardinality({t \in Txns : state[t] # "committed"}) < MaxSeq
   /\ seq' = seq + 1
   /\ versions' = [versions EXCEPT ![k] = @ \cup {[seq |-> seq + 1, value |-> Direct]}]
-  /\ UNCHANGED <<flushed, retained, state, readSeq, pinned, reads, writes, okAtCommit>>
+  /\ UNCHANGED <<flushed, retained, state, readSeq, pinned, reads, writes, okAtCommit, gone>>
 
 \* A flush: every committed row into the newest manifest; flushed_seq advances, nothing is deleted.
 Flush ==
   /\ flushed < seq
   /\ flushed' = seq
-  /\ UNCHANGED <<seq, retained, versions, state, readSeq, pinned, reads, writes, okAtCommit>>
+  /\ UNCHANGED <<seq, retained, versions, state, readSeq, pinned, reads, writes, okAtCommit, gone>>
 
 \* A trim: delete flushed rows up to some cut and raise retained_from_seq to it.
 Trim ==
   /\ \E cut \in (retained + 1) .. flushed : retained' = cut
   /\ UNCHANGED <<seq, flushed, versions, state, readSeq, pinned, reads, writes,
+                 okAtCommit, gone>>
+
+---------------------------------------------------------------------------
+\* Live (D111): reads decide as DbReader.manifestFor does, GC deletes a flush's own manifest once
+\* a compaction replaced it (the newest manifest is always stored), and an aborted transaction
+\* is retried. Each transaction reads one key, writes one key, and commits.
+
+\* manifestFor (D76): the newest manifest (its lastL0Seq is flushed) when it fits; otherwise the
+\* begin manifest when it is stored and fits; otherwise SnapshotTooOld. Before D76 a read used
+\* only the begin manifest, the writer's flushed manifest, which is the same deleted one on every
+\* retry until the next flush.
+LiveRead(t, k) ==
+  /\ Live
+  /\ state[t] = "active" /\ reads[t] = {}
+  /\ LET stored(m) == m \notin gone
+         kept == {v \in versions[k] : v.seq > retained /\ v.seq <= readSeq[t]}
+         from(m) == IF kept # {} THEN Newest(kept).value ELSE ValueAt(k, m)
+         newestFits == Broken # "beforeD76" /\ Fits(t, flushed)
+         beginFits == stored(pinned[t]) /\ Fits(t, pinned[t])
+     IN IF newestFits \/ beginFits
+          THEN /\ reads' = [reads EXCEPT ![t] = {<<k, from(IF newestFits THEN flushed ELSE pinned[t])>>}]
+               /\ UNCHANGED state
+          ELSE /\ state' = [state EXCEPT ![t] = "aborted"]
+               /\ UNCHANGED reads
+  /\ UNCHANGED <<seq, flushed, retained, versions, readSeq, pinned, writes, okAtCommit, gone>>
+
+\* GC deletes a flush's own manifest: a compaction replaced it at the head (same lastL0Seq) and
+\* gcMinAge passed. The writer still names it until its next flush.
+Collect ==
+  /\ Live
+  /\ \E m \in 0 .. flushed : m \notin gone /\ gone' = gone \cup {m}
+  /\ UNCHANGED <<seq, flushed, retained, versions, state, readSeq, pinned, reads, writes,
                  okAtCommit>>
 
+\* The caller begins a new transaction and runs it again.
+Retry(t) ==
+  /\ Live /\ state[t] = "aborted"
+  /\ state' = [state EXCEPT ![t] = "idle"]
+  /\ reads' = [reads EXCEPT ![t] = {}] /\ writes' = [writes EXCEPT ![t] = {}]
+  /\ UNCHANGED <<seq, flushed, retained, versions, readSeq, pinned, okAtCommit, gone>>
+
+TxnStep(t) == Begin(t) \/ (\E k \in Keys : LiveRead(t, k) \/ Write(t, k)) \/ Commit(t) \/ Retry(t)
+
 Next ==
-  \/ \E t \in Txns : Begin(t) \/ Commit(t)
+  \/ \E t \in Txns : Begin(t) \/ Commit(t) \/ Retry(t)
+  \/ \E t \in Txns, k \in Keys : LiveRead(t, k)
+  \/ Collect
   \/ \E t \in Txns, k \in Keys : Read(t, k) \/ Write(t, k)
   \/ \E k \in Keys : DirectWrite(k)
   \/ Flush \/ Trim
 
 Spec == Init /\ [][Next]_vars
+
+\* Every transaction keeps running and retrying; writes, flushes, trims, and GC are never forced.
+LiveSpec == Spec /\ \A t \in Txns : WF_vars(TxnStep(t))
 
 \* Keys and transactions are interchangeable: TLC checks one ordering of each.
 Symmetry == Permutations(Keys) \cup Permutations(Txns)
@@ -192,6 +246,10 @@ Serializable == \A t \in Txns : state[t] = "committed" => okAtCommit[t]
 
 \* Every read of a transaction, committed or not (a read-only transaction never commits), returned
 \* the value the database held at the transaction's begin.
+\* Liveness (Live): a transaction that is retried eventually commits. Writes are finite, so
+\* conflicts with real writes end; SnapshotTooOld must end too (D76).
+EveryTxnCommits == \A t \in Txns : <>(state[t] = "committed")
+
 ReadsAtBegin ==
   \A t \in Txns : \A r \in reads[t] : r[2] = ValueAt(r[1], readSeq[t])
 =============================================================================

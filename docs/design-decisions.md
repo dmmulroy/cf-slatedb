@@ -4115,6 +4115,52 @@ configs, with bounds in `.agents/skills/verify-writer-object`.
   `AlarmCovers` excepts these rows. A fix would set the alarm in the same storage turn as the
   commit; it is left to the writer's owner.
 
+## D111. Liveness checked for the writer and transaction models
+
+**Why.** Every model checked safety only: nothing bad happens. D76 (transactions refused forever)
+and D74's alarm loop were "nothing good ever happens", which no invariant sees.
+
+**What "keeps working" means, and where it is checked.**
+
+| Model                                           | Property                                                               | Fairness                                               | Broken value that fails it                  |
+| ----------------------------------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------ | ------------------------------------------- |
+| `WriterObject` (`WriterObjectLive.cfg`)         | `AckedFlushed`: every acknowledged write reaches the manifest          | each started request step and the alarm, strongly fair | `noAlarmRetry` (D102)                       |
+| `WriterObject` (`WriterObjectAlarmLoop.cfg`)    | `AlarmQuiets`: the alarm stops firing                                  | the same                                               | `noSettle` (D74's loop)                     |
+| `NoAckedWriteLost` (`NoAckedWriteLostLive.cfg`) | `EventuallyFlushed`: every acknowledged write is readable at `Flushed` | the flush's steps and the restart, weakly fair         | `noWake` (nothing starts an evicted writer) |
+| `Transactions` (`TransactionsLive.cfg`)         | `EveryTxnCommits`: a transaction retried after each abort commits      | each transaction's steps, weakly fair                  | `beforeD76`                                 |
+
+`Transactions` gains a `Live` constant. With it, a read decides as `DbReader.manifestFor` does,
+GC deletes a flush's own manifest (`Collect`), and an aborted transaction is retried. Writes are
+finite, so conflicts with real writes end. The safety config is unchanged.
+
+**Not checked here.** Liveness for `GcSafety`, `SealSplit`, and `ManifestCasFencing` (a fork
+eventually releases its source, a removal eventually leaves nothing) belongs to the second formal
+agent's `Lifecycle` and `CompactorObject` work (D110, D114).
+
+## D113. The change feed can repeat changes after a flush commit whose response was lost
+
+**Found** while placing the labels of a change-feed model, and shown by a failing test before
+any model was written:
+
+- **The test.** `db-writer.test.ts`, "DbWriter changelog after a flush commit whose response was
+  lost (D113)". The manifest holds the entries `(1, 1)` and `(1, 2)`.
+- **Where the commit lands without an answer.** A flush's manifest create lands, and then
+  `attemptCreate` fails reading GC's boundary, or the `putIfAbsent` response is lost. The flush
+  fails, so `markFlushed` never runs.
+- **The second export.** The next flush exports its changelog from the old `flushed_seq` again
+  (`exportChangelog(meta.flushedSeq, cut)`). `commitL0Flush` appends a second entry.
+- **The repeat.** `DbReader.changelogRows` reads every entry above `afterSeq` in `firstSeq`
+  order and keeps every row in range. A consumer gets sequence number 1 twice: the "same batch"
+  check keeps the repeat inside one batch.
+
+L0 is not affected: the merge removes the duplicate rows.
+
+**Not fixed here.** Two places could fix it; the owners of `db-reader.ts` and `db-writer.ts`
+decide which:
+
+- the feed never returns a sequence number at or below one it already returned;
+- the export starts at the newest `lastL0Seq` the commit finds.
+
 ## D115. A refused flush marks only its own phase fenced; a seal forgets its phase only after applying its edit
 
 **Found by the `WriterObject` model (D109)**, not by an audit. Two TLC counterexamples, both
