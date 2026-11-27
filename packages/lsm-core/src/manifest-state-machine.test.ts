@@ -498,5 +498,6 @@ describe("manifest edits as a state machine (D91)", () => {
       { runs: 3000 },
     );
     expect(failure).toBe("");
-  });
+    // 3,000 runs take 2 to 4 s alone and more beside the other test files: past the default 5 s.
+  }, 60_000);
 });
