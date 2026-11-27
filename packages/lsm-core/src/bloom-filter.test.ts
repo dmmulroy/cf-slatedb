@@ -65,3 +65,49 @@ describe("Bloom filter", () => {
     });
   });
 });
+
+describe("the Bloom filter's on-disk bits (mutation sweep, D117)", () => {
+  // Key n is n bytes long, so the keys cover every tail length of the hash (n mod 4).
+  const keys = Array.from({ length: 10 }, (_, n) =>
+    Uint8Array.from({ length: n }, (_, index) => (n * 37 + index * 11) & 0xff),
+  );
+  const hex = (bytes: Uint8Array) =>
+    Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+
+  it("builds exactly the filters SSTs already store: the hash and the probe positions are a format", () => {
+    // Written SSTs hold these bits. A filter built differently answers `absent` for keys they hold.
+    expect(keys.map((key) => hex(buildBloomFilter([key], 10).bits))).toEqual([
+      "8040000402011008",
+      "0882000041100020",
+      "0208102040800001",
+      "1280002000094000",
+      "0880400004022010",
+      "0000489224000000",
+      "0102040810408000",
+      "0040100401008220",
+      "0240008800100120",
+      "0088001001200240",
+    ]);
+    const all = buildBloomFilter(keys, 10);
+    expect([all.numHashes, hex(all.bits)]).toEqual([7, "9020f8108f8e9a92cd2b737f50"]);
+  });
+
+  it("holds every key after the builder grows, and a filter with no bits answers maybe", () => {
+    const many = Array.from({ length: 3_000 }, (_, index) =>
+      Uint8Array.of(index >> 8, index & 0xff, 7),
+    );
+    const filter = buildBloomFilter(many, 10);
+    expect(many.every((key) => bloomFilterMayContain(filter, key))).toBe(true);
+    expect(bloomFilterMayContain({ numHashes: 7, bits: new Uint8Array(0) }, Uint8Array.of(1))).toBe(
+      true,
+    );
+  });
+
+  it("clamps the probe count to 1-30, as documented", () => {
+    const probes = (bitsPerKey: number) =>
+      buildBloomFilter([Uint8Array.of(1)], bitsPerKey).numHashes;
+    expect([probes(0.1), probes(10), probes(43), probes(44), probes(1_000)]).toEqual([
+      1, 7, 30, 30, 30,
+    ]);
+  });
+});

@@ -395,7 +395,7 @@ describe("row resolution at its edges (mutation sweep, D117)", () => {
       seq: SeqNum.make(seq),
       value: RowValue.Value({ bytes: Uint8Array.of(seq) }),
       createTs: Option.none(),
-      expireTs: Option.map(expireTs, Timestamp.make),
+      expireTs: Option.map(expireTs, (ms) => Timestamp.make(ms)),
     });
     const atBottom = retainKeyVersions([value(2, Option.some(50)), value(1, Option.none())], {
       now: Timestamp.make(100),
