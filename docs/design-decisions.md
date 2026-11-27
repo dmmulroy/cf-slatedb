@@ -4292,3 +4292,71 @@ needs a decision of its own (`CROSS:` to the API owner).
 first page answers 200 with no rows and a `resumeFrom`, and following `resumeFrom` returns exactly
 the live key, with every page answered. Three mutations caught: no budget, the handler requiring a
 row to end early, and versions not counted.
+
+## D119. A reused id's chain continues past its tombstone; no incarnation id in v1
+
+D90 left two hazards for an id reused after a removal. Each is a concrete sequence, and each had
+a failing test (`database-lifecycle.test.ts`).
+
+- **An old snapshot.**
+  1. A client takes a `DbSnapshot` (manifest 3, sequence number 1).
+  2. The database is removed. After `gcMinAge` the id is created again.
+  3. The new chain's manifests 1 to 3 are its init, its writer's fence, and its first flush,
+     which is also sequence number 1.
+  4. A read at the old snapshot returned the new database's value (`new-0`), not
+     `SnapshotExpired`. The snapshot's promise had ended, but the documented answer for an
+     expired snapshot is `SnapshotExpired`.
+- **An old compaction.**
+  1. A job of the removed database merges its sorted run 0 at compactor epoch 1, and outlives
+     the removal by more than `gcMinAge`. A fork's rewrite reads its source's SSTs, which the
+     removal does not delete, and D103 puts a large job at about an hour per 8 GiB.
+  2. The new chain's first compactor also fences in at epoch 1, and the new chain also has a run 0.
+  3. The old commit's epoch and inputs check passed: it would have replaced the new run with
+     the old outputs. The test commits it by hand, so it shows the checks passing.
+
+**The rule.** When `create` clears a removed incarnation's tombstone (D91), the new chain starts
+past it:
+
+- `lastL0Seq` = the tombstone's + 1 (and `changelogAfterSeq` there);
+- `lastL0ClockTick` = the tombstone's;
+- writer and compactor epochs = the tombstone's + 1.
+
+Every old job's epoch is then below the new chain's, so `commitCompaction` fences it. Every old
+handle's sequence number is at or below the tombstone's, so no manifest of the new chain matches
+it. A snapshot read now also uses its manifest only when that manifest's `lastL0Seq` equals the
+snapshot's sequence number, which every snapshot this code issues satisfies (`snapshot`,
+`pinSnapshot`). Otherwise the read is `SnapshotExpired`.
+
+**Why not an incarnation id.** Both hazards need a handle or a job of the removed database that
+outlives its removal by more than `gcMinAge`. While the tombstone exists, continuing the
+numbering closes both with no format or protocol change.
+
+**What remains.** The sweep deletes a cleared tombstone `gcMinAge` after the removal, and the
+next sweep cycle at most later. A `create` after that finds no tombstone, and its chain starts
+at 0 again. Both hazards then need an old handle or job that outlives the removal by more than
+`gcMinAge` plus that wait. The snapshot's promise ended long before. A compaction job's steps
+read inputs the removal deleted, except a fork's rewrite.
+
+**Tests** (`database-lifecycle.test.ts`):
+
+- an old snapshot reads `SnapshotExpired` after the id's reuse;
+- an old compaction over a run with the new chain's id is `CompactorFenced`;
+- after an interrupted removal, the new chain's first write is sequence number 3, past the
+  tombstone's 1.
+
+Mutations: dropping the sequence carry, the compactor-epoch carry, or the snapshot's sequence
+check is each caught. Dropping the writer-epoch carry is equivalent: the removal destroys the
+writer under its commit and flush locks, so no writer of the removed database can commit later.
+
+**Also in this round.**
+
+- **A missing Workflow instance** finishes its job on the next poll (`compactor.test.ts`, a
+  fake launcher that reports it). The D94 lease covers an unreadable one.
+- **A thousand caller checkpoints** (half pinned snapshots, half checkpoints with 256-character
+  names):
+  - The newest manifest is 242,091 bytes, 6% of the 4 MiB budget. The 1,001st checkpoint is
+    refused, and a commit and a cold read work.
+  - A collection reads the 1,000 pinned manifests, 121 MB in all. That is a cost each pinned
+    snapshot's expiry repeats, and it is left to the GC owner.
+- **`manifest-state-machine.test.ts`** gets a 60 s limit. Beside the package's other files it
+  ran past the default 5 s.
