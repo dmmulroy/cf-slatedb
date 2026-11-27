@@ -994,6 +994,133 @@ describe("Compactor fence-in (D78)", () => {
   });
 });
 
+describe("Compactor jobs launched by a poll that died (D116)", () => {
+  it("a job launched by a poll that was evicted before recording it still blocks a drop of its sources", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createWithL0(ORDERS, 4);
+        const reader = yield* ManifestReader;
+        const oldest = (yield* reader.loadLatest(ORDERS)).manifest.l0.at(-1);
+        if (oldest === undefined) return yield* Effect.die("expected four L0 SSTs");
+        // Workflows accepts the job, which keeps running; the poll is evicted right after the
+        // launch, before its state write.
+        const started: Array<string> = [];
+        const evictingLauncher = CompactionLauncher.of({
+          start: (params) =>
+            Effect.sync(() => void started.push(params.jobId)).pipe(
+              Effect.andThen(Effect.interrupt),
+            ),
+          progress: () => Effect.succeed({ _tag: "Running" as const }),
+        });
+        const shared = yield* Effect.context<
+          ManifestReader | ManifestStore | CompactionBudget | LsmConfiguration | GarbageCollector
+        >();
+        const built = yield* Layer.build(
+          compactorLayerWithoutDependencies.pipe(
+            Layer.provideMerge(
+              Layer.mergeAll(compactorStateCellTestLayer, durableObjectAlarmTestLayer),
+            ),
+            Layer.provide(
+              Layer.succeedContext(shared.pipe(Context.add(CompactionLauncher, evictingLauncher))),
+            ),
+          ),
+        );
+        const compactor = Context.get(built, Compactor);
+        const alarm = Context.get(built, DurableObjectAlarm);
+        yield* compactor.wake(ORDERS);
+        yield* Effect.exit(Effect.andThen(alarm.cancel, compactor.runAlarm));
+        // An operator force-drops the oldest L0 SST, which the running job reads.
+        const dropped = yield* Effect.result(
+          compactor.dropSst(ORDERS, { sstId: oldest.id, force: true }),
+        );
+        return {
+          started: started.length,
+          drop:
+            dropped._tag === "Success"
+              ? "dropped"
+              : dropped.failure._tag === "SstDropRefusedError"
+                ? dropped.failure.reason
+                : dropped.failure._tag,
+        };
+      }),
+    );
+    // The state recorded the job before its launch, so the drop sees it and is refused.
+    expect(outcome).toEqual({ started: 1, drop: "CompactionRunning" });
+  });
+});
+
+describe("Compactor launches whose reply was lost (D116)", () => {
+  it("a start that failed after Workflows created the instance leaves the job recorded until a read finishes it", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createWithL0(ORDERS, 4);
+        // Workflows creates the instance, and the reply is lost.
+        const created = new Set<string>();
+        const finished = new Set<string>();
+        const lossyLauncher = CompactionLauncher.of({
+          start: (params) =>
+            Effect.sync(() => void created.add(params.jobId)).pipe(
+              Effect.andThen(
+                Effect.fail(
+                  new CompactionLauncherUnavailableError({
+                    jobId: params.jobId,
+                    message: "reply lost",
+                  }),
+                ),
+              ),
+            ),
+          progress: (jobId) =>
+            Effect.succeed(
+              created.has(jobId) && !finished.has(jobId)
+                ? { _tag: "Running" as const }
+                : { _tag: "Finished" as const, outcome: Option.none() },
+            ),
+        });
+        const shared = yield* Effect.context<
+          ManifestReader | ManifestStore | CompactionBudget | LsmConfiguration | GarbageCollector
+        >();
+        const built = yield* Layer.build(
+          compactorLayerWithoutDependencies.pipe(
+            Layer.provideMerge(
+              Layer.mergeAll(compactorStateCellTestLayer, durableObjectAlarmTestLayer),
+            ),
+            Layer.provide(
+              Layer.succeedContext(shared.pipe(Context.add(CompactionLauncher, lossyLauncher))),
+            ),
+          ),
+        );
+        const compactor = Context.get(built, Compactor);
+        const alarm = Context.get(built, DurableObjectAlarm);
+        const fire = Effect.andThen(alarm.cancel, compactor.runAlarm);
+        const runningIds = Effect.map(compactor.status(ORDERS), (state) =>
+          Option.match(state, {
+            onNone: () => [],
+            onSome: (current) => current.running.map((job) => job.jobId),
+          }),
+        );
+        yield* compactor.wake(ORDERS);
+        yield* fire;
+        const afterStart = yield* runningIds;
+        yield* TestClock.adjust("5 seconds");
+        yield* fire;
+        const whileRunning = yield* runningIds;
+        for (const jobId of created) finished.add(jobId);
+        yield* TestClock.adjust("5 seconds");
+        yield* fire;
+        const afterFinish = yield* runningIds;
+        return {
+          created: created.size,
+          afterStart: afterStart.length,
+          kept: whileRunning.join() === afterStart.join(),
+          // Finished, it leaves the record; its sources are planned again (another start).
+          replaced: afterFinish.length === 1 && afterFinish[0] !== afterStart[0],
+        };
+      }),
+    );
+    expect(outcome).toEqual({ created: 2, afterStart: 1, kept: true, replaced: true });
+  });
+});
+
 describe("Compactor jobs it can no longer see (D94)", () => {
   it("a job whose progress cannot be read for compactionLeaseMs is finished, freeing its lease and sources", async () => {
     const outcome = await run(

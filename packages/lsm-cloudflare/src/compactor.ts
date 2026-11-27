@@ -590,25 +590,46 @@ export const makeCompactor = Effect.gen(function* () {
         }
         // Before the launch: the job's outputs are written after it, so none is older (D96).
         const startedAt = Timestamp.make(yield* Clock.currentTimeMillis);
+        const entry: RunningCompaction = {
+          jobId,
+          job,
+          budgetGroup: group,
+          startedAt,
+          lastProgressAt: Option.none(),
+        };
+        // Recorded before it is launched (D116): a poll evicted after the launch leaves the job in
+        // the state, so a drop of its sources is refused (D62), GC keeps its outputs (D96), and
+        // the next poll renews its lease. A recorded job that was never launched reads as missing
+        // and is finished at once (D103).
+        const recorded = yield* updateExisting(databaseId, (current) =>
+          current.compactorEpoch === state.compactorEpoch && !current.fenced
+            ? { ...current, running: [...current.running, entry] }
+            : current,
+        );
+        if (
+          !Option.exists(
+            recorded,
+            (current) => current.compactorEpoch === state.compactorEpoch && !current.fenced,
+          )
+        ) {
+          yield* Effect.ignore(budget.release(holder(state, jobId)));
+          break;
+        }
         const started = yield* launcher
           .start({ databaseId, compactorEpoch: state.compactorEpoch, jobId, job })
           .pipe(
             Effect.as(true),
             Effect.catchTags({ CompactionLauncherUnavailableError: () => Effect.succeed(false) }),
           );
+        // A failed start may still have created the instance (its reply lost): the job stays
+        // recorded with its lease, and the next poll's progress read finishes it if Workflows
+        // does not hold it (D103), or keeps it if it runs.
+        running.push(entry);
         if (!started) {
-          yield* Effect.ignore(budget.release(holder(state, jobId)));
           waitingForBudget = true;
           break;
         }
         yield* Metric.update(compactionsStarted, 1);
-        running.push({
-          jobId,
-          job,
-          budgetGroup: group,
-          startedAt,
-          lastProgressAt: Option.none(),
-        });
       }
       // A finished job left garbage (its inputs, older manifests): collectable after gcMinAge.
       const anyFinished = state.running.some(
