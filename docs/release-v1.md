@@ -959,18 +959,53 @@ What v1 does not do, or has not measured.
 - **Above about 1.4 commits a second, sustained for an hour, SST collection is deferred** (D98). Old
   manifests are still deleted, but unreferenced SSTs wait until the rate falls. Storage grows
   meanwhile, and `measure health` reports the deferral.
-- **A public scan page is bounded by 1,000 rows and by 16 MiB of versions examined**
-  (`SCAN_PAGE_EXAMINED_BYTES`, D108). Returned rows count toward the 16 MiB, so a page holds at most
-  about 16 MiB plus one row. A page over deleted or expired rows may return fewer rows, or none,
-  with a `resumeFrom` to follow.
+- **Every scan page, on all three surfaces, is bounded** (D108, D125; the two new rows of
+  `docs/api-compatibility.md`, "Limits of v1"). This covers the regular, the transaction, and the
+  sharded scan:
+  - **Rows:** at most 1,000.
+  - **Work:** at most 16 MiB of versions examined (`SCAN_PAGE_EXAMINED_BYTES`).
+  - **Memory:** at most one writer page (8 MiB and 1,000 rows), 16 MiB of returned rows, one key's
+    versions, and the reader's blocks in flight. This is derived from the constants, not measured
+    live.
+  - **A short page is not the end.** A page over deleted or expired rows may return fewer rows, or
+    none, with a `resumeFrom` to follow. A null `resumeFrom` is the end.
+- **A long run of one key's merge operands is read whole** (D125). A page that starts such a key
+  finishes it, so one page can read up to `maxUnflushedBytes` (256 MiB) of one hot counter's
+  unflushed operands. D99 bounds only the merged result.
+- **A routed scan is not one snapshot across shards** (D125). A transaction's scan pages all read
+  at its `readSeq`. Its commit's `readRanges` must name the whole range scanned, not each page's
+  part. Naming only what a page returned lets a phantom past an early page commit. The in-Worker
+  `DbClient.scanAt` keeps its signature and has no budget.
+- **The sharded scan's HTTP response is not checked in workerd** (D125). Its router is tested
+  in-process.
+- **The change feed can return a change twice** (D113, not fixed at `c149afb`). This happens after
+  a flush commit whose response was lost: the next flush exports the same rows again. A consumer
+  that applies changes by sequence number, ignoring any at or below the last one applied, is not
+  affected. L0 is not affected.
+- **A read of a corrupted SST answers `InternalFailure`** (500, not retryable), not the
+  `StoredDataInvalid` the corruption runbook names (D128). The fix is on `proto/audit-api`
+  (`edfe57b`), not merged at `c149afb`. Until it is, the runbook's signal for such a read is
+  `InternalFailure` with the request id.
+- **A write evicted after its SQLite commit and before its alarm is set** (D109, a risk, not fixed).
+  The row is not acknowledged, but it is durable, and `Latest` reads see it. It has no alarm until
+  the next request to that writer, so a database that gets no further writer request never
+  flushes it. Whether the platform can evict there depends on the output gate.
+- **A stale flush view after a restart** (D115). Two guards on a flush's view install are reached by
+  no test. Their only effect is a stale view, which the next commit reloads, and a stale `l0Count`
+  in `status`.
+- **A reused id starts its numbering at 0 again once the sweep has deleted its tombstone** (D119).
+  That is `gcMinAge` after the removal, plus up to one sweep cycle. An old snapshot or compaction
+  job of the removed database would have to outlive that to meet the new chain.
+- **A collection reads every manifest a checkpoint pins, whole** (D119, D129). With 128 pins of
+  4 MiB manifests that is 512 MiB per collection (derived; about 5 s of decoding in Node). D98's
+  5,000-load budget counts young manifests by number, not bytes: up to 20 GiB at 4 MiB manifests
+  (derived), left to D98's owner.
+- **Workers Logs are not under the trace policy** (D123). The runtime's own console output gets each
+  log line's full message. No call site puts a key there.
 - **Alarms back off.** A writer's or compactor's alarm that keeps failing retries from 1 s, doubling
   to a ceiling (`maxL0Age`, 60 s, for the writer), and never stops (D102). An outage of R2 therefore
   delays flushes by up to a minute after it ends.
-- **Not reached by the audits.** These were not checked:
-  - a compaction step's memory with 8 inputs (needs workerd);
-  - the `BlockServer` under a hostile caller;
-  - `MemTable` migrations;
-  - the tools.
+- **Not reached by any audit, model, or sweep:** the list at the end of section 8.
 
 **Storage.**
 
@@ -1025,7 +1060,10 @@ the account's Workflows) are now refused when a deploy is planned.
 - **GC at scale used dev timings** (`gcMinAge` 10 s), not production's 1 hour (D60).
 - **D70's race was never reproduced live.** The fix rests on the model, on `db-client.test.ts`,
   and on mutation checks.
-- **The newest changes have no long soak yet.** That covers D76–D108 (section 5).
+- **The newest changes have no long soak yet.** D76–D108 have a 21.6-minute soak (on `d89beba`),
+  and the 130-minute one is running. D109–D129 have no soak at all (section 5).
+- **One formal run is not yet observed at `c149afb`.** `Transactions.cfg` with the code as
+  written timed out at 420 s under load with 2 TLC workers (D111, `docs/progress.md`).
 - **The rebuilt soak tool ran live once** (`preview-3`, a 6-minute forced-backlog test,
   `/tmp/shale-work/release2/NOTES.md`): it reached `done` with a bounded telemetry phase. The run
   also found that a failed soak exited 0, which is fixed. The production telemetry reads have not
@@ -1075,6 +1113,9 @@ Alchemy's Cloudflare profile.
 
    This runs `node src/access-tokens-cli.ts ensure production`. It creates
    `SHALEDB_PRODUCTION_ACCESS_TOKEN_A` and `_B` in `default_secrets_store`.
+   If a written secret has not turned `active` after 20 reads, 500 ms apart, the command still
+   shows the tokens. It then exits non-zero with `SecretNotActive`, naming the secrets (D121). Do
+   not write the tokens again: wait, then deploy.
 
 2. **Let the deploy through the guard (only if an agent will run the tasks).** pi's Cloudflare
    deployment guard (`~/.pi/agent/cloudflare-deployment-allowlist.json`) holds agents' deploys to
@@ -1107,13 +1148,18 @@ Alchemy's Cloudflare profile.
    `STAGES='["dev","preview-1","preview-2","preview-3"]'` to include `"production"` before running
    it. Then restart the agent's pi session, or confirm the change when it asks.
 
-   Three things found while writing this, still true at `fec2698`:
+   Found while writing this, and rechecked on 2026-11-27 by reading the allowlist and the guard:
 
    - **The current allowlist has no `Shaledb` entry.** Its only entry for this repository is the
      pre-rename `.../cf-slatedb/infra/cf-slatedb/alchemy.run.ts` (stack `CfSlatedb`). That path no
      longer exists, so the guard skips it (`policy.ts`, `parseCloudflareDeploymentPolicy`, which
      records it in `ignoredEntries`). Run the
      script once, whatever you decide about production.
+   - **So today the guard treats this repository as not allowlisted,** and it resolves package
+     tasks here (`evaluatePackageTask` in `evaluate.ts`). It evaluates the `alchemy destroy` inside
+     `vp run @shaledb/infra#destroy:preview-1` against the policy, as it would a typed command,
+     instead of exempting it. The two points below hold once the
+     script has run.
    - **The stage list does not keep agents off production.** Once any project in a repository is
      allowlisted, the guard exempts the whole repository and every worktree of it, matched by the
      shared git directory (`isAllowlistedRepositoryWorkingDirectory` in `policy.ts`;
@@ -1271,6 +1317,35 @@ A rollback to a commit before D76, D77, or D78 brings back those defects (sectio
 D77 and D78 change no stored format: the compactor state keeps format 1, and D78's
 read-modify-write needs no new field. D94's `lastProgressAt` and D103's `recentCompactionJobIds` are
 optional fields that older code ignores. A rollback past D77 or D78 brings back those defects.
+
+**Where a rollback can go.** Production starts at the release commit, so a production rollback
+goes to a commit at or after it (D105). Older commits matter only for the previews, which run
+them today.
+
+**Stored formats from `d89beba` to `c149afb`.** No stored record's schema changed:
+`git diff d89beba..c149afb` over `manifest.ts`, `compactor.ts`, `shard-map.ts`, and `mem-table.ts`
+adds no field and changes no format constant. D129 changes a cap, D119 changes where a new
+chain's numbering starts, and D116 changes when a job is recorded, all with existing fields. The
+fixtures hold every stored field, and their tests pass at `c149afb`
+(`manifest-format-fixtures.test.ts`, 6 tests; `stored-format-fixtures.test.ts`, 3 tests; run for
+this pass). D105's table of fields older code drops is therefore unchanged.
+
+**What a rollback below the release commit would bring back** (previews only):
+
+- D115, D116, and D119's defects, which are fixed only on the integration branch.
+- The transaction and sharded scans without a work budget (D125). Their responses have no
+  `resumeFrom`. A caller that follows `resumeFrom` would stop after one page, even when the page
+  held `limit` rows.
+- Below D91, the tombstone behavior D105 describes. Avoid removing databases while rolled back
+  across D91 (`docs/operations.md`).
+
+**Not shown here, because it needs workerd or the older code itself:**
+
+- What `f3b2ad2` and `c3807f7` do with a tombstone was read from their code, not run (D105).
+- The request-body bound's two paths only the Workers runtime takes (D100's correction, D128's
+  two survivors).
+- The sharded scan's HTTP response (D125).
+- A compaction step's memory with 8 inputs.
 
 Nothing removes production. Its LSM bucket is retained (`RemovalPolicy.retain` in
 `packages/lsm-cloudflare/src/lsm-bucket.ts`) and is not `forceDestroy`.
