@@ -24,7 +24,11 @@ import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
 import { GarbageCollector, makeGarbageCollector } from "./garbage-collector.ts";
-import { CompactionBudget, compactionBudgetTestLayer } from "./compaction-budget.ts";
+import {
+  CompactionBudget,
+  compactionBudgetTestLayer,
+  CompactionBudgetUnavailableError,
+} from "./compaction-budget.ts";
 import { makeCompactionExecutor, CompactionExecutor } from "./compaction-executor.ts";
 import {
   CompactionLauncher,
@@ -1501,5 +1505,86 @@ describe("Compactor edges (mutation sweep, D127)", () => {
       dropped: { _tag: "SortedRun", id: 0 },
       runs: 0,
     });
+  });
+
+  it("an unreadable job is kept 1 ms short of compactionLeaseMs and finished exactly at it (D94, D127)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createWithL0(ORDERS, 4);
+        const settings = yield* LsmConfiguration;
+        // Workflows accepts the job, then can never report it (a purged instance, or the
+        // service unreachable): every progress read fails.
+        const started: Array<string> = [];
+        const blindLauncher = CompactionLauncher.of({
+          start: (params) => Effect.sync(() => void started.push(params.jobId)),
+          progress: (jobId) =>
+            Effect.fail(
+              new CompactionLauncherUnavailableError({ jobId, message: "instance not found" }),
+            ),
+        });
+        const shared = yield* Effect.context<
+          ManifestReader | ManifestStore | CompactionBudget | LsmConfiguration | GarbageCollector
+        >();
+        const built = yield* Layer.build(
+          compactorLayerWithoutDependencies.pipe(
+            Layer.provideMerge(
+              Layer.mergeAll(compactorStateCellTestLayer, durableObjectAlarmTestLayer),
+            ),
+            Layer.provide(
+              Layer.succeedContext(shared.pipe(Context.add(CompactionLauncher, blindLauncher))),
+            ),
+          ),
+        );
+        const compactor = Context.get(built, Compactor);
+        const alarm = Context.get(built, DurableObjectAlarm);
+        const fire = Effect.andThen(alarm.cancel, compactor.runAlarm);
+        const runningIds = Effect.map(compactor.status(ORDERS), (state) =>
+          Option.match(state, {
+            onNone: () => [],
+            onSome: (current) => current.running.map((job) => job.jobId),
+          }),
+        );
+        yield* compactor.wake(ORDERS);
+        yield* fire;
+        const first = yield* runningIds;
+        // The job started at the first poll's time; no read has seen it running since.
+        yield* TestClock.adjust(settings.compactionLeaseMs - 1);
+        yield* fire;
+        const justShort = yield* runningIds;
+        yield* TestClock.adjust(1);
+        yield* fire;
+        const atBound = yield* runningIds;
+        return {
+          kept: justShort.join() === first.join(),
+          finishedAtBound: atBound.length === 1 && atBound[0] !== first[0],
+        };
+      }),
+    );
+    expect(outcome).toEqual({ kept: true, finishedAtBound: true });
+  });
+
+  it("launches nothing while the compaction budget cannot be reached (D127)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createWithL0(ORDERS, 4);
+        const unreachable = CompactionBudget.of({
+          acquire: () =>
+            Effect.fail(new CompactionBudgetUnavailableError({ message: "budget down" })),
+          release: () => Effect.void,
+        });
+        return yield* Effect.gen(function* () {
+          const { compactor, fire } = yield* startCompactor;
+          yield* compactor.wake(ORDERS);
+          yield* fire;
+          const jobs = yield* Ref.get(yield* CompactionLauncherRecord);
+          const state = yield* compactor.status(ORDERS);
+          return {
+            launched: jobs.size,
+            running: Option.map(state, (current) => current.running.length),
+          };
+        }).pipe(Effect.provideService(CompactionBudget, unreachable));
+      }),
+    );
+    expect(outcome).toEqual({ launched: 0, running: Option.some(0) });
   });
 });
