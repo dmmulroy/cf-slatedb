@@ -17,7 +17,6 @@ import { ScanRequest } from "./db-http-api.ts";
 import { dbHttpRouterLayer } from "./db-http-handlers.ts";
 import { dbServicesTestLayer } from "./db-services.ts";
 import { lsmTestRuntimeContextLayer, serveLsmTestRequest } from "./lsm-test-runtime.ts";
-import { WriterClient } from "./writer-client.ts";
 
 /**
  * Random request bodies around every bound (D100): each is either accepted by the endpoint's
@@ -96,7 +95,6 @@ describe("random bodies around every bound (D100)", () => {
         keyRange: Option.none(),
         databaseOptions: DEFAULT_DATABASE_OPTIONS,
       });
-      const writer = yield* WriterClient;
       let count = 0;
       let ran = 0;
       for (let round = 0; round < 60; round++) {
@@ -104,13 +102,20 @@ describe("random bodies around every bound (D100)", () => {
           const candidate = body();
           const decoded = Schema.decodeUnknownExit(schema)(candidate);
           if (Exit.isSuccess(decoded)) {
-            // An accepted write runs: it commits, or fails with a typed error, never a defect.
+            // An accepted write runs through the API to the writer: it commits, or fails with a
+            // typed 4xx answer, never a 5xx (the in-process writer starts as a Durable Object does,
+            // D131).
             const batch = Schema.decodeUnknownExit(RequestWriteBatch)(candidate);
             if (path.endsWith("/batches") && Exit.isSuccess(batch)) {
-              const written = yield* Effect.exit(
-                writer.write(DatabaseId.make("orders"), batch.value),
+              const written = yield* serveLsmTestRequest(
+                app,
+                new Request(`http://api.internal${path}`, {
+                  method: "POST",
+                  headers: { "content-type": "application/json" },
+                  body: JSON.stringify(candidate),
+                }),
               );
-              expect(Exit.hasDies(written), String(written)).toBe(false);
+              expect(written.status, written.text.slice(0, 300)).toBeLessThan(500);
               ran += 1;
             }
             continue;
