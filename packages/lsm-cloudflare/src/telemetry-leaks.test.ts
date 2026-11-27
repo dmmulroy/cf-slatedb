@@ -8,7 +8,7 @@ import {
   SeqNum,
   Timestamp,
 } from "@shaledb/lsm-core";
-import { Cause, Effect, Option, Result, Schema, Tracer } from "effect";
+import { Cause, Context, Effect, Option, Result, Schema, Tracer } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 
 import { ReaderUnavailableError } from "./db-reader.ts";
@@ -114,6 +114,48 @@ describe("no key or value leaves through telemetry (D123)", () => {
         ).toBe(true);
       }
     }
+  });
+
+  it("keeps an event's allowed attributes, and an event with none (mutation sweep, D128)", () => {
+    const recorded: Array<[string, Record<string, unknown> | undefined]> = [];
+    const inner = Tracer.make({
+      span: (options) => {
+        const span = new Tracer.NativeSpan(options);
+        span.event = (name, _time, attributes) => {
+          recorded.push([name, attributes]);
+        };
+        return span;
+      },
+    });
+    const span = lsmPolicyTracer(inner, { sampleRate: 1 }).span({
+      name: "s",
+      parent: Option.none(),
+      annotations: Context.empty(),
+      links: [],
+      startTime: 0n,
+      kind: "internal",
+      root: false,
+      sampled: true,
+    });
+    span.event("plain", 0n, undefined);
+    span.event("logged", 0n, {
+      "effect.logLevel": "WARN",
+      "database.id": "orders",
+      key: "MKSECRET",
+    });
+    expect(recorded).toEqual([
+      ["plain", undefined],
+      ["logged", { "effect.logLevel": "WARN", "database.id": "orders" }],
+    ]);
+  });
+
+  it("keeps the inner tracer's context hook, so spans run in the exporter's context (D128)", () => {
+    const context: Tracer.Tracer["context"] = (primitive, fiber) =>
+      primitive["~effect/Effect/evaluate"](fiber);
+    const inner = Tracer.make({ span: (options) => new Tracer.NativeSpan(options), context });
+    expect(lsmPolicyTracer(inner, { sampleRate: 1 }).context).toBe(context);
+    const bare = Tracer.make({ span: (options) => new Tracer.NativeSpan(options) });
+    expect(lsmPolicyTracer(bare, { sampleRate: 1 }).context).toBeUndefined();
   });
 
   it("keeps a log message's string parts and only those", () => {
