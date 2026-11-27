@@ -15,7 +15,7 @@ checklist and Dillon's go-ahead (P6). The decisions asked of Dillon are under "O
 | 6. Writer throughput and limits           | done        | `308defd`            |
 | 7. Corruption: prevent, detect, repair    | done        | `2cb5116`            |
 | 8. Production telemetry                   | done        | `62eab3d`            |
-| 9. Production readiness                   | done        | this commit          |
+| 9. Production readiness                   | done        | `8a96667`            |
 | 10. Soak, release checklist, the go-ahead | in progress |                      |
 
 The previous round (all ten build phases and `docs/handoff.md`'s seven items) is complete; its
@@ -341,6 +341,52 @@ hand-off is below.
   - **A property test** applies every manifest edit as a state machine.
   - **Model:** `ManifestCasFencingRemove.cfg`.
   - **Not run:** workerd, scenarios, previews.
+
+- **Decisions D76 to D108 and D123, one line each** (the decisions hold the detail; the audit
+  agents' reports, under `/tmp/shale-work/agents/`, hold the evidence).
+  - **D76:** a transaction reads the newest manifest when it fits; a snapshot is taken at the
+    newest manifest (found by checking `docs/invariants.md` against the code).
+  - **D79:** the sharded API answers refused requests with the public envelope and is outside
+    `/v1`'s contract.
+  - **D82:** every signal the operations guide names is read from a span or a tail record;
+    metrics are emitted and not collected.
+  - **D84:** a `Snapshot` commit re-reads the horizon after its conflict queries (a lost update).
+  - **D85:** a seal that does not return forgets the writer's phase; an alarm for a removed
+    database stops.
+  - **D86:** a compaction's `prepare` step records its inputs' ids, not their handles (the 1 MiB
+    step result).
+  - **D87:** settings must leave L0 enough SSTs to compact before writes stop.
+  - **D88:** TTL and lifetime bounded at 100 years; truthful answers to retried requests.
+  - **D89:** a shard router refreshes a map older than a second before a `Flushed` or `AtLeast`
+    read.
+  - **D92:** Cloudflare's platform limits against shaledb's demand; settings the platform cannot
+    hold are refused.
+  - **D93:** a `Latest` scan pulls the writer's pages as it needs them; every memtable page is
+    bounded by bytes; the change feed pages whole batches.
+  - **D94:** a compaction job unseen for `compactionLeaseMs` is finished.
+  - **D95:** a seal naming other successors than the recorded ones fails.
+  - **D96:** a collection keeps what a running compaction may have written.
+  - **D97:** a compaction step is bounded by the input it merges.
+  - **D98:** a collection that retains too many manifests defers SST deletion and still makes
+    progress.
+  - **D99:** bounds on checkpoints, the changelog, merged values, names, and the manifest; the
+    compactor's subrequest limit.
+  - **D100:** every request is bounded: the body (16 MiB), every string, bytes, and array field.
+  - **D101:** a request that waits out an abandoned split finishes it.
+  - **D102:** one alarm retry rule, with backoff, for the writer and the compactor; the writer's
+    view and its alarm are set by one party at a time.
+  - **D103:** a compaction's commit records its job; a missing Workflow instance is finished; what
+    a large compaction needs (the database size bound by Workflow steps).
+  - **D104:** what the first production deploy creates, its tokens, and its smoke test (read, never
+    run).
+  - **D105:** rollback against the stored formats, with fixtures for `f3b2ad2` and `c3807f7`.
+  - **D106:** the soak exercises the classes of defect the v1 audits found.
+  - **D107:** an SST's metadata stays a small fraction of its data, whatever its key size.
+  - **D108:** a scan page examines at most 16 MiB and ends early, resumably.
+  - **D123:** span events pass the trace policy, so no log line's object parts or annotations
+    export a key or value.
+  - **Still on their branches:** the formal models (D109 and on) and the mutation sweeps (D117 to
+    D122).
 
 ## Remaining-work log
 

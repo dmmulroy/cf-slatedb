@@ -330,13 +330,13 @@ From the main checkout, on `main`, after the merge:
 
 ```sh
 cd /Users/dmmulroy/Code/personal/cf-slatedb
-for name in integ2 audit-api audit-do audit-lifecycle audit-limits audit-workflow review \
+for name in integ2 audit-api audit-do audit-lifecycle audit-limits audit-workflow formal review \
   prod-health feed-ttl fork-hold compactor-fence txn-fix soak-tool docs baseline candidate \
   writer-counters tools newest-flush flush-cpu background-wake hedged-reads limit-read-ahead \
   refresh-from-cached release-doc; do
   git worktree remove "/tmp/shale-work/wt/$name"
 done
-for name in integration-2 audit-api audit-do audit-lifecycle audit-limits audit-workflow review \
+for name in integration-2 audit-api audit-do audit-lifecycle mut-read formal audit-limits audit-workflow review \
   prod-health feed-ttl fork-hold compactor-fence txn-fix soak-tool docs baseline candidate \
   writer-counters tools newest-flush flush-cpu background-wake hedged-reads limit-read-ahead \
   refresh-from-cached release-doc; do

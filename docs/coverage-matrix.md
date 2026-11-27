@@ -528,6 +528,25 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   span events as well as attributes (`exportedEventName`, `isExportedEventAttribute`). Tests:
   `telemetry-leaks.test.ts` (random markers through the policy and through public error bodies;
   schema issues of bytes fields), `lsm-trace-policy.test.ts`.
+- **Transactions after GC (D76)** — done. `DbReader.manifestFor` reads the newest manifest when it
+  fits the transaction's bounds, else the begin manifest; `DbClient.snapshot` loads the newest.
+  Tests: `db-transaction.test.ts`, `db-client.test.ts`. Formal: `Transactions.tla` `ReadsAtBegin`,
+  `noReadUpperBound`.
+- **Review of D76 (D83)** — done. Transaction reads over any cached manifest that fits; concurrent
+  collections; a collection without a retained manifest above GC's boundary deletes nothing.
+  Tests: `db-transaction.test.ts`, `garbage-collector.test.ts`, `database-lifecycle.test.ts`,
+  `db-client.test.ts`. Formal: `Transactions.tla` `Read` over any fitting manifest.
+- **A seal with other successors (D95)** — done. `DbWriter.seal` refuses successors other than the
+  recorded ones. Tests: `db-writer.test.ts`.
+- **The first production deploy (D104)** — done, read and never run. The Stack at stage
+  `production` and its tokens and smoke test. Tests: `shaledb-stack-config.test.ts`,
+  `production-durable-objects.test.ts`.
+- **Rollback against the stored formats (D105)** — done. Older code's view of today's records.
+  Tests: `manifest-format-fixtures.test.ts` (lsm-core), `stored-format-fixtures.test.ts`
+  (lsm-cloudflare).
+- **The soak's workload (D106)** — done. `tools/scenario-cli/src/soak-checks.ts` (`ChangeLedger`,
+  `FeedFollower`, `MergeKeyModel`, and the other models); `docs/testing.md`, "The soak's
+  workload". Tests: `soak-checks.test.ts`.
 - **Production readiness (v1 workstream 9)** — done (D64).
   - **Tokens.** `lsmAccessGateFrom`, `lsmAccessGateOver`, `LsmAccessTokenSource`, and
     `lsmStageAccessTokens` (`lsm-access-gate.ts`). In infra: `shaledbAccessTokens`
