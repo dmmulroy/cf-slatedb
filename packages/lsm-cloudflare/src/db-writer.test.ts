@@ -1063,3 +1063,48 @@ describe("DbWriter alarm for a database that is gone (D85)", () => {
     expect(outcome).toEqual({ set: true, fired: [false, false, false] });
   });
 });
+
+describe("DbWriter seal of a sealed database (D95)", () => {
+  it("a seal naming other successors fails with the recorded ones; the same successors again succeed", async () => {
+    const LEFT = DatabaseId.make("orders-a");
+    const RIGHT = DatabaseId.make("orders-b");
+    const OTHER = DatabaseId.make("orders-c");
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createDatabase();
+        const writer = yield* DbWriter;
+        yield* writer.write(DB, put("a", "1"));
+        yield* writer.seal(DB, [LEFT, RIGHT], true);
+        const attempt = (successors: ReadonlyArray<DatabaseId>, holds: boolean) =>
+          Effect.map(Effect.result(writer.seal(DB, successors, holds)), (result) =>
+            Result.isSuccess(result)
+              ? "sealed"
+              : result.failure._tag === "DatabaseSealedError"
+                ? `DatabaseSealedError:${result.failure.successors.join(",")}`
+                : result.failure._tag,
+          );
+        const other = yield* attempt([OTHER], false);
+        const otherWithHolds = yield* attempt([OTHER], true);
+        const same = yield* attempt([LEFT, RIGHT], false);
+        const sameWithHolds = yield* attempt([LEFT, RIGHT], true);
+        const manifest = (yield* (yield* ManifestReader).loadLatest(DB)).manifest;
+        return {
+          other,
+          otherWithHolds,
+          same,
+          sameWithHolds,
+          successors: manifest.state._tag === "Sealed" ? manifest.state.successors : [],
+          holders: manifest.checkpoints.flatMap((checkpoint) => Option.toArray(checkpoint.holder)),
+        };
+      }),
+    );
+    expect(outcome).toEqual({
+      other: "DatabaseSealedError:orders-a,orders-b",
+      otherWithHolds: "DatabaseSealedError:orders-a,orders-b",
+      same: "sealed",
+      sameWithHolds: "sealed",
+      successors: ["orders-a", "orders-b"],
+      holders: ["orders-a", "orders-b"],
+    });
+  });
+});

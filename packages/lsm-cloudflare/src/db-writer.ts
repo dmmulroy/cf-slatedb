@@ -544,6 +544,10 @@ export const makeDbWriter = Effect.gen(function* () {
       }),
     );
 
+  /** Whether two successor lists name the same databases in the same order. */
+  const sameSuccessors = (left: ReadonlyArray<DatabaseId>, right: ReadonlyArray<DatabaseId>) =>
+    left.length === right.length && left.every((id, index) => id === right[index]);
+
   const sealedError = (databaseId: DatabaseId, successors: ReadonlyArray<DatabaseId>) =>
     new DatabaseSealedError({
       databaseId,
@@ -1071,6 +1075,11 @@ export const makeDbWriter = Effect.gen(function* () {
     return yield* commitLock.withPermits(1)(
       Effect.gen(function* () {
         const ready = yield* ensureReady(databaseId);
+        // A seal names its successors once: a repeat with the same ones is a retry and succeeds;
+        // one naming others is refused with the recorded ones (D95).
+        if (Option.isSome(ready.sealed) && !sameSuccessors(ready.sealed.value, successors)) {
+          return yield* Effect.fail(sealedError(databaseId, ready.sealed.value));
+        }
         if (Option.isSome(ready.sealed) && !holdForSuccessors) {
           const meta = yield* memTable.meta.pipe(Effect.mapError(unavailable(databaseId, "seal")));
           return { flushedSeq: meta.flushedSeq, successorHolds: [] };

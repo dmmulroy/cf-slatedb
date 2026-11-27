@@ -17,6 +17,7 @@ import { makeCompactionExecutor, CompactionExecutor } from "./compaction-executo
 import {
   CompactionLauncher,
   CompactionLauncherRecord,
+  CompactionLauncherUnavailableError,
   compactionLauncherTestLayer,
 } from "./compaction-launcher.ts";
 import {
@@ -524,6 +525,7 @@ describe("Compactor", () => {
           },
           budgetGroup: ORDERS,
           startedAt: Timestamp.make(0),
+          lastProgressAt: Option.none(),
         };
         yield* cell.set({ ...state, running: [running] });
         const whileRunning = yield* Effect.flip(
@@ -784,5 +786,126 @@ describe("Compactor fence-in (D78)", () => {
     // The re-fence keeps the collection the finished compaction made due.
     expect(outcome.afterAlarm).toEqual([5, false, true]);
     expect(outcome.manifestEpoch).toBe(5);
+  });
+});
+
+describe("Compactor jobs it can no longer see (D94)", () => {
+  it("a job whose progress cannot be read for compactionLeaseMs is finished, freeing its lease and sources", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createWithL0(ORDERS, 4);
+        const settings = yield* LsmConfiguration;
+        // Workflows accepts the job, then can never report it (a purged instance, or the
+        // service unreachable): every progress read fails.
+        const started: Array<string> = [];
+        const blindLauncher = CompactionLauncher.of({
+          start: (params) => Effect.sync(() => void started.push(params.jobId)),
+          progress: (jobId) =>
+            Effect.fail(
+              new CompactionLauncherUnavailableError({ jobId, message: "instance not found" }),
+            ),
+        });
+        const shared = yield* Effect.context<
+          ManifestReader | ManifestStore | CompactionBudget | LsmConfiguration | GarbageCollector
+        >();
+        const built = yield* Layer.build(
+          compactorLayerWithoutDependencies.pipe(
+            Layer.provideMerge(
+              Layer.mergeAll(compactorStateCellTestLayer, durableObjectAlarmTestLayer),
+            ),
+            Layer.provide(
+              Layer.succeedContext(shared.pipe(Context.add(CompactionLauncher, blindLauncher))),
+            ),
+          ),
+        );
+        const compactor = Context.get(built, Compactor);
+        const alarm = Context.get(built, DurableObjectAlarm);
+        const fire = Effect.andThen(alarm.cancel, compactor.runAlarm);
+        const runningIds = Effect.map(compactor.status(ORDERS), (state) =>
+          Option.match(state, {
+            onNone: () => [],
+            onSome: (current) => current.running.map((job) => job.jobId),
+          }),
+        );
+        yield* compactor.wake(ORDERS);
+        yield* fire;
+        const first = yield* runningIds;
+        // Polls while the reads fail, short of the bound: the job is kept.
+        yield* TestClock.adjust(settings.compactionLeaseMs - 60_000);
+        yield* fire;
+        const beforeBound = yield* runningIds;
+        // Past the bound: the job is finished, its lease released, and its sources planned again.
+        yield* TestClock.adjust(120_000);
+        yield* fire;
+        const afterBound = yield* runningIds;
+        return {
+          first: first.length,
+          kept: beforeBound.join() === first.join(),
+          replanned: afterBound.length === 1 && afterBound[0] !== first[0],
+          // The budget holds one compaction: the new job started only because the old lease
+          // was released.
+          starts: started.length,
+        };
+      }),
+    );
+    expect(outcome).toEqual({
+      first: 1,
+      kept: true,
+      replanned: true,
+      starts: 2,
+    });
+  });
+  it("the bound counts from the last read that saw the job running, not from its start (D94)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createWithL0(ORDERS, 4);
+        const settings = yield* LsmConfiguration;
+        // Reads succeed ("Running") until `reachable` is cleared, then fail.
+        let reachable = true;
+        const launcher = CompactionLauncher.of({
+          start: () => Effect.void,
+          progress: (jobId) =>
+            reachable
+              ? Effect.succeed({ _tag: "Running" as const })
+              : Effect.fail(
+                  new CompactionLauncherUnavailableError({ jobId, message: "unreachable" }),
+                ),
+        });
+        const shared = yield* Effect.context<
+          ManifestReader | ManifestStore | CompactionBudget | LsmConfiguration | GarbageCollector
+        >();
+        const built = yield* Layer.build(
+          compactorLayerWithoutDependencies.pipe(
+            Layer.provideMerge(
+              Layer.mergeAll(compactorStateCellTestLayer, durableObjectAlarmTestLayer),
+            ),
+            Layer.provide(
+              Layer.succeedContext(shared.pipe(Context.add(CompactionLauncher, launcher))),
+            ),
+          ),
+        );
+        const compactor = Context.get(built, Compactor);
+        const alarm = Context.get(built, DurableObjectAlarm);
+        const fire = Effect.andThen(alarm.cancel, compactor.runAlarm);
+        const runningIds = Effect.map(compactor.status(ORDERS), (state) =>
+          Option.match(state, {
+            onNone: () => [],
+            onSome: (current) => current.running.map((job) => job.jobId),
+          }),
+        );
+        yield* compactor.wake(ORDERS);
+        yield* fire;
+        const first = yield* runningIds;
+        // A long job, seen running for longer than the bound.
+        yield* TestClock.adjust(settings.compactionLeaseMs + 60_000);
+        yield* fire;
+        // Then unreachable for less than the bound since that read.
+        reachable = false;
+        yield* TestClock.adjust(settings.compactionLeaseMs - 120_000);
+        yield* fire;
+        return (yield* runningIds).join() === first.join() && first.length === 1;
+      }),
+    );
+    expect(outcome).toBe(true);
   });
 });
