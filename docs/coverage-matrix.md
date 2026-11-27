@@ -724,8 +724,11 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `ulid` tests. Of the 82 that survive, 80 are equivalent and 2 change only how many rows a block seek decodes (`/tmp/shale-work/agents/mut-core/REPORT.md`).
 - **Bounded scan pages on every surface (D125)** — done. `ScanPageBudget`, `DbClient.scanAtPage`,
   `settledVersions`, and the routed page's shared budget (`shard-router.ts`). Tests:
-  `scan-bounds.test.ts`, `shard-scan-bounds.test.ts`. Open: the three-surface oracle property test,
-  and the cross-page and phantom transaction tests.
+  `scan-bounds.test.ts` (tiers, overwritten keys, merge runs, cross-page transactions, phantoms),
+  `shard-scan-bounds.test.ts`, `scan-oracle.property.test.ts`, `shard-scan-oracle.property.test.ts`;
+  workerd: `writer.workerd.ts` (budget pages over deletes, regular and transaction).
+  Open: no workerd test hosts the shard router, so the sharded scan's HTTP response is covered
+  only by the schema.
 - **The writer Durable Object at await granularity (D109)** — done. `WriterObject.tla` (PlusCal),
   skill `.agents/skills/verify-writer-object`: `db-writer.ts` entry points interleaved with
   eviction, interruption, and R2 failures. Invariants `NoAckedWriteLost`, `LatestSeesAcked`,
@@ -737,6 +740,45 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   seal interrupted while a flush is in flight (D115)", "DbWriter flush fenced by its own writer's
   restart (D115)"). Formal: `WriterObject` (`NeverSelfFenced`; `beforeD115`,
   `markFencedAnyPhase`).
-  `scan-bounds.test.ts` (tiers, overwritten keys, merge runs, cross-page transactions, phantoms),
-  `shard-scan-bounds.test.ts`, `scan-oracle.property.test.ts`, `shard-scan-oracle.property.test.ts`;
-  workerd: `writer.workerd.ts` (budget pages over deletes, regular and transaction).
+- **The plain Durable Object SQLite baseline (D75)** — done, live only. `PlainSqliteServer`
+  (`infra/shaledb/src/telemetry-probe-worker.ts`, preview-only) and `measure baseline`
+  (`tools/scenario-cli/src/measurements.ts`). No unit test. One provisional run on `preview-3` at
+  `ed4e787` (`docs/measurements.md`, "Baseline"); the release-commit runs are pending.
+- **Liveness of the writer and transaction models (D111)** — done. `TransactionsLive.cfg`
+  (`EveryTxnCommits`; `beforeD76` fails) and `NoAckedWriteLostLive.cfg` (`EventuallyFlushed`;
+  `noWake` fails), with `WriterObject`'s `AckedFlushed` and `AlarmQuiets`. `Transactions.cfg`
+  with the code as written is still to be observed in full under D111 (`docs/progress.md`).
+- **The change feed repeats a change after a lost flush response (D113)** — open, not fixed.
+  Recorded by `db-writer.test.ts` ("DbWriter changelog after a flush commit whose response was
+  lost (D113)"), an expected failure. No model yet.
+- **A fork's hold during its creation; a job recorded before its launch (D116)** — done; no decision
+  entry yet. `DatabaseLifecycle.deleteCheckpoint` keeps a hold whose fork has no manifest until the
+  hold is `gcMinAge` old (`ccd48db`). The compactor's poll records a job before `launcher.start`
+  (`f83cd56`). Tests: `database-lifecycle.test.ts` ("a fork's hold deleted while the fork is being
+  created (D116)"); `compactor.test.ts` ("Compactor jobs launched by a poll that died (D116)",
+  "Compactor launches whose reply was lost (D116)", and the `stateLock` and `planLock` tests).
+  Formal: `Lifecycle.cfg` with `beforeD116` fails `NoReaderNeedsDeleted`.
+- **A reused id's chain continues past its tombstone (D119)** — done. `create` over a cleared
+  tombstone starts past its `lastL0Seq` and both epochs; a snapshot read needs its manifest's
+  `lastL0Seq`. Tests: `database-lifecycle.test.ts` ("reads as expired, not as the new database
+  (D119)", "is fenced, not committed into the new chain (D119)", "DatabaseLifecycle: gaps the
+  mutation sweep found (D119)"), and `compactor.test.ts` (a missing Workflow instance, D103 and
+  D119). Mutations: 3 of 4 caught; the writer-epoch carry is equivalent.
+- **Token secrets that never turn active (D121)** — done. `awaitSecretActive`
+  (`infra/shaledb/src/access-token-store.ts`). Test: `shaledb-access-tokens.test.ts` ("a written
+  secret that never turns active (D121)"), with `TestClock`; 3 mutations caught.
+- **Mutation sweeps of the writer, the compactor, and the memtable (D122, D127)** — partial.
+  Tests: `db-writer.test.ts` ("DbWriter commit lock (D122)"); `mem-table.test.ts` ("the memtable's
+  stored row kinds (D122)", the trim's bounds and the seed, D127); `db-writer-start.test.ts` (a
+  restarted writer schedules its flush, start failures, a seal with the same count of successors,
+  the locks: D127). D127 has no decision entry yet. Not reached: `docs/release-v1.md` §8.
+- **Mutation sweep of the request edge and sharding (D128)** — done. 165 mutants; 6 survive. Tests:
+  `db-public-error-translation.test.ts` (every internal error's public answer; the corrupted SST's
+  `StoredDataInvalid` as an expected failure until `edfe57b` is merged),
+  `db-http-request-middleware.test.ts`, `lsm-trace-policy-layer.test.ts`, and cases added to
+  `db-http-request.test.ts`, `telemetry-leaks.test.ts`, and `lsm-trace-policy.test.ts`.
+- **The checkpoint cap is set by what a collection reads (D129)** — done. `MAX_CHECKPOINTS_PER_DATABASE`
+  = `GC_PINNED_MANIFEST_READ_BUDGET_BYTES` / `MANIFEST_SIZE_BUDGET_BYTES` = 128 (`lsm-core/src/manifest.ts`). Tests:
+  `manifest.test.ts` ("caps checkpoints so the manifests they pin fit one collection's read budget
+  (D129)"), `database-lifecycle.test.ts` ("the most checkpoints and pinned snapshots a database may
+  hold (D99, D129)"); 2 mutations caught.

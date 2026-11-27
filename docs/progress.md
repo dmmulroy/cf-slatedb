@@ -401,7 +401,7 @@ hand-off is below.
 
 ## Remaining-work log
 
-- **Rounds 3 and the second review (2026-11-27, 01:25–03:25 UTC; integration at `c149afb`).**
+- **Round 3 and the second review (2026-11-27, 01:25–03:25 UTC; integration at `c149afb`).**
   - **The methods.**
     - TLA+ models at await granularity and end to end: D109 to D116.
     - Mutation sweeps: D117, D122, D127, D128, and `mut-read`'s.
