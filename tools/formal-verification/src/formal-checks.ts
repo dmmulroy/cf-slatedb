@@ -308,6 +308,12 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
         expect: "ConsumerMissesNothing",
         timeLimitSeconds: 60,
       },
+      {
+        config: "ShardSplit.cfg",
+        broken: "noDirectoryLock",
+        expect: "PublishedIsSealed",
+        timeLimitSeconds: 120,
+      },
       { config: "ShardSplitLiveness.cfg", broken: "none", expect: "pass", timeLimitSeconds: 60 },
       {
         config: "ShardSplitLiveness.cfg",
