@@ -46,6 +46,19 @@ and are not part of it:
   defects (D79). Its declared errors (`DatabaseNotFoundError`, `GarbageCollectorUnavailableError`)
   are `{ _tag, databaseId, message }`, with messages of its own and never storage detail.
 
+## Request bounds (D100)
+
+- **Request bodies:** at most 16 MiB (16,777,216 bytes), whether or not the request declares its
+  length. A larger body is refused with `InvalidRequest` (400) once its first 16 MiB are read; the
+  rest is never read. The largest legitimate body, a write batch of 10,000 operations and 8 MiB of
+  keys and values, is about 11.4 MiB as base64 JSON.
+- **Fields:** every string, bytes, and array field of every request has a length bound, stated in
+  the OpenAPI document. The table is in D100.
+- **Names are trusted:** database ids and `budgetGroup` names follow one pattern (1–63 lowercase
+  letters, digits, `.`, `_`, `-`). Inside one installation they are trusted names. A caller who
+  holds the stage's access token may name any database or group. The access token is the only
+  tenant boundary.
+
 ## Limits tightened to stop a defect
 
 - `ttlMillis` and a checkpoint's `lifetimeMs` are at most 100 years (D88). A larger value had been

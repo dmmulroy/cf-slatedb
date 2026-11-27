@@ -2859,3 +2859,130 @@ for as long as its isolate cached the map: unbounded, against a lag of about a s
 - **Not changed.** `DbClient` could refuse a sealed database at `Flushed` from the manifest's
   sealed state, which would make the router exact rather than bounded. That is
   `db-client.ts`'s owner's call.
+
+## D100. Every request is bounded: the body, every string, bytes, and array field
+
+No request may make the API isolate (128 MB, shared by every database it serves) hold an
+unbounded body. v1 is not released, so these bounds go in now.
+
+**The body.** The shared request middleware (`publicHttpRequestMiddlewareLayer`, used by the
+database, shard-router, and GC APIs) reads the body itself, at most `MAX_REQUEST_BODY_BYTES`
+(16 MiB). The router then reads that copy.
+
+- **A declared length:** a `content-length` over the bound is refused before anything is read.
+- **No declared length:** a chunked body is refused once the bound is passed, and the rest is
+  never read.
+- **Why the reader is bounded too.** The Workers runtime gives the handler every body as a
+  `ReadableStream`, whether or not the client declared its length. Cloudflare's edge enforces only
+  the zone plan's limit (100 MB on Free and Pro), so the read itself is bounded, not only the
+  header.
+- **The refusal.** It is `InvalidRequest` (400), naming the 16 MiB.
+- **Why 16 MiB.** The largest legitimate body is a write batch at its limits: 10,000 operations
+  and 8 MiB of keys and values. That is 11.4 MiB as base64 JSON, measured in
+  `db-http-request.test.ts`. A commit carries a batch plus its reads, and the body bound caps the
+  sum.
+
+**Fields.** Request schemas have their own bounded types: `RequestKeyBytes`, `RequestValueBytes`,
+`RequestKeyRange`, `RequestWriteBatch`, `RequestTransactionCommit`, and `RequestSnapshot`.
+`KeyRange` and `WriteBatch` stay unbounded because stored manifests and internal calls decode
+with them. `collapseWriteBatch` still checks a batch for callers inside the Worker.
+
+| Field                                                                | Bound          | Why                                                        |
+| -------------------------------------------------------------------- | -------------- | ---------------------------------------------------------- |
+| keys (`key`, `readKeys[]`, range `start`/`end`, `atKey`)             | 16 KiB         | `MAX_KEY_BYTES`, the engine's key limit                    |
+| values and merge operands                                            | 1 MiB          | `MAX_VALUE_BYTES` (a Durable Object SQLite row holds 2 MB) |
+| `operations`                                                         | 10,000         | `MAX_BATCH_OPERATIONS`                                     |
+| `readKeys`                                                           | 10,000         | as many as a batch's operations                            |
+| `readRanges`                                                         | 1,000          | each costs the writer one query in the conflict check      |
+| `successors` (seal)                                                  | 16             | a split names 2                                            |
+| checkpoint `name`                                                    | 256 characters | a label                                                    |
+| SST drop `confirm`                                                   | 64 characters  | repeats a 26-character ULID                                |
+| database ids, `budgetGroup`, shard groups, a snapshot's `databaseId` | 63 characters  | the id pattern                                             |
+| ULIDs (SST, checkpoint)                                              | 26 characters  | `isULID`                                                   |
+| `ttlMillis`, `lifetimeMs`                                            | 100 years      | D88                                                        |
+| scan, change-feed `limit`                                            | 1,000          | unchanged                                                  |
+
+**How it is enforced.**
+
+- **The schema walker.** `unboundedRequestFields` (`request-schema-bounds.ts`) walks every
+  endpoint's params, query, headers, and payloads. It fails on any string, bytes, or array without
+  a length check, and on any record. It runs for `DbHttpApi`, `GcHttpApi`, and `ShardedHttpApi`,
+  so a future field cannot be added without a bound.
+- **Errors at the HTTP boundary.** A key or value over its limit, or more than 10,000 operations,
+  is now `InvalidRequest` naming the field. Before, it was `BatchInvalid`. `BatchInvalid` stays for
+  an empty batch, the 8 MiB total, and merge rules.
+- **`budgetGroup`** takes the database-id pattern. Groups, like ids, are trusted names inside one
+  installation, and the access token is the only tenant boundary (`docs/api-compatibility.md`).
+
+**Responses a caller can make large.**
+
+- **Get:** a value is at most 1 MiB, but merged values are unbounded (D99, audit-limits).
+- **Scan and change-feed pages:** bounded by bytes in D93 (audit-do).
+- **Compaction status:**
+  - `l0SstIds`: about `l0MaxSsts` (16), where writes stall.
+  - `sortedRuns`: limited by the size-tiered schedule.
+  - `corruptSsts`: at most the SSTs the manifest holds.
+  - `droppedSsts`: grows by one per operator drop.
+- **Checkpoint list:** unbounded. Each checkpoint lives in the manifest, so the count bounds the
+  manifest as well as this answer. The bound belongs where checkpoints are created
+  (`database-lifecycle.ts`); reported as `CROSS:` with a proposed 1,000 per database, counting
+  pinned snapshots and forks' holds.
+- **Shard map:** one shard per split.
+- **GC sweep report:** at most 50 databases per page.
+
+**Tests.**
+
+- **`db-http-request.test.ts`:**
+  - a declared length over 16 MiB, refused with at most one chunk read;
+  - a chunked body refused after about 17 of its 64 MiB;
+  - the largest batch fits.
+- **`request-schema-bounds.test.ts`:** the walker finds each kind of unbounded field, and the
+  database and GC APIs have none.
+- **`shard-router-worker.test.ts`:** the sharded API has none.
+- **`db-http-boundary.property.test.ts`:** 180 random write, scan, and commit bodies around every
+  bound. Each is accepted by its schema and runs (writes: no defect) or is refused with
+  `InvalidRequest` naming the body, never a 500.
+- **`block-server.test.ts`:** traversal and malformed ids and ranges are refused (400), so no
+  key outside `db/<id>/` is formed. The `BlockServer` is `workersDev: false`
+  (`block-server-worker.ts`); the API Worker reaches it by service binding only.
+- **Mutations caught:** `readKeys` unbounded, the checkpoint name unbounded, `budgetGroup` any
+  string, a sharded value unbounded, no declared-length refusal, and an unbounded chunked read.
+
+## D101. A request that waits out an abandoned split finishes it
+
+A split has four steps: record it, seal the shard, fork both halves, publish
+(`shard-split.ts`). Killed at the seal, the left fork, or the right fork
+(`shard-split-faults.test.ts`):
+
+- **(a) Retried as is:** it resumes with the same two databases. Every key written before and
+  after it reads back through a fresh router.
+- **(b) Another split of the group:** refused with `ShardSplitInProgress`, naming the pending one.
+- **(c) Never retried, dead at the seal:** the shard is still open and writable; only further
+  splits are refused.
+- **(c) Never retried, dead after the seal:** every write and `Latest` read to its range waits the
+  router's 30 s and fails as retryable. Before this change that lasted forever, and nobody was
+  told.
+
+**The rule.** When a routed request of the sharded API (put, delete, get, scan) fails after that
+wait, the handler finishes the group's pending split from the directory's record alone
+(`ShardSplit.resumePending`, `withAbandonedSplitFinished`), then runs the request once more.
+
+- **Why the bound.** A split normally publishes within seconds (13 s at most on `preview-1`,
+  D48), so one still pending after 30 s was abandoned.
+- **Why it is safe.** Finishing it from two places at once is safe: two identical concurrent
+  splits publish one map with the same two databases (tested). Two different concurrent splits
+  of one shard publish one and refuse the other, and no write is lost (tested).
+- **What an operator sees.**
+  - The `ShardSplit.resumePending` span carries `shard.resumed_split`, and `measure health` reports
+    it as an issue.
+  - `ShardRouter.refresh` spans carry `shard.pending_split` while a split is pending.
+  - `docs/operations.md`, "Shard splits", gives the one-command way to finish a split by hand: the
+    same `POST …/splits`.
+  - A split cannot be abandoned after its seal.
+- **Not done.** The pending split records no start time, so its age is not shown. Adding it
+  needs `shard-directory.ts` (audit-do) to stamp `beginSplit`; reported as `CROSS:`.
+
+**Also tested.** A router whose map is two generations old reads and writes every key.
+
+**Mutations caught:** the waiting request not resuming, `resumePending` ignoring the record, and
+a second split allowed while one is pending.

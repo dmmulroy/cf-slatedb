@@ -251,6 +251,39 @@ future collector. Every signal above travels on a span instead.
 Expected errors that are not trouble: `DatabaseSealedError` (a stale router's write to a sealed
 shard; the router retries), `TransactionConflictError`, and `DatabaseAlreadyExists` on create.
 
+## Shard splits
+
+A split of a shard group (`POST /v1/groups/<group>/splits` on the shard router, or
+`ShardSplit.split`) runs these steps:
+
+1. Record the split in the group's directory.
+2. Seal the shard.
+3. Fork its two halves.
+4. Publish the new map.
+
+Writes to the shard pause from the seal until the publish, normally a few seconds.
+
+If the split dies after the seal and nobody retries it, the shard's range stays sealed with no
+published successors. **Every write to that range then waits 30 s and fails as retryable.** Since
+D101 the request that waited finishes the split itself (`ShardSplit.resumePending`) and then
+succeeds. So an abandoned split is finished by the next write or read to its range.
+
+- **Watch.** `measure health` reports "abandoned shard splits were finished by a waiting
+  request", naming the shard. That means a split died after its seal. A router's
+  `ShardRouter.refresh` span carries `shard.pending_split` while one is pending.
+- **Finish one by hand** with the same request as the split, which is idempotent:
+
+  ```sh
+  curl -X POST "$SHARDS_URL/v1/groups/<group>/splits" -H "Authorization: Bearer $SHALEDB_TOKEN" \
+    -H 'content-type: application/json' -d '{"databaseId":"<shard>","atKey":"<base64 key>"}'
+  ```
+
+  `GET /v1/groups/<group>/map` shows the pending split's shard and key (`pendingSplit`).
+
+- **Abandon one.** A split cannot be abandoned after its seal: the sealed shard accepts no more
+  writes. Before the seal (only step 1 done), finishing it is still the way out. Another split of
+  the group fails with `ShardSplitInProgress`, naming the pending one, until it is finished.
+
 ## Corruption runbook
 
 ### How corruption is prevented
