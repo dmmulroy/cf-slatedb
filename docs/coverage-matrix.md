@@ -722,7 +722,7 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `merge-limits`, `garbage-collection-plan`, `size-tiered-compaction-scheduler`, `key-range`,
   `bloom-filter`, `lsm-settings`, `manifest`, `sst-codec`, `byte-codec`, `merge-iterator`, and
   `ulid` tests. Of the 82 that survive, 80 are equivalent and 2 change only how many rows a block seek decodes (`/tmp/shale-work/agents/mut-core/REPORT.md`).
-- **Bounded scan pages on every surface (D125)** — partial. `ScanPageBudget`, `DbClient.scanAtPage`,
+- **Bounded scan pages on every surface (D125)** — done. `ScanPageBudget`, `DbClient.scanAtPage`,
   `settledVersions`, and the routed page's shared budget (`shard-router.ts`). Tests:
   `scan-bounds.test.ts`, `shard-scan-bounds.test.ts`. Open: the three-surface oracle property test,
   and the cross-page and phantom transaction tests.
@@ -737,3 +737,6 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   seal interrupted while a flush is in flight (D115)", "DbWriter flush fenced by its own writer's
   restart (D115)"). Formal: `WriterObject` (`NeverSelfFenced`; `beforeD115`,
   `markFencedAnyPhase`).
+  `scan-bounds.test.ts` (tiers, overwritten keys, merge runs, cross-page transactions, phantoms),
+  `shard-scan-bounds.test.ts`, `scan-oracle.property.test.ts`, `shard-scan-oracle.property.test.ts`;
+  workerd: `writer.workerd.ts` (budget pages over deletes, regular and transaction).

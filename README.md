@@ -185,7 +185,9 @@ from `DbHttpApi`, with examples of every request and response. It covers:
   limit or after examining 16 MiB of versions, whichever comes first, so a page may hold fewer
   rows than asked, or none: follow `resumeFrom` until it is null (D108). The same loop serves the
   transaction scan (same `readSeq` and `manifestId` on every page) and the sharded scan, whose
-  pages are not one snapshot across shards (D125):
+  pages are not one snapshot across shards (D125). A transaction's commit must name the whole
+  range it scanned in `readRanges`: it checks only the ranges it is sent, so naming just what the
+  pages returned lets a write after `readSeq` beyond the last page's end pass unseen:
 
   ```text
   start = range.start

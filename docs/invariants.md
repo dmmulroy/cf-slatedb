@@ -112,6 +112,15 @@ so does a read whose begin manifest no longer covers `retained_from_seq` or has 
 GC. Every commit checks, under the commit lock, that no key it writes was written after `readSeq`
 (`MemTable.writtenAfter`). A `SerializableSnapshot` commit also checks every key and range it read.
 
+**A scan read in several pages** (D125). A transaction scan's pages all read at the same
+`readSeq`. Each uses a manifest within the bounds above, and any such manifest gives the same
+answer at `readSeq` (D70). So the pages together see one snapshot, whatever is written, flushed,
+or compacted between them (`scan-bounds.test.ts`). The commit checks the ranges it is sent: it
+catches a phantom anywhere in a range only if `readRanges` names the whole range scanned, not
+just the part the pages returned. A regular scan's pages are each their own read at their own
+time, and a routed scan's pages are not one snapshot across shards. Each page of any scan ends at
+its limit or at its examined-bytes budget, and its `resumeFrom` names where the next starts.
+
 **A fixed point fixes which writes are visible, not the time TTLs are judged at.** A snapshot
 (pinned or not), a transaction's `readSeq`, and a fork's checkpoint each fix the set of writes a
 read may see. None of them fixes the clock its TTLs are judged by. Every read resolves expiry with
