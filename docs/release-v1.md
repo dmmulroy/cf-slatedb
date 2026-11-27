@@ -903,15 +903,17 @@ What v1 does not do, or has not measured.
 **Throughput and latency.**
 
 - **One writer per database.** It was measured at ~6,500 rows/s with 100-row batches and ~15,000
-  rows/s with 1,000-row batches (D61). A workload needing more must use more databases, for example
+  rows/s with 1,000-row batches (D61; measured at `308defd`, path changed). A workload needing more must use more databases, for example
   through the range sharding in `packages/lsm-sharding`.
 - **The batch body is base64 JSON.** A binary body was declined (D61). It would only be added later,
   as an additive content type.
-- **Manifest commits cost ~285 ms beside the bucket**, and up to ~1 s from the far side of the world.
+- **Manifest commits cost ~285 ms beside the bucket**, and up to ~1 s from the far side of the world
+  (R2's own latency, measured at `774ed7b`).
   The bucket's location is fixed when it is created (`SHALEDB_BUCKET_LOCATION`). The default, `auto`,
   places it near the machine that deploys, so choose it before the first production deploy if
   callers are not near that machine.
-- **Writer start-ups dominate a get's p99.** A fence-in takes ~0.5 s (D72).
+- **Writer start-ups dominate a get's p99.** A fence-in takes ~0.5 s (D72; measured at `9776317`,
+  path changed).
 - **No Workers Cache for blocks in a restricted Stack.** A restricted (`eu`, `fedramp`) Stack has
   none, and it does not hedge block reads (D72, corrected). Reads from far away measured slower.
 - **Hedging can be started by queueing alone.** Its 50 ms timer starts when a read is issued, not
@@ -919,7 +921,8 @@ What v1 does not do, or has not measured.
   start only because its read waited, and the hedge then waits too. A cap on hedges in flight is
   not adopted (D72).
 - **CPU varies between runs with the machine a Durable Object lands on.** The write CPU of the
-  same 128 batches ranged from 9.6 to 28 s between runs (`docs/measurements.md`, D73's section).
+  same 128 batches ranged from 9.6 to 28 s between runs (`docs/measurements.md`, D73's section;
+  its commit is not recorded there).
 - **One client.** Every measurement came from one client on a US residential connection, against
   preview stages.
 
