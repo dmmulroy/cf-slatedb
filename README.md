@@ -30,6 +30,12 @@ The unit of scale is the database, and each database has one writer Durable Obje
 grows by adding databases (and, for one key space, by splitting it with range sharding), not by
 making one database's writer faster.
 
+One database holds at most about 312 GiB: past that, a compaction of the whole database outgrows
+what one Cloudflare Workflow may run (D103). Long keys lower it, because the manifest lists every
+SST's first and last key (D99). Larger data is split into several databases with range sharding.
+Every limit a caller can meet is listed in [`docs/api-compatibility.md`](docs/api-compatibility.md),
+"Limits of v1".
+
 One database's write rate is bounded by its writer, which commits one batch at a time. The highest
 rates measured on one writer (`preview-1`, production settings, 16-byte keys and 100-byte values,
 a laptop client on a US residential connection, so latencies include an internet round trip):
@@ -102,13 +108,16 @@ local Stack, with trace assertions.
 The contract is [`docs/openapi/shaledb-v1.json`](docs/openapi/shaledb-v1.json), generated
 from `DbHttpApi`, with examples of every request and response. It covers:
 
-- **Databases:** create, status, remove.
+- **Databases:** create, status, remove. A removed database's id can be created again only an
+  hour (`gcMinAge`) after its removal; before that, create answers `DatabaseRecentlyRemoved` (D90).
 - **Writes:** batches of puts, deletes, and merges, with an optional TTL each. `flush` makes
   everything acknowledged durable in R2. A TTL is judged by the reader's clock: a value expires
   within clock skew of its expiry time, readers on different machines may disagree for up to that
   skew, and a value compaction has removed does not return (D83).
 - **Reads:** `get` and `scan` at `Latest` (sees every acknowledged write), `AtLeast` a sequence
-  number, or `Flushed`; at a snapshot; pinned snapshots that outlive GC.
+  number, or `Flushed`; at a snapshot; pinned snapshots that outlive GC. A scan page ends at its
+  limit or after examining 16 MiB of versions, whichever comes first, so a page may hold fewer
+  rows than asked, or none: follow `resumeFrom` until it is null (D108).
 - **Transactions:** `Snapshot` or `SerializableSnapshot` isolation, with conflicts detected at
   commit.
 - **Change feed:** committed changes in sequence order, when the database's changelog is on.
@@ -159,3 +168,7 @@ Live stages require `Authorization: Bearer <token>`. Each stage has two rotatabl
 vp run ready    # format, lint, type checks, every workspace's tests (unit, property, workerd)
 vp run verify   # every TLA+ model, including its deliberately broken variants
 ```
+
+A release is also gated by `scenario-cli soak` on a preview stage (D65, D106): mixed writes,
+reads, scans, transactions, the change feed, splits, removals, and a redeploy, checked against a
+model of every acknowledged write ([`docs/testing.md`](docs/testing.md)).
