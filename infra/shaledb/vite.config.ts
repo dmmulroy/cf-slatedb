@@ -14,8 +14,10 @@ import { defineConfig } from "vite-plus";
  * that environment (`ShaledbStackConfig`, D55) and binds every Worker the complete settings, so a
  * deploy without overrides runs the production defaults whatever an earlier deploy bound.
  *
- * `destroy:preview-<n>` tears a preview down. Agents never run them (the deployment guard blocks
- * `alchemy destroy`); `preview-cli destroy-command <stage>` prints the command for Dillon.
+ * `destroy:preview-<n>` tears a preview down. Agents never run them, by instruction: the deployment
+ * guard blocks a directly typed `alchemy destroy`, but in an allowlisted repository it does not
+ * resolve package tasks, so it would not stop these (docs/release-v1.md, section 10).
+ * `preview-cli destroy-command <stage>` prints the command for Dillon.
  *
  * `plan:production` and `deploy:production` plan and deploy the `production` stage: production
  * names, a retained LSM bucket, 10% trace sampling, no probe Worker. Nothing runs them until Dillon's

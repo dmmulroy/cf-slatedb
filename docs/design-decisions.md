@@ -3613,3 +3613,107 @@ wait, the handler finishes the group's pending split from the directory's record
 
 **Mutations caught:** the waiting request not resuming, `resumePending` ignoring the record, and
 a second split allowed while one is pending.
+
+## D104. What the first production deploy creates, its tokens, and its smoke test
+
+**Read, never run.** Nothing that names `production` was executed in this audit.
+
+**The Stack at stage `production`, with no environment set** (`alchemy.run.ts`;
+`shaledb-stack-config.test.ts` pins the configuration):
+
+- **The LSM bucket.** Named `shaledb`, retained (`RemovalPolicy.retain`), not force-destroyed, with
+  no jurisdiction and location `auto`. A preview's is generated and force-destroyed.
+- **The trace bucket.** Its name is generated; `forceDestroy` is false only in production; traces
+  and tail records expire after 14 days.
+- **Workers:**
+  - API, with `WriterServer`;
+  - `BlockServer`, no `workers.dev`;
+  - compactor, with `CompactorServer`, `CompactionBudgetServer`, and `CompactionWorkflow`;
+    60 s CPU and 10 million subrequests;
+  - GC, with its cron;
+  - shard router, with `ShardDirectoryServer`;
+  - trace collector;
+  - CPU tail Worker, no `workers.dev`.
+- **No probe Worker,** so no `TelemetryProbeServer`, `R2ProbeServer`, or `PlainSqliteServer`
+  (`deploysTelemetryProbe`, tested).
+- **Sampling:** 10% of traces, against every trace on previews.
+- **Access:** production has no state-held access token. Its two Secrets Store slots are
+  `SHALEDB_PRODUCTION_ACCESS_TOKEN_A` and `_B`.
+- **What a later deploy would replace or delete.**
+  - A changed jurisdiction replaces the buckets and the Workflow and addresses new Durable
+    Objects (D49).
+  - A changed bucket location does nothing to the existing bucket (R2 cannot move one).
+  - A Durable Object class that is removed or renamed is a `deleted_classes` migration, which
+    destroys its storage. The classes are pinned by `production-durable-objects.test.ts`, and the
+    rule is in `docs/operations.md`, "Durable Object classes".
+- **Not pinned by a test:** physical names other than the bucket's, which Alchemy generates from
+  the stage.
+
+**Tokens** (`shaledb-access-tokens.ts`, `access-token-store.ts`, `lsm-access-gate.ts`):
+
+- **At deploy time.** The Workers bind both slots by reference: Alchemy never writes their values.
+- **At request time.** The gate reads them on the first request and every 30 s after. A rotation
+  needs no deploy, and Workers accept the new token within 30 s.
+- **A missing secret.** `deploy:production` runs `tokens check production` first and stops when
+  either secret is missing. The decision (`missingAccessTokenSlots`, exact names only) and the
+  task's order are now tested.
+- **Rotation without an outage:**
+  1. move every caller to B;
+  2. `tokens rotate production A`;
+  3. wait 30 s before giving anyone the new A.
+- **Never printed.** No test or log prints a token.
+- **Not changed, risk.** When a written secret does not turn active within about 10 s
+  (`awaitActive`), `ensure` reports success anyway.
+
+**The smoke test** (`smoke.ts`, `smoke.test.ts`):
+
+- **Interruption.** A run interrupted mid-way (a killed process, Ctrl-C) left its databases behind.
+  The cleanup now also runs on interruption (`Effect.onInterrupt`).
+- **A lost answer.** A create whose answer was lost was not recorded for removal; the id is now
+  recorded first.
+- **Every removal.** Every database is removed, and every leftover is reported, where the first
+  failed check used to stop the loop.
+- **Unique ids.** Ids carry a random part as well as the time.
+- **A hung step.** Each step fails after 60 s.
+- **What a run leaves in production.** After a passing run, its two databases are gone from the
+  API. Their head manifests stay for `gcMinAge` (1 h), and their ids cannot be created again for as
+  long (D90). The maintenance sweep then removes the rest.
+- **Exit status.** It exits non-zero on any failure.
+- **Safe on a live installation.** It touches only its own databases.
+- **Mutations caught:** cleanup without interruption, and the leftover check.
+
+**The deploy guard** (`docs/release-v1.md` §10, corrected). The guard was read at
+`~/.dotfiles/home/.pi/agent/extensions/cloudflare-deployment-guard/`.
+
+- **What it exempts.** In an allowlisted repository, and every worktree of it, the guard blocks
+  only a destroy or delete named directly on the command line.
+- **What it does not resolve.** It does not resolve package tasks there. So
+  `vp run @shaledb/infra#destroy:preview-<n>` and `deploy:production` are not blocked for agents.
+  The only gates are instructions and the token check.
+
+## D105. Rollback against the stored formats: what older code does with newer data
+
+Production starts at the release commit, so a rollback can only go back to a commit at or after
+it. Every stored record decodes with unknown keys ignored, and the next write of it drops them.
+The rule (`docs/operations.md`, "Rolling back") is that a field whose loss changes behavior raises
+the record's format, which older code refuses (D64).
+
+| Record          | Fields added since `f3b2ad2`                                     | Older code reading it                                                                       | Newer code reading older                                     |
+| --------------- | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| manifest        | `changelogAfterSeq`, and earlier `droppedSsts`                   | drops them on its next commit; `changelogAfterSeqOf` then reads on the safe side (D80 test) | `withDecodingDefaultKey` and `OptionFromOptionalKey` (tests) |
+| compactor state | `lastProgressAt` (D94); earlier `corruptSsts`, `collectionDueAt` | drops them; a running job falls back to `startedAt`                                         | decodes (`stored-format-fixtures.test.ts`)                   |
+| shard map       | none                                                             | n/a                                                                                         | n/a                                                          |
+| writer SQLite   | no schema change since D58                                       | n/a                                                                                         | n/a                                                          |
+
+The brief also named a manifest removal time, `recentCompactionJobIds`, checkpoint and changelog
+caps, and `PendingSplit.startedAt`. None of them is a stored field at the integration head: the
+caps are limits in code, and the others do not exist. They are not in the fixtures.
+
+**Fixtures.**
+
+- `manifest-v1-release-shape.json`, `compactor-state-v1-release-shape.json`, and
+  `shard-map-v1-release-shape.json` hold every field set. Their tests require that decoding and
+  re-encoding gives the same JSON, so the next change to a record fails until someone decides what
+  older code does with it.
+- A further test shows today's code dropping an unknown field, which is why the format rule
+  exists.

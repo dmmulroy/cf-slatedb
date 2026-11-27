@@ -606,15 +606,25 @@ Alchemy's Cloudflare profile.
 
    - **The current allowlist has no `Shaledb` entry.** Its only entry for this repository is the
      pre-rename `.../cf-slatedb/infra/cf-slatedb/alchemy.run.ts` (stack `CfSlatedb`). That path no
-     longer exists, so the guard skips it (`policy.ts`, `parseCloudflareDeploymentPolicy`). Run the
+     longer exists, so the guard skips it (`policy.ts`, `parseCloudflareDeploymentPolicy`, which
+     records it in `ignoredEntries`). Run the
      script once, whatever you decide about production.
    - **The stage list does not keep agents off production.** Once any project in a repository is
-     allowlisted, the guard exempts the whole repository (`isAllowlistedRepositoryWorkingDirectory`
-     in `policy.ts`; `destructiveOnly` in `evaluate.ts`). Only `alchemy destroy` and
+     allowlisted, the guard exempts the whole repository and every worktree of it, matched by the
+     shared git directory (`isAllowlistedRepositoryWorkingDirectory` in `policy.ts`;
+     `destructiveOnly` in `evaluate.ts`). Only `alchemy destroy` and
      `wrangler delete` stay blocked there. So after the script runs, an agent in this repository can
      run `deploy:production` whether or not `production` is listed. The real gates are your
      instruction and `deploy:production` refusing to run without the token secrets.
-   - **`alchemy destroy` stays blocked for agents**, whatever the allowlist says.
+   - **Only a destroy named directly stays blocked.** In an exempt repository the guard checks
+     only a deployment CLI named in the command itself: `alchemy destroy`, `wrangler delete`, or one
+     behind `pnpm exec`, `npx`, `vp exec`, or `vp dlx` (`evaluate.ts`, the `destructiveOnly`
+     branch). It does not resolve package tasks there (`evaluatePackageTask` is never reached;
+     the guard's test "exempts every canonical working directory in an allowlisted repository
+     before script resolution"). So `vp run @shaledb/infra#destroy:preview-1`, whose task runs
+     `alchemy destroy`, is not blocked in this repository or any of its worktrees, and neither is
+     `deploy:production`. There is no `destroy:production` task. Rechecked at the D104 audit by
+     reading the guard at `~/.dotfiles/home/.pi/agent/extensions/cloudflare-deployment-guard/`.
 
    You can skip this step by running steps 3 and 4 yourself.
 

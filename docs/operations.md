@@ -66,6 +66,50 @@ newer format rather than rewrite it. A rollback across a release that raised a f
 stops on those databases with `StoredDataInvalid`, naming the version to deploy, and damages
 nothing. Roll forward again to recover. v1 is format 1, the format of all data written so far.
 
+**A field older code does not know is dropped when it rewrites.** Every stored record decodes
+with unknown keys ignored: the manifest, the compactor state, and the shard directory's map. So a
+rollback to a commit that lacks a field reads newer data, and its next write of that record leaves
+the field out (`manifest-format-fixtures.test.ts`). A new field whose loss would change behavior
+must therefore raise the format, which older code refuses. A field that only adds information may
+stay at the same format if dropping it is safe.
+
+The rollback-safe fields so far:
+
+- `changelogAfterSeq`: it reads back on the safe side, D80.
+- `droppedSsts`.
+- `lastProgressAt` and `collectionDueAt`.
+
+The release's shapes are checked in as fixtures (`manifest-v1-release-shape.json`,
+`compactor-state-v1-release-shape.json`, `shard-map-v1-release-shape.json`). A change to any of
+those records fails its fixture test until the fixture is updated deliberately (D105).
+
+**The writer's SQLite** has three tables (`memtable_rows`, `writer_meta`, `flush_marks`), created
+with `CREATE TABLE IF NOT EXISTS` on every start, and no column has changed since the first preview
+deploy. A new table is safe both ways. A new or changed column needs its own migration and a raised
+format, so older code never meets it.
+
+## Durable Object classes
+
+Alchemy writes each Worker's Durable Object migrations from the classes it hosts.
+
+- **A class that leaves a deploy is a deletion.** It becomes a `deleted_classes` migration, which
+  destroys every instance's storage.
+- **A class renamed without `renamedFrom`** is a deletion plus a new class.
+
+Production hosts these classes and one Workflow; their names are permanent:
+
+- `WriterServer`: on the API Worker. It holds every database's memtable, so its unflushed,
+  acknowledged writes live here.
+- `CompactorServer` and `CompactionBudgetServer`: on the compactor Worker.
+- `ShardDirectoryServer`: on the shard router.
+- `CompactionWorkflow`: the Workflow.
+
+Never rename them, move them to another Worker, or stop declaring them; the test
+`production-durable-objects.test.ts` pins them. Migration tags are Alchemy's, not ours. Since the
+first preview deploy, classes have only been added (`R2ProbeServer`, D56; `PlainSqliteServer`,
+D75), both on the probe Worker. Production never deploys the probe Worker, so neither needs a
+production migration.
+
 ## Access tokens
 
 The API, GC, and shard-router Workers accept a request that presents either of the stage's two
