@@ -44,7 +44,7 @@ Expected: thirteen `✓` lines.
 
 | Config | `Broken` | Expected |
 | --- | --- | --- |
-| `WriterObjectSeal.cfg` | `none` | pass (3,406,245 states, 71 s with 2 workers) |
+| `WriterObjectSeal.cfg` | `none` | pass (3,855,683 states, 98 s with 2 workers under load) |
 | `WriterObjectSeal.cfg` | `sealKeepsPhase` (before D85) | `SealNotHalf` |
 | `WriterObjectSeal.cfg` | `beforeD115` | `NeverSelfFenced` |
 | `WriterObjectSeal.cfg` | `markFencedAnyPhase` | `NeverSelfFenced` |
@@ -53,7 +53,7 @@ Expected: thirteen `✓` lines.
 | `WriterObjectTxn.cfg` | `noHorizonReread` (before D84) | `Serializable` |
 | `WriterObjectTxn.cfg` | `noGeneration` (before D74b) | `CountersCover` |
 | `WriterObjectTxn.cfg` | `interruptedWrite` (before D74b's second half) | `CountersCover` |
-| `WriterObjectLive.cfg` | `none` | pass (63,765 states, about 18 s) |
+| `WriterObjectLive.cfg` | `none` | pass (72,597 states, about 15 s) |
 | `WriterObjectLive.cfg` | `noAlarmRetry` | `AckedFlushed` |
 | `WriterObjectAlarmLoop.cfg` | `none` | pass |
 | `WriterObjectAlarmLoop.cfg` | `noSettle` (D74's loop) | `AlarmQuiets` |
@@ -96,7 +96,7 @@ process's label (`pc`); replay it against the code:
 | `WDone` | `commitLock` released, `ensuring(scheduleFlush)`, the acknowledgement |
 | `FlLock`, `FlReady`, `FlMeta` | `flushThen`: `flushLock`, `ensureReady` (the `ready` it keeps), `memTable.meta` for the cut; nothing to flush: `settleCountersWithNothingToFlush` |
 | `FlUpload` | `ssts.write` (R2) |
-| `FlCommit` | `manifests.updateFrom(commitL0Flush, then sealEdit)`; refused: `markFenced` over its own epoch only (D115); may land and lose its response |
+| `FlCommit` | `manifests.updateFrom(commitL0Flush, then sealEdit)`; refused fenced: `markFenced` over its own epoch only (D115); refused stale (`FlushedSeqStaleError`, D113): `markFlushed(lastL0Seq)` and back to `FlMeta`; may land and lose its response |
 | `FlMark`, `FlTrim`, `FlRefresh`, `FlDone` | `markFlushed`, `trim`, the view install, `refreshUnflushedCounters`, `flushLock` released |
 | `SLock` … `SSet` | `seal`: `commitLock`, `ensureReady`, `flushThen(sealEdit)`, or its own `updateFrom(sealEdit)`, then phase `Ready` sealed |
 | `PReady`, `PRead`, `PManifest` | `probe`: `consistently` (snapshot, `flushedSeq`, rows), then the reader's manifest (`flushedSeq <= lastL0Seq <= snapshot`, else probe again) |
@@ -140,6 +140,11 @@ the code's words.
 
 ## Maintenance notes
 
+- D113: `FlCommit` gains the stale refusal: a flush whose `flushed_seq` is below the manifest's
+  `lastL0Seq` (an earlier commit landed and lost its response) records it and flushes again.
+  Reran: all 13 runs as expected; `WriterObjectSeal.cfg` grew from 3,406,245 to 3,855,683 states.
+  The changelog itself is `verify-change-feed`'s.
+
 - D109 (this model) found D115: a flush refused at an older epoch marked the restarted writer
   `Fenced`. Two paths, both through D85's forget: a seal interrupted while it waited for the
   flush lock, and a seal with nothing to flush whose create failed while a flush that took its
@@ -149,7 +154,8 @@ the code's words.
 
 ## Keeping it in step with the code
 
-Sync commit: the D115 fix (`fix(lsm-cloudflare): a refused flush marks only its own phase fenced;
+Sync commit: the D113 fix (`fix(lsm-cloudflare): a flush is exact about where it starts; the
+change feed reads each change once (D113)`); before it the D115 fix (`fix(lsm-cloudflare): a refused flush marks only its own phase fenced;
 a seal forgets its phase only after applying its edit (D115)`). When a covered function changes,
 move or add the labels so that each is still one step between two fiber switches, translate,
 rerun, and show each property still fails on its broken variant before moving the sync commit.
