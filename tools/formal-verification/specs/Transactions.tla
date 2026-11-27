@@ -37,7 +37,13 @@
 (*    it, and compaction changes nothing a transaction can observe.        *)
 (*                                                                         *)
 (* A transaction writes its own name as the value of each key it writes;  *)
-(* direct writes (plain puts) are one-write transactions.                  *)
+(* direct writes (plain puts) are one-write transactions. A direct merge   *)
+(* adds an operand of amount its seq (as U64Add would), so a value is its  *)
+(* base and the sum of the operands above it: an operand counted twice or  *)
+(* lost changes what a read returns (D135). A read takes the writer's rows *)
+(* only above the manifest's lastL0Seq; each source's rows are tagged, so  *)
+(* a row both hold is two rows, and the manifest's operands may be folded  *)
+(* by a compaction into one row at the newest operand's seq.               *)
 (*                                                                         *)
 (* Broken selects a deliberately broken variant (must fail):               *)
 (*   "none"               the code as written                              *)
@@ -47,24 +53,32 @@
 (*   "noReadHorizonCheck" reads skip the manifest's lower bound, so rows   *)
 (*                        trimmed below it are silently missed             *)
 (*   "noReadUpperBound"   reads accept a manifest flushed past readSeq     *)
+(*   "noPartition"        reads take every writer row beside the           *)
+(*                        manifest's (getAt before D135)                   *)
+(*   "dedupeBySeq"        reads take every writer row and drop the         *)
+(*                        manifest's row of the same seq (scanAt before    *)
+(*                        D135)                                            *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
-CONSTANTS Keys, Txns, MaxSeq, Broken, Live
+CONSTANTS Keys, Txns, MaxSeq, Broken, Live,
+  Merges \* TRUE: direct merges commit operands (D135), at a smaller bound for states
 
 ASSUME Broken \in {"none", "snapshotOnly", "trimWithoutAbort", "noReadHorizonCheck",
-                   "noReadUpperBound", "beforeD76"}
+                   "noReadUpperBound", "beforeD76", "noPartition", "dedupeBySeq"}
 ASSUME Live \in BOOLEAN
+ASSUME Merges \in BOOLEAN
 
 Init0 == "init"
 Direct == "direct"
-InitVersion == [seq |-> 0, value |-> Init0]
+Operand == "operand"
+InitVersion == [seq |-> 0, value |-> Init0, kind |-> "put"]
 
 VARIABLES
   seq,        \* the writer's last sequence number
   flushed,    \* flushed_seq: rows at or below it are in the newest manifest
   retained,   \* retained_from_seq: rows at or below it are gone from SQLite
-  versions,   \* each key's committed versions: a set of [seq, value]
+  versions,   \* each key's committed versions: a set of [seq, value, kind ("put" or "merge")]
   state,      \* each transaction: "idle" | "active" | "committed" | "aborted"
   readSeq,    \* each transaction's read sequence number
   pinned,     \* each transaction's begin manifest, by its lastL0Seq
@@ -89,9 +103,36 @@ Init ==
 
 \* The newest of a set of versions (each set read here holds the seq-0 version or is non-empty).
 Newest(vs) == CHOOSE v \in vs : \A w \in vs : w.seq <= v.seq
-\* The value of k the database held at sequence number s.
-ValueAt(k, s) == Newest({v \in versions[k] : v.seq <= s}).value
+\* A version as one source holds it: "w" the writer's SQLite, "m" the manifest. An operand adds its
+\* seq; a compaction's fold adds the sum of the operands it folded.
+RowOf(v, src) == [seq |-> v.seq, value |-> v.value, kind |-> v.kind, amt |-> v.seq, src |-> src]
+RECURSIVE SumAmt(_)
+SumAmt(R) == IF R = {} THEN 0 ELSE LET r == CHOOSE x \in R : TRUE IN r.amt + SumAmt(R \ {r})
+\* resolveVisibleRow over rows R (they hold a put): the newest put's value and the sum of every
+\* operand row above it, each row counted.
+Resolve(R) ==
+  LET base == Newest({r \in R : r.kind = "put"})
+  IN <<base.value, SumAmt({r \in R : r.kind = "merge" /\ r.seq > base.seq})>>
+\* The value of k the database held at sequence number s: each version once.
+ValueAt(k, s) == Resolve({RowOf(v, "m") : v \in {x \in versions[k] : x.seq <= s}})
 Current(k) == ValueAt(k, seq)
+\* What a manifest with lastL0Seq m holds for k: its rows, or (compacted) the operands above the
+\* newest put folded into one row at the newest operand's seq.
+ManifestRows(k, m, folded) ==
+  LET raw == {RowOf(v, "m") : v \in {x \in versions[k] : x.seq <= m}}
+      ops == {r \in raw : r.kind = "merge" /\ r.seq > Newest({x \in raw : x.kind = "put"}).seq}
+  IN IF ~folded \/ ops = {} THEN raw
+     ELSE (raw \ ops) \cup {[seq |-> Newest(ops).seq, value |-> Operand, kind |-> "merge",
+                               amt |-> SumAmt(ops), src |-> "m"]}
+\* getAt/scanAt of k by t from the writer's rows in (retained, readSeq] and a manifest with
+\* lastL0Seq m: the writer supplies only the rows above m (D135).
+ReadValue(t, k, m, folded) ==
+  LET kept == {v \in versions[k] : v.seq > retained /\ v.seq <= readSeq[t]}
+      wr == {RowOf(v, "w") : v \in kept}
+      mr == ManifestRows(k, m, folded)
+  IN Resolve(CASE Broken = "noPartition" -> wr \cup mr
+               [] Broken = "dedupeBySeq" -> wr \cup {r \in mr : r.seq \notin {v.seq : v \in kept}}
+               [] OTHER -> {r \in wr : r.seq > m} \cup mr)
 
 \* beginTransaction: readSeq and the manifest that made flushed_seq durable, read together.
 Begin(t) ==
@@ -118,11 +159,9 @@ Fits(t, m) ==
 Read(t, k) ==
   /\ ~Live
   /\ state[t] = "active" /\ k \notin writes[t]
-  /\ \/ \E m \in 0 .. seq :
+  /\ \/ \E m \in 0 .. seq, folded \in BOOLEAN :
           /\ Fits(t, m)
-          /\ LET kept == {v \in versions[k] : v.seq > retained /\ v.seq <= readSeq[t]}
-                 value == IF kept # {} THEN Newest(kept).value ELSE ValueAt(k, m)
-             IN reads' = [reads EXCEPT ![t] = @ \cup {<<k, value>>}]
+          /\ reads' = [reads EXCEPT ![t] = @ \cup {<<k, ReadValue(t, k, m, folded)>>}]
           /\ UNCHANGED state
      \/ /\ ~Fits(t, pinned[t])
         /\ state' = [state EXCEPT ![t] = "aborted"]
@@ -153,7 +192,7 @@ Commit(t) ==
           ELSE /\ okAtCommit' = [okAtCommit EXCEPT ![t] = \A r \in reads[t] : Current(r[1]) = r[2]]
                /\ seq' = seq + 1
                /\ versions' = [k \in Keys |->
-                    IF k \in writes[t] THEN versions[k] \cup {[seq |-> seq + 1, value |-> t]}
+                    IF k \in writes[t] THEN versions[k] \cup {[seq |-> seq + 1, value |-> t, kind |-> "put"]}
                     ELSE versions[k]]
                /\ state' = [state EXCEPT ![t] = "committed"]
   /\ UNCHANGED <<flushed, retained, readSeq, pinned, reads, writes, gone>>
@@ -164,7 +203,15 @@ DirectWrite(k) ==
   \* Live: leave each transaction a sequence number to commit with
   /\ Live => seq + Cardinality({t \in Txns : state[t] # "committed"}) < MaxSeq
   /\ seq' = seq + 1
-  /\ versions' = [versions EXCEPT ![k] = @ \cup {[seq |-> seq + 1, value |-> Direct]}]
+  /\ versions' = [versions EXCEPT ![k] = @ \cup {[seq |-> seq + 1, value |-> Direct, kind |-> "put"]}]
+  /\ UNCHANGED <<flushed, retained, state, readSeq, pinned, reads, writes, okAtCommit, gone>>
+
+\* A plain merge: one operand, committed like a one-write transaction with no reads.
+DirectMerge(k) ==
+  /\ Merges /\ seq < MaxSeq
+  /\ Live => seq + Cardinality({t \in Txns : state[t] # "committed"}) < MaxSeq
+  /\ seq' = seq + 1
+  /\ versions' = [versions EXCEPT ![k] = @ \cup {[seq |-> seq + 1, value |-> Operand, kind |-> "merge"]}]
   /\ UNCHANGED <<flushed, retained, state, readSeq, pinned, reads, writes, okAtCommit, gone>>
 
 \* A flush: every committed row into the newest manifest; flushed_seq advances, nothing is deleted.
@@ -192,12 +239,12 @@ LiveRead(t, k) ==
   /\ Live
   /\ state[t] = "active" /\ reads[t] = {}
   /\ LET stored(m) == m \notin gone
-         kept == {v \in versions[k] : v.seq > retained /\ v.seq <= readSeq[t]}
-         from(m) == IF kept # {} THEN Newest(kept).value ELSE ValueAt(k, m)
          newestFits == Broken # "beforeD76" /\ Fits(t, flushed)
          beginFits == stored(pinned[t]) /\ Fits(t, pinned[t])
      IN IF newestFits \/ beginFits
-          THEN /\ reads' = [reads EXCEPT ![t] = {<<k, from(IF newestFits THEN flushed ELSE pinned[t])>>}]
+          THEN /\ \E folded \in BOOLEAN :
+                    reads' = [reads EXCEPT ![t] =
+                      {<<k, ReadValue(t, k, IF newestFits THEN flushed ELSE pinned[t], folded)>>}]
                /\ UNCHANGED state
           ELSE /\ state' = [state EXCEPT ![t] = "aborted"]
                /\ UNCHANGED reads
@@ -225,7 +272,7 @@ Next ==
   \/ \E t \in Txns, k \in Keys : LiveRead(t, k)
   \/ Collect
   \/ \E t \in Txns, k \in Keys : Read(t, k) \/ Write(t, k)
-  \/ \E k \in Keys : DirectWrite(k)
+  \/ \E k \in Keys : DirectWrite(k) \/ DirectMerge(k)
   \/ Flush \/ Trim
 
 Spec == Init /\ [][Next]_vars

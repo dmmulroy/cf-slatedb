@@ -1,6 +1,7 @@
 import { Array as Arr, Bytes, Option, Result, Schema, Stream } from "effect";
 
 import type { SeqNum, Timestamp } from "./ids.ts";
+import type { KeyVersions } from "./key-versions.ts";
 import { MergedValueTooLargeError, MergeOperatorMissingError } from "./lsm-core-errors.ts";
 import { type Row, RowValue } from "./row.ts";
 
@@ -109,9 +110,13 @@ export interface ReadResolutionOptions {
 }
 
 /**
- * Resolves a key's versions (newest first) into the value a read at `snapshotSeq` sees.
+ * Resolves a key's versions into the value a read at `snapshotSeq` sees.
  *
  * **Details**
+ *
+ * Takes {@link KeyVersions} only (newest first, each sequence number from the one source that owns
+ * it): every merge operand in it is applied, so a version given twice would be applied twice
+ * (D135).
  *
  * Walks from the newest visible version until a value or a delete, then applies the newer merge
  * operands oldest to newest on top. An expired value reads as a delete; an expired operand is
@@ -122,7 +127,7 @@ export interface ReadResolutionOptions {
  *   the snapshot, or `MergeOperatorMissingError` when operands need an operator and none is set.
  */
 export const resolveVisibleRow = (
-  versions: ReadonlyArray<Row>,
+  versions: KeyVersions,
   options: ReadResolutionOptions,
 ): Result.Result<Option.Option<Row>, MergeOperatorMissingError | MergedValueTooLargeError> => {
   const operands: Array<Row> = [];

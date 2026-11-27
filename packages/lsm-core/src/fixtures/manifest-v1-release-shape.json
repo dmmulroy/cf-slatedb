@@ -55,7 +55,8 @@
   },
   "state": {
     "_tag": "Sealed",
-    "successors": ["orders-b", "orders-c"]
+    "successors": ["orders-b", "orders-c"],
+    "successorsHeld": true
   },
   "externalRefs": [
     {

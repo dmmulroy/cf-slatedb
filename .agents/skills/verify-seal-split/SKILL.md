@@ -25,6 +25,11 @@ Expected: five `✓` lines. The code as written passes; `writerNotFenced` fails 
 `sealWithoutLock`, `checkpointBeforeSeal`, and `overlappingRanges` fail
 `EveryAckedWriteInExactlyOneSuccessor`.
 
+After the model checks, run `node tools/formal-verification/src/error-branches.ts` (D137). Every
+error branch in the functions this model covers needs a row in `docs/coverage-matrix.md`'s
+"Error branches in model-covered code" that names one of the actions below, or says why no model
+covers it. A branch with no action is a gap in this model: add the action, or record the reason.
+
 ## Read a result
 
 Read results with the pstack `/statechart` skill (`.agents/skills/statechart/SKILL.md`, opened by

@@ -17,6 +17,7 @@ import {
   retainKeyVersions,
 } from "./row-resolution.ts";
 import { type Row, RowValue } from "./row.ts";
+import { keyVersionsOf } from "./key-versions.ts";
 
 const smallInt = (minimum: number, maximum: number) =>
   Arbitrary.schema(Schema.Int.check(Schema.isBetween({ minimum, maximum })));
@@ -80,7 +81,7 @@ describe("keepReachableVersions", () => {
         const reads = [...versionsByKey(history)].every(([key, versions]) =>
           sameValue(
             Result.getOrThrow(
-              resolveVisibleRow(versions, {
+              resolveVisibleRow(keyVersionsOf(versions), {
                 snapshotSeq,
                 now,
                 mergeOperator: Option.some(MERGE_OPERATORS.Concat),
@@ -142,7 +143,7 @@ describe("resolveVisibleRow", () => {
         return [...versionsByKey(rows)].every(([key, versions]) =>
           sameValue(
             Result.getOrThrow(
-              resolveVisibleRow(versions, {
+              resolveVisibleRow(keyVersionsOf(versions), {
                 snapshotSeq,
                 now,
                 mergeOperator: Option.some(MERGE_OPERATORS.Concat),
@@ -182,7 +183,7 @@ describe("resolveVisibleRow", () => {
       },
     ];
     const visible = Result.getOrThrow(
-      resolveVisibleRow(versions, {
+      resolveVisibleRow(keyVersionsOf(versions), {
         snapshotSeq: SeqNum.make(3),
         now: Timestamp.make(0),
         mergeOperator: Option.some(MERGE_OPERATORS.Concat),
@@ -208,7 +209,7 @@ describe("resolveVisibleRow", () => {
       expireTs: Option.none(),
     }));
     const visible = Result.getOrThrow(
-      resolveVisibleRow(versions, {
+      resolveVisibleRow(keyVersionsOf(versions), {
         snapshotSeq: SeqNum.make(3),
         now: Timestamp.make(0),
         mergeOperator: Option.some(MERGE_OPERATORS.U64Add),
@@ -221,7 +222,7 @@ describe("resolveVisibleRow", () => {
 
   it("fails with MergeOperatorMissingError when operands need an operator", () => {
     const resolved = resolveVisibleRow(
-      [
+      keyVersionsOf([
         {
           key: Uint8Array.of(1),
           seq: SeqNum.make(1),
@@ -229,7 +230,7 @@ describe("resolveVisibleRow", () => {
           createTs: Option.none(),
           expireTs: Option.none(),
         },
-      ],
+      ]),
       { snapshotSeq: SeqNum.make(1), now: Timestamp.make(0), mergeOperator: Option.none() },
     );
     expect(Result.isFailure(resolved) && resolved.failure._tag).toBe("MergeOperatorMissingError");
@@ -281,7 +282,7 @@ describe("retainKeyVersions with merge operands of mixed expiry (D81)", () => {
   const readAt = (versions: ReadonlyArray<Row>, now: number) =>
     Option.map(
       Result.getOrThrow(
-        resolveVisibleRow(versions, {
+        resolveVisibleRow(keyVersionsOf(versions), {
           snapshotSeq: SeqNum.make(100),
           now: Timestamp.make(now),
           mergeOperator: Option.some(MERGE_OPERATORS.Concat),
@@ -367,7 +368,7 @@ describe("row resolution at its edges (mutation sweep, D117)", () => {
     Option.map(
       Result.getOrThrow(
         resolveVisibleRow(
-          operands.map((operand, index) => merge(operands.length - index, operand)),
+          keyVersionsOf(operands.map((operand, index) => merge(operands.length - index, operand))),
           {
             snapshotSeq: SeqNum.make(100),
             now: Timestamp.make(0),

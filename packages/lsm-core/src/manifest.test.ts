@@ -135,7 +135,7 @@ describe("Manifest JSON", () => {
         },
       ],
       keyRange: Option.some({ start: Uint8Array.of(1), end: Option.some(Uint8Array.of(9)) }),
-      state: { _tag: "Sealed", successors: [DatabaseId.make("orders-a")] },
+      state: { _tag: "Sealed", successors: [DatabaseId.make("orders-a")], successorsHeld: false },
       externalRefs: [
         {
           owner: DatabaseId.make("root"),

@@ -109,14 +109,16 @@ type Step =
   | { readonly _tag: "Begin"; readonly txn: number }
   | { readonly _tag: "Read"; readonly txn: number; readonly key: number }
   | { readonly _tag: "Write"; readonly txn: number; readonly key: number; readonly value: number }
+  | { readonly _tag: "Merge"; readonly txn: number; readonly key: number; readonly value: number }
   | { readonly _tag: "Commit"; readonly txn: number }
   | { readonly _tag: "Direct"; readonly key: number; readonly value: number }
+  | { readonly _tag: "DirectMerge"; readonly key: number; readonly value: number }
   | { readonly _tag: "Flush" }
   | { readonly _tag: "Compact" }
   | { readonly _tag: "Tick" };
 
 const stepArbitrary: Arbitrary.Arbitrary<Step> = Arbitrary.all({
-  kind: smallInt(0, 21),
+  kind: smallInt(0, 23),
   txn: smallInt(0, 2),
   key: smallInt(0, 2),
   value: smallInt(1, 250),
@@ -124,19 +126,39 @@ const stepArbitrary: Arbitrary.Arbitrary<Step> = Arbitrary.all({
   Arbitrary.map(({ kind, txn, key, value }): Step => {
     if (kind <= 3) return { _tag: "Begin", txn };
     if (kind <= 9) return { _tag: "Read", txn, key };
-    if (kind <= 14) return { _tag: "Write", txn, key, value };
+    if (kind <= 12) return { _tag: "Write", txn, key, value };
+    if (kind <= 14) return { _tag: "Merge", txn, key, value };
     if (kind <= 17) return { _tag: "Commit", txn };
     if (kind === 18) return { _tag: "Direct", key, value };
-    if (kind === 19) return { _tag: "Flush" };
-    if (kind === 20) return { _tag: "Compact" };
+    if (kind === 19) return { _tag: "DirectMerge", key, value };
+    if (kind === 20) return { _tag: "Flush" };
+    if (kind === 21) return { _tag: "Compact" };
     return { _tag: "Tick" };
   }),
 );
 
+/** One write of a transaction or a direct write: a put of one byte, or a `Concat` operand. */
+interface TestWrite {
+  readonly kind: "Put" | "Merge";
+  readonly value: number;
+}
+
+/** A key's value as hex (undefined: absent), the form the oracle compares. */
+type OracleValue = string | undefined;
+
+const hexOf = (bytes: Uint8Array): string =>
+  Array.from(bytes, (part) => part.toString(16).padStart(2, "0")).join("");
+
+/** `value` after `write`: a put replaces it, a `Concat` operand appends to it. */
+const applyWrite = (value: OracleValue, write: TestWrite): OracleValue => {
+  const operand = hexOf(Uint8Array.of(write.value));
+  return write.kind === "Put" ? operand : (value ?? "") + operand;
+};
+
 interface Running extends TransactionBegin {
   readonly startedAt: number;
-  readonly reads: Map<number, number | undefined>;
-  readonly writes: Map<number, number>;
+  readonly reads: Map<number, OracleValue>;
+  readonly writes: Map<number, Array<TestWrite>>;
 }
 
 /**
@@ -149,7 +171,7 @@ const checkSchedule = (isolation: TransactionIsolation) => (steps: ReadonlyArray
     Effect.gen(function* () {
       yield* createDatabase;
       const client = yield* DbClient;
-      const oracle = new Map<number, number>();
+      const oracle = new Map<number, OracleValue>();
       // Commit "time" of each key's last write in the oracle, to detect lost updates.
       const lastWriteAt = new Map<number, number>();
       let clock = 0;
@@ -180,12 +202,20 @@ const checkSchedule = (isolation: TransactionIsolation) => (steps: ReadonlyArray
             const value = Option.flatMap(row.success, (visible) =>
               visible.value._tag === "Value" ? Option.some(visible.value.bytes) : Option.none(),
             );
-            txn.reads.set(step.key, byte(value));
+            txn.reads.set(step.key, Option.getOrUndefined(Option.map(value, hexOf)));
             break;
           }
           case "Write":
-            running.get(step.txn)?.writes.set(step.key, step.value);
+          case "Merge": {
+            const writes = running.get(step.txn)?.writes;
+            if (writes === undefined) break;
+            const write: TestWrite = {
+              kind: step._tag === "Write" ? "Put" : "Merge",
+              value: step.value,
+            };
+            writes.set(step.key, [...(writes.get(step.key) ?? []), write]);
             break;
+          }
           case "Commit": {
             const txn = running.get(step.txn);
             if (txn === undefined || txn.writes.size === 0) break;
@@ -195,12 +225,23 @@ const checkSchedule = (isolation: TransactionIsolation) => (steps: ReadonlyArray
                 readSeq: txn.readSeq,
                 isolation,
                 batch: {
-                  operations: [...txn.writes].map(([k, v]) => ({
-                    _tag: "Put" as const,
-                    key: key(k),
-                    value: Uint8Array.of(v),
-                    ttlMillis: Option.none(),
-                  })),
+                  operations: [...txn.writes].flatMap(([k, writes]) =>
+                    writes.map((write) =>
+                      write.kind === "Put"
+                        ? {
+                            _tag: "Put" as const,
+                            key: key(k),
+                            value: Uint8Array.of(write.value),
+                            ttlMillis: Option.none(),
+                          }
+                        : {
+                            _tag: "Merge" as const,
+                            key: key(k),
+                            operand: Uint8Array.of(write.value),
+                            ttlMillis: Option.none(),
+                          },
+                    ),
+                  ),
                 },
                 readKeys: [...txn.reads.keys()].map(key),
                 readRanges: [],
@@ -219,16 +260,27 @@ const checkSchedule = (isolation: TransactionIsolation) => (steps: ReadonlyArray
                 if ((lastWriteAt.get(k) ?? -1) > txn.startedAt) return false;
             }
             clock++;
-            for (const [k, v] of txn.writes) {
-              oracle.set(k, v);
+            for (const [k, writes] of txn.writes) {
+              oracle.set(k, writes.reduce(applyWrite, oracle.get(k)));
               lastWriteAt.set(k, clock);
             }
             break;
           }
           case "Direct":
-            yield* client.put(DB, key(step.key), Uint8Array.of(step.value));
+          case "DirectMerge":
+            if (step._tag === "Direct") {
+              yield* client.put(DB, key(step.key), Uint8Array.of(step.value));
+            } else {
+              yield* client.merge(DB, key(step.key), Uint8Array.of(step.value));
+            }
             clock++;
-            oracle.set(step.key, step.value);
+            oracle.set(
+              step.key,
+              applyWrite(oracle.get(step.key), {
+                kind: step._tag === "Direct" ? "Put" : "Merge",
+                value: step.value,
+              }),
+            );
             lastWriteAt.set(step.key, clock);
             break;
           case "Flush":

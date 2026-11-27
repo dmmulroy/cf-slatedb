@@ -113,7 +113,15 @@ expires after the given lifetime; the snapshot stays readable until it expires o
 `retained_from_seq <= M.lastL0Seq <= readSeq` (the newest one the reader holds when it fits, else
 the begin manifest, D76 and D83) plus the rows the writer keeps in `(retained_from_seq, readSeq]`
 (`DbWriter.probeAt`). That is exact while the writer keeps every row
-above `readSeq`. A trim keeps a flush's rows at least `transactionRetentionMs` (60 s) after that
+above `readSeq`.
+
+**Each sequence number from one source (D135).** The writer's rows and `M` overlap: the writer
+keeps flushed rows until a trim, and a compaction may have folded merge operands into one row
+carrying its newest operand's sequence number. Every read (a `Latest` or transaction `get` or
+`scan`) therefore takes a writer row only when its sequence number is above `M.lastL0Seq` and at
+or below the read's snapshot, and every row at or below `M.lastL0Seq` from `M`
+(`readTakesWriterRow` in `lsm-core/src/key-versions.ts`). The result is a `KeyVersions`, the only
+input `resolveVisibleRow` accepts, so no operand is applied twice and no fold is lost. A trim keeps a flush's rows at least `transactionRetentionMs` (60 s) after that
 flush, less only when more than `maxRetainedBytes` (64 MiB) of flushed rows are kept, and never
 removes the newest flush. Once a trim passes `readSeq`, the commit fails with `SnapshotTooOld`, and
 so does a read whose begin manifest no longer covers `retained_from_seq` or has been collected by

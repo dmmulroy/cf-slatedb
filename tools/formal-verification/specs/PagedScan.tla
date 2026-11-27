@@ -26,10 +26,17 @@
 (*    (writtenAfter). The caller names the whole range it scanned.         *)
 (*                                                                         *)
 (* A segment here is one key; a page examines one key per unit of budget.  *)
-(* Each write is one key, a put or a delete; a put's value is its seq.     *)
-(* A flush commits and records flushed_seq at once (NoAckedWriteLost and   *)
-(* WriterObject check the steps between); compaction is not a step: a      *)
-(* manifest read under these bounds answers the same compacted or not.     *)
+(* Each write is one key: a put (its value is its seq), a delete, or a     *)
+(* merge operand (adds its seq, as U64Add would), so a version counted     *)
+(* twice or lost changes the value read (D135). Rows carry their source,   *)
+(* the writer or the manifest, so a row both hold is two rows, as in the   *)
+(* code. A flush commits and records flushed_seq at once (NoAckedWriteLost *)
+(* and WriterObject check the steps between). Compaction is a choice at    *)
+(* each read: the manifest's operands above the key's base may be folded   *)
+(* into one row at the newest operand's seq (retainKeyVersions).           *)
+(*                                                                         *)
+(* Each read takes the writer's rows only above the manifest's lastL0Seq;  *)
+(* the manifest holds the rest (collectKeyVersions, streamKeyVersions).    *)
 (*                                                                         *)
 (* Broken selects a deliberately broken variant (must fail):               *)
 (*   "none"               the code as written                              *)
@@ -37,12 +44,18 @@
 (*                        starts again at a new snapshot instead of ending *)
 (*   "pageRangesOnly"     the transaction's readRanges name only the keys  *)
 (*                        its pages returned                               *)
+(*   "noPartition"        a read takes every writer row beside the         *)
+(*                        manifest's (the point read before D135): an      *)
+(*                        operand both hold is applied twice               *)
+(*   "dedupeBySeq"        a read takes every writer row and drops the      *)
+(*                        manifest's row of the same seq (the scan before  *)
+(*                        D135): a fold's older operands are lost          *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS NKeys, MaxSeq, MaxBudget, MaxGc, Scanner, Broken
 
-ASSUME Broken \in {"none", "restartAfterRows", "pageRangesOnly"}
+ASSUME Broken \in {"none", "restartAfterRows", "pageRangesOnly", "noPartition", "dedupeBySeq"}
 \* Which scanner runs: the Latest scan or the transaction scan (one per config, for states).
 ASSUME Scanner \in {"latest", "txn"}
 
@@ -51,33 +64,61 @@ None == 0          \* "no value": a key absent or deleted
 End == NKeys + 1   \* resumeFrom past the last key: the range is exhausted
 
 VARIABLES
-  lastSeq, flushedSeq, retained, keyOf, liveOf, stored, gcs,
+  lastSeq, flushedSeq, retained, keyOf, kindOf, stored, gcs,
   \* the Latest scanner: one page at a time
   lpc, lStart, lPos, lSnap, lMaxFs, lW, lRows, lBudget, lFixed,
   \* the transaction scanner
   tpc, tRead, tPos, tW, tRet, tRows, tBudget, tScanned, tResult, tPhantom
 
-vars == <<lastSeq, flushedSeq, retained, keyOf, liveOf, stored, gcs,
+vars == <<lastSeq, flushedSeq, retained, keyOf, kindOf, stored, gcs,
           lpc, lStart, lPos, lSnap, lMaxFs, lW, lRows, lBudget, lFixed,
           tpc, tRead, tPos, tW, tRet, tRows, tBudget, tScanned, tResult, tPhantom>>
-dbVars == <<lastSeq, flushedSeq, retained, keyOf, liveOf, stored, gcs>>
+dbVars == <<lastSeq, flushedSeq, retained, keyOf, kindOf, stored, gcs>>
 lVars == <<lpc, lStart, lPos, lSnap, lMaxFs, lW, lRows, lBudget, lFixed>>
 tVars == <<tpc, tRead, tPos, tW, tRet, tRows, tBudget, tScanned, tResult, tPhantom>>
 
 MaxOf(S) == CHOOSE x \in S : \A y \in S : y <= x
 Max(a, b) == IF a >= b THEN a ELSE b
-\* The newest of a set of versions, as a value: its seq when a put, None when a delete or empty.
-ValueOf(vs) == IF vs = {} THEN None ELSE LET s == MaxOf(vs) IN IF liveOf[s] THEN s ELSE None
-\* The database's value of k at sequence number s.
-ValueAt(k, s) == ValueOf({v \in 1..s : keyOf[v] = k})
-\* What a manifest with lastL0Seq m holds for k, merged with writer rows w.
-Merged(k, w, m) == ValueOf(w \cup {v \in 1..m : keyOf[v] = k})
+Kinds == {"put", "del", "merge"}
+\* A version as one source holds it: its seq, kind, what it adds (a put's value, an operand's
+\* amount, or a fold's sum), and its source ("w" the writer, "m" the manifest).
+RowOf(v, src) == [seq |-> v, kind |-> kindOf[v], amt |-> IF kindOf[v] = "del" THEN 0 ELSE v,
+                  src |-> src]
+RECURSIVE SumAmt(_)
+SumAmt(R) == IF R = {} THEN 0 ELSE LET r == CHOOSE x \in R : TRUE IN r.amt + SumAmt(R \ {r})
+\* The newest put or delete among rows R (0: none).
+BaseSeq(R) == LET bases == {r.seq : r \in {x \in R : x.kind # "merge"}}
+              IN IF bases = {} THEN 0 ELSE MaxOf(bases)
+\* resolveVisibleRow over rows R: the base's value plus every operand row above it, each row
+\* counted (a row held twice counts twice); None when there is neither a live base nor an operand.
+Resolve(R) ==
+  LET b == BaseSeq(R)
+      live == \E r \in R : r.seq = b /\ r.kind = "put"
+      ops == {r \in R : r.kind = "merge" /\ r.seq > b}
+  IN IF ~live /\ ops = {} THEN None ELSE (IF live THEN b ELSE 0) + SumAmt(ops)
+\* The database's value of k at sequence number s: each version once.
+ValueAt(k, s) == Resolve({RowOf(v, "m") : v \in {x \in 1..s : keyOf[x] = k}})
+\* What a manifest with lastL0Seq m holds for k: its rows, or (compacted) the operands above the
+\* base folded into one row at the newest operand's seq.
+ManifestRows(k, m, folded) ==
+  LET raw == {RowOf(v, "m") : v \in {x \in 1..m : keyOf[x] = k}}
+      ops == {r \in raw : r.kind = "merge" /\ r.seq > BaseSeq(raw)}
+  IN IF ~folded \/ ops = {} THEN raw
+     ELSE (raw \ ops) \cup {[seq |-> MaxOf({r.seq : r \in ops}), kind |-> "merge",
+                               amt |-> SumAmt(ops), src |-> "m"]}
+\* What a read of k resolves from writer rows w and a manifest with lastL0Seq m.
+Merged(k, w, m, folded) ==
+  LET mr == ManifestRows(k, m, folded)
+      wr == {RowOf(v, "w") : v \in w}
+  IN Resolve(CASE Broken = "noPartition" -> wr \cup mr
+               [] Broken = "dedupeBySeq" -> wr \cup {r \in mr : r.seq \notin w}
+               [] OTHER -> {r \in wr : r.seq > m} \cup mr)
 \* The live rows of keys lo..hi-1 at s.
 Live(lo, hi, s) == {<<k, ValueAt(k, s)>> : k \in {x \in lo..(hi - 1) : ValueAt(x, s) # None}}
 
 Init ==
   /\ lastSeq = 0 /\ flushedSeq = 0 /\ retained = 0
-  /\ keyOf = [s \in 1..MaxSeq |-> 0] /\ liveOf = [s \in 1..MaxSeq |-> FALSE]
+  /\ keyOf = [s \in 1..MaxSeq |-> 0] /\ kindOf = [s \in 1..MaxSeq |-> "del"]
   /\ stored = {0} /\ gcs = 0
   /\ lpc = "idle" /\ lStart = 1 /\ lPos = 1 /\ lSnap = 0 /\ lMaxFs = 0 /\ lW = {}
   /\ lRows = {} /\ lBudget = 0 /\ lFixed = FALSE
@@ -89,20 +130,20 @@ Init ==
 
 Write ==
   /\ lastSeq < MaxSeq
-  /\ \E k \in Keys, live \in BOOLEAN :
+  /\ \E k \in Keys, kind \in Kinds :
        /\ keyOf' = [keyOf EXCEPT ![lastSeq + 1] = k]
-       /\ liveOf' = [liveOf EXCEPT ![lastSeq + 1] = live]
+       /\ kindOf' = [kindOf EXCEPT ![lastSeq + 1] = kind]
   /\ lastSeq' = lastSeq + 1
   /\ UNCHANGED <<flushedSeq, retained, stored, gcs>> /\ UNCHANGED lVars /\ UNCHANGED tVars
 
 Flush ==
   /\ flushedSeq < lastSeq
   /\ flushedSeq' = lastSeq /\ stored' = stored \cup {lastSeq}
-  /\ UNCHANGED <<lastSeq, retained, keyOf, liveOf, gcs>> /\ UNCHANGED lVars /\ UNCHANGED tVars
+  /\ UNCHANGED <<lastSeq, retained, keyOf, kindOf, gcs>> /\ UNCHANGED lVars /\ UNCHANGED tVars
 
 Trim ==
   /\ \E h \in (retained + 1)..flushedSeq : retained' = h
-  /\ UNCHANGED <<lastSeq, flushedSeq, keyOf, liveOf, stored, gcs>>
+  /\ UNCHANGED <<lastSeq, flushedSeq, keyOf, kindOf, stored, gcs>>
   /\ UNCHANGED lVars /\ UNCHANGED tVars
 
 \* GC deletes a manifest that is not the newest (superseded gcMinAge ago).
@@ -110,7 +151,7 @@ Collect ==
   /\ gcs < MaxGc
   /\ \E m \in stored \ {flushedSeq} : stored' = stored \ {m}
   /\ gcs' = gcs + 1
-  /\ UNCHANGED <<lastSeq, flushedSeq, retained, keyOf, liveOf>>
+  /\ UNCHANGED <<lastSeq, flushedSeq, retained, keyOf, kindOf>>
   /\ UNCHANGED lVars /\ UNCHANGED tVars
 
 ---------------------------------------------------------------------------
@@ -137,9 +178,9 @@ LProbe ==
 \* The segment's merge with a manifest between D70's bounds; or a flush overtook the scan.
 LMerge ==
   /\ lpc = "merge"
-  /\ \/ \E m \in stored :
+  /\ \/ \E m \in stored, folded \in BOOLEAN :
           /\ lMaxFs <= m /\ m <= lSnap
-          /\ LET value == Merged(lPos, lW, m)
+          /\ LET value == Merged(lPos, lW, m, folded)
              IN lRows' = IF value = None THEN lRows ELSE lRows \cup {<<lPos, value>>}
           /\ lPos' = lPos + 1 /\ lBudget' = lBudget - 1
           /\ lpc' = IF lPos + 1 = End \/ lBudget = 1 THEN "end" ELSE "probe"
@@ -191,9 +232,9 @@ TProbe ==
 
 TMerge ==
   /\ tpc = "merge"
-  /\ \/ \E m \in stored :
+  /\ \/ \E m \in stored, folded \in BOOLEAN :
           /\ tRet <= m /\ m <= tRead
-          /\ LET value == Merged(tPos, tW, m)
+          /\ LET value == Merged(tPos, tW, m, folded)
              IN tRows' = IF value = None THEN tRows ELSE tRows \cup {<<tPos, value>>}
           /\ tScanned' = tScanned \cup {tPos}
           /\ tPos' = tPos + 1 /\ tBudget' = tBudget - 1

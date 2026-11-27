@@ -42,6 +42,25 @@
 (*                       cell.get and cell.set are two awaits, so a second  *)
 (*                       beginSplit of the same shard can overwrite the     *)
 (*                       pending record with its own successor ids (D116)   *)
+(*   "forkRetryUndoesHold" a repeated forkRange of a half that exists      *)
+(*                       removes the half's hold when it cannot find the   *)
+(*                       half's first manifest (collected by its GC), as   *)
+(*                       before D136                                       *)
+(*                                                                         *)
+(*   "resealTakesHolds"  a seal of the sealed shard takes a new hold for   *)
+(*                       each successor without one (before D138, or a     *)
+(*                       seal recorded without successorsHeld): a half     *)
+(*                       that released its own gets one nothing releases   *)
+(*   "noSkipReleased"    the split dies on a half with no hold instead of  *)
+(*                       finding the half done (before D138)               *)
+(*                                                                         *)
+(* forkRange runs whenever the split's process reaches it, a half that     *)
+(* already exists included (a resumed split repeats every step). A repeat  *)
+(* finds the half its earlier call created, whose newest manifest reads    *)
+(* the hold, and changes nothing (D136). A half releases its hold after    *)
+(* its rewrite (Release, D77), possibly before the split published; a      *)
+(* split resumed after that finds no hold for the half, and the half       *)
+(* exists, so the half is done (D138).                                     *)
 (*                                                                         *)
 (* A second split request of the same shard and key (another client, or a *)
 (* retry with its own process) runs beginSplit beside the first: each draws *)
@@ -53,7 +72,7 @@ EXTENDS Naturals, FiniteSets, TLC
 CONSTANTS MaxValues, MaxCrashes, Broken
 
 ASSUME Broken \in {"none", "noResume", "noFlushedRefresh", "resealOthers", "feedGap",
-                   "noDirectoryLock"}
+                   "noDirectoryLock", "forkRetryUndoesHold", "resealTakesHolds", "noSkipReleased"}
 
 Keys == {"a", "b"}
 \* The split point: "a" goes left, "b" right.
@@ -83,13 +102,17 @@ VARIABLES
   myIds,      \* the ids the split's process seals and forks with
   b1,         \* its beginSplit: "idle" | "sawNone" | "sawPending" (noDirectoryLock: read, then write)
   p2,         \* the second request's beginSplit: "idle" | "sawNone" | "sawPending" | "done"
-  misrouted   \* a published map names successors other than the ones the seal named
+  misrouted,  \* a published map names successors other than the ones the seal named
+  released,   \* halves whose compactor released their hold on the shard after the rewrite (D77)
+  fdone       \* halves this run of the split has forked, or found forked
 
 vars == <<dirVersion, pending, spc, crashes, sSealed, holds, sData, sealedData, forked, own, cpc,
           ckey, cval, cmap, nextValue, rmap, rold, staleRead, cons, drained, seen, pids, myIds, b1,
-          p2, misrouted>>
+          p2, misrouted, released, fdone>>
+relVars == <<released, fdone>>
 dirVars == <<pids, myIds, b1, p2, misrouted>>
-splitVars == <<dirVersion, pending, spc, crashes, sSealed, holds, sealedData, forked, dirVars>>
+splitVars == <<dirVersion, pending, spc, crashes, sSealed, holds, sealedData, forked, dirVars,
+               relVars>>
 clientVars == <<cpc, ckey, cval, cmap, nextValue>>
 readerVars == <<rmap, rold, staleRead>>
 feedVars == <<cons, drained, seen>>
@@ -102,6 +125,7 @@ Init ==
   /\ rmap = 1 /\ rold = FALSE /\ staleRead = FALSE
   /\ cons = "source" /\ drained = FALSE /\ seen = {}
   /\ pids = 0 /\ myIds = 0 /\ b1 = "idle" /\ p2 = "idle" /\ misrouted = FALSE
+  /\ released = {} /\ fdone = {}
 
 (* ----- The writer client and its router ----- *)
 ClientStart(k) ==
@@ -131,6 +155,7 @@ ClientRefresh ==
 \* The routing wait ran out with the split still pending and its process gone: the request
 \* finishes it from the directory's record (D101).
 ClientResume ==
+  /\ UNCHANGED relVars
   /\ cpc = "waiting" /\ pending /\ spc = "dead" /\ Broken # "noResume"
   /\ spc' = "recorded" /\ myIds' = pids
   /\ UNCHANGED <<dirVersion, pending, crashes, sSealed, holds, sealedData, forked, sData, own,
@@ -142,6 +167,7 @@ ClientResume ==
 DirLocked == Broken # "noDirectoryLock"
 
 Begin ==
+  /\ UNCHANGED relVars
   /\ spc = "idle" /\ b1 = "idle" /\ DirLocked
   /\ IF pending THEN myIds' = pids /\ UNCHANGED <<pending, pids>>
                 ELSE pending' = TRUE /\ pids' = 1 /\ myIds' = 1
@@ -150,12 +176,14 @@ Begin ==
                  readerVars, feedVars, b1, p2, misrouted>>
 
 BeginRead ==
+  /\ UNCHANGED relVars
   /\ spc = "idle" /\ b1 = "idle" /\ ~DirLocked
   /\ b1' = IF pending THEN "sawPending" ELSE "sawNone"
   /\ UNCHANGED <<dirVersion, pending, spc, crashes, sSealed, holds, sealedData, forked, sData, own,
                  clientVars, readerVars, feedVars, pids, myIds, p2, misrouted>>
 
 BeginWrite ==
+  /\ UNCHANGED relVars
   /\ b1 \in {"sawNone", "sawPending"}
   /\ IF b1 = "sawNone" THEN pending' = TRUE /\ pids' = 1 /\ myIds' = 1
                        ELSE myIds' = pids /\ UNCHANGED <<pending, pids>>
@@ -165,6 +193,7 @@ BeginWrite ==
 
 \* The second request's beginSplit (its own ids, 2); its request then ends, leaving any record.
 Begin2 ==
+  /\ UNCHANGED relVars
   /\ p2 = "idle" /\ DirLocked /\ dirVersion = 1
   /\ IF pending THEN UNCHANGED <<pending, pids>> ELSE pending' = TRUE /\ pids' = 2
   /\ p2' = "done"
@@ -172,38 +201,73 @@ Begin2 ==
                  clientVars, readerVars, feedVars, myIds, b1, misrouted>>
 
 Begin2Read ==
+  /\ UNCHANGED relVars
   /\ p2 = "idle" /\ ~DirLocked /\ dirVersion = 1
   /\ p2' = IF pending THEN "sawPending" ELSE "sawNone"
   /\ UNCHANGED <<dirVersion, pending, spc, crashes, sSealed, holds, sealedData, forked, sData, own,
                  clientVars, readerVars, feedVars, pids, myIds, b1, misrouted>>
 
 Begin2Write ==
+  /\ UNCHANGED relVars
   /\ p2 \in {"sawNone", "sawPending"}
   /\ IF p2 = "sawNone" THEN pending' = TRUE /\ pids' = 2 ELSE UNCHANGED <<pending, pids>>
   /\ p2' = "done"
   /\ UNCHANGED <<dirVersion, spc, crashes, sSealed, holds, sealedData, forked, sData, own,
                  clientVars, readerVars, feedVars, myIds, b1, misrouted>>
 
-\* seal(shard, [L, R], holds): flushes and seals in one commit, taking both holds; a repeat finds it
-\* done.
+\* seal(shard, [L, R], holds): flushes and seals in one commit, taking both holds. A repeat finds it
+\* done and takes no hold (D138): the holds it returns are the ones still there. Each run of the
+\* split starts its forks after its seal.
 Seal ==
   /\ spc = "recorded"
   /\ IF sSealed
-       THEN UNCHANGED <<sSealed, holds, sealedData>>
+       THEN /\ holds' = IF Broken = "resealTakesHolds" THEN holds \cup Forks ELSE holds
+            /\ UNCHANGED <<sSealed, sealedData>>
        ELSE /\ sSealed' = TRUE /\ holds' = holds \cup Forks /\ sealedData' = sData
-  /\ spc' = "sealed"
-  /\ UNCHANGED <<dirVersion, pending, crashes, forked, sData, own, clientVars, readerVars, feedVars, dirVars>>
+  /\ spc' = "sealed" /\ fdone' = {}
+  /\ UNCHANGED <<dirVersion, pending, crashes, forked, sData, own, clientVars, readerVars, feedVars,
+                 dirVars, released>>
 
-\* forkRange from its hold: the sealed data in its range (a repeat finds the fork).
+\* The split's step for half f, after its seal:
+\*  - a hold: forkRange from it. A repeat (the half exists) finds the half whose newest manifest
+\*    reads the hold, returns it, and removes nothing (D136); before D136 it asked the half's first
+\*    manifest, which the half's GC may have collected, and then removed the hold. A hold the half
+\*    does not read (resealTakesHolds: taken after the half released its own) makes forkRange fail
+\*    with DatabaseAlreadyExists; the half exists, so the split takes it as done, and the hold
+\*    stays.
+\*  - no hold, and the half exists: its compactor released the hold after its rewrite, so the half
+\*    is done (D138). noSkipReleased: the split fails here, as it did before D138.
+\*  - no hold and no half: the split fails (an operator deleted the hold; unreachable here).
 Fork(f) ==
-  /\ spc = "sealed" /\ f \in holds /\ f \notin forked
-  /\ forked' = forked \cup {f}
-  /\ UNCHANGED <<dirVersion, pending, spc, crashes, sSealed, holds, sealedData, sData, own,
-                 clientVars, readerVars, feedVars, dirVars>>
+  /\ spc = "sealed" /\ f \notin fdone
+  /\ CASE f \in holds /\ f \notin forked ->
+            /\ forked' = forked \cup {f} /\ fdone' = fdone \cup {f}
+            /\ UNCHANGED <<holds, spc>>
+       [] f \in holds ->
+            /\ fdone' = fdone \cup {f}
+            /\ holds' = IF Broken = "forkRetryUndoesHold" THEN holds \ {f} ELSE holds
+            /\ UNCHANGED <<forked, spc>>
+       [] f \notin holds /\ f \in forked /\ Broken # "noSkipReleased" ->
+            /\ fdone' = fdone \cup {f}
+            /\ UNCHANGED <<forked, holds, spc>>
+       [] OTHER ->
+            /\ spc' = "dead"
+            /\ UNCHANGED <<forked, holds, fdone>>
+  /\ UNCHANGED <<dirVersion, pending, crashes, sSealed, sealedData, sData, own,
+                 clientVars, readerVars, feedVars, dirVars, released>>
+
+\* A half's compactor, gcMinAge after its rewrite, releases its hold on the shard (D77), whether or
+\* not the split has published.
+Release(f) ==
+  /\ f \in forked /\ f \in holds /\ f \notin released
+  /\ released' = released \cup {f} /\ holds' = holds \ {f}
+  /\ UNCHANGED <<dirVersion, pending, spc, crashes, sSealed, sealedData, forked, sData, own,
+                 clientVars, readerVars, feedVars, dirVars, fdone>>
 
 \* completeSplit publishes the successors the pending record names.
 Publish ==
-  /\ spc = "sealed" /\ forked = Forks
+  /\ UNCHANGED relVars
+  /\ spc = "sealed" /\ fdone = Forks
   /\ dirVersion' = 2 /\ pending' = FALSE /\ spc' = "published"
   /\ misrouted' = (misrouted \/ pids # myIds)
   /\ UNCHANGED <<crashes, sSealed, holds, sealedData, forked, sData, own, clientVars, readerVars,
@@ -211,6 +275,7 @@ Publish ==
 
 \* The split's process dies after any step (its request ended, its Worker was evicted).
 Crash ==
+  /\ UNCHANGED relVars
   /\ spc \in {"recorded", "sealed"} /\ crashes < MaxCrashes
   /\ spc' = "dead" /\ crashes' = crashes + 1
   /\ UNCHANGED <<dirVersion, pending, sSealed, holds, sealedData, forked, sData, own, clientVars,
@@ -218,6 +283,7 @@ Crash ==
 
 \* Another caller seals the shard naming other successors (D95: refused).
 ResealOthers ==
+  /\ UNCHANGED relVars
   /\ sSealed /\ Broken = "resealOthers" /\ "L2" \notin holds
   /\ holds' = holds \cup {"L2"}
   /\ UNCHANGED <<dirVersion, pending, spc, crashes, sSealed, sealedData, forked, sData, own,
@@ -269,7 +335,7 @@ Next ==
   \/ \E k \in Keys : ClientStart(k) \/ ReadFlushed(k)
   \/ ClientWrite \/ ClientRefresh \/ ClientResume
   \/ Begin \/ BeginRead \/ BeginWrite \/ Begin2 \/ Begin2Read \/ Begin2Write
-  \/ Seal \/ Publish \/ Crash \/ ResealOthers \/ \E f \in Forks : Fork(f)
+  \/ Seal \/ Publish \/ Crash \/ ResealOthers \/ \E f \in Forks : Fork(f) \/ Release(f)
   \/ ReaderTick
   \/ ConsumeSource \/ SwitchToSuccessors \/ ConsumeSuccessors
 
@@ -287,6 +353,7 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 TypeOK ==
   /\ dirVersion \in {1, 2} /\ cpc \in {"idle", "writing", "waiting"}
   /\ holds \subseteq (Forks \cup {"L2"})
+  /\ released \subseteq Forks /\ fdone \subseteq forked
 
 \* Once published, every write the shard acknowledged is in the successor that owns its key.
 EveryShardWriteInItsSuccessor ==
@@ -294,6 +361,14 @@ EveryShardWriteInItsSuccessor ==
 
 \* Every hold on the shard belongs to a successor its seal names (D95).
 HoldsMatchSeal == holds \subseteq Forks
+
+\* Every half that exists keeps its hold on the shard (D136) until its own release after its rewrite
+\* (D77), never ended by a repeated split step.
+ForkKeepsHold == \A f \in forked \ released : f \in holds
+
+\* No hold outlives its half's release (D138): a half that released its hold never holds the shard
+\* again, so nothing keeps a hold its holder never reads, and the shard can be removed.
+NoOrphanHold == released \cap holds = {}
 
 \* A consumer that moved to the successors was given every write the shard acknowledged (D80).
 ConsumerMissesNothing == cons = "successors" => sData \subseteq seen

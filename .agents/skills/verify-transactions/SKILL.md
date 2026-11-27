@@ -1,6 +1,6 @@
 ---
 name: verify-transactions
-description: "Model-check that shaledb's SerializableSnapshot transactions admit only serializable histories: every committed transaction read exactly the values the database held when it committed. Use after any change to DbWriter.commitTransaction, MemTable.writtenAfter, DbClient.beginTransaction/getAt/scanAt/transaction, the reader's maxLastL0Seq check, or how flushes advance flushed_seq."
+description: "Model-check that shaledb's SerializableSnapshot transactions admit only serializable histories: every committed transaction read exactly the values the database held when it committed. Use after any change to DbWriter.commitTransaction, MemTable.writtenAfter, DbClient.beginTransaction/getAt/scanAt/transaction, the reader's maxLastL0Seq check, how flushes advance flushed_seq, or how a read combines the writer's rows with its manifest's (collectKeyVersions, readTakesWriterRow: D135)."
 ---
 
 # Verify: transactions
@@ -25,13 +25,22 @@ node tools/formal-verification/src/verify.ts transactions   # about 30 seconds
 vp run verify                                               # every formal check
 ```
 
-Expected: seven `✓` lines. The code as written passes both configs. `snapshotOnly` (the commit checks written
+Expected: ten `✓` lines. The code as written passes all three configs. `snapshotOnly` (the commit checks written
 keys only, which is `Snapshot` isolation) and `trimWithoutAbort` (the commit skips the
 `retained_from_seq` check, so a trim past an open transaction hides its writes) fail
 `Serializable`. `noReadHorizonCheck` (a read accepts a manifest below `retained_from_seq`) and
 `noReadUpperBound` (a read accepts a manifest flushed past `readSeq`) fail `ReadsAtBegin`.
 `beforeD76` (a read uses only the begin manifest) fails `EveryTxnCommits` in `TransactionsLive.cfg`
 (183,324 states, about 15 s with 2 workers).
+`TransactionsMerge.cfg` (`Merges = TRUE`: one key, five sequence numbers, direct merge operands
+beside the transactions, about 16 s) passes; `noPartition` (a read takes every writer row beside
+its manifest: issue #1, before D135) and `dedupeBySeq` (a read takes every writer row and drops
+the manifest's copy of a seq, losing a fold) fail `ReadsAtBegin`.
+
+After the model checks, run `node tools/formal-verification/src/error-branches.ts` (D137). Every
+error branch in the functions this model covers needs a row in `docs/coverage-matrix.md`'s
+"Error branches in model-covered code" that names one of the actions below, or says why no model
+covers it.
 
 ## Read a result
 
@@ -47,6 +56,7 @@ step:
 | `Write(t, k)` | `DbTransaction.put` (buffered in the client) |
 | `Commit(t)` | `DbWriter.commitTransaction` under `commitLock`: `flushed_seq > readSeq` aborts; `MemTable.writtenAfter(written keys, and for SerializableSnapshot read keys and ranges)` aborts; else `commitBatch` |
 | `DirectWrite(k)` | `DbWriter.write` (a plain put) |
+| `DirectMerge(k)` | `DbWriter.write` of a merge operand (`Merges = TRUE`, D135). A read's value is `ReadValue`: the writer's rows above the manifest's `lastL0Seq` (`readTakesWriterRow`) and the manifest's rows, its operands possibly folded, each applied once in order (`Resolve`) |
 | `Flush` | `DbWriter.flushNow`: rows up to the cut leave the memtable and `flushed_seq` advances |
 
 If a step cannot happen in the code, fix the model. If every step can, it is a bug: report it in
@@ -91,6 +101,11 @@ deletes rows. `writer.workerd.ts` refuses write skew through the public API.
   the pinned manifest's horizon check); each fails `Serializable`.
 
 ## Maintenance notes
+
+- D135: a read's value was the newest version in a set, so an operand taken from both the writer
+  and the manifest could not be seen twice (issue #1). Versions now carry a kind, and
+  `TransactionsMerge.cfg` adds merge operands. `Transactions.cfg` and `TransactionsLive.cfg` set
+  `Merges = FALSE` and are unchanged.
 
 - D111 (liveness): `Live = TRUE` (`TransactionsLive.cfg`, two transactions, two keys, `MaxSeq` 3,
   no symmetry) replaces `Read` with `LiveRead`, which decides as `DbReader.manifestFor` does: the
@@ -176,7 +191,7 @@ deletes rows. `writer.workerd.ts` refuses write skew through the public API.
 
 ## Keeping it in step with the code
 
-Sync commit: the D84/D85 commit (`fix(writer)`: the conflict check re-reads the horizon, a seal that does not return forgets the writer's phase). When a covered function changes after it, update the model
+Sync commit: the D135 commit. When a covered function changes after it, update the model
 so each action is still one awaited effect in the code, rerun, and show each invariant still fails on
 a broken variant before moving the sync commit. For drift that skipped this skill, use
 `.agents/skills/maintain-formal-verification-skill/SKILL.md`.

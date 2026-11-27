@@ -5640,3 +5640,155 @@ answered, so no data check failed. But the gate counted five error spans, one pe
 - the reader without the retry;
 - a failed primary ending the read;
 - a failed primary not starting the bucket read.
+
+## D135. A read takes each sequence number from exactly one source
+
+**Found by** issue #1 (@hcrosse): with a `Concat` merge operator, `merge(k,[1])`, `merge(k,[2])`,
+and a flush, a Latest `get` read `[1,2]` but `getAt` and a transaction's `get` read
+`[1,2,1,2]`. A read-modify-write through the transaction stored the doubled value durably.
+
+**Why.** The writer keeps rows after their flush until a trim (`docs/invariants.md`, the overlap
+between writer rows and L0). `DbReader.getRow` concatenated the writer's rows with every SST's and
+passed them to `resolveVisibleRow`, which applies each merge operand it is given. A row at a
+sequence number both sources hold was applied twice. `scan` happened to read correctly because
+`mergeRowStreams` deduplicates equal `(key, seq)` pairs. Deduplicating alone is not enough: a
+compaction folds operands into one row carrying its newest operand's sequence number, so keeping
+the writer's unfolded copy of that sequence number drops the operands folded below it (the second
+regression test).
+
+**Decision.**
+
+- **`KeyVersions` (`lsm-core/src/key-versions.ts`).** A branded list of one key's versions:
+  newest first, each sequence number once, all at or below the snapshot. `resolveVisibleRow`
+  accepts only this type, so a read can no longer hand it rows assembled by hand.
+- **One partition rule, `readTakesWriterRow`.** A read takes a writer row only when its sequence
+  number is above the manifest's `lastL0Seq` and at or below the snapshot. Every row at or below
+  `lastL0Seq` comes from the manifest, folded or not. This holds because a writer is seeded at its
+  manifest's `lastL0Seq` and a flush records its cut only after the manifest commit.
+- **Two builders that share the rule.** `collectKeyVersions` (point reads: `getRow`, so `get`,
+  `getAt`, a transaction's `get`) and `streamKeyVersions` (scans). The writer rows a scan skips
+  still count toward its page budget, so a page ends where it did before (`scan-bounds.test.ts`).
+
+**Tests.** `key-versions.test.ts` (both builders against the full history, at 1,000 runs);
+`db-read-agreement.test.ts` (issue #1, the fold, and a property at 300 runs that a Latest get
+and scan and a transaction's `getAt` and `scanAt` each read what the writes left, across merges,
+flushes, compactions, and trims); `db-transaction.test.ts`'s property now has `Merge` and
+`DirectMerge` steps against a `Concat` oracle. **Mutations, each caught:** deduplicating without
+the partition; the original concatenation.
+
+**Models.** `PagedScan.tla` and `Transactions.tla` read a value from source-tagged rows with
+operands applied in order (`Resolve`), with an optional compaction fold, instead of a set union
+that hid a duplicate. Broken variants `noPartition` (the concatenation) and `dedupeBySeq`
+(deduplicating alone) fail `LatestPageAtSnapshot` and `TxnPagesAtReadSeq` in PagedScan and
+`ReadsAtBegin` in Transactions. `TransactionsMerge.cfg`
+runs the transaction model with merges.
+
+## D136. A retried forkRange undoes only a hold it created, and decides from the fork's newest manifest
+
+**Found by** issue #2 (@hcrosse): after a fork's GC collected its manifest 1, retrying the same
+`forkRange` deleted the live fork's hold on its source. The source could then be removed while the
+fork still read its SSTs (`ReaderUnavailableError` on the fork: data loss).
+
+**Why.** On `DatabaseAlreadyExistsError`, `forkRange` loaded the fork's manifest 1 to decide
+whether the fork was its own. A collected manifest 1 read as "someone else's fork", and the cleanup
+then removed the hold it had found, which was not one it had created, through
+`removeCheckpointNow`, which skipped `deleteCheckpoint`'s refusal to delete a hold its holder may
+read.
+
+**Decision.**
+
+- **`acquireForkHold` returns a `ForkHoldAcquisition`:** `Created` or `Existing`. It reuses the
+  hold already pinning that manifest for that fork, or creates one in a CAS.
+- **The fork is ours** when the fork's newest manifest (`findLatest`, not Removed) has an
+  external ref to the source with the hold's id. Manifest 1 is never needed.
+- **Otherwise the call undoes only a hold it `Created`,** then fails with
+  `DatabaseAlreadyExistsError`.
+- **One guarded removal, `removeCheckpointFor`,** takes a `CheckpointRemovalPermit`
+  (`CallerCheckpoint`, `HolderGone`, `UnusedHold`) saying why the removal is allowed. It replaces
+  `removeCheckpointNow` and `remove`'s inline removal, so there is no unguarded way to remove a
+  hold.
+
+**Tests.** `database-lifecycle-retry.test.ts`: issue #2; a hold undone only when the fork id
+belongs to another database; and a retry property at 200 runs for every operation documented as
+safe to retry (`forkRange`, `remove`, `deleteCheckpoint`, `seal`, `createCheckpoint`,
+`pinSnapshot`, `create`, GC's `collect`): run it, run random later work (writes, flushes,
+compactions, collections, time), run it again, then check that no hold, ref, or value was lost.
+**Mutation, caught:** the cleanup removing any hold it found.
+
+**Models.** `Lifecycle.tla` gives holds ids (`HoldIds = Forks × {1,2}`) and adds `ForkFlush`,
+`CollectFirst`, `RetryAcquire`, and `RetryInit` under `ForkRetry = TRUE`
+(`LifecycleRetry.cfg`, `LifecycleRetryLiveness.cfg`). Broken variants `compensateAnyHold` (the
+code before D136) and `retryTrustsFirstManifest` fail `NoReaderNeedsDeleted`. `ShardSplit.tla`'s `Fork(f)` now runs a
+repeat of a half that exists instead of assuming it does nothing, with the invariant
+`ForkKeepsHold` and the broken variant `forkRetryUndoesHold`.
+
+## D137. Every error branch in model-covered code maps to a model action or a reason
+
+**Why.** Neither bug above was a gap in a property; each was an error branch no model had an action
+for (`forkRange`'s `DatabaseAlreadyExistsError` handler), or a simplification that assumed the
+branch harmless (a set union for rows, `f \notin forked` for a repeated fork).
+`coverage-matrix.md` mapped design sections to models, not branches, so nothing showed the gap.
+
+**Decision.** `tools/formal-verification/src/error-branches.ts` lists the functions each verify
+skill's model covers (`MODEL_COVERED_FUNCTIONS`) and finds, by text, every error branch in them:
+each handled tag, each constructed error, each failure helper called, and each catch-all,
+`ignore`, `orDie`, `retry`, and failure inspection. `docs/coverage-matrix.md`'s "Error branches
+in model-covered code" table gives each one a model action or the reason no model covers it.
+`error-branches.test.ts` fails `vp run ready` on a branch with no row, a row with no branch, or a
+row that maps to nothing. Each `verify-*` skill runs the check after a change.
+
+**Limits.** Matching is textual and per function: a branch in a helper the registry does not list
+is not seen, and a function added to a model needs its registry entry. A "not modeled" row is a
+decision a reviewer reads, not a proof.
+
+## D138. A repeated seal takes no hold, and a resumed split finds a released half done
+
+**Found by** the 2026-11-27 cross-review (writer reviewer,
+`docs/cross-review-2026-11-27/writer-status.md`). A split sealed and forked both halves and then
+failed to publish. Both halves rewrote the shard's SSTs and released their holds `gcMinAge` later
+(D77). A request then resumed the split (D101). Three rules, each correct alone, combined badly:
+
+- D57: a seal with `holdForSuccessors` took a hold "for each successor that has none yet", so the
+  repeated seal took two new holds;
+- D136: `forkRange` of an existing half found the seal's new hold `Existing` and the half's newest
+  manifest not reading it, and failed with `DatabaseAlreadyExistsError` (before D136 it also
+  removed the hold);
+- D101: every later resume repeated the same steps, so the split never published, the sealed
+  shard's range stayed unwritable, and the new holds were left on the shard with no holder reading
+  them, so the shard could never be removed.
+
+**Decision.**
+
+- **Successors are given their holds once.** The `Sealed` state records it in a new field,
+  `successorsHeld`, set by `holdForSuccessors` (`lsm-core`), which changes nothing once it is set.
+  A repeated seal's receipt names the holds still there (`successorHoldsOf` on the committed
+  manifest). A seal retried after its own commit landed finds the holds that commit took. A seal
+  without holds followed by one with them still takes them, in one commit (`sharding.test.ts`).
+  `successorsHeld` decodes as false when it is missing, at the same format version. A rollback's
+  rewrite drops it (`docs/operations.md`).
+- **A half with no hold that exists is done.** `ShardSplit.split` forks each half from its hold
+  when the receipt has one. Otherwise it asks the new `DatabaseLifecycle.exists`. The half ids
+  are fresh per split (the directory allocates them), so a half that exists was forked by this
+  split, and its missing hold means its compactor released it after its rewrite. The split then
+  publishes.
+- **A hold the half does not read.** A seal recorded without `successorsHeld`, which is a manifest
+  from before D138 or one a rollback rewrote, gives a released half a new hold. `forkRange` then
+  fails with `DatabaseAlreadyExistsError`. The half exists, so the split takes it as done and
+  publishes, and that hold stays until the half is removed.
+- **No hold and no half** can only follow an operator's `deleteCheckpoint` of an orphan hold
+  (D116). The split dies with a message naming the successor, and the range needs an operator.
+
+**Tests.** `database-lifecycle.test.ts`: "a seal repeated after its successors released their
+holds" (real compactors release both holds; the repeated seal takes none; the shard can be
+removed) and "a repeat before the successors forked returns the holds the sealing commit took".
+`shard-split-faults.test.ts`: "a split resumed after its halves released their holds" (publishes,
+no hold left, every key readable) and "publishes even when a seal recorded before D138 takes the
+released halves new holds". `manifest-format-fixtures.test.ts`: older code drops
+`successorsHeld`, and today's reads it back as false. **Mutations, each caught:** holds taken
+again; the split without the existence check; the split without the `AlreadyExists` fallback.
+
+**Models.** `ShardSplit.tla` adds `Release(f)` (a half's compactor releasing its hold, before or
+after the publish) and tracks each run's forks (`fdone`), so a run publishes only after it has
+forked or found done both halves. New invariant `NoOrphanHold`. `ForkKeepsHold` now excludes a
+released half. Broken variants: `resealTakesHolds` fails `NoOrphanHold`, and `noSkipReleased` fails
+`WaitingWritesLand` (`ShardSplitLiveness.cfg`).

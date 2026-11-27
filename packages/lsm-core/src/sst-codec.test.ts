@@ -34,6 +34,7 @@ import {
   type SstMeta,
   sstMayContainKey,
 } from "./sst-codec.ts";
+import { keyVersionsOf } from "./key-versions.ts";
 
 const SST_ID = SstId.make("01JD00000000000000000000AA");
 
@@ -172,7 +173,7 @@ describe("SST codec and read path", () => {
         return keys.every((key) => {
           if (!sstMayContainKey(meta, key)) return !expected.has(keyToHex(key));
           const visible = Result.getOrThrow(
-            resolveVisibleRow(keyVersions(bytes, meta, key), {
+            resolveVisibleRow(keyVersionsOf(keyVersions(bytes, meta, key)), {
               snapshotSeq,
               now,
               mergeOperator: Option.some(MERGE_OPERATORS.Concat),

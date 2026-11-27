@@ -39,6 +39,11 @@ Expect twelve `✓` lines: four configs pass, and each broken variant fails with
   neither process, because TLC does not name a violated temporal property. `verify.ts` reads the
   name from a config with exactly one.
 
+After the model checks, run `node tools/formal-verification/src/error-branches.ts` (D137). Every
+error branch in the functions this model covers needs a row in `docs/coverage-matrix.md`'s
+"Error branches in model-covered code" that names one of the actions below, or says why no model
+covers it. A branch with no action is a gap in this model: add the action, or record the reason.
+
 ## Deeper search
 
 Not part of `verify.ts`. Run it after a change to the poll, the locks, or `dropSst`, alone, for up

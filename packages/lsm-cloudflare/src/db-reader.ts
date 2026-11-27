@@ -1,7 +1,7 @@
 import {
   firstBlockForKey,
   blocksOverlappingRange,
-  groupRowsByKey,
+  collectKeyVersions,
   intersectKeyRanges,
   type KeyRange,
   keyRangeContains,
@@ -11,7 +11,7 @@ import {
   MERGE_OPERATORS,
   type MergedValueTooLargeError,
   type MergeOperatorMissingError,
-  mergeRowStreams,
+  streamKeyVersions,
   changelogAfterSeqOf,
   changelogHoldsChangesAfter,
   resolveVisibleRow,
@@ -55,7 +55,10 @@ export interface ReadView {
   readonly minLastL0Seq: SeqNum;
   /** Newest sequence number the read sees; none: the manifest's `lastL0Seq` (a `Flushed` read). */
   readonly snapshotSeq: Option.Option<SeqNum>;
-  /** Unflushed rows from the writer, in LSM order; empty for `Flushed` reads. */
+  /**
+   * Rows from the writer, in LSM order; empty for `Flushed` reads. A read takes only those above
+   * its manifest's `lastL0Seq`: the manifest holds the rest (D135).
+   */
   readonly memtable: ReadonlyArray<Row>;
   /**
    * The manifest to read instead of the newest one.
@@ -509,13 +512,17 @@ export const makeDbReader = Effect.gen(function* () {
       "database.id": databaseId,
       "read.memtable_versions": view.memtable.length,
     });
-    const versions: Array<Row> = view.memtable.filter((row) => Bytes.Equivalence(row.key, key));
-    const settled = (rows: ReadonlyArray<Row>) => rows.some((row) => row.value._tag !== "Merge");
     const { manifest } = yield* manifestFor(databaseId, view);
     const snapshotSeq = Option.getOrElse(view.snapshotSeq, () => manifest.lastL0Seq);
+    // The writer supplies only rows above the manifest's lastL0Seq; the manifest holds the rest,
+    // possibly folded by a compaction (D135).
+    const bounds = { manifestLastL0Seq: manifest.lastL0Seq, snapshotSeq };
+    const writerVersions = collectKeyVersions(key, view.memtable, [], bounds);
+    const settled = (rows: ReadonlyArray<Row>) => rows.some((row) => row.value._tag !== "Merge");
     const pointRead: BlockReadContext = { kind: "Get", snapshot: readsSnapshot(view) };
     let sstsRead = 0;
-    if (!settled(versions)) {
+    const sstVersionsRead: Array<ReadonlyArray<Row>> = [];
+    if (!settled(writerVersions)) {
       // The one SST per level that may hold the key, newest level first.
       const candidates = levels(manifest).flatMap((level) => {
         const handle = level.find(
@@ -542,14 +549,14 @@ export const makeDbReader = Effect.gen(function* () {
         const found = yield* sstVersions(databaseId, handle, key, snapshotSeq, budgetGroup).pipe(
           Effect.catchTags(blockFailures(databaseId, pointRead)),
         );
-        versions.push(...found);
+        sstVersionsRead.push(found);
         if (settled(found)) break;
       }
     }
     yield* Effect.annotateCurrentSpan({ seq: snapshotSeq, "read.ssts": sstsRead });
     const now = Timestamp.make(yield* Clock.currentTimeMillis);
     return yield* Effect.fromResult(
-      resolveVisibleRow(versions, {
+      resolveVisibleRow(collectKeyVersions(key, view.memtable, sstVersionsRead, bounds), {
         snapshotSeq,
         now,
         mergeOperator: Option.map(manifest.options.mergeOperator, (name) => MERGE_OPERATORS[name]),
@@ -628,9 +635,7 @@ export const makeDbReader = Effect.gen(function* () {
           manifest.options.mergeOperator,
           (name) => MERGE_OPERATORS[name],
         );
-        const memtable = Stream.fromIterable(
-          view.memtable.filter((row) => row.seq <= snapshotSeq && keyRangeContains(range, row.key)),
-        );
+        const writerRows = view.memtable.filter((row) => keyRangeContains(range, row.key));
         const budgetGroup = readerBudgetGroup(databaseId, manifest);
         const overlapping = manifest.l0
           .concat(manifest.sortedRuns.flatMap((run) => run.ssts))
@@ -652,8 +657,12 @@ export const makeDbReader = Effect.gen(function* () {
           sstRows(databaseId, handle, range, snapshotSeq, budgetGroup, options.limit, scanRead),
         );
         let examinedAny = false;
-        const visible = groupRowsByKey(mergeRowStreams([memtable, ...ssts])).pipe(
-          Stream.mapEffect((versions): Effect.Effect<Option.Option<Row>, DbReadError> => {
+        // The writer supplies only rows above the manifest's lastL0Seq (D135).
+        const visible = streamKeyVersions(writerRows, ssts, {
+          manifestLastL0Seq: manifest.lastL0Seq,
+          snapshotSeq,
+        }).pipe(
+          Stream.mapEffect((scanned): Effect.Effect<Option.Option<Row>, DbReadError> => {
             // A page that has examined its share ends before the next key, resumably (D108). Each
             // scan examines at least one key, so a resumed page always moves on.
             if (Option.isSome(options.budget)) {
@@ -664,16 +673,19 @@ export const makeDbReader = Effect.gen(function* () {
                     databaseId,
                     reason: "StorageUnavailable",
                     message: `A scan of database ${databaseId} examined ${budget.examinedBytes} bytes of versions, its page's share, before reaching its limit (deleted or expired rows return nothing). Resume the scan from resumeFrom (the next range start); every row before it was returned.`,
-                    resumeFrom: versions[0].key,
+                    resumeFrom: scanned.key,
                     pageEnd: "BudgetSpent",
                   }),
                 );
               }
-              for (const row of versions) budget.examinedBytes += rowEncodedSizeEstimate(row);
+              // Every row read counts, the writer's copies the read does not take among them.
+              for (const row of scanned.examined) {
+                budget.examinedBytes += rowEncodedSizeEstimate(row);
+              }
             }
             examinedAny = true;
             return Effect.fromResult(
-              resolveVisibleRow(versions, { snapshotSeq, now, mergeOperator }),
+              resolveVisibleRow(scanned.versions, { snapshotSeq, now, mergeOperator }),
             );
           }),
           Stream.flatMap((row) => Stream.fromIterable(Option.toArray(row))),

@@ -1,6 +1,6 @@
 ---
 name: verify-shard-split
-description: "Model-check a shaledb shard split end to end (TLA+, TLC): the directory's pending split, the seal with its holds, both forks in either order, the publish, a crash after any step and its resumption by a waiting request (D101), a router writing through a stale map, a Flushed read through a stale map (D89), a seal naming other successors (D95), and a change-feed consumer following the split (D80). Use after any change to shard-split.ts, the router's routing wait or map refresh, DbWriter.seal's successor rule, or the change feed's fork point."
+description: "Model-check a shaledb shard split end to end (TLA+, TLC): the directory's pending split, the seal with its holds, both forks in either order, the publish, a crash after any step and its resumption by a waiting request (D101), a half releasing its hold before the publish and the resumed split finding it done (D138), a router writing through a stale map, a Flushed read through a stale map (D89), a seal naming other successors (D95), and a change-feed consumer following the split (D80). Use after any change to shard-split.ts, DbWriter.seal's holds, DatabaseLifecycle.exists, the router's routing wait or map refresh, DbWriter.seal's successor rule, or the change feed's fork point."
 ---
 
 # Verify: a shard split end to end
@@ -19,7 +19,8 @@ description: "Model-check a shaledb shard split end to end (TLA+, TLC): the dire
 - **NoStaleBeyondBound.** A `Flushed` read through a map older than the bound never returns an
   older value than its successor holds (D89).
 - **WaitingWritesLand** (liveness, own config). A write that waits on the split eventually lands,
-  even when the split's process died after the seal (D101).
+  even when the split's process died after the seal (D101), and when the halves released their
+  holds before a resumed split published (D138).
 
 ## Run it
 
@@ -27,7 +28,12 @@ description: "Model-check a shaledb shard split end to end (TLA+, TLC): the dire
 nice -n 15 node tools/formal-verification/src/verify.ts shard-split
 ```
 
-Expect seven `✓` lines, each in a few seconds.
+Expect ten `✓` lines, each in a few seconds.
+
+After the model checks, run `node tools/formal-verification/src/error-branches.ts` (D137). Every
+error branch in the functions this model covers needs a row in `docs/coverage-matrix.md`'s
+"Error branches in model-covered code" that names one of the actions below, or says why no model
+covers it.
 
 ## Deeper search
 
@@ -48,8 +54,9 @@ nice -n 15 java -XX:+UseParallelGC -cp .tlc/downloads/tla2tools.jar tlc2.TLC -wo
 | `Begin` | `ShardDirectory.beginSplit` (the pending split, with its two database ids) under the directory's lock: `editMap`'s `cell.get`, `beginShardSplit`, `cell.set` in one step. A pending split of the same shard and key is returned as it is |
 | `BeginRead`, `BeginWrite` | the same without the lock (`noDirectoryLock`): the read and the write are two awaits |
 | `Begin2`, `Begin2Read`, `Begin2Write` | a second request to split the same shard at the same key, with its own fresh ids; its request then ends |
-| `Seal` | `DatabaseLifecycle.seal(shard, [left, right], true)` → `DbWriter.seal`: flush and seal in one commit, taking both holds; a repeat finds it done |
-| `Fork(f)` | `forkRange` from the half's hold (the two run concurrently) |
+| `Seal` | `DatabaseLifecycle.seal(shard, [left, right], true)` → `DbWriter.seal`: flush and seal in one commit, taking both holds; a repeat finds it done: the holds are given once (`successorsHeld`), so it returns the holds still there (D138) |
+| `Fork(f)` | `ShardSplit.split`'s step for half f (the two run concurrently). With a hold: `forkRange` from it; a repeat of a half that exists finds the hold `Existing` and the half's newest manifest reading it, so it returns the half and keeps the hold (D136). With no hold: `DatabaseLifecycle.exists` finds the half, which released its hold, so it is done (D138). Neither: the split dies |
+| `Release(f)` | the half's compactor releasing its hold `gcMinAge` after its rewrite (D77, `releasableExternalRefs`), before or after the publish |
 | `Publish` | `ShardDirectory.completeSplit` |
 | `Crash` | the split's request ends or its Worker is evicted after a step |
 | `ClientWrite`, `ClientRefresh` | `ShardRouter.routed`: a write by the cached map. A sealed shard (`DatabaseSealed`) or an absent fork (`DatabaseNotFound`) waits on `awaitMap`; a newer map retries |
@@ -69,7 +76,13 @@ nice -n 15 java -XX:+UseParallelGC -cp .tlc/downloads/tla2tools.jar tlc2.TLC -wo
   - a `Flushed` read sees every acknowledged write: the staleness modeled is the router's map,
     not the manifest refresh;
   - the feed consumer reads whole databases.
+- **ForkKeepsHold** (invariant, D136): every forked half keeps its hold on the shard until its
+  own release.
+- **NoOrphanHold** (invariant, D138): a half that released its hold never holds the shard again,
+  so no hold outlives the half that reads it.
 - **Not modeled:**
+  - an operator's `deleteCheckpoint` of a half's hold before the half exists (D116): the split
+    then dies on that half (`Fork(f)`'s last branch);
   - a second split of a successor before its rewrite (the fork-of-a-fork hold chain is in
     `Lifecycle`);
   - routers two generations behind (a second split). `shard-split-faults.test.ts` tests a
@@ -86,10 +99,13 @@ nice -n 15 java -XX:+UseParallelGC -cp .tlc/downloads/tla2tools.jar tlc2.TLC -wo
 | `feedGap` | the consumer leaving the source at the seal, with a fork's feed silent below its fork point (before D80) | `ConsumerMissesNothing` |
 | `noResume` | before D101 | `WaitingWritesLand` |
 | `noDirectoryLock` | the directory's `editMap` without its lock | `PublishedIsSealed` |
+| `forkRetryUndoesHold` | a repeated fork of a half that exists undoing the half's hold, as `forkRange` did before D136 (issue #2) | `ForkKeepsHold` |
+| `resealTakesHolds` | a repeated seal taking a new hold for each successor without one (before D138, or a seal recorded without `successorsHeld`); the split still publishes, finding the half existing | `NoOrphanHold` (`ShardSplit.cfg`) |
+| `noSkipReleased` | the split failing on a half with no hold instead of finding it done (before D138) | `WaitingWritesLand` (`ShardSplitLiveness.cfg`) |
 
 `noDirectoryLock`'s unit test: `shard-directory-lock.test.ts` (the lock with two permits fails it).
 
 ## Keeping it in step with the code
 
-Sync commit: the D116 commit. Rerun after any change to a covered function, and show each
+Sync commit: the D138 commit. Rerun after any change to a covered function, and show each
 property still fails on its variant.

@@ -225,7 +225,10 @@ export interface IDbWriter {
   /**
    * Flushes everything, then seals the database with `successors` (which fences this writer). Every
    * write acknowledged before the seal is in the sealed manifest; later writes fail with
-   * `DatabaseSealedError`. Safe to repeat.
+   * `DatabaseSealedError`. Safe to repeat. With `holdForSuccessors`, each successor is given a hold
+   * once, by the commit that seals or the first seal with holds after it; the manifest records it
+   * (`successorsHeld`), so a repeat returns the holds still there, and a successor that released
+   * its hold after its rewrite is left out of the receipt (D138).
    */
   readonly seal: (
     databaseId: DatabaseId,

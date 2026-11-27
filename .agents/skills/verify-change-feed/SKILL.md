@@ -32,6 +32,11 @@ Expected: six `✓` lines.
 | `ChangeFeedOldData.cfg` | `beforeD113` (no stale refusal, no reader skip) | `ExactlyOnce` |
 | `ChangeFeedOldData.cfg` | `lostResponseReexport` | pass: the reader alone reads overlapping entries once, so manifests written before D113 are safe |
 
+After the model checks, run `node tools/formal-verification/src/error-branches.ts` (D137). Every
+error branch in the functions this model covers needs a row in `docs/coverage-matrix.md`'s
+"Error branches in model-covered code" that names one of the actions below, or says why no model
+covers it. A branch with no action is a gap in this model: add the action, or record the reason.
+
 ## Read a result
 
 | Action | Code |

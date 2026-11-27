@@ -51,6 +51,11 @@ takes about 10 seconds.
 Expected output: eleven `✓` lines. The code as written passes all four configs, and each broken
 variant fails with its invariant. Any `✗` is a finding: read the next section.
 
+After the model checks, run `node tools/formal-verification/src/error-branches.ts` (D137). Every
+error branch in the functions this model covers needs a row in `docs/coverage-matrix.md`'s
+"Error branches in model-covered code" that names one of the actions below, or says why no model
+covers it. A branch with no action is a gap in this model: add the action, or record the reason.
+
 ## Read a result
 
 Read every result with the pstack `/statechart` skill (`.agents/skills/statechart/SKILL.md`; open

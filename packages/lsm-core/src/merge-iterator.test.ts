@@ -19,6 +19,7 @@ import {
   retainKeyVersions,
 } from "./row-resolution.ts";
 import { type Row, RowValue } from "./row.ts";
+import { keyVersionsOf } from "./key-versions.ts";
 
 /** Splits rows round-robin-ish into `parts` sorted inputs by each row's sequence number. */
 const partition = (rows: ReadonlyArray<Row>, parts: number): Array<Array<Row>> => {
@@ -115,7 +116,7 @@ describe("retainKeyVersions (compaction)", () => {
         const readable = new Map<string, Uint8Array>();
         for (const versions of regrouped) {
           const visible = Result.getOrThrow(
-            resolveVisibleRow(versions, {
+            resolveVisibleRow(keyVersionsOf(versions), {
               snapshotSeq: SeqNum.make(rows.length),
               now,
               mergeOperator: Option.some(MERGE_OPERATORS.Concat),

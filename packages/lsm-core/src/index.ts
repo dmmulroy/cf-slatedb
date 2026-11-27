@@ -9,6 +9,7 @@ export * from "./lsm-core-errors.ts";
 export * from "./lsm-settings.ts";
 export * from "./manifest.ts";
 export * from "./merge-iterator.ts";
+export * from "./key-versions.ts";
 export * from "./row-resolution.ts";
 export * from "./row.ts";
 export * from "./size-tiered-compaction-scheduler.ts";

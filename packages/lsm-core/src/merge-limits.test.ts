@@ -9,6 +9,7 @@ import {
   retainKeyVersions,
 } from "./row-resolution.ts";
 import { type Row, RowValue } from "./row.ts";
+import { keyVersionsOf } from "./key-versions.ts";
 
 const KEY = Uint8Array.of(0x6b);
 const concat = Option.some(MERGE_OPERATORS.Concat);
@@ -34,7 +35,11 @@ const history = (operandBytes: number) => [
 ];
 
 const read = (versions: ReadonlyArray<Row>) =>
-  resolveVisibleRow(versions, { snapshotSeq: SeqNum.make(10), now, mergeOperator: concat });
+  resolveVisibleRow(keyVersionsOf(versions), {
+    snapshotSeq: SeqNum.make(10),
+    now,
+    mergeOperator: concat,
+  });
 
 describe("merged values are bounded (D99)", () => {
   it("a read past the bound fails typed with the size; at the bound it returns the value", () => {

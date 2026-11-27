@@ -35,6 +35,11 @@ Expected: eight `✓` lines. The code as written passes the three configs; `noBo
 `GcSafetyTwoCollectors.cfg` runs two collections at once (D83) and has no broken variant: see
 "Two collections" below.
 
+After the model checks, run `node tools/formal-verification/src/error-branches.ts` (D137). Every
+error branch in the functions this model covers needs a row in `docs/coverage-matrix.md`'s
+"Error branches in model-covered code" that names one of the actions below, or says why no model
+covers it. A branch with no action is a gap in this model: add the action, or record the reason.
+
 ## Deeper search
 
 Not part of `verify.ts`. Run it after a change to `GarbageCollector.collect`, alone, for up to 20

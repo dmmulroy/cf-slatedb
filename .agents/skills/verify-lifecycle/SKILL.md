@@ -1,6 +1,6 @@
 ---
 name: verify-lifecycle
-description: "Model-check shaledb's database lifecycle across three databases (TLA+, TLC): a source, a fork, and a fork of the fork; each fork's hold, rewrite and release (D77); GC on every database; deleteCheckpoint of a hold (D91); removal interrupted at any step and resumed, keeping its Removed head (D91); a stale committer after a removal; recreation of a removed id with readers that cached the old incarnation (D90); a fork being created while an operator deletes its hold (D116); a second removal that stalls past a recreation. Use after any change to forkManifest/forkRange, releasableExternalRefs, deleteCheckpoint, DatabaseLifecycle.remove or create, or GC's protection of pinned manifests."
+description: "Model-check shaledb's database lifecycle across three databases (TLA+, TLC): a source, a fork, and a fork of the fork; each fork's hold, rewrite and release (D77); GC on every database; deleteCheckpoint of a hold (D91); removal interrupted at any step and resumed, keeping its Removed head (D91); a stale committer after a removal; recreation of a removed id with readers that cached the old incarnation (D90); a fork being created while an operator deletes its hold (D116); a second removal that stalls past a recreation; forkRange called again after the fork moved on and its GC collected the fork's first manifest (D136). Use after any change to forkManifest/forkRange, releasableExternalRefs, deleteCheckpoint, DatabaseLifecycle.remove or create, acquireForkHold, forkRange's DatabaseAlreadyExists handling, removeCheckpointFor, or GC's protection of pinned manifests."
 ---
 
 # Verify: the lifecycle across databases
@@ -26,7 +26,7 @@ description: "Model-check shaledb's database lifecycle across three databases (T
 nice -n 15 node tools/formal-verification/src/verify.ts lifecycle
 ```
 
-Expect fourteen `✓` lines: four configs pass, and each variant fails with its property. The
+Expect seventeen `✓` lines: six configs pass, and each variant fails with its property. The
 safety config takes about 40 s, niced with two workers; the others under a minute.
 
 - `Lifecycle.cfg` (`ForkRace = TRUE`): the fork of the fork is created during the behavior, its
@@ -36,6 +36,16 @@ safety config takes about 40 s, niced with two workers; the others under a minut
 - `LifecycleServed.cfg`: `NoOldIncarnationServed` alone, for `recreateAtOnce`.
 - `LifecycleLiveness.cfg`, `LifecyclePrefix.cfg`: one temporal property each, with the fork of the
   fork created from the start.
+- `LifecycleRetry.cfg`, `LifecycleRetryLiveness.cfg` (`ForkRetry = TRUE`, D136): after
+  `forkRange` of the fork of the fork returned, it is called again. Before the retry the fork may
+  flush (replacing its first manifest), its GC may delete that first manifest, and it may release
+  its hold. Holds have ids (`HoldIds = Forks × {1,2}`), so the hold a call created is told apart
+  from one it found.
+
+After the model checks, run `node tools/formal-verification/src/error-branches.ts` (D137). Every
+error branch in the functions this model covers needs a row in `docs/coverage-matrix.md`'s
+"Error branches in model-covered code" that names one of the actions below, or says why no model
+covers it. A branch with no action is a gap in this model: add the action, or record the reason.
 
 ## Deeper search
 
@@ -65,6 +75,8 @@ nice -n 15 java -XX:+UseParallelGC -cp ../../../.tlc/downloads/tla2tools.jar tlc
 | `StaleCommit(d)` | a flush, compaction, collection, checkpoint, or seal committed from a view loaded before the removal |
 | `TombstoneAges(d)` | `gcMinAge` after the removal; readers' caches of the old incarnation have ended |
 | `Recreate(d)` | `DatabaseLifecycle.create` of a removed id (refused while the tombstone is young, D90) |
+| `ForkFlush`, `CollectFirst` | the fork of the fork committing a newer manifest that still reads its hold; `gcMinAge` later, its GC deleting its first manifest (D136) |
+| `RetryAcquire`, `RetryInit` | `forkRange` called again: `acquireForkHold` finds the fork's hold (`Existing`) or commits one (`Created`); then `initialize` fails with `DatabaseAlreadyExistsError`, and the call returns the fork as its own when the fork's newest manifest (`findLatest`) has an external ref with that hold's id, or else undoes only a hold it `Created` (`removeCheckpointFor(UnusedHold)`) |
 | `ReaderLoad`, `ReaderServe`, `ReaderForget` | `ManifestCache` loading, serving (a covering hit or within the refresh interval), and dropping a manifest |
 
 ## Bounds and assumptions
@@ -99,6 +111,8 @@ nice -n 15 java -XX:+UseParallelGC -cp ../../../.tlc/downloads/tla2tools.jar tlc
 | `beforeD116` | `deleteCheckpoint` deleting a hold whose holder has no manifest yet | `NoReaderNeedsDeleted` |
 | `deleteByPrefix` | a removal deleting everything under the prefix, not only what its tombstone covers | `NewIncarnationIntact` |
 | `staleViewOutlives` | D91's assumption dropped | `RemovedNeverReopens` |
+| `compensateAnyHold` | the code before D136: a retried `forkRange` that finds the fork not its own undoes the hold it found, not only one it created (issue #2) | `NoReaderNeedsDeleted` (`LifecycleRetry.cfg`) |
+| `retryTrustsFirstManifest` | a retry that decides the fork is its own from the fork's first manifest, which GC may have deleted | `NoReaderNeedsDeleted` (`LifecycleRetry.cfg`) |
 
 The liveness properties have no broken variant: no defect found to date was a hold or a removal
 that never finished.
@@ -115,6 +129,10 @@ that never finished.
 - D116: removal has no lock. Its steps are ordered and idempotent, and `markRemoved` against a new
   hold is ordered by the manifest CAS. `LifecycleRemovers.cfg` checks a second, stalled remover.
 
+- D136: before it, holds were sets of fork names and `forkRange` had no retry, so a call that
+  undid a hold it had not created could not be written down. Issue #2 found it in the code;
+  `compensateAnyHold` reproduces it. Test: `database-lifecycle-retry.test.ts`.
+
 ## Keeping it in step with the code
 
-Sync commit: the D116 commit.
+Sync commit: the D136 commit.

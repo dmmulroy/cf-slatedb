@@ -3,6 +3,7 @@ import {
   DatabaseId,
   MAX_KEY_BYTES,
   MERGE_OPERATORS,
+  keyVersionsOf,
   resolveVisibleRow,
   RowValue,
   SeqNum,
@@ -198,13 +199,15 @@ describe("no key or value leaves through a public error (D123)", () => {
           ),
           // A merge whose operands resolve past the bound.
           resolveVisibleRow(
-            [0, 1].map((index) => ({
-              key,
-              seq: SeqNum.make(index + 1),
-              value: RowValue.Merge({ operand: new Uint8Array(600 * 1024).fill(key[0] ?? 0) }),
-              createTs: Option.none(),
-              expireTs: Option.none(),
-            })),
+            keyVersionsOf(
+              [0, 1].map((index) => ({
+                key,
+                seq: SeqNum.make(index + 1),
+                value: RowValue.Merge({ operand: new Uint8Array(600 * 1024).fill(key[0] ?? 0) }),
+                createTs: Option.none(),
+                expireTs: Option.none(),
+              })),
+            ),
             {
               snapshotSeq: SeqNum.make(10),
               now: Timestamp.make(0),

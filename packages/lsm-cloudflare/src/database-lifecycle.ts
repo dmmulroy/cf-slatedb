@@ -56,6 +56,28 @@ import {
 import { ObjectStore, type ObjectStoreUnavailableError } from "./object-store.ts";
 import { WriterClient, type WriterClientError } from "./writer-client.ts";
 
+/**
+ * A fork's hold as `forkRange` found it: `Created` by this call (its to undo when the fork is not
+ * created), or `Existing` (a split's seal or an earlier call took it, and the fork may read it).
+ */
+type ForkHoldAcquisition =
+  | { readonly _tag: "Created"; readonly hold: Checkpoint }
+  | { readonly _tag: "Existing"; readonly hold: Checkpoint };
+
+/** Why a checkpoint may be removed (D136); see `removeCheckpointFor`. */
+type CheckpointRemovalPermit =
+  | { readonly _tag: "CallerCheckpoint"; readonly checkpointId: CheckpointId }
+  | {
+      readonly _tag: "HolderGone";
+      readonly checkpointId: CheckpointId;
+      readonly holder: DatabaseId;
+    }
+  | {
+      readonly _tag: "UnusedHold";
+      readonly checkpointId: CheckpointId;
+      readonly holder: DatabaseId;
+    };
+
 /** Options of a new database. */
 export interface CreateDatabaseOptions {
   /** Keys the database accepts; writes outside fail with `KeyOutOfRangeError`. None: every key. */
@@ -190,9 +212,11 @@ export interface IDatabaseLifecycle {
    * With `holdForSuccessors`, the seal's own commit also takes each successor a hold on the sealed
    * manifest (a checkpoint the successor holds), so each can be forked from its hold at once with
    * `forkRange`, without another checkpoint commit (a split, D57). A hold lasts until the fork's
-   * compactor releases it, or until `deleteCheckpoint`.
+   * compactor releases it, or until `deleteCheckpoint`. Safe to repeat: the holds are taken once
+   * (the manifest records it), so a repeat returns the holds still there, and a successor whose
+   * compactor released its hold after its rewrite has none in the receipt (D138).
    *
-   * @returns The sequence number durable at the seal and the successors' holds.
+   * @returns The sequence number durable at the seal and the successors' holds still on it.
    */
   readonly seal: (
     databaseId: DatabaseId,
@@ -202,11 +226,24 @@ export interface IDatabaseLifecycle {
   /**
    * Creates `forkId` as a zero-copy fork of `range` of the source at a checkpoint: its SSTs are
    * views of the source's files, and it holds its own checkpoint on the source until its compaction
-   * has rewritten them. Safe to retry.
+   * has rewritten them.
+   *
+   * Safe to retry at any time (D136): a retry returns the fork's newest manifest while that
+   * manifest still reads the hold, and otherwise fails with `DatabaseAlreadyExistsError` having
+   * changed nothing. It never removes a hold it did not create.
    */
   readonly forkRange: (
     request: ForkRangeRequest,
   ) => Effect.Effect<VersionedManifest, DatabaseLifecycleError, DatabaseLifecycleServices>;
+  /**
+   * Whether a database with this id exists: it has a manifest, and it is not removed. A split
+   * resumed after a successor released its hold (D77) finds the successor this way (D138).
+   *
+   * @returns Whether it exists, or `WriterUnavailableError` when storage is unavailable.
+   */
+  readonly exists: (
+    databaseId: DatabaseId,
+  ) => Effect.Effect<boolean, DatabaseLifecycleError, DatabaseLifecycleServices>;
   /**
    * Removes a database: fences it, deletes its writer's and compactor's state, releases the
    * checkpoints it holds on sources (if it is a fork), deletes every object under `db/<id>/`, and
@@ -293,14 +330,15 @@ export const makeDatabaseLifecycle = Effect.gen(function* () {
       yield* compactors.destroy(databaseId);
       // A fork releases the checkpoints it holds on its sources, so they can collect those SSTs.
       for (const ref of removed.externalRefs) {
-        yield* manifests
-          .update(ref.owner, (manifest) =>
-            Result.succeed(removeCheckpoint(manifest, ref.checkpointId)),
-          )
-          .pipe(
-            Effect.catchTags(updateFailures(ref.owner, "remove")),
-            Effect.catchTags({ DatabaseNotFoundError: () => Effect.void }),
-          );
+        yield* removeCheckpointFor(
+          ref.owner,
+          {
+            _tag: "HolderGone",
+            checkpointId: ref.checkpointId,
+            holder: databaseId,
+          },
+          "remove",
+        ).pipe(Effect.catchTags({ DatabaseNotFoundError: () => Effect.void }));
       }
     });
 
@@ -480,11 +518,28 @@ export const makeDatabaseLifecycle = Effect.gen(function* () {
     return pinned;
   });
 
-  /** Removes a checkpoint whoever holds it (a fork's failed creation releasing its own hold). */
-  const removeCheckpointNow = (databaseId: DatabaseId, checkpointId: CheckpointId) =>
-    manifests
-      .update(databaseId, (manifest) => Result.succeed(removeCheckpoint(manifest, checkpointId)))
-      .pipe(Effect.asVoid, Effect.catchTags(updateFailures(databaseId, "checkpoint")));
+  /**
+   * The one way this module removes a checkpoint, with the reason it may go (D136): a caller's
+   * checkpoint, a hold whose holder `deleteCheckpoint` found gone, or a hold this very `forkRange`
+   * call created for a fork it then did not create. A hold that existed before the call is never
+   * removed by it: the fork may be reading what it pins.
+   */
+  const removeCheckpointFor = Effect.fn("DatabaseLifecycle.removeCheckpointFor")(function* (
+    databaseId: DatabaseId,
+    permit: CheckpointRemovalPermit,
+    operation: "checkpoint" | "fork" | "remove",
+  ) {
+    yield* Effect.annotateCurrentSpan({
+      "database.id": databaseId,
+      "checkpoint.id": permit.checkpointId,
+      "checkpoint.removal": permit._tag,
+    });
+    yield* manifests
+      .update(databaseId, (manifest) =>
+        Result.succeed(removeCheckpoint(manifest, permit.checkpointId)),
+      )
+      .pipe(Effect.catchTags(updateFailures(databaseId, operation)));
+  });
 
   const deleteCheckpoint = Effect.fn("DatabaseLifecycle.deleteCheckpoint")(function* (
     databaseId: DatabaseId,
@@ -521,7 +576,13 @@ export const makeDatabaseLifecycle = Effect.gen(function* () {
         });
       }
     }
-    yield* removeCheckpointNow(databaseId, checkpointId);
+    yield* removeCheckpointFor(
+      databaseId,
+      Option.isSome(holder)
+        ? { _tag: "HolderGone", checkpointId, holder: holder.value }
+        : { _tag: "CallerCheckpoint", checkpointId },
+      "checkpoint",
+    );
   });
 
   const seal = Effect.fn("DatabaseLifecycle.seal")(function* (
@@ -534,6 +595,59 @@ export const makeDatabaseLifecycle = Effect.gen(function* () {
       "seal.successors": successors.length,
     });
     return yield* writers.seal(databaseId, successors, holdForSuccessors);
+  });
+
+  /**
+   * The fork's hold on `source` pinning `manifestId`: the one already there (a split's seal, or an
+   * earlier call of this fork, took it), or a new one this call commits. Only a `Created` hold is
+   * this call's to undo (D136).
+   */
+  const acquireForkHold = Effect.fn("DatabaseLifecycle.acquireForkHold")(function* (
+    latest: VersionedManifest,
+    source: DatabaseId,
+    checkpointId: CheckpointId,
+    manifestId: ManifestId,
+    forkId: DatabaseId,
+  ) {
+    const holdOf = (manifest: Manifest) =>
+      manifest.checkpoints.find(
+        (candidate) =>
+          Option.contains(candidate.holder, forkId) && candidate.manifestId === manifestId,
+      );
+    const existing = holdOf(latest.manifest);
+    if (existing !== undefined) {
+      return { _tag: "Existing", hold: existing } satisfies ForkHoldAcquisition;
+    }
+    const holdId = yield* generateCheckpointId;
+    const now = Timestamp.make(yield* Clock.currentTimeMillis);
+    const held = yield* manifests
+      .update(
+        source,
+        (manifest): Result.Result<Manifest, CheckpointNotFoundError | DatabaseRemovedError> => {
+          if (holdOf(manifest) !== undefined) return Result.succeed(manifest);
+          if (!manifest.checkpoints.some((candidate) => candidate.id === checkpointId)) {
+            return Result.fail(checkpointNotFound(source, checkpointId));
+          }
+          return addCheckpoint(manifest, {
+            id: holdId,
+            manifestId,
+            createdAt: now,
+            expireAt: Option.none(),
+            holder: Option.some(forkId),
+            name: Option.some(`fork ${forkId}`),
+          });
+        },
+      )
+      .pipe(
+        Effect.catchTags(updateFailures(source, "fork")),
+        Effect.catchTags(removedIsNotFound(source)),
+      );
+    const hold = holdOf(held.manifest);
+    if (hold === undefined) return yield* checkpointNotFound(source, checkpointId);
+    // A concurrent call may have committed the hold first: then it is that call's, not this one's.
+    return (
+      hold.id === holdId ? { _tag: "Created", hold } : { _tag: "Existing", hold }
+    ) satisfies ForkHoldAcquisition;
   });
 
   const forkRange = Effect.fn("DatabaseLifecycle.forkRange")(function* (request: ForkRangeRequest) {
@@ -555,50 +669,16 @@ export const makeDatabaseLifecycle = Effect.gen(function* () {
 
     // The fork's own hold on the source, pinning the same manifest. Taken while the caller's
     // checkpoint still pins it (checked in the same CAS), so GC never sees the manifest unpinned.
-    // A split's seal already took it (`seal` with `holdForSuccessors`): then no commit is needed.
-    const holdId = yield* generateCheckpointId;
-    const now = Timestamp.make(yield* Clock.currentTimeMillis);
-    const takenHold = latest.manifest.checkpoints.find(
-      (candidate) =>
-        Option.contains(candidate.holder, forkId) && candidate.manifestId === checkpoint.manifestId,
+    // A split's seal already took it (`seal` with `holdForSuccessors`), or an earlier call of this
+    // fork did: then no commit is needed, and this call does not own the hold (D136).
+    const acquired = yield* acquireForkHold(
+      latest,
+      source,
+      checkpointId,
+      checkpoint.manifestId,
+      forkId,
     );
-    const held =
-      takenHold !== undefined
-        ? latest
-        : yield* manifests
-            .update(
-              source,
-              (
-                manifest,
-              ): Result.Result<Manifest, CheckpointNotFoundError | DatabaseRemovedError> => {
-                const existing = manifest.checkpoints.find(
-                  (candidate) =>
-                    Option.contains(candidate.holder, forkId) &&
-                    candidate.manifestId === checkpoint.manifestId,
-                );
-                if (existing !== undefined) return Result.succeed(manifest);
-                if (!manifest.checkpoints.some((candidate) => candidate.id === checkpointId)) {
-                  return Result.fail(checkpointNotFound(source, checkpointId));
-                }
-                return addCheckpoint(manifest, {
-                  id: holdId,
-                  manifestId: checkpoint.manifestId,
-                  createdAt: now,
-                  expireAt: Option.none(),
-                  holder: Option.some(forkId),
-                  name: Option.some(`fork ${forkId}`),
-                });
-              },
-            )
-            .pipe(
-              Effect.catchTags(updateFailures(source, "fork")),
-              Effect.catchTags(removedIsNotFound(source)),
-            );
-    const hold = held.manifest.checkpoints.find(
-      (candidate) =>
-        Option.contains(candidate.holder, forkId) && candidate.manifestId === checkpoint.manifestId,
-    );
-    if (hold === undefined) return yield* checkpointNotFound(source, checkpointId);
+    const hold = acquired.hold;
 
     const fork = forkManifest(pinned.value, {
       databaseId: forkId,
@@ -608,21 +688,36 @@ export const makeDatabaseLifecycle = Effect.gen(function* () {
     const created = yield* manifests.initialize(fork).pipe(
       Effect.catchTags({
         ManifestWriteError: unavailable(forkId, "fork"),
-        // A retried fork finds its own first manifest; any other database with this id wins.
         DatabaseAlreadyExistsError: (error) =>
           Effect.gen(function* () {
-            const first = yield* reader
-              .load(forkId, ManifestId.make(1))
+            // A retried fork finds the fork its earlier call created: its newest manifest still
+            // reads this hold. The first manifest is no evidence either way: the fork's GC deletes
+            // it once newer ones replace it (D136).
+            const head = yield* reader
+              .findLatest(forkId)
               .pipe(Effect.catchTags({ ManifestReadError: unavailable(forkId, "fork") }));
-            const ours = Option.exists(first, (manifest) =>
-              manifest.externalRefs.some(
-                (ref) => ref.owner === source && ref.checkpointId === hold.id,
-              ),
+            const ours = Option.filter(
+              head,
+              ({ manifest }) =>
+                manifest.state._tag !== "Removed" &&
+                manifest.externalRefs.some(
+                  (ref) => ref.owner === source && ref.checkpointId === hold.id,
+                ),
             );
-            if (ours && Option.isSome(first)) {
-              return { id: ManifestId.make(1), manifest: first.value };
+            if (Option.isSome(ours)) return ours.value;
+            // Another database has this id, or the fork no longer reads the hold. Only a hold this
+            // call created is undone; one that existed before it stays with its fork (D136).
+            if (acquired._tag === "Created") {
+              yield* removeCheckpointFor(
+                source,
+                {
+                  _tag: "UnusedHold",
+                  checkpointId: hold.id,
+                  holder: forkId,
+                },
+                "fork",
+              );
             }
-            yield* removeCheckpointNow(source, hold.id);
             return yield* Effect.fail(error);
           }),
       }),
@@ -754,6 +849,14 @@ export const makeDatabaseLifecycle = Effect.gen(function* () {
     return yield* compactors.dropSst(databaseId, { sstId: request.sstId, force: request.force });
   });
 
+  const exists = Effect.fn("DatabaseLifecycle.exists")(function* (databaseId: DatabaseId) {
+    yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
+    const head = yield* reader
+      .findLatest(databaseId)
+      .pipe(Effect.catchTags({ ManifestReadError: unavailable(databaseId, "existence check") }));
+    return Option.exists(head, ({ manifest }) => manifest.state._tag !== "Removed");
+  });
+
   return DatabaseLifecycle.of({
     create,
     createCheckpoint,
@@ -761,6 +864,7 @@ export const makeDatabaseLifecycle = Effect.gen(function* () {
     deleteCheckpoint,
     seal,
     forkRange,
+    exists,
     remove,
     dropSst,
   });

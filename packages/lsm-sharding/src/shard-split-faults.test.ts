@@ -1,12 +1,20 @@
-import { DatabaseId, DEFAULT_DATABASE_OPTIONS, FULL_KEY_RANGE } from "@shaledb/lsm-core";
+import {
+  DatabaseId,
+  DEFAULT_DATABASE_OPTIONS,
+  FULL_KEY_RANGE,
+  removeCheckpoint,
+  replaceManifestFields,
+} from "@shaledb/lsm-core";
 import {
   DatabaseLifecycle,
   dbServicesTestLayer,
   lsmTestRuntimeContextLayer,
+  ManifestReader,
+  ManifestStore,
   WriterUnavailableError,
 } from "@shaledb/lsm-cloudflare";
 import { RuntimeContext } from "alchemy/RuntimeContext";
-import { Effect, Exit, Layer, Option, Ref, type Scope, Stream } from "effect";
+import { Effect, Exit, Layer, Option, Ref, Result, type Scope, Stream } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 
 import { ShardDirectory, shardDirectoryTestLayer } from "./shard-directory.ts";
@@ -225,5 +233,109 @@ describe("an abandoned split is finished by the next request that waits for it (
       outcome.pending.right,
     ]);
     expect(outcome.seven).toEqual(Option.some(Uint8Array.of(7)));
+  }, 120_000);
+});
+
+describe("a split resumed after its halves released their holds (D138)", () => {
+  it("finds both halves done, publishes, and leaves no hold on the sealed shard", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* setUp;
+        const lifecycle = yield* DatabaseLifecycle;
+        // A split that sealed and forked both halves, then died before its publish.
+        const pending = yield* (yield* ShardDirectory).beginSplit(GROUP, FIRST, key(5));
+        const sealed = yield* lifecycle.seal(FIRST, [pending.left, pending.right], true);
+        for (const hold of sealed.successorHolds) {
+          yield* lifecycle.forkRange({
+            source: FIRST,
+            checkpointId: hold.checkpointId,
+            range:
+              hold.successor === pending.left
+                ? { start: new Uint8Array(0), end: Option.some(key(5)) }
+                : { start: key(5), end: Option.none() },
+            forkId: hold.successor,
+          });
+        }
+        // gcMinAge after their rewrites, both halves' compactors released their holds (D77). The
+        // release is the compactor's edit of the shard's manifest; lsm-cloudflare's
+        // database-lifecycle.test.ts runs the real compactors ("a seal repeated after its
+        // successors released their holds").
+        for (const hold of sealed.successorHolds) {
+          yield* (yield* ManifestStore).update(FIRST, (manifest) =>
+            Result.succeed(removeCheckpoint(manifest, hold.checkpointId)),
+          );
+        }
+        // The next request that waits for the split finishes it.
+        const router = yield* ShardRouter;
+        const receipt = yield* Effect.exit(
+          withAbandonedSplitFinished(yield* ShardSplit, GROUP, () =>
+            router.put(GROUP, key(7), Uint8Array.of(7)),
+          ),
+        );
+        const map = yield* (yield* ShardDirectory).map(GROUP);
+        const holdsLeft = (yield* (yield* ManifestReader).loadLatest(FIRST)).manifest.checkpoints
+          .length;
+        return { receipt, map, pending, holdsLeft, keys: yield* everyKey(yield* makeShardRouter) };
+      }),
+    );
+    expect(Exit.isSuccess(outcome.receipt), String(outcome.receipt)).toBe(true);
+    expect(Option.isNone(outcome.map.pendingSplit)).toBe(true);
+    expect(outcome.map.shards.map((shard) => shard.databaseId)).toEqual([
+      outcome.pending.left,
+      outcome.pending.right,
+    ]);
+    expect(outcome.holdsLeft).toBe(0);
+    expect(outcome.keys).toEqual([1, 4, 6, 7, 9]);
+  }, 120_000);
+
+  it("publishes even when a seal recorded before D138 takes the released halves new holds", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* setUp;
+        const lifecycle = yield* DatabaseLifecycle;
+        const store = yield* ManifestStore;
+        const pending = yield* (yield* ShardDirectory).beginSplit(GROUP, FIRST, key(5));
+        const sealed = yield* lifecycle.seal(FIRST, [pending.left, pending.right], true);
+        for (const hold of sealed.successorHolds) {
+          yield* lifecycle.forkRange({
+            source: FIRST,
+            checkpointId: hold.checkpointId,
+            range:
+              hold.successor === pending.left
+                ? { start: new Uint8Array(0), end: Option.some(key(5)) }
+                : { start: key(5), end: Option.none() },
+            forkId: hold.successor,
+          });
+        }
+        // Both halves released their holds, and the seal reads as written before D138: no
+        // successorsHeld (a rollback's rewrite drops it, docs/operations.md).
+        for (const hold of sealed.successorHolds) {
+          yield* store.update(FIRST, (manifest) =>
+            Result.succeed(removeCheckpoint(manifest, hold.checkpointId)),
+          );
+        }
+        yield* store.update(FIRST, (manifest) =>
+          Result.succeed(
+            manifest.state._tag === "Sealed"
+              ? replaceManifestFields(manifest, {
+                  state: { ...manifest.state, successorsHeld: false },
+                })
+              : manifest,
+          ),
+        );
+        const map = yield* (yield* ShardSplit).split(GROUP, FIRST, key(5));
+        const holdsLeft = (yield* (yield* ManifestReader).loadLatest(FIRST)).manifest.checkpoints
+          .length;
+        return { map, pending, holdsLeft, keys: yield* everyKey(yield* makeShardRouter) };
+      }),
+    );
+    expect(outcome.map.shards.map((shard) => shard.databaseId)).toEqual([
+      outcome.pending.left,
+      outcome.pending.right,
+    ]);
+    expect(Option.isNone(outcome.map.pendingSplit)).toBe(true);
+    // The holds that seal took stay until the halves' removal: the leak docs/operations.md names.
+    expect(outcome.holdsLeft).toBe(2);
+    expect(outcome.keys).toEqual([1, 4, 6, 9]);
   }, 120_000);
 });

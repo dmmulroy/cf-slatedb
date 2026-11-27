@@ -24,6 +24,7 @@ import {
   type WriteBatch,
   type WriteOperation,
 } from "./write-batch.ts";
+import { keyVersionsOf } from "./key-versions.ts";
 
 const DB = DatabaseId.make("orders");
 const context: Parameters<typeof collapseWriteBatch>[1] = {
@@ -69,7 +70,7 @@ describe("collapseWriteBatch", () => {
         return [...keys].every((key) => {
           const versions = all.filter((row) => keyToHex(row.key) === key);
           const visible = Result.getOrThrow(
-            resolveVisibleRow(versions, {
+            resolveVisibleRow(keyVersionsOf(versions), {
               snapshotSeq: batchSeq,
               now: Timestamp.make(0),
               mergeOperator: context.mergeOperator,

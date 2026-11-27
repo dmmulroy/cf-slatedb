@@ -111,10 +111,17 @@ export type ExternalRef = typeof ExternalRef.Type;
  * and compactor's state is destroyed and the database's holds on its sources are released.
  * Manifests written before D91 carry neither field: no `removedAt` reads as removed just now,
  * `cleared` as false.
+ *
+ * A `Sealed` manifest's `successorsHeld` records that its successors were given their holds
+ * (`holdForSuccessors`, D138): they are given them once, so a successor that released its hold
+ * after its rewrite never gets another. Manifests written before D138 read as false.
  */
 export const DatabaseState = Schema.Union([
   Schema.TaggedStruct("Open", {}),
-  Schema.TaggedStruct("Sealed", { successors: Schema.Array(DatabaseId) }),
+  Schema.TaggedStruct("Sealed", {
+    successors: Schema.Array(DatabaseId),
+    successorsHeld: Schema.Boolean.pipe(Schema.withDecodingDefaultKey(Effect.succeed(false))),
+  }),
   Schema.TaggedStruct("Removed", {
     removedAt: Schema.OptionFromOptionalKey(Timestamp),
     cleared: Schema.Boolean.pipe(Schema.withDecodingDefaultKey(Effect.succeed(false))),
@@ -768,7 +775,7 @@ export const sealManifest = (
     manifest.state.successors.every((id, index) => id === successors[index]))
     ? manifest
     : replaceManifestFields(manifest, {
-        state: { _tag: "Sealed", successors },
+        state: { _tag: "Sealed", successors, successorsHeld: false },
         writerEpoch: WriterEpoch.make(manifest.writerEpoch + 1),
       });
 
@@ -811,9 +818,14 @@ export interface SuccessorHold {
  * split takes them in its seal commit, pinning the sealed manifest itself, so no separate checkpoint
  * or hold commit stands between the seal and the forks (D57).
  *
+ * The holds are taken once (D138). A sealed manifest records it (`successorsHeld`), and a later call
+ * changes nothing: a successor without a hold then is one whose compactor released it after its
+ * rewrite (D77), and a new hold would pin this database for a holder that never reads it, so the
+ * database could never be removed.
+ *
  * @param proposed - A new checkpoint id per successor, used only for successors without a hold.
- * @returns The manifest with every successor held (the same manifest when all already are), or
- *   `DatabaseRemovedError`.
+ * @returns The manifest with every successor held (the same manifest when the holds were already
+ *   taken), or `DatabaseRemovedError`.
  */
 export const holdForSuccessors = (
   manifest: Manifest,
@@ -823,6 +835,9 @@ export const holdForSuccessors = (
     readonly createdAt: Timestamp;
   },
 ): Result.Result<Manifest, DatabaseRemovedError> => {
+  if (manifest.state._tag === "Sealed" && manifest.state.successorsHeld) {
+    return Result.succeed(manifest);
+  }
   let held = manifest;
   for (const hold of options.proposed) {
     if (held.checkpoints.some((existing) => Option.contains(existing.holder, hold.successor))) {
@@ -839,7 +854,11 @@ export const holdForSuccessors = (
     if (Result.isFailure(added)) return added;
     held = added.success;
   }
-  return Result.succeed(held);
+  return Result.succeed(
+    held.state._tag === "Sealed"
+      ? replaceManifestFields(held, { state: { ...held.state, successorsHeld: true } })
+      : held,
+  );
 };
 
 /** Each successor's hold in `manifest`, in `successors` order; successors without one are left out. */

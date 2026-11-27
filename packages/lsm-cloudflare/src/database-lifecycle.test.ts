@@ -1855,10 +1855,6 @@ describe("DatabaseLifecycle: the most checkpoints and pinned snapshots a databas
         };
       }),
     );
-    require("node:fs").writeFileSync(
-      "/tmp/shale-work/agents/mut-read/checkpoints-max.json",
-      JSON.stringify(outcome, null, 2),
-    );
     expect(outcome.refused).toBe("CheckpointLimitError");
     expect(outcome.checkpoints).toBe(MAX_CHECKPOINTS_PER_DATABASE);
     expect(outcome.newestBytes).toBeLessThan(MANIFEST_SIZE_BUDGET_BYTES);
@@ -2066,5 +2062,93 @@ describe("a fork's hold deleted while the fork is being created (D116)", () => {
       }),
     );
     expect(outcome).toEqual({ young: "DatabaseHasDependentsError", old: "deleted" });
+  });
+});
+
+describe("a seal repeated after its successors released their holds (D138)", () => {
+  it("takes no new hold: the receipt names only the holds still there, and none is left behind", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const client = yield* DbClient;
+        const reader = yield* ManifestReader;
+        yield* lifecycle.create(SOURCE, {
+          keyRange: Option.none(),
+          databaseOptions: DEFAULT_DATABASE_OPTIONS,
+        });
+        for (const key of ["a", "b", "e", "f"]) {
+          yield* client.put(SOURCE, bytes(key), bytes(key.toUpperCase()));
+        }
+        // A split's steps: one seal that takes each half a hold, then a fork from each hold.
+        const sealed = yield* lifecycle.seal(SOURCE, [LEFT, RIGHT], true);
+        for (const [forkId, range] of [
+          [LEFT, LEFT_RANGE],
+          [RIGHT, RIGHT_RANGE],
+        ] as const) {
+          const hold = sealed.successorHolds.find((held) => held.successor === forkId);
+          if (hold === undefined) return yield* Effect.die(`no hold for ${forkId}`);
+          yield* lifecycle.forkRange({
+            source: SOURCE,
+            checkpointId: hold.checkpointId,
+            range,
+            forkId,
+          });
+        }
+        // The publish failed, and nothing touched the group for over an hour: both halves rewrote
+        // the shard's SSTs and released their holds (D77).
+        const left = yield* compactorOf(LEFT);
+        const right = yield* compactorOf(RIGHT);
+        yield* TestClock.adjust(HOUR + 1_000);
+        yield* left.runDue;
+        yield* right.runDue;
+        const holdsAfterRelease = (yield* reader.loadLatest(SOURCE)).manifest.checkpoints.length;
+        // A resumed split seals again.
+        const resealed = yield* lifecycle.seal(SOURCE, [LEFT, RIGHT], true);
+        const holdsAfterReseal = (yield* reader.loadLatest(SOURCE)).manifest.checkpoints.length;
+        const exists = {
+          left: yield* lifecycle.exists(LEFT),
+          right: yield* lifecycle.exists(RIGHT),
+          other: yield* lifecycle.exists(DatabaseId.make("orders-z")),
+        };
+        // Nothing holds the source, so it can be removed.
+        const removed = yield* Effect.exit(lifecycle.remove(SOURCE));
+        return {
+          firstHolds: sealed.successorHolds.length,
+          holdsAfterRelease,
+          resealedHolds: resealed.successorHolds,
+          holdsAfterReseal,
+          exists,
+          removed: removed._tag,
+          leftKeys: yield* valuesIn(LEFT),
+        };
+      }),
+    );
+    expect(outcome).toEqual({
+      firstHolds: 2,
+      holdsAfterRelease: 0,
+      resealedHolds: [],
+      holdsAfterReseal: 0,
+      exists: { left: true, right: true, other: false },
+      removed: "Success",
+      leftKeys: ["a=A", "b=B"],
+    });
+  });
+
+  it("a repeat before the successors forked returns the holds the sealing commit took", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        yield* lifecycle.create(SOURCE, {
+          keyRange: Option.none(),
+          databaseOptions: DEFAULT_DATABASE_OPTIONS,
+        });
+        yield* (yield* DbClient).put(SOURCE, bytes("a"), bytes("A"));
+        const first = yield* lifecycle.seal(SOURCE, [LEFT, RIGHT], true);
+        const again = yield* lifecycle.seal(SOURCE, [LEFT, RIGHT], true);
+        return { first: first.successorHolds, again: again.successorHolds };
+      }),
+    );
+    expect(outcome.again).toEqual(outcome.first);
+    expect(outcome.first.map((hold) => hold.successor)).toEqual([LEFT, RIGHT]);
   });
 });

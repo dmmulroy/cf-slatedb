@@ -237,6 +237,20 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
         expect: "ReadsAtBegin",
         timeLimitSeconds: 240,
       },
+      // D135: the writer's rows taken beside a manifest, as getAt and scanAt were.
+      { config: "TransactionsMerge.cfg", broken: "none", expect: "pass", timeLimitSeconds: 480 },
+      {
+        config: "TransactionsMerge.cfg",
+        broken: "noPartition",
+        expect: "ReadsAtBegin",
+        timeLimitSeconds: 240,
+      },
+      {
+        config: "TransactionsMerge.cfg",
+        broken: "dedupeBySeq",
+        expect: "ReadsAtBegin",
+        timeLimitSeconds: 240,
+      },
       { config: "TransactionsLive.cfg", broken: "none", expect: "pass", timeLimitSeconds: 480 },
       {
         config: "TransactionsLive.cfg",
@@ -335,10 +349,30 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
         expect: "PublishedIsSealed",
         timeLimitSeconds: 480,
       },
+      {
+        // D136: a repeated forkRange of a half that exists, as the code was before.
+        config: "ShardSplit.cfg",
+        broken: "forkRetryUndoesHold",
+        expect: "ForkKeepsHold",
+        timeLimitSeconds: 240,
+      },
       { config: "ShardSplitLiveness.cfg", broken: "none", expect: "pass", timeLimitSeconds: 240 },
       {
         config: "ShardSplitLiveness.cfg",
         broken: "noResume",
+        expect: "WaitingWritesLand",
+        timeLimitSeconds: 240,
+      },
+      {
+        // D138: a split resumed after a half released its hold, as the code was before.
+        config: "ShardSplit.cfg",
+        broken: "resealTakesHolds",
+        expect: "NoOrphanHold",
+        timeLimitSeconds: 240,
+      },
+      {
+        config: "ShardSplitLiveness.cfg",
+        broken: "noSkipReleased",
         expect: "WaitingWritesLand",
         timeLimitSeconds: 240,
       },
@@ -418,6 +452,26 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
       },
       {
         config: "LifecyclePrefix.cfg",
+        broken: "none",
+        expect: "pass",
+        timeLimitSeconds: 480,
+      },
+      // D136: forkRange called again after the fork moved on.
+      { config: "LifecycleRetry.cfg", broken: "none", expect: "pass", timeLimitSeconds: 480 },
+      {
+        config: "LifecycleRetry.cfg",
+        broken: "compensateAnyHold",
+        expect: "NoReaderNeedsDeleted",
+        timeLimitSeconds: 480,
+      },
+      {
+        config: "LifecycleRetry.cfg",
+        broken: "retryTrustsFirstManifest",
+        expect: "NoReaderNeedsDeleted",
+        timeLimitSeconds: 480,
+      },
+      {
+        config: "LifecycleRetryLiveness.cfg",
         broken: "none",
         expect: "pass",
         timeLimitSeconds: 480,
@@ -565,6 +619,31 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
         broken: "pageRangesOnly",
         expect: "PhantomRefused",
         timeLimitSeconds: 360,
+      },
+      // D135: the writer's rows taken beside a manifest, as the point read and the scan were.
+      {
+        config: "PagedScanLatest.cfg",
+        broken: "noPartition",
+        expect: "LatestPageAtSnapshot",
+        timeLimitSeconds: 480,
+      },
+      {
+        config: "PagedScanLatest.cfg",
+        broken: "dedupeBySeq",
+        expect: "LatestPageAtSnapshot",
+        timeLimitSeconds: 480,
+      },
+      {
+        config: "PagedScanTxn.cfg",
+        broken: "noPartition",
+        expect: "TxnPagesAtReadSeq",
+        timeLimitSeconds: 480,
+      },
+      {
+        config: "PagedScanTxn.cfg",
+        broken: "dedupeBySeq",
+        expect: "TxnPagesAtReadSeq",
+        timeLimitSeconds: 480,
       },
     ],
   },

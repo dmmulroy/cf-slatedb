@@ -1,4 +1,4 @@
-import type { DatabaseId } from "@shaledb/lsm-core";
+import type { DatabaseId, KeyRange } from "@shaledb/lsm-core";
 import {
   DatabaseLifecycle,
   type DatabaseLifecycleError,
@@ -22,7 +22,9 @@ export type ShardSplitError = DatabaseLifecycleError | ShardDirectoryError;
  *    write fails with `DatabaseSealedError` (routers wait on the directory until the new map is
  *    published, `ShardDirectory.awaitMap`), and the same commit takes each half a hold on the
  *    sealed manifest.
- * 3. Fork both halves at once, each from its own hold (zero-copy, no commit on the shard).
+ * 3. Fork both halves at once, each from its own hold (zero-copy, no commit on the shard). A half
+ *    with no hold left, which exists, released its hold after its rewrite (D77): it is done, and a
+ *    resumed split goes on to publish (D138).
  * 4. Publish the new map.
  *
  * A failure after step 1 is reported to the directory (`reportSplitFailed`), so waiting routers
@@ -71,36 +73,51 @@ export const makeShardSplit = Effect.gen(function* () {
     // From here writes to the shard pause until the publish. A failure leaves the split recorded
     // (repeating it resumes) and stops routers waiting for it.
     const published = yield* Effect.gen(function* () {
-      // One commit seals the shard and takes each half a hold on the sealed manifest (D57).
+      // One commit seals the shard and takes each half a hold on the sealed manifest (D57). A
+      // repeat takes none: it returns the holds still there (D138).
       const sealed = yield* lifecycle.seal(databaseId, [pending.left, pending.right], true);
-      const holdOf = (successor: DatabaseId) =>
-        Option.match(
-          Option.fromUndefinedOr(
-            sealed.successorHolds.find((hold) => hold.successor === successor),
-          ),
-          {
-            onNone: () =>
-              Effect.die(new Error(`The seal of ${databaseId} took no hold for ${successor}.`)),
-            onSome: (hold) => Effect.succeed(hold.checkpointId),
-          },
-        );
-      const leftHold = yield* holdOf(pending.left);
-      const rightHold = yield* holdOf(pending.right);
       // Each half forks from its own hold, so neither needs another commit on the shard.
+      const forkHalf = (successor: DatabaseId, range: KeyRange) =>
+        Effect.gen(function* () {
+          const hold = sealed.successorHolds.find((held) => held.successor === successor);
+          if (hold !== undefined) {
+            yield* lifecycle
+              .forkRange({
+                source: databaseId,
+                checkpointId: hold.checkpointId,
+                range,
+                forkId: successor,
+              })
+              .pipe(
+                // The half exists and does not read this hold: it released its own after its
+                // rewrite, and a seal recorded before D138 (no successorsHeld) took it another. The
+                // half is done; that hold stays until the half's removal (docs/operations.md).
+                Effect.catchTag("DatabaseAlreadyExistsError", (error) =>
+                  Effect.flatMap(lifecycle.exists(successor), (found) =>
+                    found ? Effect.void : Effect.fail(error),
+                  ),
+                ),
+              );
+            return;
+          }
+          // No hold: the half was forked, rewrote the shard's SSTs, and released its hold (D77)
+          // while the split was unpublished. It is done (D138).
+          if (yield* lifecycle.exists(successor)) {
+            yield* Effect.annotateCurrentSpan({ "shard.half_released": successor });
+            return;
+          }
+          // Only an operator's deleteCheckpoint of a hold whose half was never created (D116)
+          // leaves neither; the sealed range then needs an operator.
+          return yield* Effect.die(
+            new Error(
+              `The seal of ${databaseId} holds nothing for successor ${successor}, which does not exist: its hold was deleted before the fork.`,
+            ),
+          );
+        });
       yield* Effect.all(
         [
-          lifecycle.forkRange({
-            source: databaseId,
-            checkpointId: leftHold,
-            range: { start: shard.range.start, end: Option.some(pending.atKey) },
-            forkId: pending.left,
-          }),
-          lifecycle.forkRange({
-            source: databaseId,
-            checkpointId: rightHold,
-            range: { start: pending.atKey, end: shard.range.end },
-            forkId: pending.right,
-          }),
+          forkHalf(pending.left, { start: shard.range.start, end: Option.some(pending.atKey) }),
+          forkHalf(pending.right, { start: pending.atKey, end: shard.range.end }),
         ],
         { concurrency: 2, discard: true },
       );

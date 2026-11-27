@@ -938,3 +938,33 @@ per Stack (Dillon's choice, D49); the §12 write, flush, and split measurements 
   pitch, a first example, then one diagram or code block per section (architecture, writes,
   reads, background work, lifecycle). It names no decision numbers. The two `STEP4` blocks that
   `scenario-cli` rewrites are kept as they were.
+
+## 2026-11-27: issues #1 and #2 fixed, and why the models missed them
+
+- **Issue #1 (D135).** `getAt` and a transaction's `get` applied a merge operand twice when the
+  writer still kept a flushed row. Fixed with one rule, used by point reads and scans alike: a
+  writer row only above the manifest's `lastL0Seq`. The result is a branded `KeyVersions`, which
+  `resolveVisibleRow` alone accepts. Deduplicating by sequence number was not enough: it loses
+  the operands a compaction folded (a second regression test).
+- **Issue #2 (D136).** A retried `forkRange` deleted the live fork's hold once the fork's GC had
+  collected its first manifest. Fixed: the hold's acquisition says whether this call created it,
+  the fork is recognized by its newest manifest's external ref, only a created hold is undone, and
+  every hold removal goes through one guarded `removeCheckpointFor`.
+- **Tests.** `db-read-agreement.test.ts`, `key-versions.test.ts`, merge steps in
+  `db-transaction.test.ts`'s property, and `database-lifecycle-retry.test.ts`: a retry property
+  for every operation documented as safe to retry. Each fails on the old code (mutations
+  recorded in D135 and D136). A stray debug write to `/tmp` in `database-lifecycle.test.ts` was
+  removed.
+- **Models.** `Lifecycle` (hold ids, a retried fork after its first manifest's collection),
+  `ShardSplit` (a repeated fork runs), `PagedScan` and `Transactions` (rows as a sequence of
+  operands, merges, folds). Each old behaviour is a broken variant that fails.
+- **Error branches mapped (D137).** `docs/coverage-matrix.md` maps every error branch in
+  model-covered code to a model action or a reason, enforced by
+  `tools/formal-verification/src/error-branches.test.ts` in `vp run ready`. Every verify skill
+  runs the check.
+- **Split resumed after its halves released their holds (D138), from the cross-review.** Fixed: a
+  seal gives its successors their holds once (the manifest records `successorsHeld`), and the
+  split finds a half with no hold that exists done
+  (`DatabaseLifecycle.exists`). `ShardSplit.tla` now models the release (`Release`,
+  `NoOrphanHold`; `resealTakesHolds` and `noSkipReleased` fail).
+- `vp run ready` exit 0 (14 tasks); `vp run verify` exit 0 (110 runs).

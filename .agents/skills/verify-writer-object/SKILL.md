@@ -68,6 +68,11 @@ alone keeps the writer correct (D115).
 TLC reports a liveness failure without the property's name, so each config with a broken
 liveness run lists one property; `verify.ts` reports that one.
 
+After the model checks, run `node tools/formal-verification/src/error-branches.ts` (D137). Every
+error branch in the functions this model covers needs a row in `docs/coverage-matrix.md`'s
+"Error branches in model-covered code" that names one of the actions below, or says why no model
+covers it. A branch with no action is a gap in this model: add the action, or record the reason.
+
 ## Edit it
 
 The algorithm is PlusCal inside the comment `(* --algorithm WriterObject`. After changing it,

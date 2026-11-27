@@ -86,6 +86,12 @@ each field added since, with the tests that show it (D105):
   - While rolled back, the older sweep leaves tombstones alone. A remove retried there deletes the
     tombstone too, which reopens the race D91 closed for that database.
   - Avoid removing databases while rolled back across D91.
+- **A seal's `successorsHeld`** (manifest, D138): dropped on the next commit, and read back as
+  false. In the rare case below, a seal repeated after that rewrite gives the half a hold its
+  holder never reads. The split still publishes (it finds the half existing), but that hold stays
+  until the half is removed, and the sealed database cannot be removed before then. The case
+  needs a split that was pending across the rollback and whose halves had already released their
+  holds.
 - **`lastProgressAt`** (compactor state): dropped on the next write. A running job is then judged
   from `startedAt`, as before D94.
 - **`droppedSsts` and `collectionDueAt`:** present at both commits.
