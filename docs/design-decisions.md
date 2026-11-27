@@ -4775,10 +4775,48 @@ regular, transaction, and routed page. A routed page holds one shard's segment a
   - the budget not shared;
   - a budget end treated as a flush overtaking.
 
-**Not done in this pass, open:**
+**Second pass.**
 
-- the oracle property test over the three surfaces with random budgets and writes, flushes, and
-  compactions between pages;
-- the tests of two transaction pages separated by a flush and a compaction, and of a phantom
-  beyond an early page's end but inside the scanned range;
-- the workerd assertions of the HTTP shapes.
+- **The oracle property tests:**
+  - `scan-oracle.property.test.ts` covers the regular and the transaction surface. It runs 30
+    seeded histories, each with runs of up to 40 deletes or expiring values, puts, flushes,
+    compactions, and time passing. Each history is followed by pages with random limits (1–6) and
+    budgets (200–1,000 bytes), with history between pages.
+    - A regular page's rows are exactly the live keys of `[start, next)` at that page's time.
+    - A transaction's pages, with writes, flushes, and compactions between them, are exactly the
+      begin state.
+    - Every page examines at most its budget plus the one key it finishes.
+    - More than 30 pages ended on their budget.
+  - `shard-scan-oracle.property.test.ts` covers the routed surface: 12 histories with splits
+    between pages (more than 5 made), each routed page checked against `[start, next)`.
+  - **Mutations:** 4 of 5 caught (no budget end; a transaction segment's manifest bound; a shard
+    going on past its budget; a routed page skipping the rest of the range after a shard). The
+    fifth, keeping one version fewer of a settled key, is caught by `scan-bounds.test.ts` instead.
+- **One transaction scan in several pages** (`scan-bounds.test.ts`):
+  - Two pages around an overwrite of every key, a flush, and a compaction both read the `readSeq`
+    values.
+  - A phantom past an early page's end but inside the range fails the commit when `readRanges`
+    names the whole range. Naming only what the page returned lets the commit succeed; the OpenAPI
+    text, the README, and `invariants.md` say so.
+  - Mutations: a segment view not at `readSeq` is caught. Writer pages not at `readSeq` are
+    equivalent, because the reader filters by the view's snapshot.
+- **A long run of one key's merge operands: held whole, never split.**
+  - **Why not split it.** Operands cannot be split across pages without the caller merging them,
+    so a page that starts a key finishes it.
+  - **What the page does.** It returns the merged value and ends right after the key with
+    `resumeFrom`, the next key, when that key spent its budget. A refusal would have made a hot
+    counter unreadable until a compaction folded its operands.
+  - **The cost.** That key's operands. In the writer they are bounded by `maxUnflushedBytes`, and
+    D99's `MergedValueTooLarge` bounds the merged result, not the operands read.
+  - **Test:** 2,500 `U64Add` operands, unflushed, read whole (sum 2,500) on the regular and the
+    transaction page, which end with key 1 next.
+  - **Mutations:** the progress guard (`examinedAny`) removed is equivalent, because a page's
+    budget starts at zero.
+- **workerd** (`packages/lsm-cloudflare/test/writer/writer.workerd.ts`, the second
+  `test.provider`, "scan and transaction scan pages end at their work budget with resumeFrom"):
+  - 24,000 keys of 1 KiB, all but one deleted;
+  - on the regular and the transaction scan, the first page answers no rows with a `resumeFrom`,
+    and following it finds exactly the live key.
+  - The sharded form is not there: no workerd test hosts the shard router. Its router is covered
+    in-process by `shard-scan-bounds.test.ts` and the routed oracle; its HTTP response shape only
+    by the schema. A workerd stack for the shard router is the open item.

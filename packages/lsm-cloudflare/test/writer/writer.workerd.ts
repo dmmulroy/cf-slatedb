@@ -529,3 +529,115 @@ test.provider(
     }),
   { timeout: 300_000 },
 );
+
+// D125, through the Workers runtime: a regular and a transaction scan page over a long run of
+// deletes answer 200 with no rows and a `resumeFrom`, and following `resumeFrom` reaches exactly
+// the live key. (The sharded scan's form is not here: no workerd stack hosts the shard router.)
+test.provider(
+  "API Worker: scan and transaction scan pages end at their work budget with resumeFrom (D125)",
+  (stack) =>
+    Effect.gen(function* () {
+      const deployed = yield* stack.deploy(writerTestStack);
+      const client = yield* HttpApiClient.makeWith(DbHttpApi, {
+        baseUrl: workerUrl(deployed.url),
+        httpClient: yield* HttpClient.HttpClient,
+      });
+      const databaseId = DatabaseId.make(`bounds-${Date.now().toString(36)}`);
+      yield* client.databases.createDatabase({
+        payload: {
+          databaseId,
+          keyRange: Option.none(),
+          mergeOperator: Option.none(),
+          changelogRetentionMs: Option.none(),
+          budgetGroup: Option.none(),
+        },
+      });
+      // 24,000 keys of 1 KiB values, then all but the last deleted: 24 MiB of versions, past one
+      // page's 16 MiB budget (SCAN_PAGE_EXAMINED_BYTES).
+      const keyOf = (index: number) => bytes(`k-${String(index).padStart(5, "0")}`);
+      const value = new Uint8Array(1024).fill(1);
+      for (let start = 0; start < 24_000; start += 1000) {
+        yield* client.databases.write({
+          params: { databaseId },
+          payload: {
+            operations: Array.from({ length: 1000 }, (_, offset) => ({
+              _tag: "Put" as const,
+              key: keyOf(start + offset),
+              value,
+              ttlMillis: Option.none(),
+            })),
+          },
+        });
+      }
+      for (let start = 0; start < 23_999; start += 1000) {
+        yield* client.databases.write({
+          params: { databaseId },
+          payload: {
+            operations: Array.from({ length: Math.min(1000, 23_999 - start) }, (_, offset) => ({
+              _tag: "Delete" as const,
+              key: keyOf(start + offset),
+            })),
+          },
+        });
+      }
+      const live = new TextDecoder().decode(keyOf(23_999));
+      const decode = (key: Uint8Array) => new TextDecoder().decode(key);
+
+      // The regular scan: the first page is empty with a continuation; following it finds the key.
+      const first = yield* client.databases.scan({
+        params: { databaseId },
+        payload: {
+          range: FULL_KEY_RANGE,
+          consistency: { _tag: "Latest" },
+          snapshot: Option.none(),
+          limit: 1,
+        },
+      });
+      expect(first.rows).toEqual([]);
+      expect(Option.isSome(first.resumeFrom)).toBe(true);
+      const regularFound: Array<string> = [];
+      let start = first.resumeFrom;
+      for (let page = 0; page < 100 && Option.isSome(start); page++) {
+        const next = yield* client.databases.scan({
+          params: { databaseId },
+          payload: {
+            range: { start: start.value, end: Option.none() },
+            consistency: { _tag: "Latest" },
+            snapshot: Option.none(),
+            limit: 1,
+          },
+        });
+        regularFound.push(...next.rows.map((row) => decode(row.key)));
+        start = next.resumeFrom;
+      }
+      expect(regularFound).toEqual([live]);
+      expect(Option.isNone(start)).toBe(true);
+
+      // The transaction scan: the same, every page at the transaction's readSeq.
+      const begun = yield* client.databases.beginTransaction({ params: { databaseId } });
+      const transactionPage = (from: Uint8Array) =>
+        client.databases.transactionScan({
+          params: { databaseId },
+          payload: {
+            readSeq: begun.readSeq,
+            manifestId: begun.manifestId,
+            range: { start: from, end: Option.none() },
+            limit: 1,
+          },
+        });
+      const firstInTransaction = yield* transactionPage(new Uint8Array(0));
+      expect(firstInTransaction.rows).toEqual([]);
+      expect(Option.isSome(firstInTransaction.resumeFrom)).toBe(true);
+      const transactionFound: Array<string> = [];
+      let from = firstInTransaction.resumeFrom;
+      for (let page = 0; page < 100 && Option.isSome(from); page++) {
+        const next = yield* transactionPage(from.value);
+        transactionFound.push(...next.rows.map((row) => decode(row.key)));
+        from = next.resumeFrom;
+      }
+      expect(transactionFound).toEqual([live]);
+      expect(Option.isNone(from)).toBe(true);
+      yield* stack.destroy();
+    }),
+  { timeout: 300_000 },
+);
