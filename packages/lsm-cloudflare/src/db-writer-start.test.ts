@@ -100,6 +100,53 @@ describe("DbWriter restarted with unflushed rows (D127)", () => {
   });
 });
 
+describe("DbWriter alarm on a fresh instance (D127)", () => {
+  it("an alarm that is the restarted object's first event starts the writer and flushes; one that fires early sets itself again", async () => {
+    const outcome = await Effect.gen(function* () {
+      yield* (yield* ManifestStore).initialize(
+        initialManifest(DB, { keyRange: Option.none(), databaseOptions: DEFAULT_DATABASE_OPTIONS }),
+      );
+      const shared = yield* Effect.context<ManifestStore | ManifestReader | ObjectStore>();
+      const alarm = yield* Effect.provide(DurableObjectAlarm, durableObjectAlarmTestLayer);
+      const newWriter = () =>
+        Layer.build(
+          dbWriterLayerWithoutDependencies.pipe(
+            Layer.provide(sstStoreLayerWithoutDependencies),
+            Layer.provide(memTableLayerWithoutDependencies),
+            Layer.provide([
+              Layer.succeed(DurableObjectAlarm, alarm),
+              compactionTriggerTestLayer,
+              backgroundWorkTestLayer,
+              lsmConfigurationTestLayer(),
+            ]),
+            Layer.provide(Layer.succeedContext(shared)),
+          ),
+        ).pipe(Effect.map((context) => Context.get(context, DbWriter)));
+      yield* TestClock.setTime(10_000);
+      const writer = yield* newWriter();
+      yield* writer.write(DB, put("a", "1"));
+      // The alarm fires early (the runtime may): nothing is due, and it is set again for maxL0Age.
+      yield* TestClock.setTime(20_000);
+      yield* alarm.cancel;
+      yield* writer.runAlarm;
+      const early = yield* alarm.scheduled;
+      // The object is evicted; the alarm is the next instance's first event, at its due time.
+      yield* TestClock.setTime(70_000);
+      yield* alarm.cancel;
+      yield* (yield* newWriter()).runAlarm;
+      const latest = yield* (yield* ManifestReader).loadLatest(DB);
+      return { early, lastL0Seq: latest.manifest.lastL0Seq };
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(Layer.merge(manifestStoreTestLayer, writerSqlStorageTestLayer)),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.provide(TestClock.layer()),
+      Effect.runPromise,
+    );
+    expect(outcome).toEqual({ early: Option.some(70_000), lastL0Seq: 1 });
+  });
+});
+
 describe("DbWriter start failures (D127)", () => {
   /** The reason a write gives when the start's fence-in fails with `failure`. */
   const reasonWhenStartFails = (failure: ManifestReadError | ManifestWriteError) =>

@@ -13,10 +13,11 @@ import {
   type WriteBatch,
 } from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
-import { Effect, Option, Result } from "effect";
+import { Effect, Option, Ref, Result } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
+import { CompactionTriggerRecord } from "./compaction-trigger.ts";
 import { DbWriter, dbWriterTestLayer } from "./db-writer.ts";
 import { DurableObjectAlarm } from "./durable-object-alarm.ts";
 import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
@@ -39,7 +40,11 @@ const put = (key: string): WriteBatch => ({
 const ONE_WRITE_BYTES = 34;
 
 const run = <A, E>(
-  body: Effect.Effect<A, E, DbWriter | ManifestStore | DurableObjectAlarm | RuntimeContext>,
+  body: Effect.Effect<
+    A,
+    E,
+    DbWriter | ManifestStore | DurableObjectAlarm | CompactionTriggerRecord | RuntimeContext
+  >,
   settings: Parameters<typeof dbWriterTestLayer>[0] = {},
 ) =>
   Effect.gen(function* () {
@@ -146,5 +151,44 @@ describe("DbWriter at its limits (D127)", () => {
       }),
     );
     expect(outcome).toEqual({ before: true, after: false });
+  });
+
+  it("names each stall's reason and retry hint, and an L0 stall wakes the compactor", async () => {
+    const stallOf = (result: Result.Result<unknown, { readonly _tag: string }>) => {
+      if (Result.isSuccess(result)) return "not stalled";
+      const failure = result.failure;
+      return failure._tag === "WriteStalledError" &&
+        "reason" in failure &&
+        "retryAfterMs" in failure
+        ? `${String(failure.reason)}:${String(failure.retryAfterMs)}`
+        : failure._tag;
+    };
+    const bytes = await run(
+      Effect.gen(function* () {
+        const writer = yield* DbWriter;
+        yield* writer.write(DB, put("a"));
+        return stallOf(yield* Effect.result(writer.write(DB, put("b"))));
+      }),
+      { l0SstSize: ONE_WRITE_BYTES, maxUnflushedBytes: ONE_WRITE_BYTES },
+    );
+    const backlog = await run(
+      Effect.gen(function* () {
+        const writer = yield* DbWriter;
+        for (const key of ["a", "b", "c", "d"]) {
+          yield* writer.write(DB, put(key));
+          yield* writer.flush(DB);
+        }
+        const woken = (yield* Ref.get(yield* CompactionTriggerRecord)).length;
+        const stall = stallOf(yield* Effect.result(writer.write(DB, put("e"))));
+        // The wake runs in the background: let it finish.
+        yield* Effect.yieldNow;
+        return { stall, wakes: (yield* Ref.get(yield* CompactionTriggerRecord)).length - woken };
+      }),
+      { l0MaxSsts: 4 },
+    );
+    expect({ bytes, backlog }).toEqual({
+      bytes: "UnflushedBytes:1000",
+      backlog: { stall: "L0Backlog:5000", wakes: 1 },
+    });
   });
 });
