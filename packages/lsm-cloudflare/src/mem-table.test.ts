@@ -341,3 +341,38 @@ describe("MemTable pages are bounded by bytes (D93)", () => {
     });
   });
 });
+
+describe("the memtable's stored row kinds (D122)", () => {
+  // A writer's SQLite outlives a deploy: the kind codes are a stored format, read back by every
+  // later version (a rollback or a roll-forward), so they never change.
+  it("stores a value as 0, a merge operand as 1, and a tombstone as 2", async () => {
+    const kinds = await Effect.gen(function* () {
+      const memTable = yield* MemTable;
+      const sql = yield* WriterSqlStorage;
+      yield* memTable.commit(
+        [
+          {
+            key: Uint8Array.of(1),
+            value: RowValue.Value({ bytes: Uint8Array.of(9) }),
+            ttlMillis: Option.none(),
+          },
+          {
+            key: Uint8Array.of(2),
+            value: RowValue.Merge({ operand: Uint8Array.of(9) }),
+            ttlMillis: Option.none(),
+          },
+          { key: Uint8Array.of(3), value: RowValue.Tombstone(), ttlMillis: Option.none() },
+        ],
+        Timestamp.make(1_000),
+      );
+      const rows = yield* sql.exec("SELECT key, kind FROM memtable_rows ORDER BY key");
+      return rows.map((row) => row["kind"]);
+    }).pipe(
+      Effect.provide(
+        memTableLayerWithoutDependencies.pipe(Layer.provideMerge(writerSqlStorageTestLayer)),
+      ),
+      Effect.runPromise,
+    );
+    expect(kinds).toEqual([0, 1, 2]);
+  });
+});
