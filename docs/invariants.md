@@ -94,17 +94,17 @@ load, or by a `Latest` read's covering hit), otherwise a fresh load. One `Flushe
 another in the same Worker isolate never sees an older manifest: the cache never replaces a manifest
 with an older one. Through different isolates they may go backwards, by about the refresh interval.
 
-**A snapshot** is a manifest id and that manifest's `lastL0Seq`. `DbClient.snapshot` takes the
-manifest a `Flushed` read would use and writes nothing. It is readable while GC keeps that manifest:
-`gcMinAge` (1 h) after a newer manifest replaced it. The cache may serve a manifest a compaction
-replaced up to half of `gcMinAge` earlier, so from the moment it is taken an unpinned snapshot is
-guaranteed only half of `gcMinAge`. After that a read may fail with `SnapshotExpired`.
+**A snapshot** is a manifest id and that manifest's `lastL0Seq`. `DbClient.snapshot` loads the
+newest manifest (`DbReader.newestManifest`, D76) and writes nothing. It is readable while GC keeps
+that manifest: `gcMinAge` (1 h) after a newer manifest replaced it, so at least `gcMinAge` from the
+moment it is taken. After that a read may fail with `SnapshotExpired`.
 `DatabaseLifecycle.pinSnapshot` flushes, then adds a checkpoint on the resulting manifest that
 expires after the given lifetime; the snapshot stays readable until it expires or is deleted.
 
-**A transaction** reads at `readSeq`, the writer's `last_seq` at its begin, from the manifest the
-writer's last flush committed (`flushed_manifest_id`) plus the rows the writer keeps in
-`(retained_from_seq, readSeq]` (`DbWriter.probeAt`). That is exact while the writer keeps every row
+**A transaction** reads at `readSeq`, the writer's `last_seq` at its begin, from a manifest `M` with
+`retained_from_seq <= M.lastL0Seq <= readSeq` (the newest one the reader holds when it fits, else
+the begin manifest, D76 and D83) plus the rows the writer keeps in `(retained_from_seq, readSeq]`
+(`DbWriter.probeAt`). That is exact while the writer keeps every row
 above `readSeq`. A trim keeps a flush's rows at least `transactionRetentionMs` (60 s) after that
 flush, less only when more than `maxRetainedBytes` (64 MiB) of flushed rows are kept, and never
 removes the newest flush. Once a trim passes `readSeq`, the commit fails with `SnapshotTooOld`, and
@@ -112,8 +112,52 @@ so does a read whose begin manifest no longer covers `retained_from_seq` or has 
 GC. Every commit checks, under the commit lock, that no key it writes was written after `readSeq`
 (`MemTable.writtenAfter`). A `SerializableSnapshot` commit also checks every key and range it read.
 
+**A fixed point fixes which writes are visible, not the time TTLs are judged at.** A snapshot
+(pinned or not), a transaction's `readSeq`, and a fork's checkpoint each fix the set of writes a
+read may see. None of them fixes the clock its TTLs are judged by. Every read resolves expiry with
+the reading isolate's clock at the moment it runs, as D81 and D83 state for every read:
+
+- a version whose `expireTs <= now` reads as deleted;
+- an expired merge operand is skipped;
+- a value expires within clock skew of its `expireTs`.
+
+`now` is taken once per point read (`DbReader.getRow`) and once per scan call to the reader
+(`DbReader.scan`). That is once per public scan page, and once per segment of a `Latest` scan
+(D93). So, with no write in between:
+
+- **Two reads of one snapshot** a few seconds apart may return a value and then nothing, once its
+  TTL passes. This holds for a pinned snapshot too: its manifest's SSTs are immutable and GC keeps
+  them, so the bytes stay, but the answer changes with the reader's clock. A compaction after the
+  expiry writes new SSTs without the value; it does not change the snapshot's own manifest.
+- **The opposite direction.** A later read whose clock is behind the first's (another isolate) may
+  see a value the first read already found expired. D83's "once compaction has turned an expired
+  value into a delete, it does not come back" holds for reads of manifests after that compaction,
+  not for a snapshot taken before it.
+- **A transaction's reads** may see a value and then not see it, at the same `readSeq`. An expiry
+  is not a write, so the commit's conflict check (`MemTable.writtenAfter`, writes after `readSeq`)
+  does not see it, and a `SerializableSnapshot` commit that read the value succeeds. Serializability
+  is over writes: the history is serializable with each read judged at its own time, not at one
+  instant.
+- **The pages of one scan,** each judged at its own time, may together return rows that no single
+  moment held.
+
+**Worked example.** At time 0, `a` and `b` are written with a 10 s TTL (`expireTs` 10,000), and
+`c` with none. Then:
+
+| Time | Read at one snapshot `S`                     | Answer                                             |
+| ---- | -------------------------------------------- | -------------------------------------------------- |
+| 5 s  | get `a`                                      | `1`                                                |
+| 10 s | get `a`                                      | none: `expireTs <= now`                            |
+| 5 s  | get `a`, in an isolate whose clock is behind | `1` again                                          |
+| 5 s  | scan page 1, limit 1                         | `a`                                                |
+| 10 s | scan page 2, from after `a`                  | `c`: `b` expired, so the scan returned `a` and `c` |
+
+To read values as of one instant, read them in one call: one get per key, or one scan page holding
+them. To keep a value past its TTL, write it without one.
+
 | Enforced by                                                                                                                             | Checked by                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | --------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `resolveVisibleRow` (`lsm-core/src/row-resolution.ts`), `now` in `DbReader.getRow` and `DbReader.scan` (`db-reader.ts`)                 | `snapshot-ttl.test.ts` (an unpinned snapshot, a pinned snapshot, a transaction's reads and its commit, a fork at its checkpoint, and two scan pages: each before and after the expiry; the gets also on a clock behind); `row-resolution.test.ts` (the oracle with TTL)                                                                                                                                                                       |
 | `DbClient.pointView`, `scanView`, `coveredByManifest`, `LATEST_READ_ATTEMPTS` (`db-client.ts`); `DbReader.manifestFor` (`db-reader.ts`) | `db-client.test.ts` ("Latest and AtLeast reads see every acknowledged write; Flushed reads see the last flush; scans agree", against a `Map` oracle; the two tests named in the worked example); `NoAckedWriteLost.tla` (`LatestSeesAcked`; `nonAtomicProbe` and `noSnapshotUpperBound` fail)                                                                                                                                                 |
 | `ManifestCache.covering`, `recent`, `current` (`manifest-cache.ts`); `ManifestReader.loadLatestFrom`                                    | `manifest-store.test.ts` ("a covering hit vouches for the cached manifest: Flushed reads use it for another refresh interval, not longer (D67)", "loads the newest manifest from the writer's last flush, never that flush's superseded manifest (D67)"); `ManifestCasFencing.tla` (`LoadFindsHead`, `LoadFromKnownFindsHead`)                                                                                                                |
 | `DbClient.beginTransaction`, `getAt`, `scanAt`; `DbWriter.commitTransaction`; `MemTable.writtenAfter`, `trim`                           | `db-transaction.test.ts` ("SerializableSnapshot: every committed transaction read what the database held at its commit", over random interleavings with flushes, compactions, and trims; "ends a transaction only once its rows are trimmed, and old callers at the first flush"); `mem-table.test.ts` ("trims flushed rows past retention or the byte bound, never the newest flush or unflushed rows"); `Transactions.tla` (`Serializable`) |
