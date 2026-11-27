@@ -12,7 +12,9 @@ import {
   exceptionType,
   forEachInvocationRecord,
   measureHealth,
+  measurementStorePath,
   pullMeasurementSpans,
+  spansPulledThroughMs,
   spansSince,
 } from "./measurements.ts";
 import { ScenarioStack, uniqueId } from "./scenario.ts";
@@ -28,6 +30,7 @@ import { soakPassed, type SoakPhase, writeReportFile } from "./soak-report.ts";
 import {
   catchUpTails,
   every,
+  makeSpanPuller,
   readTailsWithin,
   readWithin,
   TailTally,
@@ -66,6 +69,9 @@ export interface SoakOptions {
 
 /** How long one read of tail records or spans may take while the workload runs. */
 const WATCHER_READ_BUDGET = "5 minutes";
+
+/** How often the soak pulls the stage's spans while the workload runs (D132). */
+const SPAN_PULL_INTERVAL = "30 seconds";
 
 const text = new TextDecoder();
 const bytesOf = (value: string) => new TextEncoder().encode(value);
@@ -1579,17 +1585,22 @@ export const soak = (options: SoakOptions) =>
     );
 
     // Pull the stage's spans as they arrive, so the final pull is short: a busy stage exports
-    // faster than one pull at the end could read. A pull cut off resumes where it stopped.
+    // faster than one pull at the end could read (D132). One pull at a time (the puller's lock);
+    // a pull cut off resumes after the last export it stored; the report says how far they got.
+    const spanPuller = yield* makeSpanPuller(
+      pullMeasurementSpans(options.minutes + 10),
+      spansPulledThroughMs,
+    );
     const tracePuller = every(
-      "60 seconds",
+      SPAN_PULL_INTERVAL,
       Effect.gen(function* () {
-        const pulled = yield* Effect.result(
-          readWithin(WATCHER_READ_BUDGET, pullMeasurementSpans(options.minutes + 10)),
-        );
-        if (pulled._tag === "Failure")
-          ledger.note("trace pull", pulled.failure.message.slice(0, 200));
-        else if (pulled.success._tag === "OutOfTime")
-          ledger.note("trace pull", `cut off after ${WATCHER_READ_BUDGET}`);
+        const pulled = yield* spanPuller.pullWithin(WATCHER_READ_BUDGET);
+        if (pulled._tag === "Failed") ledger.note("trace pull", pulled.message.slice(0, 200));
+        else if (pulled._tag === "OutOfTime")
+          ledger.note(
+            "trace pull",
+            `cut off after ${WATCHER_READ_BUDGET}; pulled through ${spanPuller.progress.toReport().spansPulledThrough ?? "nothing yet"}`,
+          );
       }),
     );
 
@@ -1662,6 +1673,7 @@ export const soak = (options: SoakOptions) =>
         ),
         storage,
         spansChecked,
+        ...spanPuller.progress.toReport(),
         invocationsChecked: tails.recordsRead,
         newestTailRecordAt: Option.getOrNull(
           Option.map(tails.newestRecordAt, (at) => new Date(at).toISOString()),
@@ -1935,6 +1947,9 @@ export const soak = (options: SoakOptions) =>
     }
 
     endedAt = Option.some(yield* Clock.currentTimeMillis);
+    // The watcher's last pull has been interrupted and awaited with the workload: this is how far
+    // the pulls had got when the workload ended (D132).
+    spanPuller.progress.markWorkloadEnd(Option.getOrElse(endedAt, () => startedAt));
     yield* enter("telemetry");
     // Telemetry last, each read within its budget: one that runs out is a failure saying how far
     // it got, and the next check still runs.
@@ -1950,6 +1965,16 @@ export const soak = (options: SoakOptions) =>
     }
     for (const hit of tails.limitHits) ledger.failures.push(`invocation: ${hit}`);
     yield* saveReport;
+    // The spans left since the watcher's last pull, before the health report: its own pull of
+    // the last 15 minutes then has nothing left to fetch, and it cannot move the store's cursor
+    // past spans the error check below still needs (D132).
+    const caughtUp = yield* spanPuller.pullWithin(budget);
+    if (caughtUp._tag === "Failed") ledger.failures.push(`trace pull: ${caughtUp.message}`);
+    else if (caughtUp._tag === "OutOfTime")
+      ledger.failures.push(
+        `trace pull: not finished within ${budgetText}; pulled through ${spanPuller.progress.toReport().spansPulledThrough ?? "nothing"}`,
+      );
+    yield* saveReport;
     const healthRead = yield* Effect.result(readWithin(budget, measureHealth(15)));
     if (healthRead._tag === "Failure") {
       ledger.failures.push(`health report: ${healthRead.failure.message}`);
@@ -1959,17 +1984,8 @@ export const soak = (options: SoakOptions) =>
       health = Option.some(healthRead.success.value);
     }
     yield* saveReport;
-    const soakMinutes = Math.ceil(
-      (Option.getOrElse(endedAt, () => startedAt) - startedAt) / 60_000,
-    );
-    const pulled = yield* Effect.result(readWithin(budget, pullMeasurementSpans(soakMinutes + 5)));
-    const store =
-      pulled._tag === "Success" && pulled.success._tag === "Finished"
-        ? Option.some(pulled.success.value)
-        : Option.none<string>();
-    if (pulled._tag === "Failure") ledger.failures.push(`trace pull: ${pulled.failure.message}`);
-    else if (pulled.success._tag === "OutOfTime")
-      ledger.failures.push(`trace pull: not finished within ${budgetText}`);
+    // Searched even when the catch-up ran out (that is already a failure): what it holds is read.
+    const store = Option.some(yield* measurementStorePath);
     /** The spans matching `args` in the store, or `None` (recorded as a failure) when unreadable. */
     const searchSpans = (args: ReadonlyArray<string>) =>
       Effect.gen(function* () {

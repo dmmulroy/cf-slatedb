@@ -1,4 +1,6 @@
 import { spawnSync } from "node:child_process";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { DatabaseId } from "@shaledb/lsm-core";
@@ -1002,6 +1004,11 @@ const decodeGreppedSpans = Schema.decodeUnknownEffect(
 const measurementStore = (stage: string) =>
   fileURLToPath(new URL(`../../../.traces/measure/${stage}`, import.meta.url));
 
+/** The directory of the stage's measurement store, which every pull and grep of it uses. */
+export const measurementStorePath = Effect.map(MeasurementCollector, (collector) =>
+  measurementStore(collector.stage),
+);
+
 /**
  * Pulls the stage's spans from the last `minutes` into its measurement store (resuming where the
  * last pull stopped). It names the collector by URL whichever form resolved it, with the token in
@@ -1033,11 +1040,62 @@ export const pullMeasurementSpans = (minutes: number) =>
     return store;
   });
 
+/**
+ * The epoch-ms arrival time a trace pull's cursor stands at: a collector export key is
+ * `traces/<15-digit arrival ms>-<uuid>.json`.
+ *
+ * @returns The time, or `None` for a key in another form.
+ */
+export const pullCursorTimeMs = (after: string): Option.Option<number> => {
+  const digits = /^traces\/(\d{15})-/.exec(after)?.[1];
+  return digits === undefined ? Option.none() : Option.some(Number(digits));
+};
+
+/** A trace pull's saved cursor (`<store>/pulls/<name>.json`, written by `trace-cli pull`). */
+const PullCursorFile = Schema.fromJsonString(
+  Schema.Struct({ url: Schema.String, after: Schema.String }),
+);
+const decodePullCursorFile = Schema.decodeUnknownOption(PullCursorFile);
+
+/**
+ * The arrival time of the last export the stage's measurement store holds from its collector: the
+ * furthest cursor in `<store>/pulls/` for the collector's URL, with or without a trailing slash
+ * (D132).
+ *
+ * @returns The time, or `None` before the first export is stored.
+ */
+export const spansPulledThroughMs = Effect.gen(function* () {
+  const collector = yield* MeasurementCollector;
+  const pulls = join(measurementStore(collector.stage), "pulls");
+  const sameUrl = (url: string) => url.replace(/\/+$/, "") === collector.url.replace(/\/+$/, "");
+  return yield* Effect.sync(() => {
+    if (!existsSync(pulls)) return Option.none<number>();
+    let furthest = Option.none<number>();
+    for (const name of readdirSync(pulls).filter((file) => file.endsWith(".json"))) {
+      const cursor = decodePullCursorFile(readFileSync(join(pulls, name), "utf8"));
+      if (Option.isNone(cursor) || !sameUrl(cursor.value.url)) continue;
+      const at = pullCursorTimeMs(cursor.value.after);
+      if (Option.isSome(at) && (Option.isNone(furthest) || at.value > furthest.value))
+        furthest = at;
+    }
+    return furthest;
+  }).pipe(Effect.orElseSucceed(() => Option.none<number>()));
+});
+
 /** Spans `trace-cli grep` finds in `store` with `args` that started at or after `sinceMs`. */
 export const spansSince = (store: string, sinceMs: number, args: ReadonlyArray<string>) =>
   Effect.gen(function* () {
     // In its own process without blocking this one, so a time budget around it can cut it off.
-    const result = yield* runTraceCliCaptured(["grep", "--json", "--store", store, ...args]);
+    // `--since` lets the trace CLI skip every trace file last written before the window (D132).
+    const result = yield* runTraceCliCaptured([
+      "grep",
+      "--json",
+      "--store",
+      store,
+      "--since",
+      String(Math.floor(sinceMs)),
+      ...args,
+    ]);
     const step = `trace-cli grep ${args.join(" ")}`;
     if (result.status !== 0) {
       return yield* new MeasurementError({
