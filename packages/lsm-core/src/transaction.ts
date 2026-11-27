@@ -2,7 +2,7 @@ import { Schema } from "effect";
 
 import { DatabaseId, SeqNum } from "./ids.ts";
 import { KeyRange } from "./key-range.ts";
-import { WriteBatch } from "./write-batch.ts";
+import { RequestKeyBytes, RequestKeyRange, RequestWriteBatch, WriteBatch } from "./write-batch.ts";
 
 /**
  * Schema for a transaction's isolation (SlateDB RFC 0011).
@@ -37,6 +37,21 @@ export const TransactionCommit = Schema.Struct({
 
 /** A transaction's commit. */
 export type TransactionCommit = typeof TransactionCommit.Type;
+
+/** Most keys a transaction's commit may name as read (D100): as many as a batch's operations. */
+export const MAX_TRANSACTION_READ_KEYS = 10_000;
+
+/** Most ranges a transaction's commit may name as scanned (D100): each costs the writer a query. */
+export const MAX_TRANSACTION_READ_RANGES = 1_000;
+
+/** Schema for a transaction's commit in a request, every field bounded (D100). */
+export const RequestTransactionCommit = Schema.Struct({
+  readSeq: SeqNum,
+  isolation: TransactionIsolation,
+  batch: RequestWriteBatch,
+  readKeys: Schema.Array(RequestKeyBytes).check(Schema.isMaxLength(MAX_TRANSACTION_READ_KEYS)),
+  readRanges: Schema.Array(RequestKeyRange).check(Schema.isMaxLength(MAX_TRANSACTION_READ_RANGES)),
+});
 
 /**
  * The transaction cannot commit: another commit wrote a key it writes (`WriteConflict`) or read

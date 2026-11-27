@@ -50,3 +50,4 @@ export * from "./background-work.ts";
 export * from "./lsm-test-runtime.ts";
 export * from "./durable-object-cell.ts";
 export * from "./lsm-trace-policy.ts";
+export * from "./request-schema-bounds.ts";

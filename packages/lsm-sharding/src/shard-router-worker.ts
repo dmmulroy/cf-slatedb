@@ -1,5 +1,12 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
-import { DatabaseId, DEFAULT_DATABASE_OPTIONS, KeyRange, SeqNum } from "@shaledb/lsm-core";
+import {
+  DatabaseId,
+  DEFAULT_DATABASE_OPTIONS,
+  RequestKeyBytes,
+  RequestKeyRange,
+  RequestValueBytes,
+  SeqNum,
+} from "@shaledb/lsm-core";
 import {
   bindLsmWorkerSettings,
   DatabaseLifecycle,
@@ -83,12 +90,10 @@ const SHARDED_ERRORS = [
 ];
 
 const GroupParams = Schema.Struct({ group: ShardGroup });
-const KeyPayload = Schema.Struct({ key: Schema.Uint8ArrayFromBase64 });
+const KeyPayload = Schema.Struct({ key: RequestKeyBytes });
 const Receipt = Schema.Struct({ databaseId: DatabaseId, seq: SeqNum });
-const Pair = Schema.Struct({
-  key: Schema.Uint8ArrayFromBase64,
-  value: Schema.Uint8ArrayFromBase64,
-});
+/** A key and value; as a request, both bounded like the database API's (D100). */
+const Pair = Schema.Struct({ key: RequestKeyBytes, value: RequestValueBytes });
 
 /** The sharded key-value API: a group of range-sharded databases behind one key space. */
 export class ShardedHttpApiGroup extends HttpApiGroup.make("groups")
@@ -135,7 +140,7 @@ export class ShardedHttpApiGroup extends HttpApiGroup.make("groups")
     HttpApiEndpoint.post("scan", "/groups/:group/scan", {
       params: GroupParams,
       payload: Schema.Struct({
-        range: KeyRange,
+        range: RequestKeyRange,
         limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 1000 })),
       }),
       success: Schema.Struct({ rows: Schema.Array(Pair) }),
@@ -145,7 +150,7 @@ export class ShardedHttpApiGroup extends HttpApiGroup.make("groups")
   .add(
     HttpApiEndpoint.post("split", "/groups/:group/splits", {
       params: GroupParams,
-      payload: Schema.Struct({ databaseId: DatabaseId, atKey: Schema.Uint8ArrayFromBase64 }),
+      payload: Schema.Struct({ databaseId: DatabaseId, atKey: RequestKeyBytes }),
       success: ShardMap,
       error: SHARDED_ERRORS,
     }),

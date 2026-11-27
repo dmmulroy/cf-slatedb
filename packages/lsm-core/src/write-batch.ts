@@ -60,6 +60,48 @@ export type WriteOperation = typeof WriteOperation.Type;
 /** Schema for a write batch: operations that commit atomically with one sequence number. */
 export const WriteBatch = Schema.Struct({ operations: Schema.Array(WriteOperation) });
 
+/**
+ * Schema for a key in a request: base64 bytes, at most {@link MAX_KEY_BYTES} (D100). Request
+ * schemas bound every field at the boundary; the engine's own schemas (`WriteBatch`, `KeyRange`)
+ * stay unbounded because stored data and internal calls decode with them, and
+ * {@link collapseWriteBatch} still checks a batch's limits for callers inside the Worker.
+ */
+export const RequestKeyBytes = Schema.Uint8ArrayFromBase64.check(Schema.isMaxLength(MAX_KEY_BYTES));
+
+/** Schema for a value or merge operand in a request: at most {@link MAX_VALUE_BYTES} (D100). */
+export const RequestValueBytes = Schema.Uint8ArrayFromBase64.check(
+  Schema.isMaxLength(MAX_VALUE_BYTES),
+);
+
+/** Schema for a key range in a request: each bound at most {@link MAX_KEY_BYTES} (D100). */
+export const RequestKeyRange = Schema.Struct({
+  start: RequestKeyBytes,
+  end: Schema.OptionFromNullOr(RequestKeyBytes),
+});
+
+/** Schema for one operation of a write batch in a request, every field bounded (D100). */
+export const RequestWriteOperation = Schema.Union([
+  Schema.TaggedStruct("Put", {
+    key: RequestKeyBytes,
+    value: RequestValueBytes,
+    ttlMillis: TtlMillis,
+  }),
+  Schema.TaggedStruct("Delete", { key: RequestKeyBytes }),
+  Schema.TaggedStruct("Merge", {
+    key: RequestKeyBytes,
+    operand: RequestValueBytes,
+    ttlMillis: TtlMillis,
+  }),
+]);
+
+/**
+ * Schema for a write batch in a request: at most {@link MAX_BATCH_OPERATIONS} operations, each
+ * bounded (D100). The total of {@link MAX_BATCH_BYTES} is checked by {@link collapseWriteBatch}.
+ */
+export const RequestWriteBatch = Schema.Struct({
+  operations: Schema.Array(RequestWriteOperation).check(Schema.isMaxLength(MAX_BATCH_OPERATIONS)),
+});
+
 /** A write batch. */
 export type WriteBatch = typeof WriteBatch.Type;
 

@@ -16,9 +16,11 @@ const NonNegativeSafeInt = Schema.Int.check(
  * and the cache tag `db:<id>` all derive from it, so it is limited to 1–63 lowercase letters,
  * digits, `-`, `_`, and `.`, starting with a letter or digit.
  */
-export const DatabaseId = Schema.String.check(Schema.isPattern(/^[a-z0-9][a-z0-9._-]{0,62}$/)).pipe(
-  Schema.brand("DatabaseId"),
-);
+export const DatabaseId = Schema.String.check(
+  Schema.isPattern(/^[a-z0-9][a-z0-9._-]{0,62}$/),
+  // Implied by the pattern; stated so request schemas show the bound (D100).
+  Schema.isMaxLength(63),
+).pipe(Schema.brand("DatabaseId"));
 
 /** A database's opaque identifier. */
 export type DatabaseId = typeof DatabaseId.Type;

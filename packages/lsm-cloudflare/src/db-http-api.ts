@@ -3,15 +3,16 @@ import {
   CheckpointId,
   DatabaseId,
   DroppedSst,
-  KeyRange,
   ManifestId,
   MergeOperatorName,
   ReadConsistency,
+  RequestKeyBytes,
+  RequestKeyRange,
+  RequestTransactionCommit,
+  RequestWriteBatch,
   RowSchema,
   SeqNum,
   SortedRunId,
-  TransactionCommit,
-  WriteBatch,
   WriteReceipt,
   SstId,
   Timestamp,
@@ -34,13 +35,17 @@ const DatabaseParams = Schema.Struct({
 export const CreateDatabaseRequest = Schema.Struct({
   databaseId: DatabaseId.annotate({ examples: [DatabaseId.make("orders-eu")] }),
   /** Keys the database accepts; writes outside fail with `KeyOutOfRange`. Null: every key. */
-  keyRange: Schema.OptionFromNullOr(KeyRange),
+  keyRange: Schema.OptionFromNullOr(RequestKeyRange),
   /** Built-in merge operator for merge operands; null: merges are stored but cannot be read. */
   mergeOperator: Schema.OptionFromNullOr(MergeOperatorName),
   /** Changelog retention in milliseconds; null disables change data capture export. */
   changelogRetentionMs: Schema.OptionFromNullOr(Schema.Int.check(Schema.isGreaterThan(0))),
-  /** Group for fair compaction and cache budgets; null: the database id. */
-  budgetGroup: Schema.OptionFromNullOr(Schema.String),
+  /**
+   * Group for fair compaction and cache budgets; null: the database id. A name like a database id
+   * (D100): groups, like ids, are trusted names inside one installation, and the access token is
+   * the only tenant boundary.
+   */
+  budgetGroup: Schema.OptionFromNullOr(DatabaseId),
 });
 
 /** Schema for a created database. */
@@ -49,11 +54,25 @@ export const CreateDatabaseResponse = Schema.Struct({
   manifestId: Schema.Int,
 });
 
+/** Schema for a snapshot a read names (as `snapshot` returns it), with its id bounded (D100). */
+export const RequestSnapshot = Schema.Struct({
+  // The same type as `DbSnapshot`'s, so a snapshot's answer is sent back as is.
+  databaseId: Schema.String.check(Schema.isMaxLength(63)),
+  manifestId: ManifestId,
+  snapshotSeq: SeqNum,
+});
+
+/** Longest checkpoint name, in characters (D100): a label, not data. */
+export const MAX_CHECKPOINT_NAME_LENGTH = 256;
+
+/** Most successors a seal may name (D100): a split names two. */
+export const MAX_SEAL_SUCCESSORS = 16;
+
 /** Schema for a point read: the key, how fresh the read must be, and an optional snapshot. */
 export const GetRequest = Schema.Struct({
-  key: Schema.Uint8ArrayFromBase64,
+  key: RequestKeyBytes,
   consistency: ReadConsistency,
-  snapshot: Schema.OptionFromNullOr(DbSnapshot),
+  snapshot: Schema.OptionFromNullOr(RequestSnapshot),
 });
 
 /** Schema for a point read's result: the visible row (value, `seq`, timestamps), or null. */
@@ -92,7 +111,7 @@ export const CompactionStatusResponse = Schema.Struct({
 /** Schema for an SST drop request (D62). */
 export const DropSstRequest = Schema.Struct({
   /** Must repeat the SST id in the path: dropping loses the SST's rows. */
-  confirm: Schema.String,
+  confirm: Schema.String.check(Schema.isMaxLength(64)),
   /** Drop the SST even though no compaction reported it corrupted. */
   force: Schema.optionalKey(Schema.Boolean),
 });
@@ -102,7 +121,9 @@ export const CheckpointsResponse = Schema.Struct({ checkpoints: Schema.Array(Che
 
 /** Schema for a checkpoint request: an optional name and lifetime (none: until deleted). */
 export const CreateCheckpointRequest = Schema.Struct({
-  name: Schema.OptionFromNullOr(Schema.String),
+  name: Schema.OptionFromNullOr(
+    Schema.String.check(Schema.isMaxLength(MAX_CHECKPOINT_NAME_LENGTH)),
+  ),
   /** At most 100 years (`MAX_TTL_MILLIS`, D88). */
   lifetimeMs: Schema.OptionFromNullOr(TtlMillisSchema),
 });
@@ -113,13 +134,15 @@ export const PinSnapshotRequest = Schema.Struct({
 });
 
 /** Schema for a seal request: the databases that replace the sealed one. */
-export const SealDatabaseRequest = Schema.Struct({ successors: Schema.Array(DatabaseId) });
+export const SealDatabaseRequest = Schema.Struct({
+  successors: Schema.Array(DatabaseId).check(Schema.isMaxLength(MAX_SEAL_SUCCESSORS)),
+});
 
 /** Schema for a fork request: the new database, the source checkpoint, and the key range. */
 export const ForkDatabaseRequest = Schema.Struct({
   forkId: DatabaseId,
   checkpointId: CheckpointId,
-  range: KeyRange,
+  range: RequestKeyRange,
 });
 
 /**
@@ -140,14 +163,14 @@ export const TransactionBeginResponse = Schema.Struct({
 export const TransactionGetRequest = Schema.Struct({
   readSeq: SeqNum,
   manifestId: Schema.OptionFromOptionalKey(ManifestId),
-  key: Schema.Uint8ArrayFromBase64,
+  key: RequestKeyBytes,
 });
 
 /** Schema for a transaction's scan: a range at the transaction's read sequence number (see get). */
 export const TransactionScanRequest = Schema.Struct({
   readSeq: SeqNum,
   manifestId: Schema.OptionFromOptionalKey(ManifestId),
-  range: KeyRange,
+  range: RequestKeyRange,
   limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 1000 })),
 });
 
@@ -170,9 +193,9 @@ export const MAX_SCAN_PAGE_ROWS = 1000;
 
 /** Schema for a scan: a key range, how fresh, a page size, and an optional snapshot. */
 export const ScanRequest = Schema.Struct({
-  range: KeyRange,
+  range: RequestKeyRange,
   consistency: ReadConsistency,
-  snapshot: Schema.OptionFromNullOr(DbSnapshot),
+  snapshot: Schema.OptionFromNullOr(RequestSnapshot),
   limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: MAX_SCAN_PAGE_ROWS })),
 });
 
@@ -203,7 +226,7 @@ export class DbHttpApiGroup extends HttpApiGroup.make("databases")
   .add(
     HttpApiEndpoint.post("write", "/databases/:databaseId/batches", {
       params: DatabaseParams,
-      payload: WriteBatch,
+      payload: RequestWriteBatch,
       success: WriteReceipt,
       error: DB_PUBLIC_ERRORS,
     }).annotateMerge(
@@ -391,7 +414,7 @@ export class DbHttpApiGroup extends HttpApiGroup.make("databases")
   .add(
     HttpApiEndpoint.post("commitTransaction", "/databases/:databaseId/transactions/commit", {
       params: DatabaseParams,
-      payload: TransactionCommit,
+      payload: RequestTransactionCommit,
       success: WriteReceipt,
       error: DB_PUBLIC_ERRORS,
     }).annotateMerge(
@@ -481,6 +504,6 @@ export class DbHttpApi extends HttpApi.make("DbHttpApi")
       title: "shaledb",
       version: "1.0.0",
       description:
-        "A SlateDB-style LSM key-value store on R2 and Durable Objects. Keys and values are base64 in JSON. Every response carries `x-request-id`; error bodies repeat it as `requestId`.",
+        "A SlateDB-style LSM key-value store on R2 and Durable Objects. Keys and values are base64 in JSON. Every response carries `x-request-id`; error bodies repeat it as `requestId`. A request body is at most 16 MiB (16,777,216 bytes, whether or not it declares its length); a larger one is refused with `InvalidRequest` before it is read further. Every string, byte, and array field states its bound.",
     }),
   ) {}
