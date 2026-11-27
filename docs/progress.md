@@ -927,5 +927,8 @@ per Stack (Dillon's choice, D49); the §12 write, flush, and split measurements 
   `dist/index.html` and deploys stage `docs`; state is in the account's Cloudflare state store.
   **Live** (approved by Dillon): <https://shaledb.mulroy.workers.dev>. It touches no shaledb
   stage and costs only static-asset requests.
+- **Link previews.** The page has a description, Open Graph and Twitter tags, and a favicon.
+  `infra/docs-site/public/og.png` (1200x630) is rendered from `og-card.html` with
+  `npx -y -p puppeteer@24 node render-og.mjs`; `build` copies `public/` into `dist/`.
 - `vp run ready` exit 0 (14 tasks). The first run failed when parallel test tasks raced to clear
   `node_modules/.vitest-cache`; the run after clearing it passed.
