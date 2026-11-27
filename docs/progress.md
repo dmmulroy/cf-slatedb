@@ -401,6 +401,13 @@ hand-off is below.
 
 ## Remaining-work log
 
+- **D115 (formal audit, 2026-11-26).** The `WriterObject` model found a flush refused at an older
+  epoch marking the restarted writer `Fenced` (every request then failed until eviction). Fixed in
+  `db-writer.ts`: `markFenced` and the flush's view install change only the phase of their own
+  epoch; a seal forgets its phase only after applying its edit. Two failing tests first
+  (`db-writer.test.ts`), 4 of 6 mutations caught. `vp check` exit 0; `db-writer.test.ts` and
+  `mem-table.test.ts` exit 0. Not run: `vp run ready`, workerd.
+
 - **Set up (new session).** Node 24.22, `vp` 1.8, pnpm 12.14; `repos/slatedb` and `.tlc/` present;
   the deploy guard already allowlists `Shaledb` for `dev`, `preview-1..3`. `vp run ready` exit 0
   before any change.

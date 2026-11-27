@@ -1494,3 +1494,188 @@ describe("DbWriter commit lock (D122)", () => {
     });
   });
 });
+
+/** Lets every other fiber run until it suspends. */
+const settle = Effect.forEach(Array.from({ length: 50 }), () => Effect.yieldNow, {
+  discard: true,
+});
+
+describe("DbWriter seal interrupted while a flush is in flight (D115)", () => {
+  // Found by the WriterObject model (D109). On the code before D115: a flush holds the flush lock
+  // at writer epoch e; a seal takes the commit lock, waits for the flush lock, and is interrupted,
+  // so its onExit forgot the phase (D85); the next request started the writer again at e + 1;
+  // the flush's commit was refused with WriterFencedError, and markFenced replaced the new phase
+  // with Fenced. Every later request failed until the object was evicted, and the alarm stopped.
+  it("a seal interrupted before it applied its edit keeps the phase, and the flush in flight commits", async () => {
+    const outcome = await Effect.gen(function* () {
+      const store = yield* ManifestStore;
+      yield* store.initialize(
+        initialManifest(DB, {
+          keyRange: Option.none(),
+          databaseOptions: { ...DEFAULT_DATABASE_OPTIONS, changelog: Option.none() },
+        }),
+      );
+      const shared = yield* Effect.context<ManifestStore | ManifestReader | ObjectStore>();
+      const reached = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const armed = yield* Ref.make(false);
+      const gatedStore = ManifestStore.of({
+        ...store,
+        updateFrom: (view, edit) =>
+          Effect.gen(function* () {
+            if (yield* Ref.getAndSet(armed, false)) {
+              yield* Deferred.succeed(reached, undefined);
+              yield* Deferred.await(release);
+            }
+            return yield* store.updateFrom(view, edit);
+          }),
+      });
+      const writer = yield* Layer.build(
+        dbWriterLayerWithoutDependencies.pipe(
+          Layer.provide(sstStoreLayerWithoutDependencies),
+          Layer.provide(memTableLayerWithoutDependencies),
+          Layer.provide([
+            durableObjectAlarmTestLayer,
+            compactionTriggerTestLayer,
+            backgroundWorkTestLayer,
+            lsmConfigurationTestLayer(),
+          ]),
+          Layer.provide(Layer.succeedContext(shared.pipe(Context.add(ManifestStore, gatedStore)))),
+        ),
+      ).pipe(Effect.map((context) => Context.get(context, DbWriter)));
+
+      yield* writer.write(DB, put("a", "1"));
+      // The flush uploads and stops before its manifest commit, holding the flush lock.
+      yield* Ref.set(armed, true);
+      const flush = yield* Effect.forkChild(Effect.result(writer.flush(DB)));
+      yield* Deferred.await(reached);
+      // The seal takes the commit lock and waits for the flush lock; its caller hangs up.
+      const seal = yield* Effect.forkChild(writer.seal(DB, [], false));
+      yield* settle;
+      yield* Fiber.interrupt(seal);
+      // On the code before D115 this request started the writer again, at a new epoch.
+      const status = yield* writer.status(DB);
+      yield* Deferred.succeed(release, undefined);
+      const flushed = yield* Fiber.join(flush);
+      const later = yield* Effect.result(writer.write(DB, put("b", "2")));
+      const flushedLater = yield* Effect.result(writer.flush(DB));
+      const latest = yield* (yield* ManifestReader).loadLatest(DB);
+      return {
+        restartedEpoch: status.writerEpoch,
+        manifestEpoch: latest.manifest.writerEpoch,
+        firstFlush: Result.isSuccess(flushed) ? "flushed" : flushed.failure._tag,
+        later: Result.isSuccess(later) ? "acknowledged" : later.failure._tag,
+        flushedLater: Result.isSuccess(flushedLater) ? "flushed" : flushedLater.failure._tag,
+      };
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(Layer.merge(manifestStoreTestLayer, writerSqlStorageTestLayer)),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.provide(TestClock.layer()),
+      Effect.runPromise,
+    );
+    expect(outcome.restartedEpoch).toBe(outcome.manifestEpoch);
+    expect(outcome.firstFlush).toBe("flushed");
+    expect(outcome.later).toBe("acknowledged");
+    expect(outcome.flushedLater).toBe("flushed");
+  });
+});
+
+describe("DbWriter flush fenced by its own writer's restart (D115)", () => {
+  // Found by the WriterObject model (D109). A seal with nothing to flush commits outside the flush
+  // lock; its edit is applied and the seal is interrupted, so it forgets the phase (D85). A flush
+  // that took the flush lock and its view at epoch e before that reads the memtable after a write
+  // restarted the writer at e + 1; its commit at e is refused. On the code before D115 markFenced
+  // then replaced the restarted writer's phase with Fenced: every later request failed until the
+  // object was evicted, and the alarm stopped.
+  it("a flush refused at an older epoch leaves the restarted writer serving", async () => {
+    const outcome = await Effect.gen(function* () {
+      yield* createDatabase();
+      const store = yield* ManifestStore;
+      const shared = yield* Effect.context<ManifestStore | ManifestReader | ObjectStore>();
+      const sealReached = yield* Deferred.make<void>();
+      const sealArmed = yield* Ref.make(false);
+      const gatedStore = ManifestStore.of({
+        ...store,
+        updateFrom: (view, edit) =>
+          Effect.gen(function* () {
+            if (yield* Ref.getAndSet(sealArmed, false)) {
+              // The edit is applied and the create never answers.
+              edit(view.manifest, view.id);
+              yield* Deferred.succeed(sealReached, undefined);
+              return yield* Effect.never;
+            }
+            return yield* store.updateFrom(view, edit);
+          }),
+      });
+      const base = Context.get(yield* Layer.build(memTableLayerWithoutDependencies), MemTable);
+      const metaReached = yield* Deferred.make<void>();
+      const metaRelease = yield* Deferred.make<void>();
+      const metaArmed = yield* Ref.make(false);
+      const gatedMemTable = MemTable.of({
+        ...base,
+        meta: Effect.gen(function* () {
+          if (yield* Ref.getAndSet(metaArmed, false)) {
+            yield* Deferred.succeed(metaReached, undefined);
+            yield* Deferred.await(metaRelease);
+          }
+          return yield* base.meta;
+        }),
+      });
+      const writer = yield* Layer.build(
+        dbWriterLayerWithoutDependencies.pipe(
+          Layer.provide(sstStoreLayerWithoutDependencies),
+          Layer.provide(Layer.succeed(MemTable, gatedMemTable)),
+          Layer.provide([
+            durableObjectAlarmTestLayer,
+            compactionTriggerTestLayer,
+            backgroundWorkTestLayer,
+            lsmConfigurationTestLayer(),
+          ]),
+          Layer.provide(Layer.succeedContext(shared.pipe(Context.add(ManifestStore, gatedStore)))),
+        ),
+      ).pipe(Effect.map((context) => Context.get(context, DbWriter)));
+
+      yield* writer.write(DB, put("a", "1"));
+      yield* writer.flush(DB);
+      // The seal has nothing to flush: its own commit applies the edit and hangs.
+      yield* Ref.set(sealArmed, true);
+      const seal = yield* Effect.forkChild(writer.seal(DB, [], false));
+      yield* Deferred.await(sealReached);
+      // A flush takes the flush lock and its view, and stops before reading the memtable.
+      yield* Ref.set(metaArmed, true);
+      const flush = yield* Effect.forkChild(Effect.result(writer.flush(DB)));
+      yield* Deferred.await(metaReached);
+      // The seal's caller hangs up: its commit may have landed, so it forgets the phase.
+      yield* Fiber.interrupt(seal);
+      // A write starts the writer again at a new epoch and commits a row for the flush to cut.
+      yield* writer.write(DB, put("b", "2"));
+      yield* Deferred.succeed(metaRelease, undefined);
+      const flushed = yield* Fiber.join(flush);
+      const later = yield* Effect.result(writer.write(DB, put("c", "3")));
+      const flushedLater = yield* Effect.result(writer.flush(DB));
+      const status = yield* Effect.result(writer.status(DB));
+      return {
+        firstFlush: Result.isSuccess(flushed) ? "flushed" : flushed.failure._tag,
+        later: Result.isSuccess(later) ? "acknowledged" : later.failure._tag,
+        flushedLater: Result.isSuccess(flushedLater) ? "flushed" : flushedLater.failure._tag,
+        unflushedRows: Result.isSuccess(status) ? status.success.unflushedRows : -1,
+        durable: Object.fromEntries((yield* durableValues).values),
+      };
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(Layer.merge(manifestStoreTestLayer, writerSqlStorageTestLayer)),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.provide(TestClock.layer()),
+      Effect.runPromise,
+    );
+    expect(outcome).toEqual({
+      // Cut at the older epoch: refused, its rows stay in SQLite for the next flush.
+      firstFlush: "WriterFencedError",
+      later: "acknowledged",
+      flushedLater: "flushed",
+      unflushedRows: 0,
+      durable: { a: "1", b: "2", c: "3" },
+    });
+  });
+});
