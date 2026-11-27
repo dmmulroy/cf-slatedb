@@ -112,7 +112,8 @@ cache hit or miss). Never put keys, values, or secrets in span attributes or log
 ## Formal verification
 
 Protocol properties (no acknowledged write lost, fencing, manifest CAS linearizability, GC safety,
-seal and split, transactions) are TLA+ models under `tools/formal-verification`, each with a
+seal and split, transactions, the compactor object, a split end to end, the lifecycle across
+databases) are TLA+ models under `tools/formal-verification`, each with a
 project-local skill in `.agents/skills/verify-*`. `vp run verify` runs every check. Read a TLA+
 result with the pstack `/statechart` skill (`.agents/skills/statechart/SKILL.md`). After a change to
 covered code, follow the matching `verify-*` skill; for drift that skipped it, use

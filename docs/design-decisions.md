@@ -4333,6 +4333,98 @@ first page answers 200 with no rows and a `resumeFrom`, and following `resumeFro
 the live key, with every page answered. Three mutations caught: no budget, the handler requiring a
 row to end early, and versions not counted.
 
+## D110. The compactor Durable Object is modeled at await granularity
+
+`CompactorObject.tla` models one database's compactor:
+
+- two concurrent wakes through `ensureState`;
+- the alarm's poll, with its awaits and its `updateState` write;
+- Workflow jobs whose commit step may run twice;
+- the compaction budget's lease (one slot);
+- GC with D96's running-job cap;
+- the writer's flushes and its stalled-write wake;
+- eviction, which loses the processes and locks but keeps the cell, the alarm, and the Workflow
+  instances.
+
+**Properties.**
+
+- `EpochNeverRegresses`, an action property;
+- `OutcomeTrue`;
+- `LeaseCapacity`;
+- `L0Drains` (liveness): L0 at its limit is eventually compacted;
+- `RunningJobsLeave` (liveness).
+
+**Each known defect is a variant that fails:**
+
+| Variant                         | Fails                 |
+| ------------------------------- | --------------------- |
+| D78's missing lock              | `EpochNeverRegresses` |
+| the code before D78             | `L0Drains`            |
+| D103's unrecognized retry       | `OutcomeTrue`         |
+| D96's GC ignoring a running job | `L0Drains`            |
+| D94's unbounded unreadable job  | `RunningJobsLeave`    |
+
+D78's stale write and terminal fence are unreachable once `startLock` is held, because only this
+object fences in. The model shows them only together with the missing lock.
+
+**Assumptions the code relies on.** Building the model surfaced three, each first a lasso that
+was a modeling error, not a defect:
+
+- the runtime retries an alarm handler that an eviction cut off;
+- a lease expires on time whatever the polls do;
+- `gcMinAge` is far longer than the gap between a job's launch and its record.
+
+No new defect was found. `verify.ts` now reads a violated temporal property's name from a config
+that has exactly one, because TLC does not print it.
+
+## D112. A shard split is modeled end to end
+
+`ShardSplit.tla` models a split from start to finish:
+
+- the directory's pending split, the seal with both holds, both forks in either order, and the
+  publish;
+- a crash after any step, resumed by a request that waited out the routing wait (D101);
+- a writer whose router has a stale map;
+- a `Flushed` reader whose map ages past D89's bound;
+- a rogue seal naming other successors (D95);
+- a change-feed consumer following D80's procedure.
+
+**Properties and the variants that fail them:**
+
+| Property                        | Variant     |
+| ------------------------------- | ----------- |
+| `EveryShardWriteInItsSuccessor` | —           |
+| `HoldsMatchSeal`                | before D95  |
+| `ConsumerMissesNothing`         | before D80  |
+| `NoStaleBeyondBound`            | before D89  |
+| `WaitingWritesLand` (liveness)  | before D101 |
+
+The safety run has 24,118 states. An exploration at larger bounds (228,918 states) found nothing.
+
+## D114. The lifecycle is modeled across three databases
+
+`Lifecycle.tla` models a source, a fork, and a fork of the fork:
+
+- holds, rewrites, and releases (D77);
+- GC on every database, protecting pinned manifests;
+- `deleteCheckpoint` of a hold (D91);
+- removal step by step, interrupted and resumed, keeping its `Removed` head (D91);
+- a stale committer after a removal;
+- recreation with readers that cached the old incarnation (D90).
+
+**Properties and the variants that fail them:**
+
+| Property                   | Variant                                                                 |
+| -------------------------- | ----------------------------------------------------------------------- |
+| `NoReaderNeedsDeleted`     | both forms of the early release before D77; the deleted hold before D91 |
+| `RemovedNeverReopens`      | the deleted head before D91                                             |
+| `NoOldIncarnationServed`   | the immediate recreation before D90                                     |
+| `HoldsReleased` (liveness) | —                                                                       |
+| `PrefixEmptied` (liveness) | —                                                                       |
+
+Two collections at once (D83) are not modeled. D60's argument and the collection's boundary
+re-read cover them, with tests.
+
 ## D121. `tokens ensure` and `rotate` fail when a written secret never turns active
 
 `awaitActive` waited up to about 10 s (20 reads, 500 ms apart) for a written secret to turn

@@ -66,6 +66,13 @@ views and ranges), `writer.workerd.ts` (the same split through the public API).
 
 ## Maintenance notes
 
+- D110–D114 drift check (formal2), against the integration head:
+  - **D95.** A seal of a sealed database naming other successors is refused. This model has one
+    set of successors, so no step changed. `ShardSplit.tla` checks the refusal (`HoldsMatchSeal`,
+    variant `resealOthers`).
+  - **D101.** A request that waited out an abandoned split finishes it. That is after the forks,
+    outside this model; `ShardSplit.tla` checks it (`WaitingWritesLand`, variant `noResume`).
+
 - D85: the model's `Seal` is one step that also updates the writer, so it cannot express a seal
   whose manifest commit landed while the writer never saw the answer (its caller hung up, or the
   read after the create failed). The code then kept believing it was open and acknowledged writes
@@ -103,7 +110,7 @@ views and ranges), `writer.workerd.ts` (the same split through the public API).
 
 ## Keeping it in step with the code
 
-Sync commit: the D84/D85 commit (`fix(writer)`: a seal that does not return forgets the writer's phase); before it the D77 commit (a fork releases its hold from its own collection). When a covered function changes after it, update the model
+Sync commit: the D110–D114 drift check (formal2); before it, the D84/D85 commit (`fix(writer)`: a seal that does not return forgets the writer's phase); before it the D77 commit (a fork releases its hold from its own collection). When a covered function changes after it, update the model
 so each action is still one awaited effect in the code, rerun, and show each invariant still fails on
 a broken variant before moving the sync commit. For drift that skipped this skill, use
 `.agents/skills/maintain-formal-verification-skill/SKILL.md`.

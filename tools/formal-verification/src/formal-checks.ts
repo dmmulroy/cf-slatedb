@@ -298,4 +298,59 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
       },
     ],
   },
+  {
+    // D114: create, remove, recreate, checkpoints and fork holds across three databases.
+    name: "lifecycle",
+    spec: "Lifecycle.tla",
+    runs: [
+      {
+        config: "Lifecycle.cfg",
+        broken: "none",
+        expect: "pass",
+        timeLimitSeconds: 120,
+      },
+      {
+        config: "Lifecycle.cfg",
+        broken: "releaseNewestOnly",
+        expect: "NoReaderNeedsDeleted",
+        timeLimitSeconds: 120,
+      },
+      {
+        config: "Lifecycle.cfg",
+        broken: "releaseIgnoresPins",
+        expect: "NoReaderNeedsDeleted",
+        timeLimitSeconds: 120,
+      },
+      {
+        config: "Lifecycle.cfg",
+        broken: "deleteHold",
+        expect: "NoReaderNeedsDeleted",
+        timeLimitSeconds: 120,
+      },
+      {
+        config: "Lifecycle.cfg",
+        broken: "deleteHead",
+        expect: "RemovedNeverReopens",
+        timeLimitSeconds: 120,
+      },
+      {
+        config: "Lifecycle.cfg",
+        broken: "recreateAtOnce",
+        expect: "NoOldIncarnationServed",
+        timeLimitSeconds: 120,
+      },
+      {
+        config: "LifecycleLiveness.cfg",
+        broken: "none",
+        expect: "pass",
+        timeLimitSeconds: 120,
+      },
+      {
+        config: "LifecyclePrefix.cfg",
+        broken: "none",
+        expect: "pass",
+        timeLimitSeconds: 120,
+      },
+    ],
+  },
 ];

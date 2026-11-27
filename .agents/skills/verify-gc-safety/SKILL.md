@@ -111,6 +111,17 @@ moment ago counted as old and its SSTs could be deleted under a reader. `ownUplo
 
 ## Maintenance notes
 
+- D110–D114 drift check (formal2), against the integration head. Each action still maps to its
+  function. Changes since the last note:
+  - **D98.** A collection folds retained manifests' references as it reads them. Over
+    `gcMaxRetainedManifestLoads` it defers SST deletion and does not release a fork's hold. Both
+    only delete less, and manifests older than `gcMinAge` are deleted without a read, as before. No
+    step changed.
+  - **D99.** Checkpoint and changelog caps change no reference GC reads.
+  - **D90/D91.** Removal and recreation are outside this one-database model. `Lifecycle.tla`
+    checks them across databases, with fork chains and holds; `ManifestCasFencingRemove.cfg`
+    checks the tombstone.
+
 - D96: a collection's cutoff is now `min(now - gcMinAge, oldest running job's start - 60 s)`,
   passed by the compactor, so a compaction running longer than `gcMinAge` keeps its outputs and
   can commit. That only lowers `Cutoff` for some runs. A lower cutoff deletes a subset of what
@@ -187,7 +198,7 @@ moment ago counted as old and its SSTs could be deleted under a reader. `ownUplo
 
 ## Keeping it in step with the code
 
-Sync commit: the D77 commit (`fix(lsm-cloudflare): a fork releases its hold only when no manifest GC keeps names another database's SST`); before it the D70–D74 commit. When a covered function changes after it, update the model
+Sync commit: the D110–D114 drift check (formal2); before it, the D77 commit (`fix(lsm-cloudflare): a fork releases its hold only when no manifest GC keeps names another database's SST`); before it the D70–D74 commit. When a covered function changes after it, update the model
 so each action is still one awaited effect in the code, rerun, and show each invariant still fails on
 a broken variant before moving the sync commit. For drift that skipped this skill, use
 `.agents/skills/maintain-formal-verification-skill/SKILL.md`.
