@@ -3842,6 +3842,25 @@ size.
 - **Unlimited scans stay unbounded.** An in-Worker stream with no limit reads its whole range, as
   before.
 
+**Also: a damaged cached copy no longer fails a block for a year.**
+
+- **The defect.** Responses of the `BlockServer` are cached immutable for a year. A copy damaged in
+  Workers Cache, or in transit, failed its checksum, and the read failed with `SstCorruptedError`
+  even though the bucket held intact bytes. The L1 never kept it, but Workers Cache did, so every
+  read of that block failed until the copy was evicted.
+- **The fix.** `BlockCache` reads a range whose bytes fail their checksum once more past every
+  cache (`BlockSource.uncached`). Where the Stack has Workers Cache, that reads the bucket. In a
+  restricted Stack it goes through the `BlockServer` again, which reads the bucket on every
+  request there.
+  - An intact copy answers, with `cache.damaged_copy` on the span and a warning that names the SST
+    and the offset.
+  - A damaged bucket copy still fails, typed.
+- **Tests.**
+  - `block-cache.test.ts`: a damaged cached copy with an intact bucket copy answers; damage in both
+    fails as `SstCorruptedError` naming the SST.
+  - `block-source.test.ts`: the hedged source's `uncached` reads the bucket at once.
+  - Two mutations caught.
+
 **Not covered.** The transaction scan (`DbClient.scanAt`, `transactions/scan`) passes no budget.
 Its pages are bounded by `limit` rows, not by what they examine, and its `resumeFrom`-less contract
 needs a decision of its own (`CROSS:` to the API owner).

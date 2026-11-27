@@ -64,6 +64,22 @@ export interface IBlockSource {
     SstMissingError | BlockSourceUnavailableError,
     BlockSourceServices
   >;
+  /**
+   * The same byte range, read past every cache: for a read whose bytes failed their checksum, which
+   * may be a damaged cached or in-transit copy of an intact object (read audit). Where the Stack
+   * has Workers Cache it reads the bucket; otherwise the `BlockServer` reads the bucket on every
+   * request, so this reads through it again.
+   */
+  readonly uncached: (
+    owner: DatabaseId,
+    sstId: SstId,
+    offset: number,
+    length: number,
+  ) => Effect.Effect<
+    Uint8Array,
+    SstMissingError | BlockSourceUnavailableError,
+    BlockSourceServices
+  >;
   /** Purges `databaseId`'s cached blocks (after the database is removed). */
   readonly purge: (
     databaseId: DatabaseId,
@@ -150,24 +166,30 @@ export const makeBlockSource = Effect.gen(function* () {
       ),
   });
 
+  const block = Effect.fn("BlockSource.block")(function* (
+    owner: DatabaseId,
+    sstId: SstId,
+    offset: number,
+    length: number,
+  ) {
+    yield* Effect.annotateCurrentSpan({
+      "database.id": owner,
+      "sst.id": sstId,
+      "block.offset": offset,
+      "block.length": length,
+    });
+    const blocks = yield* client;
+    return yield* blocks.blocks
+      .block({ params: { databaseId: owner, sstId, range: `${offset}-${length}` } })
+      .pipe(Effect.catchTags(failures(owner, sstId)));
+  });
+
   return BlockSource.of({
-    block: Effect.fn("BlockSource.block")(function* (
-      owner: DatabaseId,
-      sstId: SstId,
-      offset: number,
-      length: number,
-    ) {
-      yield* Effect.annotateCurrentSpan({
-        "database.id": owner,
-        "sst.id": sstId,
-        "block.offset": offset,
-        "block.length": length,
-      });
-      const blocks = yield* client;
-      return yield* blocks.blocks
-        .block({ params: { databaseId: owner, sstId, range: `${offset}-${length}` } })
-        .pipe(Effect.catchTags(failures(owner, sstId)));
-    }),
+    block,
+    // Through the BlockServer again: right where it runs without Workers Cache (a restricted
+    // Stack), which is the only place this source is used for reads; `hedgeBlockSource` reads the
+    // bucket instead where there is a cache.
+    uncached: block,
     meta: Effect.fn("BlockSource.meta")(function* (
       owner: DatabaseId,
       sstId: SstId,
@@ -299,6 +321,7 @@ export const hedgeBlockSource = (blockServer: IBlockSource) =>
           fromBucket(owner, sstId, offset, length),
           settings.blockReadHedgeAfterMs,
         ),
+      uncached: fromBucket,
       purge: blockServer.purge,
     });
   });
@@ -350,6 +373,7 @@ export const blockSourceTestLayer = Layer.effect(
         yield* Effect.annotateCurrentSpan({ "database.id": owner, "sst.id": sstId });
         return yield* read(owner, sstId, offset, length);
       }),
+      uncached: read,
       purge: () => Effect.succeed(true),
     });
   }),

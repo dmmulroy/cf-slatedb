@@ -77,6 +77,7 @@ const recordingSource = (ssts: ReadonlyArray<{ bytes: Uint8Array; handle: SstHan
     const source = BlockSource.of({
       block: (_owner, sstId, offset, length) => read(sstId, offset, length),
       meta: (_owner, sstId, offset, length) => read(sstId, offset, length),
+      uncached: (_owner, sstId, offset, length) => read(sstId, offset, length),
       purge: () => Effect.succeed(true),
     });
     return { source, reads, failing, hanging };
@@ -215,5 +216,82 @@ describe("BlockCache", () => {
       }),
     );
     expect(rereads).toBeGreaterThan(0);
+  });
+});
+
+describe("BlockCache over damaged copies (read audit)", () => {
+  /**
+   * The cache over a source whose cached path (`block`, `meta`) returns `cachedCopy(bytes)` and whose
+   * uncached path returns `bucketCopy(bytes)`; counts each path's reads.
+   */
+  const readThrough = (
+    cachedCopy: (bytes: Uint8Array) => Uint8Array,
+    bucketCopy: (bytes: Uint8Array) => Uint8Array,
+  ) => {
+    const sst = buildSst("01JD00000000000000000000AA", 4);
+    const counts = { cached: 0, uncached: 0 };
+    const range = (offset: number, length: number) => sst.bytes.slice(offset, offset + length);
+    const source = BlockSource.of({
+      block: (_owner, _sstId, offset, length) =>
+        Effect.sync(() => {
+          counts.cached++;
+          return cachedCopy(range(offset, length));
+        }),
+      meta: (_owner, _sstId, offset, length) =>
+        Effect.sync(() => {
+          counts.cached++;
+          return cachedCopy(range(offset, length));
+        }),
+      uncached: (_owner, _sstId, offset, length) =>
+        Effect.sync(() => {
+          counts.uncached++;
+          return bucketCopy(range(offset, length));
+        }),
+      purge: () => Effect.succeed(true),
+    });
+    const read = Effect.gen(function* () {
+      const cache = yield* BlockCache;
+      const meta = yield* cache.meta(OWNER, sst.handle, "group");
+      const entry = meta.index[0];
+      if (entry === undefined) return yield* Effect.die("no block");
+      const block = yield* cache.block(OWNER, sst.handle, entry, "group");
+      return [...block.rows()].length;
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        blockCacheLayerWithoutDependencies.pipe(
+          Layer.provide(
+            Layer.mergeAll(
+              Layer.succeed(BlockSource, source),
+              lsmConfigurationTestLayer(DEFAULT_LSM_SETTINGS),
+            ),
+          ),
+        ),
+      ),
+      Effect.provide(lsmTestRuntimeContextLayer),
+    );
+    return { read, counts };
+  };
+  const damaged = (bytes: Uint8Array) => {
+    const copy = bytes.slice();
+    copy[Math.floor(copy.length / 2)] = (copy[Math.floor(copy.length / 2)] ?? 0) ^ 0x5a;
+    return copy;
+  };
+  const intact = (bytes: Uint8Array) => bytes;
+
+  it("reads a range again past every cache when its copy fails its checksum, and answers", async () => {
+    const { read, counts } = readThrough(damaged, intact);
+    const rows = await Effect.runPromise(read);
+    expect(rows).toBeGreaterThan(0);
+    // The metadata and the block each came damaged once and were read again from the bucket.
+    expect(counts).toEqual({ cached: 2, uncached: 2 });
+  });
+
+  it("fails typed, naming the SST, when the bucket's copy is damaged too, and keeps nothing", async () => {
+    const { read, counts } = readThrough(damaged, damaged);
+    const failure = await Effect.runPromise(Effect.flip(read));
+    expect(failure._tag).toBe("SstCorruptedError");
+    expect(failure.message).toContain("01JD00000000000000000000AA");
+    expect(counts).toEqual({ cached: 1, uncached: 1 });
   });
 });
