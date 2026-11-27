@@ -282,6 +282,73 @@ describe("SST codec and read path", () => {
 
 const smallSize = Arbitrary.schema(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 64 })));
 
+describe("decoders over damaged bytes (read audit)", () => {
+  const damageArbitrary = Arbitrary.all({
+    writes: historyArbitrary(60),
+    position: Arbitrary.schema(
+      Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 100_000 })),
+    ),
+    flip: Arbitrary.schema(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 255 }))),
+    cut: Arbitrary.schema(Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 100 }))),
+  });
+
+  /** Whether `decode` fails typed (an `SstCorruptedError`) rather than throwing or answering. */
+  const failsTyped = <A>(decode: () => Result.Result<A, { readonly _tag: string }>) => {
+    try {
+      const decoded = decode();
+      return Result.isFailure(decoded) && decoded.failure._tag === "SstCorruptedError";
+    } catch {
+      return false;
+    }
+  };
+
+  it("refuses a metadata section with any one byte changed, or cut anywhere, with a typed error", () => {
+    assertProperty(
+      damageArbitrary,
+      ({ writes, position, flip, cut }) => {
+        const rows = rowsFromWrites(writes);
+        if (rows.length === 0) return true;
+        const { bytes, info } = buildSst(sortRows(rows));
+        const meta = bytes.slice(info.metaOffset);
+        const changed = meta.slice();
+        const at = position % changed.length;
+        changed[at] = (changed[at] ?? 0) ^ flip;
+        const truncated = meta.slice(0, Math.floor((meta.length * cut) / 101));
+        return (
+          failsTyped(() => decodeSstMeta(SST_ID, changed)) &&
+          failsTyped(() => decodeSstMeta(SST_ID, truncated))
+        );
+      },
+      { runs: 400 },
+    );
+  });
+
+  it("refuses a data block with any one byte changed, or cut anywhere, with a typed error", () => {
+    assertProperty(
+      damageArbitrary,
+      ({ writes, position, flip, cut }) => {
+        const rows = rowsFromWrites(writes);
+        if (rows.length === 0) return true;
+        const { bytes, info } = buildSst(sortRows(rows));
+        const meta = openSst(bytes, info.metaOffset);
+        const entry = meta.index[position % meta.index.length];
+        if (entry === undefined) return false;
+        const block = bytes.slice(entry.offset, entry.offset + entry.length);
+        const changed = block.slice();
+        const at = position % changed.length;
+        changed[at] = (changed[at] ?? 0) ^ flip;
+        const truncated = block.slice(0, Math.floor((block.length * cut) / 101));
+        const at0 = { sstId: SST_ID, offset: entry.offset };
+        return (
+          failsTyped(() => decodeDataBlock(changed, at0)) &&
+          failsTyped(() => decodeDataBlock(truncated, at0))
+        );
+      },
+      { runs: 400 },
+    );
+  });
+});
+
 describe("groupBlockReads", () => {
   it("covers exactly the given blocks in order with contiguous reads within the size bound", () => {
     const result = Effect.runSync(

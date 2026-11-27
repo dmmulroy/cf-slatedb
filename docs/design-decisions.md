@@ -3793,6 +3793,21 @@ then at most about 1/32 of the data.
 **Revises D103's memory row.** The index of a 64 MiB output is now at most about 2 MiB, at any key
 size.
 
+**Also found: a damaged SST trailer threw instead of failing typed.**
+
+- **The defect.** The trailer (footer length, metadata offset, format version) has no checksum of
+  its own. `decodeSstMeta` read it with unguarded `ByteReader` calls. A damaged metadata offset (above
+  2^53 - 1), or metadata cut short by a short response or cache entry, threw a plain error: the read
+  died as a defect (`InternalFailure`), naming no SST, where every other section fails with
+  `SstCorruptedError`.
+- **The fix.** The trailer is read inside `Result.try` and fails as `SstCorruptedError` (`Trailer`,
+  `Malformed`). Any other damage to it is then caught by the footer's checksum.
+- **Tests.** New property tests in `sst-codec.test.ts`, 400 runs each, cover any one byte changed
+  and a cut at any length, for both the metadata section and a data block. Each decoder must fail
+  typed, never throw and never answer. Neither decoder had such a property before, only one fixed
+  damage each. The metadata property fails without the fix: shrunk, a one-row SST whose metadata is
+  cut to 8% of its length.
+
 ## D108. A scan page examines a bounded amount and ends early, resumably
 
 **Found by the read audit.**

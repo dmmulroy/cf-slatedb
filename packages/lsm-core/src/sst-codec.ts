@@ -327,10 +327,22 @@ export const decodeSstMeta = (
         metaCorrupted(sstId, "Trailer", "Truncated", 0, "shorter than the trailer"),
       );
     }
-    const trailer = new ByteReader(meta, meta.length - SST_TRAILER_LENGTH);
-    const footerLength = trailer.u32();
-    const metaOffset = trailer.u64();
-    const version = trailer.u16();
+    // The trailer's bytes have no checksum of their own: a damaged one must still fail typed, not
+    // throw (read audit). The footer's checksum then catches any other damage to it.
+    const { footerLength, metaOffset, version } = yield* Result.try({
+      try: () => {
+        const trailer = new ByteReader(meta, meta.length - SST_TRAILER_LENGTH);
+        return { footerLength: trailer.u32(), metaOffset: trailer.u64(), version: trailer.u16() };
+      },
+      catch: (cause) =>
+        metaCorrupted(
+          sstId,
+          "Trailer",
+          "Malformed",
+          0,
+          cause instanceof ByteReadOutOfBounds ? cause.message : "unreadable",
+        ),
+    });
     if (version !== SST_FORMAT_VERSION) {
       return yield* Result.fail(
         metaCorrupted(
