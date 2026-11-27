@@ -804,7 +804,7 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `RunningStaysRecorded`, `PublishedIsSealed`, `NewIncarnationIntact`. Two defects found and
   fixed: `deleteCheckpoint` during `forkRange` (`database-lifecycle.test.ts`), and a job launched
   before it was recorded (`compactor.test.ts`). Deeper search configs, unregistered, in each skill.
-- **Paged scans model-checked (D116)** — done. `PagedScan.tla`, skill
+- **Paged scans model-checked (D133)** — done. `PagedScan.tla`, skill
   `.agents/skills/verify-paged-scan`: `LatestPageAtSnapshot` (`restartAfterRows` fails),
   `TxnPagesAtReadSeq`, `TxnPagesComplete`, `PhantomRefused` (`pageRangesOnly` fails). Code-level:
   `scan-oracle.property.test.ts`, `scan-bounds.test.ts`.

@@ -5348,7 +5348,7 @@ commit's check. It still fails without `scheduleFlush`'s lock (mutation caught).
 `alarmBeforeMark`, and `schedulerIgnoresCommit` fail it. `WriterObjectSeal.cfg` passes with
 4,949,012 states.
 
-## D116. Paged scans are model-checked: Latest segments, budget-limited pages, and transaction pages with the phantom rule
+## D133. Paged scans are model-checked: Latest segments, budget-limited pages, and transaction pages with the phantom rule
 
 **Why.** D93's and D125's paging rules were checked by oracle property tests on the code
 (`scan-oracle.property.test.ts`), but by no model. The formal report listed them as unchecked.

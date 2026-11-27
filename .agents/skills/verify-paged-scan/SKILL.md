@@ -65,7 +65,7 @@ Expected: four `✓` lines.
 
 ## Maintenance notes
 
-- D116 (this model). Writing it showed one thing about the code, recorded in the model: a restart
+- D133 (this model). Writing it showed one thing about the code, recorded in the model: a restart
   before any row was emitted goes back to the range's start, not to the segment that was
   overtaken (`restart()` sets `start = range.start`). A first draft that resumed at the
   overtaken segment failed `LatestPageAtSnapshot`: an earlier key examined at the old snapshot
@@ -73,7 +73,7 @@ Expected: four `✓` lines.
 
 ## Keeping it in step with the code
 
-Sync commit: the D116 commit (`test(formal): PagedScan, paged Latest and transaction scans
-(D116)`). When a covered function changes, update the action it maps to, rerun, and show each
+Sync commit: the D133 commit (`test(formal): PagedScan, paged Latest and transaction scans
+(D133)`). When a covered function changes, update the action it maps to, rerun, and show each
 property still fails on its broken variant. For drift that skipped this skill, use
 `.agents/skills/maintain-formal-verification-skill/SKILL.md`.

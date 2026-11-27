@@ -413,7 +413,7 @@ hand-off is below.
 
 - **D131, D116 (formal round 2, 2026-11-26).** D131: a commit makes sure an alarm exists before its
   rows reach SQLite, so `WriterObject`'s `AlarmCovers` has no exception; two tests in
-  `db-writer.test.ts`; 16 `writer-object` runs. D116: `PagedScan.tla` (4 runs) models Latest
+  `db-writer.test.ts`; 16 `writer-object` runs. D133: `PagedScan.tla` (4 runs) models Latest
   segments, budget-limited pages, and transaction pages with the phantom rule.
   `TLC_WORKERS=2 node tools/formal-verification/src/verify.ts writer-object paged-scan` exit 0;
   `vp check` exit 0; `lsm-cloudflare` `vp test run --maxWorkers 2` 319 passed. Deeper search

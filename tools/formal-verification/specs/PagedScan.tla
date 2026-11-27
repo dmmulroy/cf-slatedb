@@ -1,6 +1,6 @@
 ------------------------------ MODULE PagedScan ------------------------------
 (***************************************************************************)
-(* Paged scans of one shaledb database (D116): a Latest scan read in       *)
+(* Paged scans of one shaledb database (D133): a Latest scan read in       *)
 (* segments with resumeFrom (D93), pages that end on their work budget     *)
 (* (D125), and a transaction scan read in several pages at one readSeq    *)
 (* whose commit checks its read range (D125's phantom rule), with writes,  *)
