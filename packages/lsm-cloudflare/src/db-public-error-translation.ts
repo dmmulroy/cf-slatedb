@@ -1,8 +1,10 @@
 import type {
+  CheckpointLimitError,
   TransactionConflictError,
   DatabaseHasDependentsError,
   DatabaseSealedError,
   KeyOutOfRangeError,
+  MergedValueTooLargeError,
   MergeOperatorMissingError,
   SstCorruptedError,
   SstNotInManifestError,
@@ -14,6 +16,7 @@ import { Option } from "effect";
 import {
   BatchInvalidPublicError,
   ChangelogUnavailablePublicError,
+  CheckpointLimitReachedPublicError,
   CheckpointNotFoundPublicError,
   DatabaseAlreadyExistsPublicError,
   DatabaseHasDependentsPublicError,
@@ -23,6 +26,7 @@ import {
   DatabaseSealedPublicError,
   InternalFailurePublicError,
   KeyOutOfRangePublicError,
+  MergedValueTooLargePublicError,
   MergeOperatorMissingPublicError,
   SnapshotExpiredPublicError,
   StorageUnavailablePublicError,
@@ -55,11 +59,13 @@ export type DbInternalError =
   | KeyOutOfRangeError
   | WriterUnavailableError
   | MergeOperatorMissingError
+  | MergedValueTooLargeError
   | SstCorruptedError
   | ReaderUnavailableError
   | CompactorUnavailableError
   | DatabaseHasDependentsError
   | CheckpointNotFoundError
+  | CheckpointLimitError
   | TransactionConflictError
   | ChangelogUnavailableError
   | SstNotInManifestError
@@ -132,6 +138,15 @@ export const toPublicError =
           requestId,
           retryable: true,
         });
+      case "MergedValueTooLargeError":
+        return new MergedValueTooLargePublicError({
+          code: "MergedValueTooLarge",
+          operation,
+          message: `A key's merge operands resolve to ${error.bytes} bytes, more than the ${error.limit} a read returns. Replace the key with a put (or delete it), then merge onto that.`,
+          details: { bytes: error.bytes, limit: error.limit },
+          requestId,
+          retryable: false,
+        });
       case "MergeOperatorMissingError":
         return new MergeOperatorMissingPublicError({
           code: "MergeOperatorMissing",
@@ -202,6 +217,19 @@ export const toPublicError =
           operation,
           message: `Checkpoint ${error.checkpointId} of database ${error.databaseId} does not exist (deleted or expired). Create a new checkpoint.`,
           details: { databaseId: error.databaseId, checkpointId: error.checkpointId },
+          requestId,
+          retryable: false,
+        });
+      case "CheckpointLimitError":
+        return new CheckpointLimitReachedPublicError({
+          code: "CheckpointLimitReached",
+          operation,
+          message: `Database ${error.databaseId} already has ${error.checkpoints} checkpoints and pinned snapshots, the most it may hold (${error.limit}). Delete one, or wait for a pinned snapshot to expire, then retry.`,
+          details: {
+            databaseId: error.databaseId,
+            checkpoints: error.checkpoints,
+            limit: error.limit,
+          },
           requestId,
           retryable: false,
         });

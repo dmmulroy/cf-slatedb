@@ -152,7 +152,7 @@
             }
           },
           "409": {
-            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError",
+            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | MergedValueTooLargePublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError | CheckpointLimitReachedPublicError",
             "content": {
               "application/json": {
                 "schema": {
@@ -173,6 +173,9 @@
                       "$ref": "#/components/schemas/MergeOperatorMissingPublicErrorEncoded"
                     },
                     {
+                      "$ref": "#/components/schemas/MergedValueTooLargePublicErrorEncoded"
+                    },
+                    {
                       "$ref": "#/components/schemas/TransactionConflictPublicErrorEncoded"
                     },
                     {
@@ -183,6 +186,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/SstDropRefusedPublicErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CheckpointLimitReachedPublicErrorEncoded"
                     }
                   ],
                   "examples": [
@@ -346,8 +352,8 @@
                     "anyOf": [
                       {
                         "type": "integer",
-                        "maximum": 9007199254740991,
-                        "exclusiveMinimum": 0
+                        "minimum": 1,
+                        "maximum": 2592000000
                       },
                       {
                         "type": "null"
@@ -357,7 +363,8 @@
                   "budgetGroup": {
                     "anyOf": [
                       {
-                        "type": "string"
+                        "type": "string",
+                        "maxLength": 63
                       },
                       {
                         "type": "null"
@@ -561,7 +568,7 @@
             }
           },
           "409": {
-            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError",
+            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | MergedValueTooLargePublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError | CheckpointLimitReachedPublicError",
             "content": {
               "application/json": {
                 "schema": {
@@ -582,6 +589,9 @@
                       "$ref": "#/components/schemas/MergeOperatorMissingPublicErrorEncoded"
                     },
                     {
+                      "$ref": "#/components/schemas/MergedValueTooLargePublicErrorEncoded"
+                    },
+                    {
                       "$ref": "#/components/schemas/TransactionConflictPublicErrorEncoded"
                     },
                     {
@@ -592,6 +602,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/SstDropRefusedPublicErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CheckpointLimitReachedPublicErrorEncoded"
                     }
                   ],
                   "examples": [
@@ -975,7 +988,7 @@
             }
           },
           "409": {
-            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError",
+            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | MergedValueTooLargePublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError | CheckpointLimitReachedPublicError",
             "content": {
               "application/json": {
                 "schema": {
@@ -996,6 +1009,9 @@
                       "$ref": "#/components/schemas/MergeOperatorMissingPublicErrorEncoded"
                     },
                     {
+                      "$ref": "#/components/schemas/MergedValueTooLargePublicErrorEncoded"
+                    },
+                    {
                       "$ref": "#/components/schemas/TransactionConflictPublicErrorEncoded"
                     },
                     {
@@ -1006,6 +1022,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/SstDropRefusedPublicErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CheckpointLimitReachedPublicErrorEncoded"
                     }
                   ]
                 }
@@ -1340,7 +1359,7 @@
             }
           },
           "409": {
-            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError",
+            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | MergedValueTooLargePublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError | CheckpointLimitReachedPublicError",
             "content": {
               "application/json": {
                 "schema": {
@@ -1361,6 +1380,9 @@
                       "$ref": "#/components/schemas/MergeOperatorMissingPublicErrorEncoded"
                     },
                     {
+                      "$ref": "#/components/schemas/MergedValueTooLargePublicErrorEncoded"
+                    },
+                    {
                       "$ref": "#/components/schemas/TransactionConflictPublicErrorEncoded"
                     },
                     {
@@ -1371,6 +1393,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/SstDropRefusedPublicErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CheckpointLimitReachedPublicErrorEncoded"
                     }
                   ]
                 }
@@ -2016,7 +2041,7 @@
             }
           },
           "409": {
-            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError",
+            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | MergedValueTooLargePublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError | CheckpointLimitReachedPublicError",
             "content": {
               "application/json": {
                 "schema": {
@@ -2037,6 +2062,9 @@
                       "$ref": "#/components/schemas/MergeOperatorMissingPublicErrorEncoded"
                     },
                     {
+                      "$ref": "#/components/schemas/MergedValueTooLargePublicErrorEncoded"
+                    },
+                    {
                       "$ref": "#/components/schemas/TransactionConflictPublicErrorEncoded"
                     },
                     {
@@ -2047,6 +2075,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/SstDropRefusedPublicErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CheckpointLimitReachedPublicErrorEncoded"
                     }
                   ]
                 }
@@ -2440,7 +2471,7 @@
             }
           },
           "409": {
-            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError",
+            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | MergedValueTooLargePublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError | CheckpointLimitReachedPublicError",
             "content": {
               "application/json": {
                 "schema": {
@@ -2461,6 +2492,9 @@
                       "$ref": "#/components/schemas/MergeOperatorMissingPublicErrorEncoded"
                     },
                     {
+                      "$ref": "#/components/schemas/MergedValueTooLargePublicErrorEncoded"
+                    },
+                    {
                       "$ref": "#/components/schemas/TransactionConflictPublicErrorEncoded"
                     },
                     {
@@ -2471,6 +2505,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/SstDropRefusedPublicErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CheckpointLimitReachedPublicErrorEncoded"
                     }
                   ],
                   "examples": [
@@ -2805,7 +2842,7 @@
             }
           },
           "409": {
-            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError",
+            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | MergedValueTooLargePublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError | CheckpointLimitReachedPublicError",
             "content": {
               "application/json": {
                 "schema": {
@@ -2826,6 +2863,9 @@
                       "$ref": "#/components/schemas/MergeOperatorMissingPublicErrorEncoded"
                     },
                     {
+                      "$ref": "#/components/schemas/MergedValueTooLargePublicErrorEncoded"
+                    },
+                    {
                       "$ref": "#/components/schemas/TransactionConflictPublicErrorEncoded"
                     },
                     {
@@ -2836,6 +2876,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/SstDropRefusedPublicErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CheckpointLimitReachedPublicErrorEncoded"
                     }
                   ]
                 }
@@ -2939,7 +2982,8 @@
                   "name": {
                     "anyOf": [
                       {
-                        "type": "string"
+                        "type": "string",
+                        "maxLength": 256
                       },
                       {
                         "type": "null"
@@ -3184,7 +3228,7 @@
             }
           },
           "409": {
-            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError",
+            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | MergedValueTooLargePublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError | CheckpointLimitReachedPublicError",
             "content": {
               "application/json": {
                 "schema": {
@@ -3205,6 +3249,9 @@
                       "$ref": "#/components/schemas/MergeOperatorMissingPublicErrorEncoded"
                     },
                     {
+                      "$ref": "#/components/schemas/MergedValueTooLargePublicErrorEncoded"
+                    },
+                    {
                       "$ref": "#/components/schemas/TransactionConflictPublicErrorEncoded"
                     },
                     {
@@ -3215,6 +3262,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/SstDropRefusedPublicErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CheckpointLimitReachedPublicErrorEncoded"
                     }
                   ]
                 }
@@ -3452,7 +3502,7 @@
             }
           },
           "409": {
-            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError",
+            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | MergedValueTooLargePublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError | CheckpointLimitReachedPublicError",
             "content": {
               "application/json": {
                 "schema": {
@@ -3473,6 +3523,9 @@
                       "$ref": "#/components/schemas/MergeOperatorMissingPublicErrorEncoded"
                     },
                     {
+                      "$ref": "#/components/schemas/MergedValueTooLargePublicErrorEncoded"
+                    },
+                    {
                       "$ref": "#/components/schemas/TransactionConflictPublicErrorEncoded"
                     },
                     {
@@ -3483,6 +3536,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/SstDropRefusedPublicErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CheckpointLimitReachedPublicErrorEncoded"
                     }
                   ]
                 }
@@ -3731,7 +3787,7 @@
             }
           },
           "409": {
-            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError",
+            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | MergedValueTooLargePublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError | CheckpointLimitReachedPublicError",
             "content": {
               "application/json": {
                 "schema": {
@@ -3752,6 +3808,9 @@
                       "$ref": "#/components/schemas/MergeOperatorMissingPublicErrorEncoded"
                     },
                     {
+                      "$ref": "#/components/schemas/MergedValueTooLargePublicErrorEncoded"
+                    },
+                    {
                       "$ref": "#/components/schemas/TransactionConflictPublicErrorEncoded"
                     },
                     {
@@ -3762,6 +3821,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/SstDropRefusedPublicErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CheckpointLimitReachedPublicErrorEncoded"
                     }
                   ]
                 }
@@ -4039,7 +4101,7 @@
             }
           },
           "409": {
-            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError",
+            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | MergedValueTooLargePublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError | CheckpointLimitReachedPublicError",
             "content": {
               "application/json": {
                 "schema": {
@@ -4060,6 +4122,9 @@
                       "$ref": "#/components/schemas/MergeOperatorMissingPublicErrorEncoded"
                     },
                     {
+                      "$ref": "#/components/schemas/MergedValueTooLargePublicErrorEncoded"
+                    },
+                    {
                       "$ref": "#/components/schemas/TransactionConflictPublicErrorEncoded"
                     },
                     {
@@ -4070,6 +4135,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/SstDropRefusedPublicErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CheckpointLimitReachedPublicErrorEncoded"
                     }
                   ]
                 }
@@ -4352,7 +4420,7 @@
             }
           },
           "409": {
-            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError",
+            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | MergedValueTooLargePublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError | CheckpointLimitReachedPublicError",
             "content": {
               "application/json": {
                 "schema": {
@@ -4373,6 +4441,9 @@
                       "$ref": "#/components/schemas/MergeOperatorMissingPublicErrorEncoded"
                     },
                     {
+                      "$ref": "#/components/schemas/MergedValueTooLargePublicErrorEncoded"
+                    },
+                    {
                       "$ref": "#/components/schemas/TransactionConflictPublicErrorEncoded"
                     },
                     {
@@ -4383,6 +4454,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/SstDropRefusedPublicErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CheckpointLimitReachedPublicErrorEncoded"
                     }
                   ]
                 }
@@ -4637,7 +4711,7 @@
             }
           },
           "409": {
-            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError",
+            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | MergedValueTooLargePublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError | CheckpointLimitReachedPublicError",
             "content": {
               "application/json": {
                 "schema": {
@@ -4658,6 +4732,9 @@
                       "$ref": "#/components/schemas/MergeOperatorMissingPublicErrorEncoded"
                     },
                     {
+                      "$ref": "#/components/schemas/MergedValueTooLargePublicErrorEncoded"
+                    },
+                    {
                       "$ref": "#/components/schemas/TransactionConflictPublicErrorEncoded"
                     },
                     {
@@ -4668,6 +4745,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/SstDropRefusedPublicErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CheckpointLimitReachedPublicErrorEncoded"
                     }
                   ]
                 }
@@ -5015,7 +5095,7 @@
             }
           },
           "409": {
-            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError",
+            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | MergedValueTooLargePublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError | CheckpointLimitReachedPublicError",
             "content": {
               "application/json": {
                 "schema": {
@@ -5036,6 +5116,9 @@
                       "$ref": "#/components/schemas/MergeOperatorMissingPublicErrorEncoded"
                     },
                     {
+                      "$ref": "#/components/schemas/MergedValueTooLargePublicErrorEncoded"
+                    },
+                    {
                       "$ref": "#/components/schemas/TransactionConflictPublicErrorEncoded"
                     },
                     {
@@ -5046,6 +5129,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/SstDropRefusedPublicErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CheckpointLimitReachedPublicErrorEncoded"
                     }
                   ]
                 }
@@ -5427,7 +5513,7 @@
             }
           },
           "409": {
-            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError",
+            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | MergedValueTooLargePublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError | CheckpointLimitReachedPublicError",
             "content": {
               "application/json": {
                 "schema": {
@@ -5448,6 +5534,9 @@
                       "$ref": "#/components/schemas/MergeOperatorMissingPublicErrorEncoded"
                     },
                     {
+                      "$ref": "#/components/schemas/MergedValueTooLargePublicErrorEncoded"
+                    },
+                    {
                       "$ref": "#/components/schemas/TransactionConflictPublicErrorEncoded"
                     },
                     {
@@ -5458,6 +5547,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/SstDropRefusedPublicErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CheckpointLimitReachedPublicErrorEncoded"
                     }
                   ]
                 }
@@ -5776,7 +5868,7 @@
             }
           },
           "409": {
-            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError",
+            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | MergedValueTooLargePublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError | CheckpointLimitReachedPublicError",
             "content": {
               "application/json": {
                 "schema": {
@@ -5797,6 +5889,9 @@
                       "$ref": "#/components/schemas/MergeOperatorMissingPublicErrorEncoded"
                     },
                     {
+                      "$ref": "#/components/schemas/MergedValueTooLargePublicErrorEncoded"
+                    },
+                    {
                       "$ref": "#/components/schemas/TransactionConflictPublicErrorEncoded"
                     },
                     {
@@ -5807,6 +5902,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/SstDropRefusedPublicErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CheckpointLimitReachedPublicErrorEncoded"
                     }
                   ],
                   "examples": [
@@ -6340,7 +6438,7 @@
             }
           },
           "409": {
-            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError",
+            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | MergedValueTooLargePublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError | CheckpointLimitReachedPublicError",
             "content": {
               "application/json": {
                 "schema": {
@@ -6361,6 +6459,9 @@
                       "$ref": "#/components/schemas/MergeOperatorMissingPublicErrorEncoded"
                     },
                     {
+                      "$ref": "#/components/schemas/MergedValueTooLargePublicErrorEncoded"
+                    },
+                    {
                       "$ref": "#/components/schemas/TransactionConflictPublicErrorEncoded"
                     },
                     {
@@ -6371,6 +6472,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/SstDropRefusedPublicErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CheckpointLimitReachedPublicErrorEncoded"
                     }
                   ]
                 }
@@ -6826,7 +6930,7 @@
             }
           },
           "409": {
-            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError",
+            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | MergedValueTooLargePublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError | CheckpointLimitReachedPublicError",
             "content": {
               "application/json": {
                 "schema": {
@@ -6847,6 +6951,9 @@
                       "$ref": "#/components/schemas/MergeOperatorMissingPublicErrorEncoded"
                     },
                     {
+                      "$ref": "#/components/schemas/MergedValueTooLargePublicErrorEncoded"
+                    },
+                    {
                       "$ref": "#/components/schemas/TransactionConflictPublicErrorEncoded"
                     },
                     {
@@ -6857,6 +6964,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/SstDropRefusedPublicErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CheckpointLimitReachedPublicErrorEncoded"
                     }
                   ]
                 }
@@ -7260,7 +7370,7 @@
             }
           },
           "409": {
-            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError",
+            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | MergedValueTooLargePublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError | CheckpointLimitReachedPublicError",
             "content": {
               "application/json": {
                 "schema": {
@@ -7281,6 +7391,9 @@
                       "$ref": "#/components/schemas/MergeOperatorMissingPublicErrorEncoded"
                     },
                     {
+                      "$ref": "#/components/schemas/MergedValueTooLargePublicErrorEncoded"
+                    },
+                    {
                       "$ref": "#/components/schemas/TransactionConflictPublicErrorEncoded"
                     },
                     {
@@ -7291,6 +7404,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/SstDropRefusedPublicErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CheckpointLimitReachedPublicErrorEncoded"
                     }
                   ]
                 }
@@ -7573,7 +7689,7 @@
             }
           },
           "409": {
-            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError",
+            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | MergedValueTooLargePublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError | CheckpointLimitReachedPublicError",
             "content": {
               "application/json": {
                 "schema": {
@@ -7594,6 +7710,9 @@
                       "$ref": "#/components/schemas/MergeOperatorMissingPublicErrorEncoded"
                     },
                     {
+                      "$ref": "#/components/schemas/MergedValueTooLargePublicErrorEncoded"
+                    },
+                    {
                       "$ref": "#/components/schemas/TransactionConflictPublicErrorEncoded"
                     },
                     {
@@ -7604,6 +7723,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/SstDropRefusedPublicErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CheckpointLimitReachedPublicErrorEncoded"
                     }
                   ]
                 }
@@ -7973,7 +8095,7 @@
             }
           },
           "409": {
-            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError",
+            "description": "DatabaseAlreadyExistsPublicError | KeyOutOfRangePublicError | DatabaseSealedPublicError | DatabaseHasDependentsPublicError | MergeOperatorMissingPublicError | MergedValueTooLargePublicError | TransactionConflictPublicError | SnapshotExpiredPublicError | ChangelogUnavailablePublicError | SstDropRefusedPublicError | CheckpointLimitReachedPublicError",
             "content": {
               "application/json": {
                 "schema": {
@@ -7994,6 +8116,9 @@
                       "$ref": "#/components/schemas/MergeOperatorMissingPublicErrorEncoded"
                     },
                     {
+                      "$ref": "#/components/schemas/MergedValueTooLargePublicErrorEncoded"
+                    },
+                    {
                       "$ref": "#/components/schemas/TransactionConflictPublicErrorEncoded"
                     },
                     {
@@ -8004,6 +8129,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/SstDropRefusedPublicErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CheckpointLimitReachedPublicErrorEncoded"
                     }
                   ]
                 }
@@ -8322,6 +8450,70 @@
         "required": ["_tag", "code", "details", "operation", "message", "requestId", "retryable"],
         "additionalProperties": false
       },
+      "CheckpointLimitReachedPublicErrorEncoded": {
+        "type": "object",
+        "properties": {
+          "_tag": {
+            "type": "string",
+            "enum": ["CheckpointLimitReachedPublicError"]
+          },
+          "code": {
+            "type": "string",
+            "enum": ["CheckpointLimitReached"]
+          },
+          "details": {
+            "type": "object",
+            "properties": {
+              "databaseId": {
+                "type": "string"
+              },
+              "checkpoints": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": ["databaseId", "checkpoints", "limit"],
+            "additionalProperties": false
+          },
+          "operation": {
+            "type": "string",
+            "enum": [
+              "createDatabase",
+              "write",
+              "flush",
+              "status",
+              "changes",
+              "compaction",
+              "get",
+              "scan",
+              "seal",
+              "fork",
+              "remove",
+              "checkpoint",
+              "transaction",
+              "routeRequest",
+              "dropSst"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "requestId": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
+          }
+        },
+        "required": ["_tag", "code", "details", "operation", "message", "requestId", "retryable"],
+        "additionalProperties": false
+      },
       "SstDropRefusedPublicErrorEncoded": {
         "type": "object",
         "properties": {
@@ -8519,6 +8711,67 @@
               }
             },
             "required": ["databaseId", "reason"],
+            "additionalProperties": false
+          },
+          "operation": {
+            "type": "string",
+            "enum": [
+              "createDatabase",
+              "write",
+              "flush",
+              "status",
+              "changes",
+              "compaction",
+              "get",
+              "scan",
+              "seal",
+              "fork",
+              "remove",
+              "checkpoint",
+              "transaction",
+              "routeRequest",
+              "dropSst"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "requestId": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
+          }
+        },
+        "required": ["_tag", "code", "details", "operation", "message", "requestId", "retryable"],
+        "additionalProperties": false
+      },
+      "MergedValueTooLargePublicErrorEncoded": {
+        "type": "object",
+        "properties": {
+          "_tag": {
+            "type": "string",
+            "enum": ["MergedValueTooLargePublicError"]
+          },
+          "code": {
+            "type": "string",
+            "enum": ["MergedValueTooLarge"]
+          },
+          "details": {
+            "type": "object",
+            "properties": {
+              "bytes": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": ["bytes", "limit"],
             "additionalProperties": false
           },
           "operation": {

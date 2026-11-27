@@ -1,7 +1,11 @@
 import { compactorWorkerLayer } from "@shaledb/lsm-cloudflare";
 
 import { shaledbTailConsumers, shaledbTelemetry } from "./shaledb-telemetry.ts";
-import { shaledbCompactorCpuLimit, shaledbWorkerSettings } from "./shaledb-stack-config.ts";
+import {
+  shaledbCompactorCpuLimit,
+  shaledbCompactorSubrequestLimit,
+  shaledbWorkerSettings,
+} from "./shaledb-stack-config.ts";
 
 /** Local dev port of the compactor Worker (it has no public URL when deployed). */
 export const COMPACTOR_DEV_PORT = 1339;
@@ -15,6 +19,7 @@ export const shaledbCompactorWorkerLayer = compactorWorkerLayer({
   telemetry: shaledbTelemetry,
   settings: shaledbWorkerSettings,
   cpuLimitMs: shaledbCompactorCpuLimit,
+  subrequestLimit: shaledbCompactorSubrequestLimit,
   tailConsumers: shaledbTailConsumers,
   devPort: COMPACTOR_DEV_PORT,
 });

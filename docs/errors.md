@@ -103,6 +103,13 @@ unmatched route, a malformed request, an unaccepted content type, a defect) gets
 envelope from the shared request middleware: D69 for the database API, D79 for the shard router
 and the GC operator API.
 
+A limit the caller reached is `409` with a code naming the limit, its counts in `details`, and
+`retryable: false`; the message says what to remove or rewrite (D99):
+
+- `CheckpointLimitReached`: the database holds 1,000 checkpoints and pinned snapshots; delete one;
+- `MergedValueTooLarge`: a key's merge operands resolve to more than 1 MiB; replace the key with a
+  put.
+
 The concrete public `HttpApi` owns each endpoint's exact status and error schemas. Infrastructure such as Cloudflare Access may reject a request before it reaches that application contract.
 
 ## Review Checklist

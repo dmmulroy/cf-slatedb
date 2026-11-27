@@ -9,6 +9,7 @@ import {
   type Manifest,
   type ManifestId,
   MERGE_OPERATORS,
+  type MergedValueTooLargeError,
   type MergeOperatorMissingError,
   mergeRowStreams,
   changelogAfterSeqOf,
@@ -134,6 +135,7 @@ export type DbReadError =
   | DatabaseNotFoundError
   | ReaderUnavailableError
   | MergeOperatorMissingError
+  | MergedValueTooLargeError
   | SstCorruptedError;
 
 /** Services a read needs from the current invocation. */

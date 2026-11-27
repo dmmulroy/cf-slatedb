@@ -2899,6 +2899,117 @@ are refused for L0 backlog and nothing runs". Over every settings value the sche
 any sorted runs, the plan includes an L0 job. It fails without the rule (shrunk to `l0MaxSsts` 1
 and `minCompactionSources` 2), and the mutation that drops the rule fails it.
 
+## D92. Cloudflare's platform limits against what shaledb can ask of them
+
+An audit of every platform limit the design touches. Each documented value below was read from
+developers.cloudflare.com on 2026-11-26, from the page named, whose last change is the date given.
+Each demand is the largest one that the default settings (`DEFAULT_LSM_SETTINGS`) and the schema
+limits allow (`MAX_KEY_BYTES` 16 KiB, `MAX_VALUE_BYTES` 1 MiB, `MAX_BATCH_BYTES` 8 MiB, 1,000 rows
+per scan or change-feed page). Every row is marked: **measured** (on a preview,
+`docs/measurements.md`), **derived** (computed from the code and the settings), or **docs** (the
+documentation only).
+
+**Pages read:**
+
+- workers/platform/limits (2026-11-25);
+- durable-objects/platform/limits (2026-11-13);
+- r2/platform/limits (2026-10-30);
+- r2/api/workers/workers-api-reference (2026-11-04);
+- workflows/reference/limits (2026-11-10);
+- durable-objects/api/alarms (2026-11-18);
+- workers/configuration/cron-triggers (2026-11-18);
+- workers/runtime-apis/context (2026-11-18);
+- workers/runtime-apis/rpc (2026-10-12);
+- secrets-store/manage-secrets (2026-10-22);
+- workers/configuration/routing/workers-dev (2026-11-06);
+- workers/observability/logs/tail-workers (2026-10-02).
+
+| Limit (documented value)                                                                                                                                                   | Where shaledb meets it                                                                                                                                  | Largest demand                                                                                                                                                                                                                                                        |                       Margin | Kind                                                                    |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------: | ----------------------------------------------------------------------- |
+| Workers CPU per invocation: 30 s default, up to 5 min                                                                                                                      | API Worker and writers 30 s, compactor 60 s (`limits.cpu_ms`, D61)                                                                                      | largest invocation 9.8 s (a 256 MiB flush), compaction step 17.7 s                                                                                                                                                                                                    |                     3×, 3.4× | measured                                                                |
+| Same, one compaction step whose rows are dropped                                                                                                                           | `CompactionExecutor.writeOutput` ends at its output's size only                                                                                         | reads every input of the job: about 0.07 to 0.28 s CPU per input MiB (D61), so 60 s at about 0.2 to 0.9 GiB of deleted or expired input                                                                                                                               |                         < 1× | derived; finding 2                                                      |
+| Memory per isolate: 128 MB                                                                                                                                                 | API Worker (readers, L1 caches), writer and compactor Durable Objects, Workflow steps                                                                   | L1 caches 48 MiB by default. A `Latest` scan holds every unflushed row of its range, up to 256 MiB. A flush page holds 1,024 rows, a writer scan page 1,000 rows, a public scan page 1,000 rows: up to 1 GiB each with 1 MiB values. GC holds every retained manifest |                         < 1× | derived; findings 3, 4                                                  |
+| Subrequests per invocation: 10,000 (Paid)                                                                                                                                  | flush parts, compaction reads (2 MiB chunks), scans, GC lists, loads, and deletes                                                                       | flush 256 MiB: 32 parts. A 1,000-row scan page of 1 MiB rows: one block per row, doubled by hedges, about 2,000 reads. One GC collection: one read per manifest superseded within `gcMinAge`, so about 5,000 at 1.4 commits/s                                         |                 300×, 5×, 2× | derived; finding 4. The compactor Worker is set to 10 million since D99 |
+| Six connections waiting for headers                                                                                                                                        | scans and hedged reads (D72)                                                                                                                            | read-ahead of 8 blocks per SST over up to 24 SSTs                                                                                                                                                                                                                     |  queueing, not failure (D72) | docs                                                                    |
+| `waitUntil`: 30 s after the response                                                                                                                                       | `BackgroundWork`: the `LATEST` hint, fork warming, compactor wakes (D56, D57, D73)                                                                      | a cold compactor wake took 5.4 to 9.2 s (D73)                                                                                                                                                                                                                         |                           3× | measured                                                                |
+| Variable size: 5 KB; 128 variables per Worker                                                                                                                              | `SHALEDB_LSM_SETTINGS` and three more (D55)                                                                                                             | the settings JSON with every field at its longest number is under 5,000 bytes (`shaledb-stack-config.test.ts`)                                                                                                                                                        |                 > 1× by test | derived                                                                 |
+| Worker size: 64 MiB; startup: 1 s                                                                                                                                          | every Worker                                                                                                                                            | 3.35 MB uploaded (`deploy-p1` output)                                                                                                                                                                                                                                 |    19×; startup not measured | measured                                                                |
+| Log data per request: 256 KB                                                                                                                                               | warnings and errors only                                                                                                                                | a few lines per request                                                                                                                                                                                                                                               |                        large | derived                                                                 |
+| DO SQLite storage per object: 10 GB                                                                                                                                        | the writer's memtable                                                                                                                                   | `maxRetainedBytes` + 2 × `maxUnflushedBytes` + one batch = 584 MiB (audit risk 5c)                                                                                                                                                                                    |     16×, now a settings rule | derived                                                                 |
+| DO row or value: 8 MB                                                                                                                                                      | one memtable row                                                                                                                                        | 16 KiB + 1 MiB                                                                                                                                                                                                                                                        |                         7.5× | derived                                                                 |
+| DO SQL: 100 bound parameters, 100 KB statement                                                                                                                             | `MemTable` statements                                                                                                                                   | fixed statements, one row each                                                                                                                                                                                                                                        |                            — | derived                                                                 |
+| DO soft limit: 1,000 requests/s per object                                                                                                                                 | one writer per database                                                                                                                                 | 65 requests/s with the writer 48% busy (100-row batches, D61), so about 136 at its ceiling                                                                                                                                                                            |                           7× | measured                                                                |
+| DO alarm wall time: 15 min                                                                                                                                                 | writer flush, compactor poll and collection                                                                                                             | flush of 256 MiB: 82 s (D61). Collection: one sequential manifest read per retained manifest, about 350 s at 5,000                                                                                                                                                    |                    11×, 2.6× | measured, derived                                                       |
+| DO alarm retries: 6, from 2 s, only when the handler throws                                                                                                                | writer `runAlarm` catches and reschedules. Compactor `runAlarm` catches the typed failures; a defect is retried 6 times, then the next wake restarts it | —                                                                                                                                                                                                                                                                     |                            — | derived                                                                 |
+| RPC: 32 MiB                                                                                                                                                                | not used: Workers and Durable Objects talk HTTP over bindings                                                                                           | —                                                                                                                                                                                                                                                                     |                            — | derived                                                                 |
+| DO outbound request body: 100 MiB                                                                                                                                          | the API Worker's calls to the writer                                                                                                                    | a batch of 8 MiB, base64 in JSON (about 11 MB)                                                                                                                                                                                                                        |                           9× | derived                                                                 |
+| R2 object: 4.995 TiB; part: 5 GiB less 5 MiB; 10,000 parts                                                                                                                 | SSTs at `multipartPartSize` 8 MiB                                                                                                                       | 32 parts per flush; 8 per 64 MiB output                                                                                                                                                                                                                               |    300×, now a settings rule | derived                                                                 |
+| R2 list: 1,000 per call; delete: 1,000 keys per call                                                                                                                       | `ObjectStore.list`, `ObjectStore.delete` (batches of 1,000)                                                                                             | paged                                                                                                                                                                                                                                                                 |                            — | derived                                                                 |
+| R2: one write per second to the same key (429 above)                                                                                                                       | `manifest/LATEST` (every commit, in the background), `gc/manifest.boundary`, `maintenance/sweep.cursor`                                                 | about 1.4 hint writes/s with small flushes back to back. A failed hint lags, and readers probe past it (D56)                                                                                                                                                          |  < 1× for the hint, harmless | derived                                                                 |
+| R2 conditional put                                                                                                                                                         | manifest create-if-absent                                                                                                                               | 16 concurrent creates: 1 `Created`, 15 `AlreadyExists`                                                                                                                                                                                                                |                            — | measured                                                                |
+| Workflows: step result 1 MiB (non-stream)                                                                                                                                  | `prepare` returns every input `SstHandle`                                                                                                               | about 220 B per handle with 16-byte keys, 43,868 B with 16 KiB keys. A job over 4 runs of 6 SSTs with 16 KiB keys is 1,053,051 B; 4 runs of 1,300 SSTs with 16-byte keys is 1,133,867 B                                                                               |          < 1× for large jobs | derived; finding 1                                                      |
+| Workflows: event payload 1 MiB                                                                                                                                             | job parameters: SST ids only                                                                                                                            | small                                                                                                                                                                                                                                                                 |                        large | derived                                                                 |
+| Workflows: 10,000 steps per instance                                                                                                                                       | one step per 64 MiB output                                                                                                                              | 625 GiB of output per job                                                                                                                                                                                                                                             | large; finding 1 binds first | derived                                                                 |
+| Workflows: 50,000 concurrent instances; 100 created/s per Workflow                                                                                                         | `compactionBudgetCapacity` 32                                                                                                                           | 32 running; 200 started in 3 s on `preview-3` (D61)                                                                                                                                                                                                                   |  1,500×, now a settings rule | measured                                                                |
+| Workflows: completed state kept 7 days; 10,000 retries per step                                                                                                            | the compactor reads a job's progress while it runs (lease 15 min)                                                                                       | —                                                                                                                                                                                                                                                                     |                            — | derived                                                                 |
+| Cron: CPU 30 s default under hourly; wall 15 min                                                                                                                           | the maintenance sweep every 5 min, 50 databases a page                                                                                                  | about 160 ms CPU per run (D60)                                                                                                                                                                                                                                        |                         180× | measured                                                                |
+| Cache API: 512 MB per object; 1,000 calls per request                                                                                                                      | `BlockServer` caches blocks and metadata                                                                                                                | one block or one SST's metadata per call                                                                                                                                                                                                                              |                        large | derived                                                                 |
+| Tail Workers                                                                                                                                                               | `CpuTailWorker`                                                                                                                                         | what the platform drops under load is not documented on its page                                                                                                                                                                                                      |                      unknown | docs                                                                    |
+| Secrets Store: 100 secrets per account (open beta); one store; 65,536 bytes each                                                                                           | two token slots per live stage (D64)                                                                                                                    | 8 today, plus 6 orphaned `CF_SLATEDB_*`                                                                                                                                                                                                                               |                           7× | docs                                                                    |
+| `workers.dev`: "treated as a Free website … intended for personal or hobby projects that aren't business-critical"; a route or custom domain is recommended for production | the production API URL (P3)                                                                                                                             | —                                                                                                                                                                                                                                                                     |                            — | docs; finding 5                                                         |
+
+**Findings.** The code paths are other auditors' files. Each has a failing test, or a measured
+path, in `/tmp/shale-work/agents/audit-limits/`.
+
+1. **A large compaction's `prepare` result exceeds 1 MiB** (`zz-limits-step-result.test.ts`).
+   Such a step can never be persisted. The job fails, the compactor replans it, L0 fills, and
+   writes are refused for good. The proposed rule: no step result carries an unbounded list.
+2. **One output step reads all of a job's droppable input** (`zz-limits-compaction-step.test.ts`:
+   13 reads and the whole job in one step, against 4). It fails the same way at a few hundred MiB
+   of deleted or expired data. The proposed rule: a step also ends after a bounded number of input
+   bytes.
+3. **A `Latest` scan reads every unflushed row of its range before emitting one**
+   (`zz-limits-latest-scan.test.ts`: 6 writer calls for a one-row scan over 5,000 rows). It also
+   holds them all. Pages are bounded by rows, not bytes: 1,024 or 1,000 rows of up to 1 MiB.
+   The proposed rule: every page is bounded by bytes too, and the scan merges pages lazily.
+4. **One collection loads, one after another, and holds every manifest superseded within
+   `gcMinAge`** (`zz-limits-gc-loads.test.ts`: 404 loads after 400 commits, against 24 after 20).
+   Its cost follows the commit rate, not the data, so it fails on every retry above a few commits
+   a second, and garbage is then never collected.
+5. **`workers.dev` for production (P3)** goes against Cloudflare's own guidance. A custom domain
+   needs a zone in the account. The checklist's limitations say so.
+
+**Fixed here: settings that the platform cannot hold are refused** (`LSM_PLATFORM_LIMITS`,
+`lsm-settings.ts`):
+
+- the largest flush and each compaction output fit in 10,000 R2 parts;
+- a part is at most R2's largest;
+- the two L1 caches together are below one isolate's memory;
+- the writer's SQLite fits in a Durable Object: `maxRetainedBytes` + 2 × `maxUnflushedBytes` +
+  one batch;
+- the compaction budget is at most the account's concurrent Workflow instances.
+
+The defaults pass each rule with the margins above. Tests: `lsm-settings.test.ts` checks each rule
+at its edge, and six mutations are each caught. `shaledb-stack-config.test.ts` checks that the
+bound settings fit a Worker variable.
+
+**Costs that grow without use** (derived):
+
+- **The maintenance sweep.** It runs every 5 minutes on every live stage, so 288 runs a day,
+  each visiting up to 50 databases, idle or not.
+- **The writer's newest flush.** Every idle database keeps its newest flush's rows in its
+  writer's SQLite indefinitely: the trim never removes the newest flush (D58), so up to
+  `l0SstSize` (64 MiB) of Durable Object storage per database.
+- **Checkpoints.** A checkpoint without a lifetime keeps every SST its manifest names, forever.
+  The number of checkpoints, and the changelog's retention (`changelogRetentionMs`, no maximum),
+  are unbounded, so the manifest grows with them. Every commit rewrites the manifest whole, and
+  every cold read decodes it.
+- **Traces and tail records.** They are kept 14 days. Every invocation that did not end `ok` is
+  kept (D71).
+- **Workflow instance state.** Each compaction's state is kept 7 days by the platform.
+- **Stale multipart uploads.** R2 aborts them after a day (D63).
+- **Idle compactors cost nothing:** an idle database with no garbage sets no alarm (D60).
+
 ## D93. A Latest scan pulls the writer's pages as it needs them; every memtable page is bounded by bytes
 
 **Found by the limits audit.** A `Latest` scan read every unflushed row of its range from the
@@ -3149,3 +3260,140 @@ to deferred deletion, which reverses itself when the commit rate falls.
   do not either. The guard stays as stated.
 - `audit-limits`' test still fails as written: it asks that loads not grow with commits. They now
   grow only up to the budget, which is the decision for v1.
+
+## D99. Bounds on what a caller can grow: checkpoints, the changelog, merged values, the manifest; the compactor's subrequests
+
+D92 found lists and values that a caller can grow without limit. The manifest holds most of them,
+and it is rewritten whole on every commit and decoded on every cold read. This decision sets each
+bound from a measured size budget. It also sets the compactor Worker's subrequest limit.
+
+**The manifest's size budget.** `manifest-size.test.ts` (lsm-core) measures the encoded size of
+each item, and Node's time to encode and decode a whole manifest (`Schema` over `JSON`, as
+`ManifestStore` and `ManifestReader` do):
+
+| Item                     | Bytes in the manifest |
+| ------------------------ | --------------------: |
+| SST handle, 16-byte keys |                   217 |
+| SST handle, 16 KiB keys  |                43,868 |
+| Checkpoint               |                   130 |
+| Changelog entry          |                   286 |
+
+| Manifest | SST handles | Encode | Decode | Heap of the decoded manifest |
+| -------: | ----------: | -----: | -----: | ---------------------------: |
+|    1 MiB |       4,832 |  10 ms |  12 ms |                      ~10 MiB |
+|   10 MiB |      48,321 | 100 ms |  90 ms |               not determined |
+|   50 MiB |     241,607 | 600 ms | 410 ms |                     ~194 MiB |
+
+The heap figures were taken without a forced GC, so they are rough; the 10 MiB reading was
+negative. They cover the decoded objects only, beside the JSON text.
+
+**The budget is 4 MiB.** At 4 MiB a commit spends about 40 ms encoding and a cold read about 40 ms
+decoding. The decoded manifest takes about 16 to 40 MiB of an isolate that also holds 48 MiB of L1
+caches and serves many requests, so it fits within 128 MB. At 10 MiB, 100 ms per commit and per
+cold read, plus up to 100 MiB of heap, is the point where a commit or a cold read becomes a
+problem. These times were measured in Node; workerd was not measured.
+
+**Checkpoints: at most 1,000 per database** (`MAX_CHECKPOINTS_PER_DATABASE`, lsm-core
+`addCallerCheckpoint`).
+
+- **What counts.** Checkpoints and pinned snapshots that callers create. A fork's or successor's
+  hold is not counted, so a split or fork never fails because of a caller's checkpoints.
+- **The 1,001st.** It is refused with `CheckpointLimitError`. The public error is
+  `CheckpointLimitReached` (409, not retryable). It names how many exist and says to delete one, or
+  to wait for a pinned snapshot to expire.
+- **A repeat is never refused.**
+- **Cost.** 1,000 checkpoints are about 127 KiB, 3% of the budget.
+
+**The changelog: at most its newest 2,048 flushes** (`MAX_CHANGELOG_ENTRIES`, `capChangelog`,
+applied in `commitL0Flush`).
+
+- **The bound holds however short the flush interval.** The oldest entries are dropped first, and
+  `changelogAfterSeq` is raised past them (D80). A consumer behind them gets a clean `Expired`, and
+  GC collects the dropped SSTs.
+- **What it holds.** At one flush a minute (`maxL0Age`) that is about 34 hours of changes; a
+  database that flushes more often keeps fewer hours.
+- **Cost.** About 570 KiB, 14% of the budget.
+- **Retention.** `changelogRetentionMs` is now at most 30 days (`MAX_CHANGELOG_RETENTION_MS`),
+  like a pinned snapshot's lifetime.
+
+**Strings a caller names.** A checkpoint name may be at most 256 characters, and a budget group at
+most 63 (a database id's length). Both are stored in the manifest; neither had a bound.
+
+**SSTs and sorted runs: the v1 database size limit.**
+
+- **What bounds them.** L0 is bounded by `l0MaxSsts` (16), and D87 makes the scheduler able to
+  drain it. Compaction keeps the rest in sorted runs of `compactionOutputSstSize` SSTs, so the
+  number of handles is about the data's size divided by 64 MiB. Nothing bounds that number but the
+  data.
+- **A handle's size** is about 169 bytes plus 2.67 bytes per byte of the SST's first and last keys
+  (base64), plus as much again for a fork's view.
+- **1 TiB with default settings and 16-byte keys** is about 16,400 SSTs, about 3.4 MiB: inside the
+  budget.
+- **The v1 database size limit is therefore about 1 TiB for keys of up to 16 bytes, and less for
+  longer keys.** About 300 GiB for 256-byte keys, about 90 GiB for 1 KiB keys, and about 6 GiB for
+  16 KiB keys, where every SST's boundary keys are that long.
+- **Larger databases** use range sharding (`packages/lsm-sharding`), or a larger
+  `compactionOutputSstSize`.
+
+**Merged values: at most 1 MiB, the largest value a put may write** (`MAX_MERGED_VALUE_BYTES`).
+
+- **Before.** `MAX_VALUE_BYTES` bounded each operand only. N merges of 1 MiB with `Concat` read
+  back as one N MiB value in the API isolate, and compaction folded them into one row of N MiB, which
+  every read of its block would load.
+- **Reads.** A read whose operands resolve past the bound fails with `MergedValueTooLargeError`;
+  the public error is `MergedValueTooLarge` (409, not retryable). It tells the caller to replace the
+  key with a put (or delete it). This is complete: every read path resolves through
+  `resolveVisibleRow`. A key stays unreadable until it is rewritten.
+- **Compaction never fails on such a key** (D97's lesson). `retainKeyVersions` leaves a run of
+  operands that would fold past the bound as it is, with the base below it. No stored row grows
+  past the bound, and a read over what compaction kept answers as it did before.
+- **Rejected: refusing a merge write once the key's unflushed operands pass the bound.** It is
+  cheap but partial: the writer sees only unflushed operands, so the read bound is needed anyway.
+- **SlateDB** puts no bound on a merged value (`slatedb/src/merge_operator.rs`; RFC 0006).
+
+**Other lists checked.**
+
+- `droppedSsts` keeps its newest 32 entries (D62).
+- `externalRefs` has one entry per database a fork reads from (its source, and the source's own
+  sources in a fork of a fork), bounded by the fork chain.
+- Ids are fixed-length ULIDs and database ids at most 63 characters. Keys in handles are at most
+  16 KiB each (`MAX_KEY_BYTES`).
+
+**The compactor Worker's subrequests: 10 million** (`limits.subrequests`;
+`SHALEDB_COMPACTOR_SUBREQUESTS`, from 1 to 10,000,000).
+
+- **How Cloudflare counts them.** The Workflows documentation counts subrequests per Workflow
+  instance: 10,000 by default, configurable up to 10 million with `limits.subrequests`
+  (developers.cloudflare.com/workflows/reference/limits, 2026-11-10). The Workers documentation
+  counts them per invocation, set per Worker the same way (workers/platform/limits, 2026-11-25). A
+  compaction job is one instance.
+- **What a job needs.** The Workflow audit counted about 8,600 subrequests for a 10 GiB merge:
+  5,100 chunk reads, 1,300 part uploads, 1,300 metadata reads, and 640 manifest reads. That is
+  about 860 per GiB, so the default fails every attempt above about 11 GiB.
+- **What 10 million covers.** About 11 TiB, past the database size limit above. The same Worker's
+  Durable Objects run the compactors' garbage collections: about 5,000 subrequests at 1.4 commits a
+  second over the last hour (D92).
+- **How it is set.** Alchemy passes a Worker's `limits` to the script upload's metadata, whose type
+  has `cpuMs` and `subrequests`. `compactorWorkerLayer` takes an optional `subrequestLimit`, and
+  the Stack's resolves from the configuration at plan time, like the CPU limits (D61).
+- **The API Worker keeps the default.** A flush of 256 MiB makes about 40 subrequests (32 parts and
+  its commits). A scan is bounded by D93's pages. Neither is within 100× of 10,000.
+
+**Tests.**
+
+- `manifest-size.test.ts`: the budget.
+- `manifest-limits.test.ts`: the checkpoint cap at its edge, repeats, and holds; the changelog
+  bound and its `changelogAfterSeq`.
+- `merge-limits.test.ts`: the read at and past the bound; compaction unfolded and consistent.
+- `db-public-error-limits.test.ts`: both public errors; the request bounds on retention, budget
+  group, and checkpoint name.
+- `shaledb-stack-config.test.ts`: the subrequest default, an override, and the refusal above
+  10 million.
+- **Mutations:** 12, each caught (`/tmp/shale-work/agents/audit-limits/mutations.log`). One
+  survived at first (the read bound made inclusive) and is caught since a test reads at exactly
+  the bound.
+
+**Before the release.** Three of these bounds narrow what `/v1` accepted: changelog retention,
+budget-group length, and checkpoint-name length. That is done before v1 is released.
+`docs/api-compatibility.md` forbids tightening a limit only within a released `/v1`, so from the
+release on these bounds are part of the contract.

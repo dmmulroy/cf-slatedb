@@ -125,6 +125,19 @@ export class CheckpointNotFoundPublicError extends Schema.TaggedError<Checkpoint
   },
 ) {}
 
+/**
+ * `409` — the database already holds the most checkpoints and pinned snapshots a caller may keep
+ * (D99). Delete one, or wait for a pinned snapshot to expire.
+ */
+export class CheckpointLimitReachedPublicError extends Schema.TaggedError<CheckpointLimitReachedPublicError>()(
+  "CheckpointLimitReachedPublicError",
+  {
+    code: Schema.Literal("CheckpointLimitReached"),
+    details: Schema.Struct({ databaseId: DatabaseId, checkpoints: Schema.Int, limit: Schema.Int }),
+    ...common,
+  },
+) {}
+
 /** `404` — the SST is not in the database's manifest (wrong id, or already replaced). */
 export class SstNotFoundPublicError extends Schema.TaggedError<SstNotFoundPublicError>()(
   "SstNotFoundPublicError",
@@ -166,6 +179,19 @@ export class ChangelogUnavailablePublicError extends Schema.TaggedError<Changelo
       databaseId: DatabaseId,
       reason: Schema.Literals(["Disabled", "Expired"]),
     }),
+    ...common,
+  },
+) {}
+
+/**
+ * `409` — a key's merge operands resolve to more than a read returns, 1 MiB (D99). Replace the key
+ * with a put, or delete it.
+ */
+export class MergedValueTooLargePublicError extends Schema.TaggedError<MergedValueTooLargePublicError>()(
+  "MergedValueTooLargePublicError",
+  {
+    code: Schema.Literal("MergedValueTooLarge"),
+    details: Schema.Struct({ bytes: Schema.Int, limit: Schema.Int }),
     ...common,
   },
 ) {}
@@ -266,10 +292,12 @@ export const DB_PUBLIC_ERRORS = [
   DatabaseSealedPublicError.pipe(HttpApiSchema.status(409)),
   DatabaseHasDependentsPublicError.pipe(HttpApiSchema.status(409)),
   MergeOperatorMissingPublicError.pipe(HttpApiSchema.status(409)),
+  MergedValueTooLargePublicError.pipe(HttpApiSchema.status(409)),
   TransactionConflictPublicError.pipe(HttpApiSchema.status(409)),
   SnapshotExpiredPublicError.pipe(HttpApiSchema.status(409)),
   ChangelogUnavailablePublicError.pipe(HttpApiSchema.status(409)),
   SstDropRefusedPublicError.pipe(HttpApiSchema.status(409)),
+  CheckpointLimitReachedPublicError.pipe(HttpApiSchema.status(409)),
   WriteStalledPublicError.pipe(HttpApiSchema.status(503)),
   StorageUnavailablePublicError.pipe(HttpApiSchema.status(503)),
   StoredDataInvalidPublicError.pipe(HttpApiSchema.status(500)),
@@ -289,11 +317,13 @@ export type DbPublicError =
   | DatabaseSealedPublicError
   | DatabaseHasDependentsPublicError
   | MergeOperatorMissingPublicError
+  | MergedValueTooLargePublicError
   | TransactionConflictPublicError
   | SnapshotExpiredPublicError
   | ChangelogUnavailablePublicError
   | SstNotFoundPublicError
   | SstDropRefusedPublicError
+  | CheckpointLimitReachedPublicError
   | WriteStalledPublicError
   | StorageUnavailablePublicError
   | StoredDataInvalidPublicError

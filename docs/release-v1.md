@@ -476,14 +476,50 @@ What v1 does not do, or has not measured.
   (`MemTable.trim`), and after a stall a flush can be up to `maxUnflushedBytes` (256 MiB; D61
   measured a 267 MB flush). Retention can therefore reach 64 MiB + 256 MiB. This is Durable Object
   storage, not isolate memory (audit risk 5c).
+- **An idle database keeps its newest flush in SQLite indefinitely** (up to `l0SstSize`, 64 MiB),
+  because the trim never removes the newest flush (D58, D92).
+
+**Platform limits (D92).** Four places where the default settings and the schema limits allow a
+demand above a Cloudflare limit. Each has a failing test, and none is fixed in this audit:
+
+- **Large compaction jobs.** A large job's first Workflow step result exceeds 1 MiB. That happens
+  at about 1.5 GiB of input with 16 KiB keys, or about 300 GiB with 16-byte keys. The job can never
+  run, so L0 fills and writes are refused.
+- **Dropped rows in one step.** A compaction step whose rows are all dropped reads every input of
+  its job. After deleting or expiring a few hundred MiB, it can exceed the compactor's 60 s of CPU
+  on every retry, with the same result.
+- **Memory on reads.** A `Latest` scan holds every unflushed row of its range, up to 256 MiB.
+  Pages are bounded by rows, not bytes: 1,000 rows of up to 1 MiB each. Either can exceed a
+  128 MB isolate.
+- **Garbage collection.** One collection reads, one after another, every manifest superseded within
+  `gcMinAge`. At a few commits a second it runs past its subrequests (10,000), memory, or alarm
+  wall time (15 min) on every retry, and garbage is then never collected.
+
+Settings the platform cannot hold (R2 parts, the Durable Object's storage, the isolate's memory,
+the account's Workflows) are now refused when a deploy is planned.
+
+**Bounds a caller meets (D99).**
+
+- **Checkpoints and pinned snapshots:** at most 1,000 per database. The next one is refused with
+  `CheckpointLimitReached` (409).
+- **The changelog:** its newest 2,048 flushes and at most 30 days of retention. A consumer behind
+  them gets `Expired`.
+- **Merged values:** at most 1 MiB. Past that, a read fails with `MergedValueTooLarge` (409) until
+  the key is rewritten with a put.
+- **Names:** a checkpoint name is at most 256 characters and a budget group at most 63.
+- **Database size:** about 1 TiB for keys of 16 bytes, less for longer keys (about 90 GiB for 1 KiB
+  keys). Beyond that the manifest passes its 4 MiB budget; such databases are sharded.
+- **The compactor Worker** is set to 10 million subrequests, because Cloudflare counts a
+  compaction job's subrequests together. `docs/operations.md`
+  ("Platform limits") says what an operator should watch.
 
 **Not measured or not shown.**
 
 - **The SQLite page cache and 128 MB.** Whether Durable Object SQLite's page cache counts against
   the 128 MB isolate limit was not measured as such. Only the outcome was: no `exceededMemory` at
   256 MiB unflushed (`docs/measurements.md`, "Not measured").
-- **The Workflows concurrent-instance limit itself.** 200 at once ran; production's compaction
-  budget is 32.
+- **The Workflows concurrent-instance limit** is documented as 50,000 per account (D92). 200 at
+  once ran; production's compaction budget is 32.
 - **GC at scale used dev timings** (`gcMinAge` 10 s), not production's 1 hour (D60).
 - **D70's race was never reproduced live.** The fix rests on the model, on `db-client.test.ts`,
   and on mutation checks.
@@ -508,8 +544,12 @@ What v1 does not do, or has not measured.
   stuck (D82).
 - **The health report's L0 limit is the engine default** (16). A stage deployed with another
   `l0MaxSsts` is judged against 16 (D82).
-- **The only production hostname is `workers.dev`.** The OpenAPI spec lists only the local server
-  URL.
+- **The only production hostname is `workers.dev`.** Cloudflare treats a `workers.dev` subdomain as
+  a Free website, "intended for personal or hobby projects that aren't business-critical", and
+  recommends a route or custom domain for production
+  ([workers.dev](https://developers.cloudflare.com/workers/configuration/routing/workers-dev/),
+  2026-11-06). P3 chose it because no zone was given for a custom domain. The OpenAPI spec lists only the local
+  server URL.
 - **Secrets Store is in open beta**, with one store per account (Cloudflare's
   [Wrangler Secrets Store page](https://developers.cloudflare.com/workers/wrangler/commands/secrets-store/)).
   The tokens depend on the account's `default_secrets_store`.

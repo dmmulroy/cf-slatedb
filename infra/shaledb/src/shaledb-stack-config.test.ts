@@ -29,7 +29,7 @@ describe("ShaledbStackConfig", () => {
       lsmSettings: DEFAULT_LSM_SETTINGS,
       telemetry: { traceSampleRate: 1, traceRetentionDays: 14 },
       access: { mode: "BearerToken" },
-      limits: { apiCpuMs: 30_000, compactorCpuMs: 60_000 },
+      limits: { apiCpuMs: 30_000, compactorCpuMs: 60_000, compactorSubrequests: 10_000_000 },
     });
     expect((await resolve("dev", {})).access.mode).toBe("Open");
     // Production's decided defaults (P2–P5): no jurisdiction, R2 places the bucket, the default
@@ -41,7 +41,7 @@ describe("ShaledbStackConfig", () => {
       lsmSettings: DEFAULT_LSM_SETTINGS,
       telemetry: { traceSampleRate: 0.1, traceRetentionDays: 14 },
       access: { mode: "BearerToken" },
-      limits: { apiCpuMs: 30_000, compactorCpuMs: 60_000 },
+      limits: { apiCpuMs: 30_000, compactorCpuMs: 60_000, compactorSubrequests: 10_000_000 },
     });
     // Blank is unset: a shell's `VAR=` must not bind an empty value.
     expect((await resolve("preview-1", { SHALEDB_JURISDICTION: " " })).jurisdiction).toBe("none");
@@ -69,6 +69,10 @@ describe("ShaledbStackConfig", () => {
     expect((await resolve("preview-1", { SHALEDB_API_CPU_MS: "45000" })).limits.apiCpuMs).toBe(
       45_000,
     );
+    expect(
+      (await resolve("preview-1", { SHALEDB_COMPACTOR_SUBREQUESTS: "50000" })).limits
+        .compactorSubrequests,
+    ).toBe(50_000);
   });
 
   it("refuses an invalid variable or combination, naming the variable", async () => {
@@ -98,6 +102,10 @@ describe("ShaledbStackConfig", () => {
     expect(await refusedVariable("preview-1", { SHALEDB_COMPACTOR_CPU_MS: "900000" })).toBe(
       "SHALEDB_COMPACTOR_CPU_MS",
     );
+    // Workers Paid allows at most 10 million subrequests per invocation (D99).
+    expect(await refusedVariable("preview-1", { SHALEDB_COMPACTOR_SUBREQUESTS: "10000001" })).toBe(
+      "SHALEDB_COMPACTOR_SUBREQUESTS",
+    );
     expect(await refusedVariable("preview-1", { SHALEDB_TRACE_SAMPLE_RATE: "2" })).toBe(
       "SHALEDB_TRACE_SAMPLE_RATE",
     );
@@ -116,5 +124,24 @@ describe("ShaledbStackConfig", () => {
     const eu = shaledbWorkerSettingsOf(await resolve("preview-3", { SHALEDB_JURISDICTION: "eu" }));
     expect(eu.jurisdiction).toEqual(Option.some("eu"));
     expect(lsmWorkerSettingsBindings(eu)["SHALEDB_JURISDICTION"]).toBe("eu");
+  });
+
+  it("binds each setting within a Worker variable's 5 KB, with the largest values settings allow (D92)", async () => {
+    // Workers: a variable or secret is at most 5 KB (developers.cloudflare.com/workers/platform/limits,
+    // 2026-11-25). The engine settings are one JSON variable; its numbers grow with their values.
+    const largest = Object.fromEntries(
+      Object.entries(DEFAULT_LSM_SETTINGS).map(([name, value]) => [
+        name,
+        Number.isInteger(value) ? Number.MAX_SAFE_INTEGER : 0.123456789012345,
+      ]),
+    );
+    // The settings' JSON is plain numbers, so its longest form is every field at its longest number.
+    expect(new TextEncoder().encode(JSON.stringify(largest)).length).toBeLessThanOrEqual(5_000);
+    const bindings = lsmWorkerSettingsBindings(
+      shaledbWorkerSettingsOf(await resolve("production", {})),
+    );
+    for (const [name, value] of Object.entries(bindings)) {
+      expect([name, new TextEncoder().encode(value).length <= 5_000]).toEqual([name, true]);
+    }
   });
 });
