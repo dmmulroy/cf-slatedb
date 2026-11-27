@@ -48,7 +48,43 @@ const overtakenScans = Layer.effect(
   ),
 );
 
+const overtakenPage = (limit: number) =>
+  Effect.gen(function* () {
+    const app = yield* HttpRouter.toHttpEffect(dbHttpRouterLayer);
+    const web = yield* serveLsmTestRequest(
+      app,
+      new Request("http://api.internal/v1/databases/orders/scan", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          range: { start: "", end: null },
+          consistency: { _tag: "Latest" },
+          snapshot: null,
+          limit,
+        }),
+      }),
+    );
+    return { status: web.status, body: JSON.parse(web.text) };
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(overtakenScans.pipe(Layer.provideMerge(dbServicesTestLayer()))),
+    Effect.provide(lsmTestRuntimeContextLayer),
+    Effect.runPromise,
+  );
+
 describe("the public scan of a scan overtaken after it returned rows (D93)", () => {
+  it("answers a page that filled its limit before it ended early with its rows and resumeFrom (D130)", async () => {
+    // Three rows, exactly the limit, then the early end: a full page, not a failure.
+    const answer = await overtakenPage(3);
+    expect(answer.status).toBe(200);
+    expect(answer.body.rows.map((returned: { key: string }) => returned.key)).toEqual([
+      "AQ==",
+      "Ag==",
+      "Aw==",
+    ]);
+    expect(answer.body.resumeFrom).toBe("BA==");
+  });
+
   it("answers the rows it has and resumeFrom, as a page that ended early", async () => {
     const answer = await Effect.gen(function* () {
       const app = yield* HttpRouter.toHttpEffect(dbHttpRouterLayer);
