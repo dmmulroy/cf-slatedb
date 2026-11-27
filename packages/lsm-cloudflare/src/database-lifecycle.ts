@@ -18,6 +18,10 @@ import {
   markRemoved,
   removalExpiresAt,
   removeCheckpoint,
+  replaceManifestFields,
+  SeqNum,
+  WriterEpoch,
+  CompactorEpoch,
   type SstId,
   Timestamp,
 } from "@shaledb/lsm-core";
@@ -381,6 +385,21 @@ export const makeDatabaseLifecycle = Effect.gen(function* () {
           });
         }
         yield* clearRemovedIncarnation(databaseId, head.value, now);
+        // The new chain continues past the removed one: its sequence numbers and epochs start
+        // above the tombstone's, so a handle or a job of the removed database names nothing in it
+        // (D119). An old snapshot's sequence number then matches no manifest of the new chain, and
+        // an old compaction's epoch is fenced.
+        const removed = head.value.manifest;
+        const nextSeq = SeqNum.make(removed.lastL0Seq + 1);
+        return yield* manifests.initialize(
+          replaceManifestFields(initialManifest(databaseId, options), {
+            lastL0Seq: nextSeq,
+            lastL0ClockTick: removed.lastL0ClockTick,
+            writerEpoch: WriterEpoch.make(removed.writerEpoch + 1),
+            compactorEpoch: CompactorEpoch.make(removed.compactorEpoch + 1),
+            changelogAfterSeq: Option.some(nextSeq),
+          }),
+        );
       }
       return yield* manifests.initialize(initialManifest(databaseId, options));
     },

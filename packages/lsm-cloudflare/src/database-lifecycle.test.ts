@@ -1519,7 +1519,7 @@ describe("DatabaseLifecycle: a manifest CAS in flight during removal", () => {
 });
 
 describe("DatabaseLifecycle: a removal that stopped after marking", () => {
-  it("leaves nothing of the old incarnation to a create gcMinAge later, and sequence numbers start again (D91)", async () => {
+  it("leaves nothing of the old incarnation to a create gcMinAge later, whose sequence numbers continue past the tombstone (D91, D119)", async () => {
     const outcome = await run(
       Effect.gen(function* () {
         const lifecycle = yield* DatabaseLifecycle;
@@ -1563,7 +1563,9 @@ describe("DatabaseLifecycle: a removal that stopped after marking", () => {
     );
     expect(outcome).toEqual({
       tooSoon: "DatabaseRecentlyRemovedError",
-      firstSeq: 1,
+      // The tombstone's lastL0Seq was 1 (the unflushed rows never reached a manifest): the new
+      // chain starts at 2, so its first write is 3.
+      firstSeq: 3,
       a: null,
       u1: null,
       b: "new",
@@ -1684,5 +1686,253 @@ describe("DatabaseLifecycle: a fork's hold", () => {
     );
     expect(outcome.fork).toBe("DatabaseAlreadyExistsError");
     expect(outcome.checkpoints).toHaveLength(1);
+  });
+});
+
+describe("DatabaseLifecycle: an old incarnation's snapshot after the id is reused", () => {
+  it("reads as expired, not as the new database (D119)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const client = yield* DbClient;
+        const options = { keyRange: Option.none(), databaseOptions: DEFAULT_DATABASE_OPTIONS };
+        yield* TestClock.adjust(HOUR);
+        yield* lifecycle.create(SOURCE, options);
+        yield* client.put(SOURCE, bytes("a"), bytes("old"));
+        yield* client.flush(SOURCE);
+        const snapshot = yield* client.snapshot(SOURCE);
+        yield* lifecycle.remove(SOURCE);
+        yield* TestClock.adjust(HOUR + 1);
+        yield* lifecycle.create(SOURCE, options);
+        // The new chain reaches the snapshot's manifest id with other data.
+        for (let round = 0; round < snapshot.manifestId + 2; round++) {
+          yield* client.put(SOURCE, bytes("a"), bytes(`new-${round}`));
+          yield* client.flush(SOURCE);
+        }
+        const read = yield* client
+          .get(SOURCE, bytes("a"), {
+            consistency: { _tag: "Flushed" },
+            snapshot: Option.some(snapshot),
+            refuseSealed: false,
+          })
+          .pipe(
+            Effect.map((value) => Option.getOrElse(Option.map(value, text), () => "none")),
+            Effect.catchTag("ReaderUnavailableError", (error) => Effect.succeed(error.reason)),
+          );
+        return { manifestId: snapshot.manifestId, read };
+      }),
+    );
+    expect(outcome.read).toBe("SnapshotExpired");
+  });
+});
+
+describe("DatabaseLifecycle: an old incarnation's compaction after the id is reused", () => {
+  it("is fenced, not committed into the new chain (D119)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const client = yield* DbClient;
+        const store = yield* ManifestStore;
+        const reader = yield* ManifestReader;
+        const options = { keyRange: Option.none(), databaseOptions: DEFAULT_DATABASE_OPTIONS };
+        const withRun = Effect.gen(function* () {
+          for (let round = 0; round < 4; round++) {
+            yield* client.put(SOURCE, bytes(`k${round}`), bytes("v"));
+            yield* client.flush(SOURCE);
+          }
+          yield* compactUntilIdle(SOURCE);
+          return yield* reader.loadLatest(SOURCE);
+        });
+        yield* TestClock.adjust(HOUR);
+        yield* lifecycle.create(SOURCE, options);
+        const old = yield* withRun;
+        // A job of the old incarnation over its sorted run, still running when it is removed.
+        const oldRun = old.manifest.sortedRuns[0];
+        if (oldRun === undefined) return yield* Effect.die("the old chain has no sorted run");
+        const oldEpoch = old.manifest.compactorEpoch;
+        yield* lifecycle.remove(SOURCE);
+        yield* TestClock.adjust(HOUR + 1);
+        yield* lifecycle.create(SOURCE, options);
+        const fresh = yield* withRun;
+        const commit = yield* Effect.result(
+          store.update(SOURCE, (manifest) =>
+            commitCompaction(manifest, {
+              compactorEpoch: oldEpoch,
+              jobId: "old-incarnation-job",
+              job: {
+                sources: [{ _tag: "SortedRun", id: oldRun.id }],
+                destination: oldRun.id,
+                isBottom: true,
+              },
+              outputs: oldRun.ssts,
+            }),
+          ),
+        );
+        return {
+          sameRunId: fresh.manifest.sortedRuns.some((run) => run.id === oldRun.id),
+          commit: commit._tag === "Success" ? "committed" : commit.failure._tag,
+        };
+      }),
+    );
+    expect(outcome).toEqual({ sameRunId: true, commit: "CompactorFencedError" });
+  });
+});
+
+describe("DatabaseLifecycle: a thousand checkpoints and pinned snapshots (D99)", () => {
+  it("keep commits, cold reads, and a collection inside the manifest budget", async () => {
+    const MANIFEST_BUDGET_BYTES = 4 * 1024 * 1024;
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const client = yield* DbClient;
+        const objects = yield* ObjectStore;
+        const reader = yield* ManifestReader;
+        const gc = yield* GarbageCollector;
+        yield* lifecycle.create(SOURCE, {
+          keyRange: Option.none(),
+          databaseOptions: DEFAULT_DATABASE_OPTIONS,
+        });
+        yield* client.put(SOURCE, bytes("a"), bytes("A"));
+        for (let index = 0; index < 1_000; index++) {
+          if (index % 2 === 0) {
+            yield* lifecycle.createCheckpoint(SOURCE, {
+              name: Option.some(`checkpoint-${index}`.padEnd(256, "x")),
+              lifetimeMs: Option.none(),
+            });
+          } else {
+            yield* lifecycle.pinSnapshot(SOURCE, 7 * 24 * HOUR);
+          }
+        }
+        const refused = yield* Effect.flip(lifecycle.pinSnapshot(SOURCE, HOUR));
+        // A commit still goes through, and a cold load decodes the whole manifest.
+        yield* client.put(SOURCE, bytes("b"), bytes("B"));
+        yield* client.flush(SOURCE);
+        const newest = yield* reader.loadLatest(SOURCE);
+        const newestBytes = Option.getOrElse(
+          Option.map(yield* objects.get(manifestKey(SOURCE, newest.id)), (body) => body.length),
+          () => 0,
+        );
+        // What one collection reads: every manifest a checkpoint pins.
+        const pinned = new Set(newest.manifest.checkpoints.map((cp) => cp.manifestId));
+        let pinnedBytes = 0;
+        for (const id of pinned) {
+          const body = yield* objects.get(manifestKey(SOURCE, id));
+          pinnedBytes += Option.getOrElse(
+            Option.map(body, (value) => value.length),
+            () => 0,
+          );
+        }
+        yield* TestClock.adjust(HOUR + 1);
+        const report = yield* gc.collect(SOURCE, Option.none());
+        return {
+          refused: refused._tag,
+          checkpoints: newest.manifest.checkpoints.length,
+          newestBytes,
+          pinnedManifests: pinned.size,
+          pinnedBytes,
+          collected: report.manifestId._tag,
+          read: Option.getOrNull(
+            Option.map(
+              yield* client.get(SOURCE, bytes("b"), {
+                consistency: { _tag: "Flushed" },
+                snapshot: Option.none(),
+                refuseSealed: false,
+              }),
+              text,
+            ),
+          ),
+        };
+      }),
+    );
+    require("node:fs").writeFileSync(
+      "/tmp/shale-work/agents/mut-read/checkpoints-1000.json",
+      JSON.stringify(outcome, null, 2),
+    );
+    expect(outcome.refused).toBe("CheckpointLimitError");
+    expect(outcome.checkpoints).toBe(1_000);
+    expect(outcome.newestBytes).toBeLessThan(MANIFEST_BUDGET_BYTES);
+    expect(outcome.pinnedManifests).toBeLessThanOrEqual(1_000);
+    expect(outcome.collected).toBe("Some");
+    expect(outcome.read).toBe("B");
+  }, 300_000);
+});
+
+describe("DatabaseLifecycle: gaps the mutation sweep found (D119)", () => {
+  it("deletes a hold whose holder no longer exists, for repair", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const client = yield* DbClient;
+        const reader = yield* ManifestReader;
+        const store = yield* ManifestStore;
+        yield* lifecycle.create(SOURCE, {
+          keyRange: Option.none(),
+          databaseOptions: DEFAULT_DATABASE_OPTIONS,
+        });
+        yield* client.put(SOURCE, bytes("a"), bytes("A"));
+        const checkpoint = yield* lifecycle.createCheckpoint(SOURCE, {
+          name: Option.none(),
+          lifetimeMs: Option.none(),
+        });
+        yield* lifecycle.forkRange({
+          source: SOURCE,
+          checkpointId: checkpoint.id,
+          range: LEFT_RANGE,
+          forkId: LEFT,
+        });
+        const hold = (yield* reader.loadLatest(SOURCE)).manifest.checkpoints.find((cp) =>
+          Option.contains(cp.holder, LEFT),
+        );
+        if (hold === undefined) return yield* Effect.die("the fork holds no checkpoint");
+        // The fork's removal stopped after marking it, before releasing its hold.
+        const removedAt = Timestamp.make(yield* Clock.currentTimeMillis);
+        yield* store.update(LEFT, (manifest) => markRemoved(manifest, removedAt));
+        const deleted = yield* Effect.result(lifecycle.deleteCheckpoint(SOURCE, hold.id));
+        return {
+          deleted: deleted._tag === "Success" ? "deleted" : deleted.failure._tag,
+          holdLeft: (yield* reader.loadLatest(SOURCE)).manifest.checkpoints.some(
+            (cp) => cp.id === hold.id,
+          ),
+        };
+      }),
+    );
+    expect(outcome).toEqual({ deleted: "deleted", holdLeft: false });
+  });
+
+  it("drops an SST only when confirm repeats its id", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const client = yield* DbClient;
+        const reader = yield* ManifestReader;
+        yield* lifecycle.create(SOURCE, {
+          keyRange: Option.none(),
+          databaseOptions: DEFAULT_DATABASE_OPTIONS,
+        });
+        yield* client.put(SOURCE, bytes("a"), bytes("A"));
+        yield* client.flush(SOURCE);
+        const sst = (yield* reader.loadLatest(SOURCE)).manifest.l0[0];
+        if (sst === undefined) return yield* Effect.die("the flush wrote no SST");
+        const mismatch = yield* Effect.flip(
+          lifecycle.dropSst(SOURCE, { sstId: sst.id, confirm: "not-the-id", force: true }),
+        );
+        const matched = yield* Effect.result(
+          lifecycle.dropSst(SOURCE, { sstId: sst.id, confirm: sst.id, force: true }),
+        );
+        return {
+          mismatch: mismatch._tag === "SstDropRefusedError" ? mismatch.reason : mismatch._tag,
+          // The test layer's compactor client does not run the drop; what matters is that the
+          // confirmation passed it on.
+          matched:
+            matched._tag === "Success"
+              ? "Success"
+              : matched.failure._tag === "SstDropRefusedError"
+                ? matched.failure.reason
+                : matched.failure._tag,
+        };
+      }),
+    );
+    expect(outcome.mismatch).toBe("ConfirmationMismatch");
+    expect(outcome.matched).not.toBe("ConfirmationMismatch");
   });
 });

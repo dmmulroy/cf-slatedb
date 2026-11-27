@@ -19,9 +19,14 @@ import { describe, expect, it } from "vite-plus/test";
 import { lsmConfigurationTestLayer } from "./lsm-configuration.ts";
 import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
 import { ManifestCache, manifestCacheLayerWithoutDependencies } from "./manifest-cache.ts";
-import { ManifestReader } from "./manifest-reader.ts";
-import { ManifestStore, manifestStoreTestLayer } from "./manifest-store.ts";
-import { latestManifestKey, manifestKey } from "./object-keys.ts";
+import { ManifestReader, manifestReaderLayerWithoutDependencies } from "./manifest-reader.ts";
+import {
+  ManifestStore,
+  manifestStoreLayerWithoutDependencies,
+  manifestStoreTestLayer,
+} from "./manifest-store.ts";
+import { backgroundWorkTestLayer } from "./background-work.ts";
+import { latestManifestKey, manifestGcBoundaryKey, manifestKey } from "./object-keys.ts";
 import { ObjectStore, objectStoreTestLayer } from "./object-store.ts";
 
 const DB = DatabaseId.make("orders");
@@ -649,5 +654,109 @@ describe("ManifestStore", () => {
       }),
     );
     expect(newest).toBe(6);
+  });
+});
+
+describe("GC's manifest boundary under a concurrent advance (mutation sweep)", () => {
+  /**
+   * An object store where, just before the first create or versioned write of the boundary key,
+   * another collection advances the boundary to `rival` (its write lands first).
+   */
+  const racingStore = (rival: ManifestId) =>
+    Layer.effect(
+      ObjectStore,
+      Effect.gen(function* () {
+        const inner = yield* ObjectStore;
+        let raced = false;
+        const race = (key: string) =>
+          Effect.gen(function* () {
+            if (raced || key !== manifestGcBoundaryKey(DB)) return;
+            raced = true;
+            yield* inner.put(key, new TextEncoder().encode(String(rival)));
+          });
+        return ObjectStore.of({
+          ...inner,
+          putIfAbsent: (key, body) => Effect.andThen(race(key), inner.putIfAbsent(key, body)),
+          putIfVersion: (key, body, version) =>
+            Effect.andThen(race(key), inner.putIfVersion(key, body, version)),
+        });
+      }),
+    ).pipe(Layer.provide(objectStoreTestLayer));
+  const runRacing = <A, E>(
+    rival: ManifestId,
+    effect: Effect.Effect<A, E, ManifestStore | ManifestReader | ObjectStore | RuntimeContext>,
+  ) =>
+    effect.pipe(
+      Effect.provide(
+        manifestStoreLayerWithoutDependencies.pipe(
+          Layer.provideMerge(manifestReaderLayerWithoutDependencies),
+          Layer.provideMerge(racingStore(rival)),
+          Layer.provide(backgroundWorkTestLayer),
+        ),
+      ),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.runPromise,
+    );
+
+  for (const [name, first] of [
+    ["its first write", true],
+    ["a versioned write", false],
+  ] as const) {
+    it(`re-reads and retries ${name} that a lower concurrent advance beat`, async () => {
+      const boundary = await runRacing(
+        ManifestId.make(2),
+        Effect.gen(function* () {
+          yield* initialize;
+          const store = yield* ManifestStore;
+          for (const n of [1, 2, 3, 4, 5, 6]) {
+            yield* store.update(DB, flushEdit(n, WriterEpoch.make(0)));
+          }
+          if (!first) {
+            // A boundary exists, so the advance is a versioned write (the race is spent on it).
+            yield* (yield* ObjectStore).put(
+              manifestGcBoundaryKey(DB),
+              new TextEncoder().encode("1"),
+            );
+          }
+          yield* store.advanceManifestBoundary(DB, ManifestId.make(5));
+          return (yield* (yield* ManifestReader).loadManifestBoundary(DB)).id;
+        }),
+      );
+      // A collection deletes manifests up to the boundary it asked for, so the stored one must not
+      // be lower: readers start above it (D56).
+      expect(boundary).toBe(5);
+    });
+  }
+});
+
+describe("loadLatest's listing fallback (mutation sweep)", () => {
+  it("lists to the newest manifest, not to a pinned one below GC's boundary", async () => {
+    const newest = await run(
+      Effect.gen(function* () {
+        yield* initialize;
+        const store = yield* ManifestStore;
+        const objects = yield* ObjectStore;
+        for (const n of [1, 2, 3, 4, 5, 6])
+          yield* store.update(DB, flushEdit(n, WriterEpoch.make(0)));
+        // GC kept manifest 2 (a checkpoint pins it), deleted 1, 3, and 4, and the hint names an id
+        // that was never written: the reader must list.
+        yield* Effect.sleep("20 millis");
+        yield* store.advanceManifestBoundary(DB, ManifestId.make(4));
+        yield* objects.delete([1, 3, 4].map((id) => manifestKey(DB, ManifestId.make(id))));
+        yield* objects.put(latestManifestKey(DB), new TextEncoder().encode("9"));
+        return (yield* (yield* ManifestReader).loadLatest(DB)).id;
+      }),
+    );
+    expect(newest).toBe(7);
+  });
+
+  it("answers a database with only a stale hint left as not found", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* (yield* ObjectStore).put(latestManifestKey(DB), new TextEncoder().encode("3"));
+        return (yield* Effect.flip((yield* ManifestReader).loadLatest(DB)))._tag;
+      }),
+    );
+    expect(outcome).toBe("DatabaseNotFoundError");
   });
 });
