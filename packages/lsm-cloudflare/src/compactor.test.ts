@@ -30,6 +30,7 @@ import {
   CompactionLauncherRecord,
   CompactionLauncherUnavailableError,
   compactionLauncherTestLayer,
+  type CompactionJobProgress,
 } from "./compaction-launcher.ts";
 import {
   Compactor,
@@ -948,6 +949,59 @@ describe("Compactor jobs it can no longer see (D94)", () => {
       replanned: true,
       starts: 2,
     });
+  });
+  it("a job whose Workflow instance is not found is finished on the next poll, not after the lease bound (D103, D119)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createWithL0(ORDERS, 4);
+        const settings = yield* LsmConfiguration;
+        // Workflows accepts the job, then purges it from retention: the launcher reports a
+        // missing instance as finished with no outcome (D103).
+        const started: Array<string> = [];
+        const blindLauncher = CompactionLauncher.of({
+          start: (params) => Effect.sync(() => void started.push(params.jobId)),
+          progress: () =>
+            Effect.succeed<CompactionJobProgress>({ _tag: "Finished", outcome: Option.none() }),
+        });
+        const shared = yield* Effect.context<
+          ManifestReader | ManifestStore | CompactionBudget | LsmConfiguration | GarbageCollector
+        >();
+        const built = yield* Layer.build(
+          compactorLayerWithoutDependencies.pipe(
+            Layer.provideMerge(
+              Layer.mergeAll(compactorStateCellTestLayer, durableObjectAlarmTestLayer),
+            ),
+            Layer.provide(
+              Layer.succeedContext(shared.pipe(Context.add(CompactionLauncher, blindLauncher))),
+            ),
+          ),
+        );
+        const compactor = Context.get(built, Compactor);
+        const alarm = Context.get(built, DurableObjectAlarm);
+        const fire = Effect.andThen(alarm.cancel, compactor.runAlarm);
+        const runningIds = Effect.map(compactor.status(ORDERS), (state) =>
+          Option.match(state, {
+            onNone: () => [],
+            onSome: (current) => current.running.map((job) => job.jobId),
+          }),
+        );
+        yield* compactor.wake(ORDERS);
+        yield* fire;
+        const first = yield* runningIds;
+        // One poll interval later, well inside compactionLeaseMs: the job is finished and its
+        // sources planned again.
+        yield* TestClock.adjust(settings.compactorPollInterval);
+        yield* fire;
+        const next = yield* runningIds;
+        return {
+          first: first.length,
+          boundAhead: settings.compactorPollInterval < settings.compactionLeaseMs,
+          replanned: next.length === 1 && next[0] !== first[0],
+          starts: started.length,
+        };
+      }),
+    );
+    expect(outcome).toEqual({ first: 1, boundAhead: true, replanned: true, starts: 2 });
   });
   it("the bound counts from the last read that saw the job running, not from its start (D94)", async () => {
     const outcome = await run(
