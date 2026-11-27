@@ -74,6 +74,16 @@ export interface IManifestReader {
     databaseId: DatabaseId,
   ) => Effect.Effect<VersionedManifest, DatabaseNotFoundError | ManifestReadError, RuntimeContext>;
   /**
+   * {@link IManifestReader.loadLatest} for a caller to whom "no such database" is an answer, not
+   * a failure (a create checking its id): its span does not end in error for a new id, which a
+   * trace check would otherwise report on every create.
+   *
+   * @returns The newest manifest, none when the database has no manifest, or `ManifestReadError`.
+   */
+  readonly findLatest: (
+    databaseId: DatabaseId,
+  ) => Effect.Effect<Option.Option<VersionedManifest>, ManifestReadError, RuntimeContext>;
+  /**
    * {@link IManifestReader.loadLatest} for a caller that serves the database: a removed database's
    * head (its tombstone, D91) answers as no database.
    *
@@ -289,13 +299,26 @@ export const makeManifestReader = Effect.gen(function* () {
       : Option.none<ManifestId>();
   });
 
-  const loadLatest = Effect.fn("ManifestReader.loadLatest")(function* (databaseId: DatabaseId) {
+  const newestFromStorage = Effect.fnUntraced(function* (databaseId: DatabaseId) {
     yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
     const { hint, boundary } = yield* Effect.all(
       { hint: loadLatestHint(databaseId), boundary: loadManifestBoundary(databaseId) },
       { concurrency: 2 },
     );
     return yield* newestFromHint(databaseId, hint, boundary);
+  });
+
+  const loadLatest = Effect.fn("ManifestReader.loadLatest")(newestFromStorage);
+
+  const findLatest = Effect.fn("ManifestReader.findLatest")(function* (databaseId: DatabaseId) {
+    const newest = yield* newestFromStorage(databaseId).pipe(
+      Effect.map(Option.some),
+      Effect.catchTags({
+        DatabaseNotFoundError: () => Effect.succeed(Option.none<VersionedManifest>()),
+      }),
+    );
+    yield* Effect.annotateCurrentSpan({ "manifest.found": Option.isSome(newest) });
+    return newest;
   });
 
   /** The newest manifest, searched from an already-read `LATEST` hint and GC boundary. */
@@ -403,7 +426,14 @@ export const makeManifestReader = Effect.gen(function* () {
         : Effect.succeed(latest),
     );
 
-  return ManifestReader.of({ load, loadLatest, loadLive, loadLatestFrom, loadManifestBoundary });
+  return ManifestReader.of({
+    load,
+    loadLatest,
+    findLatest,
+    loadLive,
+    loadLatestFrom,
+    loadManifestBoundary,
+  });
 });
 
 /** Provides the manifest reader, leaving the object store requirement visible. */

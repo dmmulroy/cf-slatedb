@@ -18,7 +18,7 @@ import {
   SstId,
   Timestamp,
 } from "@shaledb/lsm-core";
-import { Clock, Context, Effect, Layer, Option, Ref, Result } from "effect";
+import { Clock, Context, Effect, Exit, Layer, Option, Ref, Result, Tracer } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -306,6 +306,32 @@ const valuesIn = (databaseId: DatabaseId) =>
   });
 
 describe("DatabaseLifecycle", () => {
+  it("creating a database with a new id ends no span in error (D90's check finds no manifest)", async () => {
+    const spans: Array<Tracer.NativeSpan> = [];
+    const recordingTracer = Tracer.make({
+      span: (options) => {
+        const span = new Tracer.NativeSpan(options);
+        spans.push(span);
+        return span;
+      },
+    });
+    await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        yield* lifecycle.create(SOURCE, {
+          keyRange: Option.none(),
+          databaseOptions: DEFAULT_DATABASE_OPTIONS,
+        });
+      }).pipe(Effect.withTracer(recordingTracer)),
+    );
+    // A trace check for error spans (the scenarios' NoErrorStatus) must stay quiet on a create.
+    const failed = spans
+      .filter((span) => span.status._tag === "Ended" && Exit.isFailure(span.status.exit))
+      .map((span) => span.name);
+    expect(failed).toEqual([]);
+    expect(spans.map((span) => span.name)).toContain("ManifestReader.findLatest");
+  });
+
   it("a transaction begun before a seal cannot commit after it, in the source or its successors", async () => {
     const outcome = await run(
       Effect.gen(function* () {

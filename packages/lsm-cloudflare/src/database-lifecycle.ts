@@ -354,10 +354,8 @@ export const makeDatabaseLifecycle = Effect.gen(function* () {
       // An id removed less than gcMinAge ago is not reusable yet: a reader isolate may still hold
       // a manifest of the removed database, and would serve it as the new one's, and a commit from
       // a view loaded before the removal must still find the tombstone (D90, D91).
-      const head = yield* reader.loadLatest(databaseId).pipe(
-        Effect.map(Option.some),
+      const head = yield* reader.findLatest(databaseId).pipe(
         Effect.catchTags({
-          DatabaseNotFoundError: () => Effect.succeed(Option.none<VersionedManifest>()),
           ManifestReadError: (error) =>
             Effect.fail(
               new ManifestWriteError({
