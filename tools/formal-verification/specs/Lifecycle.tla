@@ -44,16 +44,23 @@
 (*   "deleteHead"       removal deletes its Removed head, so a stale       *)
 (*                      committer reopens the database (before D91)        *)
 (*   "recreateAtOnce"   a removed id is recreated at once (before D90)     *)
+(*   "deleteByPrefix"   a removal deletes every object under the prefix,   *)
+(*                      not only those written no later than its tombstone *)
+(*   "staleViewOutlives" a committer's view outlives gcMinAge (D91's       *)
+(*                      assumption dropped), so it can commit between      *)
+(*                      create's clear and its first manifest              *)
 (*   "beforeD116"       deleteCheckpoint deletes a hold whose holder has   *)
 (*                      no manifest yet, while forkRange may still write it *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets, TLC
 
 CONSTANTS Broken,
-  ForkRace  \* TRUE: the fork of the fork is created during the behavior, racing deleteCheckpoint (D116)
+  ForkRace,     \* TRUE: the fork of the fork is created during the behavior, racing deleteCheckpoint (D116)
+  SecondRemover \* TRUE: a second removal of the fork of the fork (a retried remove, or the sweep) runs
+                \* beside the first, and may stall past gcMinAge and a recreation
 
 ASSUME Broken \in {"none", "releaseNewestOnly", "releaseIgnoresPins", "deleteHold", "deleteHead",
-                   "recreateAtOnce", "beforeD116"}
+                   "recreateAtOnce", "beforeD116", "deleteByPrefix", "staleViewOutlives"}
 
 DBs == {"src", "fork", "fof"}
 Forks == {"fork", "fof"}
@@ -79,12 +86,15 @@ VARIABLES
   reopened,   \* a removed incarnation answered as open again
   fpc,        \* the fork of the fork's creation (forkRange): "idle" | "held" | "done" | "dead"
   dpc,        \* an operator's deleteCheckpoint of that fork's hold: "idle" | "read" | "done"
-  dLive       \* what its read of the holder found: TRUE when the hold must stay
+  dLive,      \* what its read of the holder found: TRUE when the hold must stay
+  r2,         \* the second removal of "fof": "none" | "marked" | "destroyed" | "released" | "done"
+  newObj,     \* each database's recreated incarnation's first manifest exists
+  rcl         \* create of a removed id: "idle" | "cleared" (the old objects, its head among them, gone)
 
 vars == <<live, refs, recent, holds, pinned, stored, rpc, stale, aged, inc, cache, wrongInc,
-          reopened, fpc, dpc, dLive>>
+          reopened, fpc, dpc, dLive, r2, newObj, rcl>>
 \* The variables the fork-creation and hold-deletion processes own.
-procVars == <<fpc, dpc, dLive>>
+procVars == <<fpc, dpc, dLive, r2, newObj, rcl>>
 
 Init ==
   \* The fork of the fork is created during the behavior (forkRange: its hold, then its manifest).
@@ -105,6 +115,7 @@ Init ==
   /\ fpc = IF ForkRace THEN "idle" ELSE "done"
   /\ dpc = IF ForkRace THEN "idle" ELSE "done"
   /\ dLive = FALSE
+  /\ r2 = "none" /\ newObj = [d \in DBs |-> FALSE] /\ rcl = [d \in DBs |-> "idle"]
 
 (* ----- A fork's rewrite and release ----- *)
 \* The fork's compaction rewrites what it reads from its owner into its own SST.
@@ -113,13 +124,13 @@ Rewrite(c) ==
   /\ refs' = [refs EXCEPT ![c] = {Own(c)}]
   /\ recent' = [recent EXCEPT ![c] = @ \cup refs[c]]
   /\ stored' = stored \cup {Own(c)}
-  /\ UNCHANGED <<fpc, dpc, dLive, live, holds, pinned, rpc, stale, aged, inc, cache, wrongInc, reopened>>
+  /\ UNCHANGED <<fpc, dpc, dLive, r2, newObj, rcl, live, holds, pinned, rpc, stale, aged, inc, cache, wrongInc, reopened>>
 
 \* gcMinAge passes: the replaced manifests may be collected, and no reader holds them any longer.
 Expire(d) ==
   /\ recent[d] # {}
   /\ recent' = [recent EXCEPT ![d] = {}]
-  /\ UNCHANGED <<fpc, dpc, dLive, live, refs, holds, pinned, stored, rpc, stale, aged, inc, cache, wrongInc,
+  /\ UNCHANGED <<fpc, dpc, dLive, r2, newObj, rcl, live, refs, holds, pinned, stored, rpc, stale, aged, inc, cache, wrongInc,
                  reopened>>
 
 \* What a database still reads from SSTs others own, in every manifest it keeps.
@@ -136,7 +147,7 @@ Release(c) ==
   /\ live[c] = "open" /\ c \in holds[Parent(c)]
   /\ Kept(c) \subseteq {Own(c)}
   /\ holds' = [holds EXCEPT ![Parent(c)] = @ \ {c}]
-  /\ UNCHANGED <<fpc, dpc, dLive, live, refs, recent, pinned, stored, rpc, stale, aged, inc, cache, wrongInc,
+  /\ UNCHANGED <<fpc, dpc, dLive, r2, newObj, rcl, live, refs, recent, pinned, stored, rpc, stale, aged, inc, cache, wrongInc,
                  reopened>>
 
 (* ----- GC on every database ----- *)
@@ -147,14 +158,14 @@ Collect(d) ==
   /\ live[d] = "open"
   /\ \E s \in stored : Owner(s) = d /\ s \notin Protected(d)
   /\ stored' = stored \ {s \in stored : Owner(s) = d /\ s \notin Protected(d)}
-  /\ UNCHANGED <<fpc, dpc, dLive, live, refs, recent, holds, pinned, rpc, stale, aged, inc, cache, wrongInc,
+  /\ UNCHANGED <<fpc, dpc, dLive, r2, newObj, rcl, live, refs, recent, holds, pinned, rpc, stale, aged, inc, cache, wrongInc,
                  reopened>>
 
 \* An operator deletes a fork's hold (D91: refused while the fork exists).
 DeleteHold(d) ==
   /\ Broken = "deleteHold" /\ holds[d] # {}
   /\ holds' = [holds EXCEPT ![d] = {}]
-  /\ UNCHANGED <<fpc, dpc, dLive, live, refs, recent, pinned, stored, rpc, stale, aged, inc, cache, wrongInc,
+  /\ UNCHANGED <<fpc, dpc, dLive, r2, newObj, rcl, live, refs, recent, pinned, stored, rpc, stale, aged, inc, cache, wrongInc,
                  reopened>>
 
 (* ----- Removal, interrupted anywhere and resumed ----- *)
@@ -163,49 +174,81 @@ DeleteHold(d) ==
 RemoveStep(d) ==
   \/ /\ rpc[d] = "none" /\ live[d] = "open" /\ holds[d] = {}
      /\ rpc' = [rpc EXCEPT ![d] = "marked"] /\ live' = [live EXCEPT ![d] = "removed"]
-     /\ UNCHANGED <<fpc, dpc, dLive, refs, recent, holds, stored, cache>>
+     /\ UNCHANGED <<fpc, dpc, dLive, r2, newObj, rcl, refs, recent, holds, stored, cache>>
   \/ /\ rpc[d] = "marked"
      /\ rpc' = [rpc EXCEPT ![d] = "destroyed"]
-     /\ UNCHANGED <<fpc, dpc, dLive, live, refs, recent, holds, stored, cache>>
+     /\ UNCHANGED <<fpc, dpc, dLive, r2, newObj, rcl, live, refs, recent, holds, stored, cache>>
   \/ /\ rpc[d] = "destroyed"
      \* A removed fork releases the hold it has on its owner.
      /\ holds' = IF d \in Forks THEN [holds EXCEPT ![Parent(d)] = @ \ {d}] ELSE holds
      /\ rpc' = [rpc EXCEPT ![d] = "released"]
-     /\ UNCHANGED <<fpc, dpc, dLive, live, refs, recent, stored, cache>>
+     /\ UNCHANGED <<fpc, dpc, dLive, r2, newObj, rcl, live, refs, recent, stored, cache>>
   \/ /\ rpc[d] = "released"
      /\ stored' = {s \in stored : Owner(s) # d}
      /\ refs' = [refs EXCEPT ![d] = {}] /\ recent' = [recent EXCEPT ![d] = {}]
      /\ rpc' = [rpc EXCEPT ![d] = "deleted"]
-     /\ UNCHANGED <<fpc, dpc, dLive, live, holds, cache>>
+     /\ UNCHANGED <<fpc, dpc, dLive, r2, newObj, rcl, live, holds, cache>>
   \/ /\ rpc[d] = "deleted"
      /\ rpc' = [rpc EXCEPT ![d] = "cleared"]
-     /\ UNCHANGED <<fpc, dpc, dLive, live, refs, recent, holds, stored, cache>>
-  /\ UNCHANGED <<fpc, dpc, dLive, pinned, stale, aged, inc, wrongInc, reopened>>
+     /\ UNCHANGED <<fpc, dpc, dLive, r2, newObj, rcl, live, refs, recent, holds, stored, cache>>
+  /\ UNCHANGED <<fpc, dpc, dLive, r2, newObj, rcl, pinned, stale, aged, inc, wrongInc, reopened>>
+
+\* A second removal of the fork of the fork (a retried remove, or the maintenance sweep finishing
+\* it) that read the Removed head, beside the first, and may stall past gcMinAge and a recreation.
+\* Each step repeats the first removal's; its deletes take only objects written no later than the
+\* tombstone it read, so nothing of a later incarnation (deleteByPrefix: everything).
+Remove2 ==
+  /\ SecondRemover
+  /\ \/ /\ r2 = "none" /\ live["fof"] = "removed" /\ inc["fof"] = 1
+        /\ r2' = "marked" /\ UNCHANGED <<holds, stored, refs, recent, newObj>>
+     \/ /\ r2 = "marked" /\ r2' = "destroyed" /\ UNCHANGED <<holds, stored, refs, recent, newObj>>
+     \/ /\ r2 = "destroyed"
+        /\ holds' = [holds EXCEPT !["fork"] = @ \ {"fof"}]
+        /\ r2' = "released" /\ UNCHANGED <<stored, refs, recent, newObj>>
+     \/ /\ r2 = "released"
+        /\ IF inc["fof"] = 1
+             THEN /\ stored' = {x \in stored : Owner(x) # "fof"}
+                  /\ refs' = [refs EXCEPT !["fof"] = {}] /\ recent' = [recent EXCEPT !["fof"] = {}]
+             ELSE UNCHANGED <<stored, refs, recent>>
+        /\ newObj' = IF Broken = "deleteByPrefix" THEN [newObj EXCEPT !["fof"] = FALSE] ELSE newObj
+        /\ r2' = "done" /\ UNCHANGED holds
+  /\ UNCHANGED <<fpc, dpc, dLive, rcl, live, pinned, rpc, stale, aged, inc, cache, wrongInc, reopened>>
 
 \* A committer that loaded the newest manifest before the removal commits after its deletes. The
 \* Removed head stays (D91), so its create loses, it reloads, finds Removed, and is refused.
 StaleCommit(d) ==
   /\ stale[d] /\ rpc[d] \in {"deleted", "cleared"}
+  \* D91: no view outlives gcMinAge, so none commits once the tombstone is that old.
+  /\ ~aged[d] \/ Broken = "staleViewOutlives"
   /\ stale' = [stale EXCEPT ![d] = FALSE]
-  /\ IF Broken = "deleteHead"
+  /\ IF Broken = "deleteHead" \/ rcl[d] = "cleared"
        THEN /\ live' = [live EXCEPT ![d] = "open"] /\ reopened' = TRUE
-       ELSE UNCHANGED <<fpc, dpc, dLive, live, reopened>>
-  /\ UNCHANGED <<fpc, dpc, dLive, refs, recent, holds, pinned, stored, rpc, aged, inc, cache, wrongInc>>
+       ELSE UNCHANGED <<fpc, dpc, dLive, r2, newObj, rcl, live, reopened>>
+  /\ UNCHANGED <<fpc, dpc, dLive, r2, newObj, rcl, refs, recent, holds, pinned, stored, rpc, aged, inc, cache, wrongInc>>
 
 \* gcMinAge passes after the removal: every reader's cache of the old incarnation has ended.
 TombstoneAges(d) ==
   /\ rpc[d] # "none" /\ live[d] = "removed" /\ ~aged[d]
   /\ aged' = [aged EXCEPT ![d] = TRUE] /\ cache' = [cache EXCEPT ![d] = 0]
-  /\ UNCHANGED <<fpc, dpc, dLive, live, refs, recent, holds, pinned, stored, rpc, stale, inc, wrongInc, reopened>>
+  /\ UNCHANGED <<fpc, dpc, dLive, r2, newObj, rcl, live, refs, recent, holds, pinned, stored, rpc, stale, inc, wrongInc, reopened>>
 
 \* create of a removed id: refused while the tombstone is young (D90); it clears what is left.
-Recreate(d) ==
-  /\ live[d] = "removed" /\ rpc[d] = "cleared" /\ inc[d] = 1
+RecreateClear(d) ==
+  /\ live[d] = "removed" /\ rpc[d] = "cleared" /\ inc[d] = 1 /\ rcl[d] = "idle"
   /\ aged[d] \/ Broken = "recreateAtOnce"
+  /\ rcl' = [rcl EXCEPT ![d] = "cleared"]
+  /\ UNCHANGED <<fpc, dpc, dLive, r2, newObj, live, refs, recent, holds, pinned, stored, rpc, stale,
+                 aged, inc, cache, wrongInc, reopened>>
+
+\* ... then manifest 1 of the new chain (after awaits).
+Recreate(d) ==
+  /\ live[d] = "removed" /\ rpc[d] = "cleared" /\ inc[d] = 1 /\ rcl[d] = "cleared"
+  /\ rcl' = [rcl EXCEPT ![d] = "idle"]
   /\ live' = [live EXCEPT ![d] = "open"] /\ inc' = [inc EXCEPT ![d] = 2]
   /\ refs' = [refs EXCEPT ![d] = {}] /\ rpc' = [rpc EXCEPT ![d] = "none"]
   /\ aged' = [aged EXCEPT ![d] = FALSE] /\ stale' = [stale EXCEPT ![d] = FALSE]
-  /\ UNCHANGED <<fpc, dpc, dLive, recent, holds, pinned, stored, cache, wrongInc, reopened>>
+  /\ newObj' = [newObj EXCEPT ![d] = TRUE]
+  /\ UNCHANGED <<fpc, dpc, dLive, r2, recent, holds, pinned, stored, cache, wrongInc, reopened>>
 
 (* ----- The fork of the fork being created, and an operator deleting its hold ----- *)
 \* forkRange of the fork, step 1: the hold on its source, pinning the source's newest manifest.
@@ -215,7 +258,7 @@ ForkHold ==
   /\ pinned' = [pinned EXCEPT !["fof"] = refs["fork"]]
   /\ fpc' = "held"
   /\ UNCHANGED <<live, refs, recent, stored, rpc, stale, aged, inc, cache, wrongInc, reopened, dpc,
-                 dLive>>
+                 dLive, r2, newObj, rcl>>
 
 \* Step 2, after an await: the fork's first manifest, reading what the hold pins.
 ForkInit ==
@@ -223,13 +266,13 @@ ForkInit ==
   /\ live' = [live EXCEPT !["fof"] = "open"] /\ refs' = [refs EXCEPT !["fof"] = pinned["fof"]]
   /\ fpc' = "done"
   /\ UNCHANGED <<recent, holds, pinned, stored, rpc, stale, aged, inc, cache, wrongInc, reopened,
-                 dpc, dLive>>
+                 dpc, dLive, r2, newObj, rcl>>
 
 \* forkRange dies between its hold and the fork's first manifest: the hold is an orphan.
 ForkDies ==
   /\ fpc = "held" /\ fpc' = "dead"
   /\ UNCHANGED <<live, refs, recent, holds, pinned, stored, rpc, stale, aged, inc, cache, wrongInc,
-                 reopened, dpc, dLive>>
+                 reopened, dpc, dLive, r2, newObj, rcl>>
 
 \* deleteCheckpoint of the fork's hold: it reads the holder's head (an await) ... A removed holder
 \* no longer reads the hold. A holder with no manifest is gone only once the hold is gcMinAge old
@@ -241,7 +284,7 @@ DeleteHoldRead ==
               \/ live["fof"] = "none" /\ fpc = "held" /\ Broken # "beforeD116"
   /\ dpc' = "read"
   /\ UNCHANGED <<live, refs, recent, holds, pinned, stored, rpc, stale, aged, inc, cache, wrongInc,
-                 reopened, fpc>>
+                 reopened, fpc, r2, newObj, rcl>>
 
 \* ... and deletes the hold only if the holder was gone (D91, D116). Refused while the fork does not
 \* exist, the operator retries (the hold may be an orphan); a refusal for a created fork is final.
@@ -250,33 +293,33 @@ DeleteHoldCommit ==
   /\ holds' = IF ~dLive THEN [holds EXCEPT !["fork"] = @ \ {"fof"}] ELSE holds
   /\ dpc' = IF dLive /\ live["fof"] = "none" THEN "idle" ELSE "done"
   /\ UNCHANGED <<live, refs, recent, pinned, stored, rpc, stale, aged, inc, cache, wrongInc,
-                 reopened, fpc, dLive>>
+                 reopened, fpc, dLive, r2, newObj, rcl>>
 
 (* ----- A reader's manifest cache ----- *)
 ReaderLoad(d) ==
   /\ live[d] = "open" /\ cache[d] = 0
   /\ cache' = [cache EXCEPT ![d] = inc[d]]
-  /\ UNCHANGED <<fpc, dpc, dLive, live, refs, recent, holds, pinned, stored, rpc, stale, aged, inc, wrongInc,
+  /\ UNCHANGED <<fpc, dpc, dLive, r2, newObj, rcl, live, refs, recent, holds, pinned, stored, rpc, stale, aged, inc, wrongInc,
                  reopened>>
 
 \* A read served from the cache (a covering hit, or within the refresh interval).
 ReaderServe(d) ==
   /\ live[d] = "open" /\ cache[d] # 0
   /\ wrongInc' = (wrongInc \/ cache[d] # inc[d])
-  /\ UNCHANGED <<fpc, dpc, dLive, live, refs, recent, holds, pinned, stored, rpc, stale, aged, inc, cache,
+  /\ UNCHANGED <<fpc, dpc, dLive, r2, newObj, rcl, live, refs, recent, holds, pinned, stored, rpc, stale, aged, inc, cache,
                  reopened>>
 
 ReaderForget(d) ==
   /\ cache[d] # 0
   /\ cache' = [cache EXCEPT ![d] = 0]
-  /\ UNCHANGED <<fpc, dpc, dLive, live, refs, recent, holds, pinned, stored, rpc, stale, aged, inc, wrongInc,
+  /\ UNCHANGED <<fpc, dpc, dLive, r2, newObj, rcl, live, refs, recent, holds, pinned, stored, rpc, stale, aged, inc, wrongInc,
                  reopened>>
 
 Next ==
   \/ \E c \in Forks : Rewrite(c) \/ Release(c)
-  \/ ForkHold \/ ForkInit \/ ForkDies \/ DeleteHoldRead \/ DeleteHoldCommit
+  \/ Remove2 \/ ForkHold \/ ForkInit \/ ForkDies \/ DeleteHoldRead \/ DeleteHoldCommit
   \/ \E d \in DBs : Expire(d) \/ Collect(d) \/ DeleteHold(d) \/ RemoveStep(d) \/ StaleCommit(d)
-                    \/ TombstoneAges(d) \/ Recreate(d) \/ ReaderLoad(d) \/ ReaderServe(d)
+                    \/ TombstoneAges(d) \/ RecreateClear(d) \/ Recreate(d) \/ ReaderLoad(d) \/ ReaderServe(d)
                     \/ ReaderForget(d)
 
 \* Compactions, collections, and time run; a stopped removal is retried.
@@ -300,6 +343,9 @@ TypeOK ==
 \* hold pins) needs a deleted SST.
 NoReaderNeedsDeleted ==
   \A d \in DBs : live[d] = "open" => (refs[d] \cup recent[d]) \subseteq stored
+
+\* A recreated database's first manifest is never deleted by a removal of the old incarnation.
+NewIncarnationIntact == \A d \in DBs : (inc[d] = 2 /\ live[d] = "open") => newObj[d]
 
 \* A removed database never answers as open again (D91).
 RemovedNeverReopens == ~reopened

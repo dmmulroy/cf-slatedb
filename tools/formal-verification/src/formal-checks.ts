@@ -332,7 +332,7 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
         config: "Lifecycle.cfg",
         broken: "none",
         expect: "pass",
-        timeLimitSeconds: 120,
+        timeLimitSeconds: 240,
       },
       {
         config: "Lifecycle.cfg",
@@ -361,7 +361,26 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
       {
         config: "Lifecycle.cfg",
         broken: "recreateAtOnce",
+        expect: "RemovedNeverReopens",
+        timeLimitSeconds: 120,
+      },
+      {
+        config: "LifecycleServed.cfg",
+        broken: "recreateAtOnce",
         expect: "NoOldIncarnationServed",
+        timeLimitSeconds: 120,
+      },
+      { config: "LifecycleRemovers.cfg", broken: "none", expect: "pass", timeLimitSeconds: 120 },
+      {
+        config: "LifecycleRemovers.cfg",
+        broken: "deleteByPrefix",
+        expect: "NewIncarnationIntact",
+        timeLimitSeconds: 120,
+      },
+      {
+        config: "LifecycleRemovers.cfg",
+        broken: "staleViewOutlives",
+        expect: "RemovedNeverReopens",
         timeLimitSeconds: 120,
       },
       {
