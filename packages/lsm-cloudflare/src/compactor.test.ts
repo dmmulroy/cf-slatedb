@@ -452,6 +452,40 @@ describe("Compactor", () => {
     expect(startedAt).toBeLessThan(outcome.launchedAt[0] ?? 0);
   });
 
+  it("a fenced compactor releases its running jobs' leases, so another database compacts at once (Workflow audit)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createWithL0(ORDERS, 4);
+        yield* createWithL0(USERS, 4);
+        // The orders job keeps running and holds the one compaction slot.
+        const heldLauncher = CompactionLauncher.of({
+          start: () => Effect.void,
+          progress: () => Effect.succeed({ _tag: "Running" as const }),
+        });
+        const orders = yield* startCompactor.pipe(
+          Effect.provideService(CompactionLauncher, heldLauncher),
+        );
+        const users = yield* startCompactor;
+        yield* orders.compactor.wake(ORDERS);
+        yield* orders.fire;
+        yield* users.compactor.wake(USERS);
+        yield* users.fire;
+        const reader = yield* ManifestReader;
+        const usersWhileHeld = (yield* reader.loadLatest(USERS)).manifest.l0.length;
+        // A newer compactor epoch for orders: its next poll finds itself fenced.
+        yield* (yield* ManifestStore).update(ORDERS, (manifest) =>
+          Result.succeed(fenceCompactor(manifest)),
+        );
+        yield* orders.fire.pipe(Effect.provideService(CompactionLauncher, heldLauncher));
+        yield* users.fire;
+        const usersAfter = (yield* reader.loadLatest(USERS)).manifest.l0.length;
+        return { usersWhileHeld, usersAfter };
+      }),
+    );
+    expect(outcome.usersWhileHeld).toBe(4);
+    expect(outcome.usersAfter).toBe(0);
+  });
+
   it("shares the compaction budget: a second database waits until the first job's lease is released", async () => {
     const outcome = await run(
       Effect.gen(function* () {
