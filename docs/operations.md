@@ -437,7 +437,10 @@ compactor then:
 - stops compacting that SST's L0 SST or sorted run.
 
 A corrupted **L0** SST pauses all L0 compaction, because L0 merges oldest first. Once L0 fills,
-writes fail with `WriteStalled`. Reads that touch the SST fail with `StoredDataInvalid` (500).
+writes fail with `WriteStalled`. Reads that touch the SST fail with `StoredDataInvalid` (500,
+not retryable), naming the database and the SST (D128). Through the sharded API they fail with
+`ShardedRequestRefused`, reason `SstCorruptedError` (409), naming the SST. `measure health` reports
+such reads even before a compaction reports the SST.
 
 Find the report:
 
