@@ -496,23 +496,28 @@ export const makeDatabaseLifecycle = Effect.gen(function* () {
     const latest = yield* reader
       .loadLive(databaseId)
       .pipe(Effect.catchTags({ ManifestReadError: unavailable(databaseId, "checkpoint") }));
+    const target = latest.manifest.checkpoints.find((cp) => cp.id === checkpointId);
     const holder = Option.flatMap(
-      Option.fromUndefinedOr(latest.manifest.checkpoints.find((cp) => cp.id === checkpointId)),
+      Option.fromUndefinedOr(target),
       (checkpoint) => checkpoint.holder,
     );
-    if (Option.isSome(holder)) {
-      const holderLive = yield* reader.loadLive(holder.value).pipe(
-        Effect.as(true),
-        Effect.catchTags({
-          DatabaseNotFoundError: () => Effect.succeed(false),
-          ManifestReadError: unavailable(databaseId, "checkpoint"),
-        }),
-      );
-      if (holderLive) {
+    if (target !== undefined && Option.isSome(holder)) {
+      const holderHead = yield* reader
+        .findLatest(holder.value)
+        .pipe(Effect.catchTags({ ManifestReadError: unavailable(databaseId, "checkpoint") }));
+      const now = yield* Clock.currentTimeMillis;
+      // A removed holder no longer reads the hold. A holder with no manifest is gone only once the
+      // hold is older than gcMinAge: until then forkRange may still be writing the fork's first
+      // manifest, which reads what the hold pins (D116).
+      const holderGone = Option.match(holderHead, {
+        onNone: () => now - target.createdAt >= settings.gcMinAge,
+        onSome: (head) => head.manifest.state._tag === "Removed",
+      });
+      if (!holderGone) {
         return yield* new DatabaseHasDependentsError({
           databaseId,
           dependents: [holder.value],
-          message: `Checkpoint ${checkpointId} of database ${databaseId} is the hold of fork ${holder.value}, which still reads its SSTs, so it was not deleted. The fork releases it once it no longer needs it; remove the fork to release it now.`,
+          message: `Checkpoint ${checkpointId} of database ${databaseId} is the hold of fork ${holder.value}, which still reads its SSTs or is still being created, so it was not deleted. The fork releases it once it no longer needs it; remove the fork to release it now. A hold whose fork was never created is deletable once it is gcMinAge old.`,
         });
       }
     }

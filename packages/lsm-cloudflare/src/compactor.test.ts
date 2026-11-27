@@ -35,9 +35,11 @@ import {
 import {
   Compactor,
   compactorLayerWithoutDependencies,
+  type CompactorState,
   CompactorStateCell,
   compactorStateCellTestLayer,
 } from "./compactor.ts";
+import { inMemoryCell } from "./durable-object-cell.ts";
 import { DbClient, dbClientTestLayer } from "./db-client.ts";
 import type { DbReaderServices } from "./db-reader.ts";
 import { DurableObjectAlarm, durableObjectAlarmTestLayer } from "./durable-object-alarm.ts";
@@ -112,6 +114,16 @@ interface ManifestGates {
   >;
   /** Fence-ins the compactor committed (its `update` calls). */
   readonly updateCalls: Ref.Ref<number>;
+  /**
+   * Called by the next read of the compactor's state cell after it read: signals, then waits.
+   * In production the read is an await (Durable Object storage), so other work can run there.
+   */
+  readonly cellGet: Ref.Ref<
+    Option.Option<{
+      readonly loaded: Deferred.Deferred<void>;
+      readonly resume: Deferred.Deferred<void>;
+    }>
+  >;
 }
 
 /** A compactor like {@link startCompactor}, whose manifest store and reader pass through gates. */
@@ -131,7 +143,26 @@ const startGatedCompactor = Effect.gen(function* () {
       }>
     >(Option.none()),
     updateCalls: yield* Ref.make(0),
+    cellGet: yield* Ref.make<
+      Option.Option<{
+        readonly loaded: Deferred.Deferred<void>;
+        readonly resume: Deferred.Deferred<void>;
+      }>
+    >(Option.none()),
   };
+  const inner = yield* inMemoryCell<CompactorState>();
+  const gatedCell = CompactorStateCell.of({
+    ...inner,
+    get: Effect.gen(function* () {
+      const current = yield* inner.get;
+      const gate = yield* Ref.getAndSet(gates.cellGet, Option.none());
+      if (Option.isSome(gate)) {
+        yield* Deferred.succeed(gate.value.loaded, undefined);
+        yield* Deferred.await(gate.value.resume);
+      }
+      return current;
+    }),
+  });
   const store = yield* ManifestStore;
   const reader = yield* ManifestReader;
   const gatedStore = ManifestStore.of({
@@ -175,7 +206,9 @@ const startGatedCompactor = Effect.gen(function* () {
   >();
   const built = yield* Layer.build(
     compactorLayerWithoutDependencies.pipe(
-      Layer.provideMerge(Layer.mergeAll(compactorStateCellTestLayer, durableObjectAlarmTestLayer)),
+      Layer.provideMerge(
+        Layer.mergeAll(Layer.succeed(CompactorStateCell, gatedCell), durableObjectAlarmTestLayer),
+      ),
       Layer.provide(
         Layer.succeedContext(
           shared.pipe(
@@ -204,6 +237,13 @@ const startGatedCompactor = Effect.gen(function* () {
     yield* Ref.set(gates.collect, Option.some({ loaded, resume }));
     return { loaded, resume };
   });
+  /** Arms the next read of the state cell: returns when it has read, and a way to let it go on. */
+  const holdNextCellGet = Effect.gen(function* () {
+    const loaded = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    yield* Ref.set(gates.cellGet, Option.some({ loaded, resume }));
+    return { loaded, resume };
+  });
   /** Arms the next `count` `update` calls, each behind its own gate. */
   const holdUpdates = (count: number) =>
     Effect.gen(function* () {
@@ -220,6 +260,7 @@ const startGatedCompactor = Effect.gen(function* () {
     gates,
     holdNextLoad,
     holdNextCollection,
+    holdNextCellGet,
     holdUpdates,
   };
 });
@@ -805,6 +846,75 @@ describe("Compactor fence-in (D78)", () => {
     );
     // The report (nothing more to collect) predates the request, which stands.
     expect(outcome).toEqual(Option.some(1_000));
+  });
+
+  it("a collection's state write never puts back the running jobs a poll replaced meanwhile (D116, stateLock)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createWithL0(ORDERS, 4);
+        const { compactor, fire, cell, holdNextCollection, holdNextCellGet } =
+          yield* startGatedCompactor;
+        yield* compactor.wake(ORDERS);
+        // An operator's collect is held in the collector; then its state write reads the cell
+        // (no running job yet) and is held between that read and its write.
+        const collectGate = yield* holdNextCollection;
+        const collecting = yield* Effect.forkChild(compactor.collect(ORDERS));
+        yield* Deferred.await(collectGate.loaded);
+        const cellGate = yield* holdNextCellGet;
+        yield* Deferred.succeed(collectGate.resume, undefined);
+        yield* Deferred.await(cellGate.loaded);
+        // Meanwhile the alarm's poll starts a compaction and records it.
+        const polling = yield* Effect.forkChild(fire);
+        for (let step = 0; step < 100; step++) yield* Effect.yieldNow;
+        yield* Deferred.succeed(cellGate.resume, undefined);
+        yield* Fiber.join(collecting);
+        yield* Fiber.join(polling);
+        const jobs = yield* Ref.get(yield* CompactionLauncherRecord);
+        const state = Option.getOrThrow(yield* cell.get);
+        return { started: jobs.size, recorded: state.running.length };
+      }),
+    );
+    // The job the poll started is still recorded: its lease is renewed and GC keeps its outputs.
+    expect(outcome).toEqual({ started: 1, recorded: 1 });
+  });
+
+  it("an SST drop waits for a poll that is starting a compaction of it, and is refused (D116, planLock)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createWithL0(ORDERS, 4);
+        const reader = yield* ManifestReader;
+        const oldest = (yield* reader.loadLatest(ORDERS)).manifest.l0.at(-1);
+        if (oldest === undefined) return yield* Effect.die("expected four L0 SSTs");
+        const { compactor, fire, holdNextLoad } = yield* startGatedCompactor;
+        yield* compactor.wake(ORDERS);
+        // The poll has loaded the manifest and is about to plan and launch a compaction of L0.
+        const pollGate = yield* holdNextLoad;
+        const polling = yield* Effect.forkChild(fire);
+        yield* Deferred.await(pollGate.loaded);
+        // An operator force-drops the oldest L0 SST meanwhile.
+        const dropping = yield* Effect.forkChild(
+          Effect.result(compactor.dropSst(ORDERS, { sstId: oldest.id, force: true })),
+        );
+        for (let step = 0; step < 100; step++) yield* Effect.yieldNow;
+        yield* Deferred.succeed(pollGate.resume, undefined);
+        yield* Fiber.join(polling);
+        const dropped = yield* Fiber.join(dropping);
+        const jobs = [...(yield* Ref.get(yield* CompactionLauncherRecord)).values()];
+        return {
+          drop:
+            dropped._tag === "Success"
+              ? "dropped"
+              : dropped.failure._tag === "SstDropRefusedError"
+                ? dropped.failure.reason
+                : dropped.failure._tag,
+          started: jobs.length,
+        };
+      }),
+    );
+    // The drop ran after the poll: the compaction it started reads the SST, so the drop is refused
+    // while it runs, or finds the SST already merged. It never drops an SST a started job reads.
+    expect(outcome.started).toBe(1);
+    expect(["CompactionRunning", "SstNotInManifestError"]).toContain(outcome.drop);
   });
 
   it("a poll never writes its older epoch over a fence-in that happened while it ran (D78)", async () => {

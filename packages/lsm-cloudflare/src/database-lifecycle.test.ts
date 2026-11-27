@@ -35,6 +35,7 @@ import {
 import { CompactorClientRecord, compactorClientTestLayer } from "./compactor-client.ts";
 import {
   DatabaseLifecycle,
+  type DatabaseLifecycleServices,
   databaseLifecycleLayerWithoutDependencies,
 } from "./database-lifecycle.ts";
 import { DbClient, type DbSnapshot, dbClientTestLayer } from "./db-client.ts";
@@ -1934,5 +1935,122 @@ describe("DatabaseLifecycle: gaps the mutation sweep found (D119)", () => {
     );
     expect(outcome.mismatch).toBe("ConfirmationMismatch");
     expect(outcome.matched).not.toBe("ConfirmationMismatch");
+  });
+});
+
+describe("a fork's hold deleted while the fork is being created (D116)", () => {
+  it("deleteCheckpoint between forkRange's hold and its first manifest cannot leave the fork without a hold", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const client = yield* DbClient;
+        const reader = yield* ManifestReader;
+        const store = yield* ManifestStore;
+        yield* lifecycle.create(SOURCE, {
+          keyRange: Option.none(),
+          databaseOptions: DEFAULT_DATABASE_OPTIONS,
+        });
+        yield* client.put(SOURCE, bytes("a"), bytes("A"));
+        const checkpoint = yield* lifecycle.createCheckpoint(SOURCE, {
+          name: Option.none(),
+          lifetimeMs: Option.none(),
+        });
+        // An operator's deleteCheckpoint of the new hold runs while forkRange awaits between
+        // committing the hold and writing the fork's first manifest (its fork does not exist yet).
+        let deleted = "not attempted";
+        const services = yield* Effect.context<DatabaseLifecycleServices>();
+        const racing = ManifestStore.of({
+          ...store,
+          initialize: (manifest) =>
+            Effect.gen(function* () {
+              if (manifest.databaseId === LEFT && deleted === "not attempted") {
+                const hold = (yield* reader.loadLatest(SOURCE)).manifest.checkpoints.find((cp) =>
+                  Option.contains(cp.holder, LEFT),
+                );
+                if (hold !== undefined) {
+                  const result = yield* Effect.result(
+                    lifecycle.deleteCheckpoint(SOURCE, hold.id).pipe(Effect.provide(services)),
+                  );
+                  deleted = result._tag === "Success" ? "deleted" : result.failure._tag;
+                }
+              }
+              return yield* store.initialize(manifest);
+            }).pipe(
+              Effect.catchTags({
+                ManifestReadError: (error) => Effect.die(error),
+                DatabaseNotFoundError: (error) => Effect.die(error),
+              }),
+            ),
+        });
+        const forking = Context.get(
+          yield* Layer.build(
+            Layer.fresh(databaseLifecycleLayerWithoutDependencies).pipe(
+              Layer.provide(blockSourceTestLayer),
+              Layer.provide(backgroundWorkTestLayer),
+              Layer.provide(Layer.succeed(ManifestStore, racing)),
+              Layer.provide(
+                Layer.succeedContext(yield* Effect.context<Layer.Success<typeof testLayer>>()),
+              ),
+            ),
+          ),
+          DatabaseLifecycle,
+        );
+        const forked = yield* Effect.result(
+          forking.forkRange({
+            source: SOURCE,
+            checkpointId: checkpoint.id,
+            range: LEFT_RANGE,
+            forkId: LEFT,
+          }),
+        );
+        const forkExists = Option.isSome(
+          yield* Effect.option(reader.loadLatest(LEFT)).pipe(
+            Effect.map(Option.flatMap(() => Option.some(true))),
+          ),
+        );
+        const holdLeft = (yield* reader.loadLatest(SOURCE)).manifest.checkpoints.some((cp) =>
+          Option.contains(cp.holder, LEFT),
+        );
+        return { deleted, forked: forked._tag, forkExists, holdLeft };
+      }),
+    );
+    // A fork that exists always has its hold on the source: either the deletion was refused, or the
+    // fork was not created.
+    expect(outcome.deleted).not.toBe("not attempted");
+    expect(!outcome.forkExists || outcome.holdLeft).toBe(true);
+  });
+
+  it("a hold whose fork was never created is deletable only once it is gcMinAge old", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const store = yield* ManifestStore;
+        yield* lifecycle.create(SOURCE, {
+          keyRange: Option.none(),
+          databaseOptions: DEFAULT_DATABASE_OPTIONS,
+        });
+        // A forkRange that committed its hold and died before the fork's first manifest.
+        const holdId = CheckpointId.make("01JD0000000000000000000HD9");
+        const now = Timestamp.make(yield* Clock.currentTimeMillis);
+        yield* store.update(SOURCE, (manifest, id) =>
+          addCheckpoint(manifest, {
+            id: holdId,
+            manifestId: id,
+            createdAt: now,
+            expireAt: Option.none(),
+            holder: Option.some(LEFT),
+            name: Option.none(),
+          }),
+        );
+        const young = yield* Effect.result(lifecycle.deleteCheckpoint(SOURCE, holdId));
+        yield* TestClock.adjust(HOUR);
+        const old = yield* Effect.result(lifecycle.deleteCheckpoint(SOURCE, holdId));
+        return {
+          young: young._tag === "Success" ? "deleted" : young.failure._tag,
+          old: old._tag === "Success" ? "deleted" : old.failure._tag,
+        };
+      }),
+    );
+    expect(outcome).toEqual({ young: "DatabaseHasDependentsError", old: "deleted" });
   });
 });

@@ -340,6 +340,12 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
         timeLimitSeconds: 120,
       },
       {
+        config: "Lifecycle.cfg",
+        broken: "beforeD116",
+        expect: "NoReaderNeedsDeleted",
+        timeLimitSeconds: 120,
+      },
+      {
         config: "LifecycleLiveness.cfg",
         broken: "none",
         expect: "pass",
