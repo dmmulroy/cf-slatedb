@@ -1830,3 +1830,83 @@ describe("DatabaseLifecycle: a thousand checkpoints and pinned snapshots (D99)",
     expect(outcome.read).toBe("B");
   }, 300_000);
 });
+
+describe("DatabaseLifecycle: gaps the mutation sweep found (D119)", () => {
+  it("deletes a hold whose holder no longer exists, for repair", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const client = yield* DbClient;
+        const reader = yield* ManifestReader;
+        const store = yield* ManifestStore;
+        yield* lifecycle.create(SOURCE, {
+          keyRange: Option.none(),
+          databaseOptions: DEFAULT_DATABASE_OPTIONS,
+        });
+        yield* client.put(SOURCE, bytes("a"), bytes("A"));
+        const checkpoint = yield* lifecycle.createCheckpoint(SOURCE, {
+          name: Option.none(),
+          lifetimeMs: Option.none(),
+        });
+        yield* lifecycle.forkRange({
+          source: SOURCE,
+          checkpointId: checkpoint.id,
+          range: LEFT_RANGE,
+          forkId: LEFT,
+        });
+        const hold = (yield* reader.loadLatest(SOURCE)).manifest.checkpoints.find((cp) =>
+          Option.contains(cp.holder, LEFT),
+        );
+        if (hold === undefined) return yield* Effect.die("the fork holds no checkpoint");
+        // The fork's removal stopped after marking it, before releasing its hold.
+        const removedAt = Timestamp.make(yield* Clock.currentTimeMillis);
+        yield* store.update(LEFT, (manifest) => markRemoved(manifest, removedAt));
+        const deleted = yield* Effect.result(lifecycle.deleteCheckpoint(SOURCE, hold.id));
+        return {
+          deleted: deleted._tag === "Success" ? "deleted" : deleted.failure._tag,
+          holdLeft: (yield* reader.loadLatest(SOURCE)).manifest.checkpoints.some(
+            (cp) => cp.id === hold.id,
+          ),
+        };
+      }),
+    );
+    expect(outcome).toEqual({ deleted: "deleted", holdLeft: false });
+  });
+
+  it("drops an SST only when confirm repeats its id", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const client = yield* DbClient;
+        const reader = yield* ManifestReader;
+        yield* lifecycle.create(SOURCE, {
+          keyRange: Option.none(),
+          databaseOptions: DEFAULT_DATABASE_OPTIONS,
+        });
+        yield* client.put(SOURCE, bytes("a"), bytes("A"));
+        yield* client.flush(SOURCE);
+        const sst = (yield* reader.loadLatest(SOURCE)).manifest.l0[0];
+        if (sst === undefined) return yield* Effect.die("the flush wrote no SST");
+        const mismatch = yield* Effect.flip(
+          lifecycle.dropSst(SOURCE, { sstId: sst.id, confirm: "not-the-id", force: true }),
+        );
+        const matched = yield* Effect.result(
+          lifecycle.dropSst(SOURCE, { sstId: sst.id, confirm: sst.id, force: true }),
+        );
+        return {
+          mismatch: mismatch._tag === "SstDropRefusedError" ? mismatch.reason : mismatch._tag,
+          // The test layer's compactor client does not run the drop; what matters is that the
+          // confirmation passed it on.
+          matched:
+            matched._tag === "Success"
+              ? "Success"
+              : matched.failure._tag === "SstDropRefusedError"
+                ? matched.failure.reason
+                : matched.failure._tag,
+        };
+      }),
+    );
+    expect(outcome.mismatch).toBe("ConfirmationMismatch");
+    expect(outcome.matched).not.toBe("ConfirmationMismatch");
+  });
+});
