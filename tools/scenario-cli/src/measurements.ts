@@ -1532,6 +1532,7 @@ export const measureHealth = (minutes: number) =>
       uploads: yield* named("ObjectStore.putMultipart"),
       failedCollections: yield* named("GarbageCollector.collect", "--error"),
       failedSweeps: yield* named("MaintenanceSweep.sweepPage", "--error"),
+      resumedSplits: yield* named("ShardSplit.resumePending"),
       errors: yield* spansSince(store, sinceMs, ["--error"]),
     });
     return { minutes, ...report, invocations };

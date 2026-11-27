@@ -28,6 +28,7 @@ const none: HealthSpans = {
   uploads: [],
   failedCollections: [],
   failedSweeps: [],
+  resumedSplits: [],
   errors: [],
 };
 
@@ -174,5 +175,18 @@ describe("summarizeHealth (D82)", () => {
       "GarbageCollector.collect": 1,
       "MaintenanceSweep.sweepPage": 1,
     });
+  });
+
+  it("reports a shard split a waiting request had to finish (D101)", () => {
+    const report = summarizeHealth([], {
+      ...none,
+      resumedSplits: [span("ShardSplit.resumePending", { "shard.resumed_split": "orders-0" })],
+    });
+    expect(report.issues).toEqual([
+      'abandoned shard splits were finished by a waiting request (orders-0): see docs/operations.md, "Shard splits"'.replace(
+        /^/,
+        "1 ",
+      ),
+    ]);
   });
 });

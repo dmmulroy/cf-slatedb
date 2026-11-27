@@ -131,7 +131,15 @@ export const makeShardRouter = Effect.gen(function* () {
   const refresh = Effect.fn("ShardRouter.refresh")(function* (group: ShardGroup) {
     const map = yield* directory.map(group);
     yield* remember(group, map);
-    yield* Effect.annotateCurrentSpan({ "shard.group": group, "shard.version": map.version });
+    yield* Effect.annotateCurrentSpan({
+      "shard.group": group,
+      "shard.version": map.version,
+      // A split still pending shows here (D101); `measure health` reports one that a request had
+      // to finish (`ShardSplit.resumePending`).
+      ...(Option.isSome(map.pendingSplit)
+        ? { "shard.pending_split": map.pendingSplit.value.databaseId }
+        : {}),
+    });
     return map;
   });
   const mapFor = (group: ShardGroup) =>

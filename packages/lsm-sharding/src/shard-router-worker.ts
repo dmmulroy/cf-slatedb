@@ -61,7 +61,11 @@ import {
   ShardRouter,
   shardRouterLayerWithoutDependencies,
 } from "./shard-router.ts";
-import { ShardSplit, shardSplitLayerWithoutDependencies } from "./shard-split.ts";
+import {
+  ShardSplit,
+  shardSplitLayerWithoutDependencies,
+  withAbandonedSplitFinished,
+} from "./shard-split.ts";
 
 /**
  * A database operation behind the router failed in a way retrying may fix (storage, backpressure,
@@ -218,6 +222,10 @@ const shardedHttpHandlersLayer = HttpApiBuilder.group(ShardedHttpApi, "groups", 
     const splitter = yield* ShardSplit;
     const directory = yield* ShardDirectory;
     const lifecycle = yield* DatabaseLifecycle;
+    const finishingAbandonedSplit = <A, E extends { readonly _tag: string }, R>(
+      group: ShardGroup,
+      request: () => Effect.Effect<A, E, R>,
+    ) => withAbandonedSplitFinished(splitter, group, request);
     return handlers
       .handle("create", ({ params, payload }) =>
         shardedFailures(
@@ -234,31 +242,39 @@ const shardedHttpHandlersLayer = HttpApiBuilder.group(ShardedHttpApi, "groups", 
       )
       .handle("map", ({ params }) => shardedFailures(router.refresh(params.group)))
       .handle("put", ({ params, payload }) =>
-        shardedFailures(router.put(params.group, payload.key, payload.value)),
+        shardedFailures(
+          finishingAbandonedSplit(params.group, () =>
+            router.put(params.group, payload.key, payload.value),
+          ),
+        ),
       )
       .handle("delete", ({ params, payload }) =>
-        shardedFailures(router.delete(params.group, payload.key)),
+        shardedFailures(
+          finishingAbandonedSplit(params.group, () => router.delete(params.group, payload.key)),
+        ),
       )
       .handle("get", ({ params, payload }) =>
         shardedFailures(
-          router
-            .get(params.group, payload.key, {
+          finishingAbandonedSplit(params.group, () =>
+            router.get(params.group, payload.key, {
               consistency: { _tag: "Latest" },
               snapshot: Option.none(),
               refuseSealed: true,
-            })
-            .pipe(Effect.map((value) => ({ value }))),
+            }),
+          ).pipe(Effect.map((value) => ({ value }))),
         ),
       )
       .handle("scan", ({ params, payload }) =>
         shardedFailures(
-          Stream.runCollect(
-            router.scan(params.group, payload.range, {
-              consistency: { _tag: "Latest" },
-              snapshot: Option.none(),
-              refuseSealed: true,
-              limit: Option.some(payload.limit),
-            }),
+          finishingAbandonedSplit(params.group, () =>
+            Stream.runCollect(
+              router.scan(params.group, payload.range, {
+                consistency: { _tag: "Latest" },
+                snapshot: Option.none(),
+                refuseSealed: true,
+                limit: Option.some(payload.limit),
+              }),
+            ),
           ).pipe(
             Effect.map((rows) => ({
               rows: rows.flatMap((row) =>
