@@ -1,4 +1,5 @@
 import {
+  type CompactionJob,
   DatabaseId,
   DEFAULT_DATABASE_OPTIONS,
   fenceCompactor,
@@ -1083,6 +1084,131 @@ describe("Compactor alarm retries (D102)", () => {
       // Recovered: the poll started the compaction it could not plan while the manifest was down.
       compacting: 1,
       afterReset: 1_000,
+    });
+  });
+});
+
+describe("Compactor edges (mutation sweep, D127)", () => {
+  it("destroy cancels the alarm and clears the stored state, so the object never wakes again", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createWithL0(ORDERS, 1);
+        const { compactor, alarm, cell } = yield* startCompactor;
+        yield* compactor.wake(ORDERS);
+        const before = [Option.isSome(yield* alarm.scheduled), Option.isSome(yield* cell.get)];
+        yield* compactor.destroy(ORDERS);
+        return {
+          before,
+          after: [Option.isSome(yield* alarm.scheduled), Option.isSome(yield* cell.get)],
+        };
+      }),
+    );
+    expect(outcome).toEqual({ before: [true, true], after: [false, false] });
+  });
+
+  it("tells a collection when the oldest of several running jobs started, whatever their order (D96)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createWithL0(ORDERS, 4);
+        const collector = yield* GarbageCollector;
+        const told: Array<Option.Option<Timestamp>> = [];
+        const recordingCollector = GarbageCollector.of({
+          collect: (databaseId, oldestRunningJobStartedAt) =>
+            Effect.sync(() => told.push(oldestRunningJobStartedAt)).pipe(
+              Effect.andThen(collector.collect(databaseId, oldestRunningJobStartedAt)),
+            ),
+          collectLeftovers: collector.collectLeftovers,
+        });
+        const heldLauncher = CompactionLauncher.of({
+          start: () => Effect.void,
+          progress: () => Effect.succeed({ _tag: "Running" as const }),
+        });
+        return yield* Effect.gen(function* () {
+          const orders = yield* startCompactor;
+          yield* TestClock.setTime(10_000);
+          yield* orders.compactor.wake(ORDERS);
+          yield* orders.fire;
+          const state = Option.getOrThrow(yield* orders.cell.get);
+          const [oldest] = state.running;
+          if (oldest === undefined) return { told, oldest: -1 };
+          // A newer job listed first: the oldest start is not the first one.
+          yield* orders.cell.set({
+            ...state,
+            running: [
+              { ...oldest, jobId: "newer", startedAt: Timestamp.make(oldest.startedAt + 5_000) },
+              oldest,
+            ],
+          });
+          yield* orders.compactor.collect(ORDERS);
+          return { told, oldest: oldest.startedAt };
+        }).pipe(
+          Effect.provideService(CompactionLauncher, heldLauncher),
+          Effect.provideService(GarbageCollector, recordingCollector),
+        );
+      }),
+    );
+    expect(outcome.told.at(-1)).toEqual(Option.some(outcome.oldest));
+    expect(outcome.oldest).toBe(10_000);
+  });
+
+  it("drops a sorted run's SST, refused only while a job reads that same run (D62, D127)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createWithL0(ORDERS, 4);
+        const reader = yield* ManifestReader;
+        const { compactor, fire, cell } = yield* startCompactor;
+        yield* compactor.wake(ORDERS);
+        yield* fire;
+        for (let poll = 0; poll < 3; poll++) {
+          yield* TestClock.adjust("5 seconds");
+          yield* fire;
+        }
+        const compacted = (yield* reader.loadLatest(ORDERS)).manifest;
+        const [runSst] = compacted.sortedRuns[0]?.ssts ?? [];
+        if (runSst === undefined) return yield* Effect.die("expected one sorted run");
+        const state = Option.getOrThrow(yield* cell.get);
+        const runningOver = (sources: CompactionJob["sources"]) =>
+          cell.set({
+            ...state,
+            running: [
+              {
+                jobId: "job",
+                job: { sources, destination: SortedRunId.make(9), isBottom: true },
+                budgetGroup: ORDERS,
+                startedAt: Timestamp.make(0),
+                lastProgressAt: Option.none(),
+              },
+            ],
+          });
+        const drop = Effect.result(compactor.dropSst(ORDERS, { sstId: runSst.id, force: true }));
+        const outcomeOf = (
+          result: Result.Result<unknown, { readonly _tag: string; readonly reason?: unknown }>,
+        ) =>
+          Result.isSuccess(result)
+            ? "dropped"
+            : `${result.failure._tag}:${String(result.failure.reason)}`;
+        yield* runningOver([
+          { _tag: "SortedRun", id: compacted.sortedRuns[0]?.id ?? SortedRunId.make(0) },
+        ]);
+        const sameRun = outcomeOf(yield* drop);
+        // Another run, and an L0 source that happens to carry the same id, read other files.
+        yield* runningOver([
+          { _tag: "SortedRun", id: SortedRunId.make(7) },
+          { _tag: "L0", sstId: runSst.id },
+        ]);
+        const dropped = yield* drop;
+        const after = (yield* reader.loadLatest(ORDERS)).manifest;
+        return {
+          sameRun,
+          dropped: Result.isSuccess(dropped) ? dropped.success.dropped.from : outcomeOf(dropped),
+          runs: after.sortedRuns.length,
+        };
+      }),
+    );
+    expect(outcome).toEqual({
+      sameRun: "SstDropRefusedError:CompactionRunning",
+      dropped: { _tag: "SortedRun", id: 0 },
+      runs: 0,
     });
   });
 });
