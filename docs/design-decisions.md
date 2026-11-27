@@ -5463,3 +5463,90 @@ trims, and GC of old manifests can happen between any two steps of a scanner.
 the overtaken segment, and it must. A first draft that resumed at the overtaken segment failed
 `LatestPageAtSnapshot`. An earlier key examined at the old snapshot had found nothing, and
 returned nothing, but had a value at the new one.
+
+## D134. A transient R2 read failure does not reach the caller
+
+**Found by the 130-minute release soak** on `preview-1` at `d89beba`. One ranged read in the
+`BlockServer` failed with R2's "We encountered an internal error. Please try again. (10001)",
+21 ms in. The read reached the client as a 503 (`ReaderUnavailable`, retryable). The client's retry
+answered, so no data check failed. But the gate counted five error spans, one per layer:
+`ObjectStoreUnavailableError`, `BlockStorageUnavailableError`, `BlockSourceUnavailableError`,
+`ReaderUnavailableError`, `HttpServerError`.
+
+**Why.**
+
+- **The `BlockServer`'s reader did not retry.** `ObjectReader` (the read-only binding it reads
+  through) mapped the first failure to an error. `ObjectStore` retried, but every error alike:
+  three retries from 50 ms, a range past the end included.
+- **The hedge gave up on a failed arm** (D72's stated choice). A `BlockServer` failure failed the
+  read even with the bucket read in flight or about to start.
+
+**The rule.**
+
+- **Idempotent reads retry transient failures, in one span** (`retryTransientRead`,
+  `object-store.ts`). This covers `ObjectStore`'s `get`, `getRange`, `getVersioned`, `head`,
+  `list`, `listPrefixes`, and `ObjectReader`'s `get`, `getRange`. Each retry covers the request
+  and its body.
+  - **What counts as transient.** Cloudflare's R2 error codes
+    (https://developers.cloudflare.com/r2/api/error-codes/, "Service errors"): 10001
+    InternalError, 10043 ServiceUnavailable, 10054 ClientDisconnect, 10058 TooManyRequests. A
+    binding failure with no code, such as "Network connection lost.", also counts. The Workers
+    binding puts the code in parentheses at the end of the message, and Alchemy's `R2Error` keeps
+    the message.
+  - **What is not retried.** Every other code is a fact about the request: 10039 InvalidRange,
+    10031 PreconditionFailed, 10020, and the authorization codes. A missing object is not an
+    error (`get` and `head` return null). Interruption is not a failure.
+  - **The count and the delays** (`R2_READ_RETRIES` = 2): 25 ms, then 50 ms, jittered. A block
+    read costs about 20 ms, and a get's p99 is about 350 ms on `preview-3`. So a read that would
+    have failed takes at most about 150 ms more. At R2's observed rate (about 1 in 150,000), a
+    read then fails once in about 10^15 reads, if failures are independent.
+- **Marked, not an error.** The read's span ends ok and carries `object.read_retried`, the number
+  of retries; a read that failed every attempt carries it too. It is exported under the `object.`
+  namespace, which the trace policy test lists.
+- **`measure health` reports retried reads** as `objectReads` (reads, retried, rate). They become
+  an issue above 0.1% of reads, with at least 10 retried:
+  - one in 10,000 is noise, about 15 times R2's normal rate;
+  - one in 100 is not, because a retry's 25–75 ms then reaches the read p99, and failures that
+    come together start to exhaust the retries;
+  - 0.1% sits ten times below that, and the minimum of 10 keeps a short run from judging a rate.
+- **The hedge keeps the other arm** (`hedgedBlockRead`). A failed arm leaves the answer to the
+  other. If the `BlockServer` fails before the hedge delay, the bucket read starts at once
+  (`block.primary_failed`). The read fails only when both arms failed, and then with the
+  `BlockServer`'s error. A Stack without Workers Cache has no hedge, and there the `BlockServer`'s
+  own retry is what protects the read.
+  - **Nothing from a failed read is cached.** The `BlockServer`'s 503 is `no-store` (read audit,
+    `block-server.test.ts`), and the L1 cache keeps only successes ("never keeps a failed read").
+- **Writes are unchanged.** Writes and deletes keep their own three retries. A conditional write
+  or create whose response was lost may find its own write on the retry, and each caller reads
+  the result (D85, D113). Multipart parts retry and are checked (D62).
+- **Still visible to the caller.** After the retries, the caller gets the retryable
+  `StorageUnavailable` (`ReaderUnavailable` for reads), as before (`docs/errors.md`).
+- **The write path.**
+  - A flush that meets a failure is retried by its alarm (D102), and its uploads become orphans
+    that GC removes.
+  - A compaction is a Workflow step per output SST (at most `compactionOutputSstSize`, 64 MiB)
+    plus prepare and commit. Each step retries five times from 5 s, and only that step's work is
+    lost. With each read retried, a step of thousands of reads fails at R2's rate about once in
+    10^11, so a 10 GiB merge does not stall under a small steady error rate.
+- **The soak's expected-error list is unchanged.** After D134 these errors mean a read failed
+  three times, which should fail the gate.
+
+**Tests:**
+
+- `object-store.test.ts`: six read kinds, with a transient failure on the first attempt and on
+  every attempt; a non-transient failure; the classification.
+- `object-reader.test.ts`.
+- `block-source.test.ts`: one arm failed before and during the hedge, and both failed.
+- `fault-injection-transient.test.ts`: the read path's kinds, a `Flushed` manifest refresh, a
+  flush, and every attempt failing.
+- `health-report.test.ts`.
+
+**Mutations, each caught:**
+
+- no retries;
+- every failure retried;
+- no attribute;
+- a code-less failure not transient;
+- the reader without the retry;
+- a failed primary ending the read;
+- a failed primary not starting the bucket read.

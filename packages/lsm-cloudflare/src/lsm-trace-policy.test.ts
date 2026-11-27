@@ -40,6 +40,7 @@ describe("isExportedSpanAttribute (D63)", () => {
       "object.parts_unverified",
       // The health report reads these (D82).
       "object.part_retried",
+      "object.read_retried",
       "writer.stall_reason",
       "compactor.fenced",
       "compactor.refenced",

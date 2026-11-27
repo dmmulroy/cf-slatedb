@@ -412,6 +412,14 @@ hand-off is below.
 ## Remaining-work log
 
 - **D131, D133 (formal round 2, 2026-11-26).** D131: a commit makes sure an alarm exists before its
+- **D134 (r2-transient, 2026-11-27).** One transient R2 read failure (10001) in the 130-minute soak
+  reached its caller as a 503. The cause: the `BlockServer`'s `ObjectReader` did not retry, and
+  the hedge gave up on a failed arm. Now idempotent reads retry R2's transient codes twice inside
+  their span (`object.read_retried`), the hedge fails only when both arms failed, and
+  `measure health` reports retried reads, an issue above 0.1%. Tests: `object-store.test.ts`,
+  `object-reader.test.ts`, `block-source.test.ts`, `fault-injection-transient.test.ts`,
+  `health-report.test.ts`. Seven mutations caught. `vp check` exit 0.
+- **D131, D116 (formal round 2, 2026-11-26).** D131: a commit makes sure an alarm exists before its
   rows reach SQLite, so `WriterObject`'s `AlarmCovers` has no exception; two tests in
   `db-writer.test.ts`; 16 `writer-object` runs. D133: `PagedScan.tla` (4 runs) models Latest
   segments, budget-limited pages, and transaction pages with the phantom rule.

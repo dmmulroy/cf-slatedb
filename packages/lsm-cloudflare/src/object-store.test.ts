@@ -19,7 +19,9 @@ import {
   objectStoreLayerWithoutDependencies,
   objectStoreTestLayer,
   objectStoreWithTransitCorruptionTestLayer,
+  isTransientR2Error,
   PART_INTEGRITY_ATTEMPTS,
+  R2_READ_RETRIES,
   toUniformParts,
   uploadPartVerified,
 } from "./object-store.ts";
@@ -298,5 +300,140 @@ describe("ObjectStore.delete against R2's limits (Workflow audit)", () => {
     bucket.heal();
     await Effect.runPromise(bucket.withStore((store) => store.delete(keys)));
     expect(bucket.stored.size).toBe(0);
+  });
+});
+
+describe("transient R2 read failures are retried inside the read (D134)", () => {
+  const TRANSIENT = "get: We encountered an internal error. Please try again. (10001)";
+  /**
+   * A bucket whose read operations fail with `message` on their first `failures` calls (per
+   * operation), then succeed. Writes and deletes are out of scope and die.
+   */
+  const flakyBucket = (failures: number, message: string) => {
+    const calls = { get: 0, head: 0, list: 0 };
+    const fail = (operation: keyof typeof calls) =>
+      calls[operation]++ < failures
+        ? Effect.fail(new Cloudflare.R2.R2Error({ message, cause: new Error(message) }))
+        : undefined;
+    const object: Cloudflare.R2.R2Object = {
+      key: "k",
+      version: "v1",
+      size: 3,
+      etag: "v1",
+      httpEtag: '"v1"',
+      checksums: { toJSON: () => ({}) },
+      uploaded: new Date(0),
+      storageClass: "Standard",
+      writeHttpMetadata: () => Effect.void,
+    };
+    const body: Cloudflare.R2.ObjectBody = {
+      ...object,
+      body: Stream.make(Uint8Array.of(1, 2, 3)),
+      bodyUsed: false,
+      arrayBuffer: () => Effect.succeed(Uint8Array.of(1, 2, 3).buffer),
+      bytes: () => Effect.succeed(Uint8Array.of(1, 2, 3)),
+      text: () => Effect.succeed(""),
+      json: () => Effect.die(new Error("not used by this test")),
+      blob: () => Effect.die(new Error("not used by this test")),
+    };
+    const listing: Cloudflare.R2.Objects = { objects: [], delimitedPrefixes: [], truncated: false };
+    const outOfScope = () => Effect.die(new Error("not used by this test"));
+    const bucket = LsmBucketClient.of({
+      raw: outOfScope(),
+      get: () => Effect.suspend(() => fail("get") ?? Effect.succeed(body)),
+      head: () => Effect.suspend(() => fail("head") ?? Effect.succeed(object)),
+      list: () => Effect.suspend(() => fail("list") ?? Effect.succeed(listing)),
+      put: outOfScope,
+      delete: outOfScope,
+      createMultipartUpload: outOfScope,
+      resumeMultipartUpload: outOfScope,
+    });
+    return { bucket, calls };
+  };
+  const reads: ReadonlyArray<
+    readonly [
+      string,
+      keyof ReturnType<typeof flakyBucket>["calls"],
+      (store: ObjectStore["Service"]) => Effect.Effect<unknown, unknown, RuntimeContext>,
+    ]
+  > = [
+    ["get", "get", (store) => store.get("k")],
+    ["getRange", "get", (store) => store.getRange("k", { offset: 0, length: 3 })],
+    ["getVersioned", "get", (store) => store.getVersioned("k")],
+    ["head", "head", (store) => store.head("k")],
+    ["list", "list", (store) => store.list("db/", Option.none())],
+    ["listPrefixes", "list", (store) => store.listPrefixes("db/", Option.none(), 10)],
+  ];
+  const runRead = (
+    failures: number,
+    message: string,
+    read: (store: ObjectStore["Service"]) => Effect.Effect<unknown, unknown, RuntimeContext>,
+  ) => {
+    const flaky = flakyBucket(failures, message);
+    const spans: Array<Tracer.NativeSpan> = [];
+    const tracer = Tracer.make({
+      span: (options) => {
+        const span = new Tracer.NativeSpan(options);
+        spans.push(span);
+        return span;
+      },
+    });
+    return Effect.gen(function* () {
+      const store = yield* ObjectStore;
+      return yield* Effect.result(read(store));
+    }).pipe(
+      Effect.provide(objectStoreLayerWithoutDependencies),
+      Effect.provideService(LsmBucketClient, flaky.bucket),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.withTracer(tracer),
+      Effect.runPromise,
+      (promise) =>
+        promise.then((result) => {
+          const span = spans.find((candidate) => candidate.name.startsWith("ObjectStore."));
+          return {
+            result: result._tag,
+            calls: flaky.calls,
+            retried: span?.attributes.get("object.read_retried"),
+            spanOk: span?.status._tag === "Ended" && span.status.exit._tag === "Success",
+          };
+        }),
+    );
+  };
+
+  for (const [name, operation, read] of reads) {
+    it(`${name}: one transient failure is retried, and the span ends ok, marked`, async () => {
+      const outcome = await runRead(1, TRANSIENT, read);
+      expect(outcome).toMatchObject({ result: "Success", retried: 1, spanOk: true });
+      expect(outcome.calls[operation]).toBe(2);
+    });
+    it(`${name}: a transient failure on every attempt fails after ${R2_READ_RETRIES} retries`, async () => {
+      const outcome = await runRead(Number.POSITIVE_INFINITY, TRANSIENT, read);
+      expect(outcome).toMatchObject({ result: "Failure", retried: R2_READ_RETRIES, spanOk: false });
+      expect(outcome.calls[operation]).toBe(R2_READ_RETRIES + 1);
+    });
+  }
+
+  it("a failure that is a fact about the request (a range past the end) is not retried", async () => {
+    const outcome = await runRead(
+      Number.POSITIVE_INFINITY,
+      "get: The requested range is not satisfiable (10039)",
+      (store) => store.getRange("k", { offset: 10, length: 3 }),
+    );
+    expect(outcome).toMatchObject({ result: "Failure", retried: undefined });
+    expect(outcome.calls.get).toBe(1);
+  });
+
+  it("names the transient R2 failures: service codes and code-less binding failures", () => {
+    expect(
+      [
+        TRANSIENT,
+        "get: Service Unavailable (10043)",
+        "put: Reduce your concurrent request rate for the same object. (10058)",
+        "Network connection lost.",
+        "get: The requested range is not satisfiable (10039)",
+        "put: Precondition Failed (10031)",
+        "get: Unauthorized (10002)",
+      ].map((message) => isTransientR2Error({ message })),
+    ).toEqual([true, true, true, true, false, false, false]);
   });
 });

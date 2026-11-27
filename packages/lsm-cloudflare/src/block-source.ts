@@ -3,7 +3,17 @@ import type * as cf from "@cloudflare/workers-types";
 import type { DatabaseId, SstId } from "@shaledb/lsm-core";
 import { makeExecutionMemo } from "alchemy/Runtime/ExecutionMemo";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
-import { Context, Data, Duration, Effect, Layer, Option, type Scope } from "effect";
+import {
+  Cause,
+  Context,
+  Data,
+  Deferred,
+  Duration,
+  Effect,
+  Layer,
+  Option,
+  type Scope,
+} from "effect";
 import { HttpClient } from "effect/http";
 import { HttpApiClient } from "effect/http-api";
 
@@ -254,18 +264,23 @@ const readSstRangeFromBucket =
     );
 
 /**
- * `primary`, and once it has taken `hedgeAfterMs`, `direct` as well: whichever succeeds first.
+ * `primary`, and once it has taken `hedgeAfterMs` or failed, `direct` as well: whichever succeeds
+ * first.
  *
  * **Details**
  *
  * `primary` is a read through the `BlockServer`. Workers Cache answers most of them in a few
  * milliseconds, but the slowest take hundreds of milliseconds to seconds (a miss pays the hop
  * to the `BlockServer` on top of its bucket read; a rare hit is slow). `direct` reads the same
- * immutable bytes from the bucket, which costs one more bucket read only when `primary` is slow.
+ * immutable bytes from the bucket, which costs one more bucket read only when `primary` is slow
+ * or failed.
  *
- * Only a success of `direct` counts. Its failures leave the outcome to `primary`, so a hedge never
- * makes a read fail that `primary` would have answered, and every failure a caller sees is
- * `primary`'s. The loser is interrupted. With `hedgeAfterMs` 0 this is `primary`.
+ * A failed arm leaves the answer to the other (D134; before it, a `primary` failure failed the
+ * read even with `direct` in flight). When `primary` fails before the hedge delay, `direct`
+ * starts at once (`block.primary_failed`). The read fails only when both have failed, and then
+ * with `primary`'s failure, so every failure a caller sees is still the `BlockServer`'s. The
+ * loser is interrupted. With `hedgeAfterMs` 0 this is `primary`: a Stack without Workers Cache,
+ * where the `BlockServer`'s own retry of R2's transient failures (D134) protects the read.
  */
 export const hedgedBlockRead = <A, E, R, E2, R2>(
   primary: Effect.Effect<A, E, R>,
@@ -274,15 +289,28 @@ export const hedgedBlockRead = <A, E, R, E2, R2>(
 ): Effect.Effect<A, E, R | R2> =>
   hedgeAfterMs <= 0
     ? primary
-    : Effect.raceFirst(
-        primary,
-        Effect.sleep(Duration.millis(hedgeAfterMs)).pipe(
+    : Effect.gen(function* () {
+        const primaryFailed = yield* Deferred.make<Cause.Cause<E>>();
+        // A failed primary does not end the race: it hands its cause to the direct arm.
+        const primaryArm = primary.pipe(
+          Effect.catchCause((cause) =>
+            Deferred.succeed(primaryFailed, cause).pipe(Effect.andThen(Effect.never)),
+          ),
+        );
+        const directArm = Effect.raceFirst(
+          Effect.sleep(Duration.millis(hedgeAfterMs)),
+          Deferred.await(primaryFailed).pipe(
+            Effect.andThen(Effect.annotateCurrentSpan("block.primary_failed", true)),
+          ),
+        ).pipe(
           Effect.andThen(Effect.annotateCurrentSpan("block.hedged", true)),
           Effect.andThen(direct),
           Effect.tap(() => Effect.annotateCurrentSpan("block.hedge_won", true)),
-          Effect.catch(() => Effect.never),
-        ),
-      );
+          // Both failed: the read fails with the BlockServer's failure.
+          Effect.catchCause(() => Effect.flatMap(Deferred.await(primaryFailed), Effect.failCause)),
+        );
+        return yield* Effect.raceFirst(primaryArm, directArm);
+      });
 
 /**
  * `blockServer` with each block and metadata read hedged by a read straight from the contextual

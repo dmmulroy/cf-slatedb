@@ -88,29 +88,63 @@ describe("hedgedBlockRead", () => {
     expect(answer).toBe("server");
   });
 
-  it("a BlockServer failure is the read's failure, before or after the hedge started", async () => {
+  const failAfter = (millis: number, log: Array<string>) =>
+    Effect.sleep(millis).pipe(
+      Effect.andThen(Effect.sync(() => log.push(`server failed at ${millis}`))),
+      Effect.andThen(Effect.fail(`server failed at ${millis}`)),
+    );
+
+  it("a BlockServer failure before the hedge delay starts the bucket read at once, which answers (D134)", async () => {
     const log: Array<string> = [];
     const outcome = await run(
       Effect.gen(function* () {
-        const failAfter = (millis: number) =>
-          Effect.sleep(millis).pipe(Effect.andThen(Effect.fail(`server failed at ${millis}`)));
-        const early = yield* Effect.forkChild(
-          Effect.result(hedgedBlockRead(failAfter(10), readAfter(40, "bucket", log), 50)),
+        const read = yield* Effect.forkChild(
+          Effect.result(hedgedBlockRead(failAfter(10, log), readAfter(5, "bucket", log), 50)),
         );
         yield* TestClock.adjust("10 millis");
-        const beforeHedge = yield* Fiber.join(early);
-        const startedBeforeHedge = log.length;
-        const late = yield* Effect.forkChild(
-          Effect.result(hedgedBlockRead(failAfter(70), readAfter(500, "bucket", log), 50)),
-        );
-        yield* TestClock.adjust("70 millis");
-        return { beforeHedge, startedBeforeHedge, afterHedge: yield* Fiber.join(late) };
+        const atFailure = [...log];
+        yield* TestClock.adjust("5 millis");
+        return { atFailure, answer: yield* Fiber.join(read) };
       }),
     );
-    expect(outcome.beforeHedge).toEqual(Result.fail("server failed at 10"));
-    expect(outcome.startedBeforeHedge).toBe(0);
-    expect(outcome.afterHedge).toEqual(Result.fail("server failed at 70"));
-    expect(log).toEqual(["bucket started", "bucket interrupted"]);
+    expect(outcome.atFailure).toEqual(["server failed at 10", "bucket started"]);
+    expect(outcome.answer).toEqual(Result.succeed("bucket"));
+  });
+
+  it("a BlockServer failure while the bucket read is in flight leaves the answer to it (D134)", async () => {
+    const log: Array<string> = [];
+    const answer = await run(
+      Effect.gen(function* () {
+        const read = yield* Effect.forkChild(
+          Effect.result(hedgedBlockRead(failAfter(70, log), readAfter(500, "bucket", log), 50)),
+        );
+        yield* TestClock.adjust("550 millis");
+        return yield* Fiber.join(read);
+      }),
+    );
+    expect(answer).toEqual(Result.succeed("bucket"));
+    expect(log).toEqual(["bucket started", "server failed at 70"]);
+  });
+
+  it("fails only when both arms failed, with the BlockServer's failure (D134)", async () => {
+    const log: Array<string> = [];
+    const outcome = await run(
+      Effect.gen(function* () {
+        const bucketFails = Effect.sleep(20).pipe(Effect.andThen(Effect.fail("bucket failed")));
+        const early = yield* Effect.forkChild(
+          Effect.result(hedgedBlockRead(failAfter(10, log), bucketFails, 50)),
+        );
+        const late = yield* Effect.forkChild(
+          Effect.result(hedgedBlockRead(failAfter(100, log), bucketFails, 50)),
+        );
+        yield* TestClock.adjust("200 millis");
+        return { early: yield* Fiber.join(early), late: yield* Fiber.join(late) };
+      }),
+    );
+    expect(outcome).toEqual({
+      early: Result.fail("server failed at 10"),
+      late: Result.fail("server failed at 100"),
+    });
   });
 
   it("never reads the bucket when the hedge delay is 0", async () => {
