@@ -31,6 +31,7 @@ import { DurableObjectAlarm, durableObjectAlarmTestLayer } from "./durable-objec
 import { GarbageCollector, makeGarbageCollector } from "./garbage-collector.ts";
 import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
 import { ManifestReader } from "./manifest-reader.ts";
+import { ManifestStore } from "./manifest-store.ts";
 import { databasePrefix, manifestKey, manifestPrefix } from "./object-keys.ts";
 import { ObjectStore, ObjectStoreUnavailableError, objectStoreTestLayer } from "./object-store.ts";
 import { sstStoreLayerWithoutDependencies } from "./sst-store.ts";
@@ -646,6 +647,13 @@ describe("DatabaseLifecycle", () => {
           ),
         );
         yield* Ref.set(faults, { ...NO_STORE_FAULTS, hideGet: (key) => beforeRewrite.has(key) });
+        // Above GC's manifest boundary nothing but a removal deletes a manifest, so the collection
+        // fails, deleting and releasing nothing (D83).
+        const unexplained = yield* Effect.flip(gc.collect(LEFT));
+        const whileUnexplained = yield* holdsAndRefs;
+        // A later collection moved the boundary past them and deleted them: this one goes on
+        // without them, and still releases nothing, because it cannot know what they named.
+        yield* (yield* ManifestStore).advanceManifestBoundary(LEFT, ManifestId.make(rewriteId - 1));
         yield* gc.collect(LEFT);
         const whileMissing = yield* holdsAndRefs;
         // Their loads fail instead: the collection fails, and releases nothing either.
@@ -656,9 +664,18 @@ describe("DatabaseLifecycle", () => {
         yield* Ref.set(faults, NO_STORE_FAULTS);
         yield* TestClock.adjust(HOUR);
         yield* left.runDue;
-        return { whileMissing, failed: failed._tag, whileFailing, after: yield* holdsAndRefs };
+        return {
+          unexplained: unexplained._tag,
+          whileUnexplained,
+          whileMissing,
+          failed: failed._tag,
+          whileFailing,
+          after: yield* holdsAndRefs,
+        };
       }),
     );
+    expect(outcome.unexplained).toBe("GarbageCollectorUnavailableError");
+    expect(outcome.whileUnexplained).toEqual({ holds: 1, refs: 1 });
     expect(outcome.whileMissing).toEqual({ holds: 1, refs: 1 });
     expect(outcome.failed).toBe("GarbageCollectorUnavailableError");
     expect(outcome.whileFailing).toEqual({ holds: 1, refs: 1 });
