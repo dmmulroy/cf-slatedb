@@ -18,7 +18,7 @@ import {
   sortRows,
 } from "./lsm-core-arbitraries.ts";
 import { MERGE_OPERATORS, resolveVisibleRow } from "./row-resolution.ts";
-import type { Row } from "./row.ts";
+import { type Row, RowValue } from "./row.ts";
 import {
   blocksOverlappingRange,
   decodeSstMeta,
@@ -203,6 +203,44 @@ describe("SST codec and read path", () => {
         meta.index.reduce((sum, entry) => sum + entry.length, 0) === info.metaOffset
       );
     });
+  });
+
+  it("keeps an SST's metadata a small fraction of its data, whatever its key size (D107)", () => {
+    // Rows of long keys (up to MAX_KEY_BYTES, 16 KiB) and short values, as a database keyed by
+    // long paths or composite keys holds. 4 MiB of rows each, with production's 16 KiB blocks.
+    const fractions: Array<readonly [number, number]> = [];
+    for (const keyBytes of [16, 1024, 4096, 16 * 1024]) {
+      const rows: Array<Row> = [];
+      const count = Math.ceil((4 * 1024 * 1024) / (keyBytes + 16));
+      for (let index = 0; index < count; index++) {
+        const key = new Uint8Array(keyBytes).fill(0x61);
+        key[0] = index >> 16;
+        key[1] = (index >> 8) & 0xff;
+        key[2] = index & 0xff;
+        rows.push({
+          key,
+          seq: SeqNum.make(index + 1),
+          value: RowValue.Value({ bytes: new Uint8Array(16).fill(1) }),
+          createTs: Option.none(),
+          expireTs: Option.none(),
+        });
+      }
+      const { bytes, info } = buildSst(rows, 16 * 1024);
+      fractions.push([keyBytes, Math.round((info.metaLength / info.metaOffset) * 1000) / 1000]);
+      // Still readable: every key is found through the index.
+      const meta = openSst(bytes, info.metaOffset);
+      const last = rows.at(-1);
+      if (last === undefined) throw new Error("no rows");
+      const found = firstBlockForKey(meta, last.key);
+      expect(Option.isSome(found)).toBe(true);
+    }
+    // The metadata is read whole by every reader of the SST and held in its L1 cache: at most a
+    // sixteenth of the data (Bloom filter and index), 4 MiB for a 64 MiB SST. Before D107 it was
+    // 50% at 4 KiB keys and 200% at 16 KiB.
+    expect(
+      fractions.every(([, fraction]) => fraction <= 1 / 16),
+      JSON.stringify(fractions),
+    ).toBe(true);
   });
 
   it("lists the blocks a key range overlaps", () => {

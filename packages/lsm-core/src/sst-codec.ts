@@ -107,6 +107,17 @@ const encodeSection = (body: Uint8Array): Uint8Array => {
  * {@link rowOrder}; changelog SSTs in {@link changelogRowOrder}. {@link add} returns each data block
  * as soon as it closes; {@link finish} returns the last block and the metadata section.
  */
+/**
+ * How many bytes of rows a data block holds, at least, per byte of the keys its index entry
+ * records (its first and last key). An index entry holds both keys, so with 16 KiB blocks and long
+ * keys the index grew to twice the data at 16 KiB keys (`MAX_KEY_BYTES`): 128 MiB of metadata for
+ * a 64 MiB SST, which every reader and the writer's flush hold at once. Holding blocks open to 32
+ * times their keys bounds the index near 1/32 of the data; a block of 16 KiB keys then holds about
+ * 64 rows (1 MiB). Readers follow each SST's own index, so SSTs written before stay readable
+ * (D107).
+ */
+export const BLOCK_BYTES_PER_INDEX_KEY_BYTE = 32;
+
 export class SstBuilder {
   private block = new DataBlockBuilder();
   private readonly index: Array<SstIndexEntry> = [];
@@ -178,7 +189,15 @@ export class SstBuilder {
         this.previousFilterKey = Option.some(row.key);
       }
     }
-    return this.block.estimatedSize >= this.options.blockSize ? [this.closeBlock()] : [];
+    // A block also stays open until it is `BLOCK_BYTES_PER_INDEX_KEY_BYTE` times its index entry's
+    // keys, so the index stays a small fraction of the data however long the keys are (D107).
+    const indexKeyBytes =
+      Option.getOrElse(this.block.firstKey, () => row.key).length + row.key.length;
+    const closesAt = Math.max(
+      this.options.blockSize,
+      BLOCK_BYTES_PER_INDEX_KEY_BYTE * indexKeyBytes,
+    );
+    return this.block.estimatedSize >= closesAt ? [this.closeBlock()] : [];
   }
 
   /**

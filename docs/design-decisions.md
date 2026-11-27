@@ -3750,3 +3750,45 @@ Kind: **measured** on a preview, **derived** from the code and the measured figu
   manifest bound for 16-byte keys. Passed to `audit-limits` (`CROSS:`).
 - **Memory** is the figure to measure first: a heap snapshot of one output step of an 8-input L0
   job on a preview.
+
+## D107. An SST's metadata stays a small fraction of its data, whatever its key size
+
+**Found by the read audit.**
+
+- **The cause.** An index entry records each data block's first and last key. A block closed once
+  it reached `blockSize` (16 KiB), so with long keys each block held one or two rows and the
+  index grew with the keys.
+- **Measured** on 4 MiB SSTs with 16 KiB blocks and 16-byte values, metadata as a share of data:
+
+  | Key size | 16 B | 1 KiB | 4 KiB | 16 KiB (`MAX_KEY_BYTES`) |
+  | -------- | ---: | ----: | ----: | -----------------------: |
+  | Before   | 3.2% | 12.5% |   50% |                     200% |
+  | After    | 3.2% |  3.3% |  3.4% |        3.4% (about 3.3%) |
+
+- **At a 64 MiB SST** that was 32 MiB of metadata at 4 KiB keys and 128 MiB at 16 KiB.
+  - Every reader reads the metadata whole, and the L1 metadata cache never holds an entry larger
+    than its group share (8 MiB of 16 MiB). So every get re-read it, and gets fetch the metadata
+    of all their candidate SSTs at once (D67).
+  - At 16 KiB keys, the writer's flush builds that index in memory, past the 128 MB isolate: the
+    flush fails on every attempt and writes then stall.
+
+**The rule.** A data block closes once it reaches `blockSize`, and also not before it holds
+`BLOCK_BYTES_PER_INDEX_KEY_BYTE` (32) times the bytes of its index entry's two keys. The index is
+then at most about 1/32 of the data.
+
+- **Keys up to 256 bytes** change nothing at the default 16 KiB block.
+- **16 KiB keys** make 1 MiB blocks of about 64 rows. A point read of such a key fetches one 1 MiB
+  block, which the L1 data cache charges as 1 MiB.
+- **Older SSTs stay readable.** Readers follow each SST's own index, so no format changes and
+  nothing is rewritten.
+
+**Tests.**
+
+- `sst-codec.test.ts`: metadata is at most 1/16 of the data for keys of 16 bytes to 16 KiB, and the
+  last key is still found. It fails without the rule, at 200%.
+- `db-client.test.ts`'s short-scan test (D72) asserted exactly two block reads over 64-byte test
+  blocks. Those blocks now hold about ten rows, so it asserts one or two. The D72 mutation (a
+  merge that fills its batch before emitting) still fails it.
+
+**Revises D103's memory row.** The index of a 64 MiB output is now at most about 2 MiB, at any key
+size.
