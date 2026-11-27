@@ -2968,3 +2968,75 @@ to deferred deletion, which reverses itself when the commit rate falls.
   do not either. The guard stays as stated.
 - `audit-limits`' test still fails as written: it asks that loads not grow with commits. They now
   grow only up to the budget, which is the decision for v1.
+
+## D103. A compaction's commit records its job; a missing Workflow instance is finished; what a large compaction needs
+
+**A retried commit of a job with no outputs.**
+
+- **The defect.** `commitCompaction` recognized its own retried commit only by its outputs, which
+  needed at least one. Since D97 a job can drop every row: deletes at the bottom, or values that
+  expired together. When such a job's commit step ran again after its result was lost, the inputs
+  were already gone. It failed with `CompactionInputsChangedError`, and the job reported
+  `Discarded`.
+- **What the compactor did with that.** No harm: `poll` releases the job's lease and plans from the
+  newest manifest, where those sources are gone, so nothing is replanned. Only the outcome was
+  wrong.
+- **The rule.** A commit records its job id in the manifest: `recentCompactionJobIds`, the newest 16. A commit whose id is recorded is already applied and changes nothing, whatever its outputs.
+  - The executor's `commit` takes the job id, which is the Workflow instance id.
+  - The field is optional. A manifest written before D103 decodes with none.
+  - Older code that rewrites a manifest drops the field. A retry then reports `Discarded`, as
+    before, and loses nothing. So the format stays 1 (D64's rule for additive fields).
+  - 16 ids cover far more than a commit step's retries: compactions of one database run one at a
+    time.
+- **Tests.**
+  - `garbage-collector.test.ts`: an all-dropped job whose commit step runs twice ends `Committed`,
+    once, with its sources gone and its id recorded once.
+  - `manifest.test.ts`: the record survives a later flush and caps at 16; another job over the same
+    inputs is still refused; a manifest without the key decodes.
+  - Four mutations caught.
+  - The `verify-manifest-cas-fencing` skill records why no model step changed: the model has no
+    retried commit, and the already-applied path writes nothing.
+- **`CROSS`.** `manifest.ts` is `audit-lifecycle`'s file; this function was assigned here.
+
+**A Workflow instance that does not exist** (left open by D94). `CompactionLauncher.progress` now
+reports a missing instance as finished with no outcome, at once rather than after D94's bound.
+Workflows' `get` rejects such an instance with `instance.not_found`
+(`isWorkflowInstanceNotFound`). Any other failure still reads as running.
+
+- **Statuses.** Only `queued`, `running`, `paused`, `waiting`, and `waitingForPause` count as
+  running. `unknown`, and any status this code does not know, finish the job. If such an instance
+  commits after all, the exact-inputs check refuses it once another job took its sources.
+- **The risk this takes.** Workflows has answered `instance.not_found` for an instance that existed
+  (a report on Cloudflare's community forum, 2025-09-16). The compactor reads progress at least
+  one poll interval (5 s) after it created the instance. A false not-found costs a duplicate job:
+  one of the two commits is refused, and the other's outputs become an orphan.
+- **Not unit-testable.** The launcher's own call of the check needs the Workflows binding.
+  `compaction-workflow.test.ts` tests the check (two mutations caught) and the status mapping.
+
+**What a large compaction needs.** A job of 8 inputs of N GiB each, 8N GiB in all, with the default
+settings (64 MiB outputs, 2 MiB input reads, 8 MiB parts, 16 KiB blocks), since D86, D96, and D97.
+Kind: **measured** on a preview, **derived** from the code and the measured figures, or **unknown**.
+
+| Quantity                | Value                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Limit                                                                         | Largest N with 2× headroom                                                             | Kind                                           |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- | ---------------------------------------------- |
+| Steps per job           | outputs + 2: up to 128N + 2 if little is dropped (one per 64 MiB written), at least 85N if everything is (one per 96 MiB read, D97)                                                                                                                                                                                                                                                                                                                                                                        | 10,000 per instance (configurable to 25,000)                                  | **N ≈ 39 (a 312 GiB merge)**; 10,000 is reached at a 625 GiB merge                     | derived                                        |
+| Subrequests per step    | about 48 chunk reads (≤ 96 MiB), ≤ 8 metadata reads, 10 part calls, 4 manifest reads (D86) ≈ 70                                                                                                                                                                                                                                                                                                                                                                                                            | —                                                                             | —                                                                                      | derived                                        |
+| Subrequests per job     | about 860 per GiB of input (agrees with `audit-limits`' D99 figure) ≈ 6,900 N                                                                                                                                                                                                                                                                                                                                                                                                                              | 10 million (set by `audit-limits`, D99)                                       | N ≈ 727                                                                                | derived                                        |
+| `prepare` step result   | about 40 bytes per input SST (D86)                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | 1 MiB                                                                         | about 13,000 input SSTs: N ≈ 100                                                       | derived                                        |
+| An output step's result | one handle, about 300 bytes (two 16 KiB keys at most: 44 KB)                                                                                                                                                                                                                                                                                                                                                                                                                                               | 1 MiB                                                                         | any N                                                                                  | derived                                        |
+| CPU per step            | 9.0 to 17.7 s for a 64 MiB step (D61, D73); at most 26.6 s for a 96 MiB-input step at the worst rate                                                                                                                                                                                                                                                                                                                                                                                                       | 60 s (compactor)                                                              | any N: steps are bounded, not jobs                                                     | measured (64 MiB), derived (96 MiB)            |
+| Wall time per step      | about 25 s: four steps finished 112 s after the last flush, less a 5 to 9 s wake (D61)                                                                                                                                                                                                                                                                                                                                                                                                                     | none per step                                                                 | —                                                                                      | derived from measured                          |
+| Wall time per job       | about 25 s × 128N ≈ 53 N minutes: an 8 GiB job runs about an hour                                                                                                                                                                                                                                                                                                                                                                                                                                          | none; D96 keeps a job past `gcMinAge`, D94 only ends one no read sees running | —                                                                                      | derived                                        |
+| Peak memory per step    | inputs: 2 chunks of ≤ 2 MiB raw per input plus their decoded rows, 8 to 10 MiB per input, 64 to 80 MiB for 8. Output: the 8 MiB part buffer and the chunk it is cut from, 8 to 16 MiB. Index: 4,096 blocks × 2 keys, 0.4 MiB with 16-byte keys, 8 MiB with 1 KiB keys. Bloom hashes: 8 bytes per key, 0.5 MiB for 1 KB rows, 5 MiB for 100-byte rows. The newest manifest (D86), 4 to 10 × its size, up to 40 MiB at D99's 4 MiB budget. About 83 MiB in the common case, up to about 130 MiB in the worst | 128 MB per isolate                                                            | does not grow with N. **2× headroom is not met for 8 inputs**, even in the common case | derived; the decoded-row factor is **unknown** |
+| Workflow state per job  | about 300 bytes per output step plus `prepare`                                                                                                                                                                                                                                                                                                                                                                                                                                                             | 1 GB                                                                          | any N                                                                                  | derived                                        |
+
+- **Measured evidence.** The largest compaction ever run live is about 0.5 GiB. The documented runs
+  are four 60 MiB L0 SSTs (240 MiB, four steps, every invocation `ok`, `docs/measurements.md`).
+  Everything above that size in the table is derived.
+- **Database size.** A size-tiered bottom merge can take most of a database, so the step limit is
+  the first one reached. A database above about 312 GiB can plan a merge without 2× headroom, and
+  above about 625 GiB one that exceeds 10,000 steps and fails at its last step on every attempt.
+  Raising the Workflow's step limit to 25,000 moves this to about 1.5 TiB, past D99's 1 TiB
+  manifest bound for 16-byte keys. Passed to `audit-limits` (`CROSS:`).
+- **Memory** is the figure to measure first: a heap snapshot of one output step of an 8-input L0
+  job on a preview.
