@@ -32,6 +32,8 @@ import {
   type DbReadError,
   type ChangelogUnavailableError,
   ReaderUnavailableError,
+  SCAN_PAGE_EXAMINED_BYTES,
+  ScanBudget,
   type ReadView,
 } from "./db-reader.ts";
 import { compactionTriggerTestLayer } from "./compaction-trigger.ts";
@@ -429,6 +431,7 @@ export const makeDbClient = Effect.gen(function* () {
     databaseId: DatabaseId,
     range: KeyRange,
     options: ScanReadOptions,
+    budget: Option.Option<ScanBudget>,
   ): Stream.Stream<Row, DbClientReadError, DbReaderServices> =>
     Stream.unwrap(
       Effect.sync(() => {
@@ -509,41 +512,43 @@ export const makeDbClient = Effect.gen(function* () {
                       manifestHint,
                     };
                     const segmentStart = start;
-                    return reader.scan(databaseId, segment, view, { limit: remaining() }).pipe(
-                      Stream.tap(() =>
-                        Effect.sync(() => {
-                          emitted++;
+                    return reader
+                      .scan(databaseId, segment, view, { limit: remaining(), budget })
+                      .pipe(
+                        Stream.tap(() =>
+                          Effect.sync(() => {
+                            emitted++;
+                          }),
+                        ),
+                        Stream.catchTags({
+                          ReaderUnavailableError: (error) => {
+                            if (!flushedPastSnapshot(options, error)) return Stream.fail(error);
+                            if (emitted > 0) {
+                              return Stream.fail(
+                                new ReaderUnavailableError({
+                                  databaseId,
+                                  reason: "StorageUnavailable",
+                                  message: `Database ${databaseId} was flushed during the scan after it had returned rows, so the rest cannot be read at the same snapshot. Resume the scan from resumeFrom (the next range start).`,
+                                  resumeFrom: segmentStart,
+                                }),
+                              );
+                            }
+                            if (attempt >= LATEST_READ_ATTEMPTS) {
+                              return Stream.fail(overtakenByFlushes(databaseId));
+                            }
+                            attempt++;
+                            restart();
+                            return segments;
+                          },
                         }),
-                      ),
-                      Stream.catchTags({
-                        ReaderUnavailableError: (error) => {
-                          if (!flushedPastSnapshot(options, error)) return Stream.fail(error);
-                          if (emitted > 0) {
-                            return Stream.fail(
-                              new ReaderUnavailableError({
-                                databaseId,
-                                reason: "StorageUnavailable",
-                                message: `Database ${databaseId} was flushed during the scan after it had returned rows, so the rest cannot be read at the same snapshot. Resume the scan from resumeFrom (the next range start).`,
-                                resumeFrom: segmentStart,
-                              }),
-                            );
-                          }
-                          if (attempt >= LATEST_READ_ATTEMPTS) {
-                            return Stream.fail(overtakenByFlushes(databaseId));
-                          }
-                          attempt++;
-                          restart();
-                          return segments;
-                        },
-                      }),
-                      Stream.concat(
-                        Stream.suspend(() => {
-                          if (Option.isNone(next)) done = true;
-                          else start = next.value;
-                          return segments;
-                        }),
-                      ),
-                    );
+                        Stream.concat(
+                          Stream.suspend(() => {
+                            if (Option.isNone(next)) done = true;
+                            else start = next.value;
+                            return segments;
+                          }),
+                        ),
+                      );
                   }),
                 ),
         );
@@ -552,12 +557,15 @@ export const makeDbClient = Effect.gen(function* () {
     );
 
   const scan = (databaseId: DatabaseId, range: KeyRange, options: ScanReadOptions) => {
+    // A scan with a limit is a page: it examines a bounded amount and may end early with
+    // resumeFrom (D108). One without reads its whole range, as an in-Worker stream may.
+    const budget = Option.map(options.limit, () => new ScanBudget(SCAN_PAGE_EXAMINED_BYTES));
     // The reader checks the manifest before it emits a row, so asking again repeats no row.
     const fromManifest = (
       number: number,
       view: ReadView,
     ): Stream.Stream<Row, DbClientReadError, DbReaderServices> =>
-      reader.scan(databaseId, range, view, { limit: options.limit }).pipe(
+      reader.scan(databaseId, range, view, { limit: options.limit, budget }).pipe(
         Stream.catchTags({
           ReaderUnavailableError: (error) =>
             !flushedPastSnapshot(options, error)
@@ -580,7 +588,7 @@ export const makeDbClient = Effect.gen(function* () {
               : FLUSHED_VIEW,
           );
         }
-        return scanUnflushed(databaseId, range, options);
+        return scanUnflushed(databaseId, range, options, budget);
       }),
     );
     return stream.pipe(
@@ -705,7 +713,7 @@ export const makeDbClient = Effect.gen(function* () {
       manifestHint: Option.none(),
     };
     return yield* Stream.runCollect(
-      reader.scan(databaseId, range, view, { limit: Option.some(limit) }),
+      reader.scan(databaseId, range, view, { limit: Option.some(limit), budget: Option.none() }),
     ).pipe(Effect.catchTags(expiredIsTooOld(databaseId, readSeq)));
   });
 

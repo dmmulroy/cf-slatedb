@@ -252,13 +252,13 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
           );
           if (scanned._tag === "Failure") {
             const failure = Cause.findErrorOption(scanned.cause);
-            // Overtaken by a flush after it returned rows (D93): the page ends early, and the
-            // caller continues from `resumeFrom` as from any page.
+            // Overtaken by a flush after it returned rows (D93), or past the bytes one page may
+            // examine (D108, possibly with no row: a range of deletes): the page ends early, and
+            // the caller continues from `resumeFrom` as from any page.
             if (
               Option.isSome(failure) &&
               failure.value._tag === "ReaderUnavailableError" &&
               failure.value.resumeFrom !== undefined &&
-              rows.length > 0 &&
               rows.length <= payload.limit
             ) {
               return { rows, resumeFrom: Option.some(failure.value.resumeFrom) };

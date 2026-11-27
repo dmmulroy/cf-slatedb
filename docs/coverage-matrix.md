@@ -82,7 +82,8 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 
 - **`Flushed`, `AtLeast(seq)`, `Latest` (probe + `flushedSeq`)** — done. `read-consistency.ts`
   (lsm-core), `DbClient.pointView`/`scanUnflushed` (D93: a `Latest` scan pages lazily by segment;
-  `db-client-scan.test.ts`), `DbReader.manifestFor` (refresh when older than
+  `db-client-scan.test.ts`; D108: a page examines at most 16 MiB of versions and ends early with
+  `resumeFrom`, `db-http-scan.test.ts`), `DbReader.manifestFor` (refresh when older than
   `flushedSeq`/`seq`). Tests: `db-client.test.ts` (Map-oracle property at every consistency;
   staleness bound, shown failing without the refresh), `writer.workerd.ts`. Formal:
   `NoAckedWriteLost` (`LatestSeesAcked`) (D29).

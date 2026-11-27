@@ -3792,3 +3792,46 @@ then at most about 1/32 of the data.
 
 **Revises D103's memory row.** The index of a 64 MiB output is now at most about 2 MiB, at any key
 size.
+
+## D108. A scan page examines a bounded amount and ends early, resumably
+
+**Found by the read audit.**
+
+- **The defect.** A scan ended only when it had `limit` visible rows or the range ended. Over a
+  range of deletes or expired values, the same shape as D97 on the write side, one page read and
+  resolved every version in the range to return a few rows or none.
+- **The cost.** Reading, decoding, and resolving versions costs up to about 0.28 s of CPU per MiB
+  (D61's compaction rate, an upper bound for reads). A range holding more than about 100 MiB of
+  deleted versions then exceeded the API Worker's 30 s on every request: a timeout, not a
+  resumable page.
+- **The block reads.** At 16 KiB blocks each MiB is 64 block reads, 128 hedged, against an
+  invocation's 10,000 subrequests.
+
+**The rule.**
+
+- **The budget.** A scan with a limit (every public scan page, and any in-Worker scan given a
+  limit) examines at most `SCAN_PAGE_EXAMINED_BYTES` (16 MiB) of versions, counted with
+  `rowEncodedSizeEstimate` whether returned or not. That is at most about 4.5 s and 2,048 hedged
+  block reads.
+- **Sharing.** The budget (`ScanBudget`) is shared by the segments a `Latest` page is made of
+  (D93).
+- **Where it ends.** Once spent, the scan ends before the next key with `ReaderUnavailableError`
+  carrying `resumeFrom`, that key. Every row before it was returned, and none at or after it, as
+  for D93's early end.
+- **Progress.** Each underlying scan examines at least one key, so a resumed page always moves on.
+- **The public page.** It turns that into a page with the rows it has, possibly none, and
+  `resumeFrom`. Before, it required at least one row, which D93 guaranteed; that guard is gone.
+- **The contract.** The OpenAPI description says a page may end early, with fewer rows or none, and
+  that a client follows `resumeFrom` until it is null. That was already the rule for continuing.
+  The contract is regenerated.
+- **Unlimited scans stay unbounded.** An in-Worker stream with no limit reads its whole range, as
+  before.
+
+**Not covered.** The transaction scan (`DbClient.scanAt`, `transactions/scan`) passes no budget.
+Its pages are bounded by `limit` rows, not by what they examine, and its `resumeFrom`-less contract
+needs a decision of its own (`CROSS:` to the API owner).
+
+**Test** (`db-http-scan.test.ts`): 24,000 keys of 1 KiB values, all but the last deleted. The
+first page answers 200 with no rows and a `resumeFrom`, and following `resumeFrom` returns exactly
+the live key, with every page answered. Three mutations caught: no budget, the handler requiring a
+row to end early, and versions not counted.

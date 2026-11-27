@@ -15,6 +15,7 @@ import {
   changelogAfterSeqOf,
   changelogHoldsChangesAfter,
   resolveVisibleRow,
+  rowEncodedSizeEstimate,
   type Row,
   type SeqNum,
   type SstCorruptedError,
@@ -146,7 +147,34 @@ export type DbReaderServices = BlockSourceServices | RuntimeContext;
 export interface ScanOptions {
   /** Most rows to return; none: all. */
   readonly limit: Option.Option<number>;
+  /**
+   * How much the scan may examine before it ends early, shared by every scan of one page; none:
+   * unbounded. A page over deletes or expired rows otherwise reads the whole range to return a few
+   * rows or none (D108).
+   */
+  readonly budget: Option.Option<ScanBudget>;
 }
+
+/**
+ * The bytes of versions one page of a scan may examine (D108): every version merged counts,
+ * returned or not. Shared by the scans a page is made of (D93's segments).
+ */
+export class ScanBudget {
+  /** Bytes of versions examined so far, by `rowEncodedSizeEstimate`. */
+  examinedBytes = 0;
+  readonly maxBytes: number;
+  constructor(maxBytes: number) {
+    this.maxBytes = maxBytes;
+  }
+}
+
+/**
+ * Bytes of versions one public scan page examines at most (D108). Reading, decoding, and resolving
+ * versions costs at most about what a compaction step does per input byte (D61: 0.28 s per MiB at
+ * worst), so 16 MiB is at most about 4.5 s of the API Worker's 30 s; at 16 KiB blocks it is 1,024
+ * block reads, 2,048 with every one hedged, of an invocation's 10,000 subrequests.
+ */
+export const SCAN_PAGE_EXAMINED_BYTES = 16 * 1024 * 1024;
 
 /**
  * Reads SSTs in the caller's isolate: finds the manifest a view needs, skips SSTs by key range and
@@ -588,10 +616,30 @@ export const makeDbReader = Effect.gen(function* () {
         const ssts = overlapping.map((handle) =>
           sstRows(databaseId, handle, range, snapshotSeq, budgetGroup, options.limit, scanRead),
         );
+        let examinedAny = false;
         const visible = groupRowsByKey(mergeRowStreams([memtable, ...ssts])).pipe(
-          Stream.mapEffect((versions) =>
-            Effect.fromResult(resolveVisibleRow(versions, { snapshotSeq, now, mergeOperator })),
-          ),
+          Stream.mapEffect((versions): Effect.Effect<Option.Option<Row>, DbReadError> => {
+            // A page that has examined its share ends before the next key, resumably (D108). Each
+            // scan examines at least one key, so a resumed page always moves on.
+            if (Option.isSome(options.budget)) {
+              const budget = options.budget.value;
+              if (examinedAny && budget.examinedBytes >= budget.maxBytes) {
+                return Effect.fail(
+                  new ReaderUnavailableError({
+                    databaseId,
+                    reason: "StorageUnavailable",
+                    message: `A scan of database ${databaseId} examined ${budget.examinedBytes} bytes of versions, its page's share, before reaching its limit (deleted or expired rows return nothing). Resume the scan from resumeFrom (the next range start); every row before it was returned.`,
+                    resumeFrom: versions[0].key,
+                  }),
+                );
+              }
+              for (const row of versions) budget.examinedBytes += rowEncodedSizeEstimate(row);
+            }
+            examinedAny = true;
+            return Effect.fromResult(
+              resolveVisibleRow(versions, { snapshotSeq, now, mergeOperator }),
+            );
+          }),
           Stream.flatMap((row) => Stream.fromIterable(Option.toArray(row))),
         );
         return Option.match(options.limit, {
