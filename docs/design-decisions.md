@@ -5070,6 +5070,21 @@ regular, transaction, and routed page. A routed page holds one shard's segment a
   `set`, so `stateLock` (and `collectionLock`, `planLock` around it) can be removed with every test
   passing. Production storage does yield. `CROSS: formal`: model them in `CompactorObject`, or
   give the test cell a yielding variant.
+- **Round 2.**
+  - **`db-writer.ts` swept in full.** 183 mutants; stage 2 used per-region test sets. It closed
+    gaps that matter:
+    - a writer fenced by a newer one could seal (without the epoch check), and no test saw it;
+    - a retried seal must return its recorded holds;
+    - `flushedManifestId` after a flush, and after a crash-restart;
+    - the transaction horizon at, below, and beyond its bounds;
+    - backpressure, the size threshold, and `l0MaxSsts` exactly at their values, plus the
+      reload;
+    - the stall hints, and the compactor wake;
+    - an alarm that is a restarted object's first event, and an early alarm.
+  - **`compactor.ts`** (after D116): the D94 lease bound exactly, and no launch while the budget
+    is unreachable.
+  - **Every survivor is classified** in `/tmp/shale-work/agents/mut-write2/REPORT-2.md`. No
+    defect was found.
 - **Not finished.** Part of the compactor triage, the `db-writer` runner sweep,
   `compaction-executor`, `compaction-budget`, `sst-store`, and `object-store`. The numbers and
   the resume command are in `/tmp/shale-work/agents/mut-write2/REPORT.md`.
