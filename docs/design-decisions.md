@@ -4292,3 +4292,63 @@ needs a decision of its own (`CROSS:` to the API owner).
 first page answers 200 with no rows and a `resumeFrom`, and following `resumeFrom` returns exactly
 the live key, with every page answered. Three mutations caught: no budget, the handler requiring a
 row to end early, and versions not counted.
+
+## D121. `tokens ensure` and `rotate` fail when a written secret never turns active
+
+`awaitActive` waited up to about 10 s (20 reads, 500 ms apart) for a written secret to turn
+`active`, then reported success whatever it saw. A deploy right after could then fail to bind a
+pending secret (D104's finding 5).
+
+**The rule.**
+
+- `awaitSecretActive` returns whether the secret turned active; a failed read counts as not yet.
+- The tokens are still shown: they cannot be read again.
+- The command then exits non-zero with `SecretNotActive`, naming the secrets, and says to wait and
+  deploy, not to write the token again.
+
+**Tests** (`shaledb-access-tokens.test.ts`, `TestClock`):
+
+- active after a pending read and a failed one: active, in 3 reads;
+- never active: not active after exactly 20 reads, and the failure names the secret without the
+  token.
+- **Mutations caught:** the status ignored, the failure never reported, and a failed read
+  aborting the wait.
+
+## D122. Mutation sweep of the writer, the compactor, and the memtable (partial)
+
+**The method.**
+
+- **The generator** (`/tmp/shale-work/agents/mut-write/mutants.py`) is a token scan. It blanks
+  comments and strings, then emits:
+  - comparisons with their boundaries moved or flipped;
+  - `&&` and `||` swapped, a negation removed, a boolean swapped;
+  - `± 1` removed or flipped, an integer constant changed by one;
+  - `Math.min` and `Math.max` swapped, `Option.isSome` and `isNone` swapped;
+  - a lock's `withPermits` removed, an unused `yield*` statement removed, an early `return`
+    removed.
+- **The runner** (`run.py`) runs each mutant with
+  `nice -n 15 vp test run --bail=1 --maxWorkers=1 --no-file-parallelism`, with a timeout that kills
+  the process group.
+
+**Coverage.** Under the one-worker rule, the sweep reached only part of its files in its time:
+
+- `db-writer.ts`: 98 of 221 mutants;
+- `mem-table.ts`: 115 of 138;
+- `compactor.ts`: 101 of 181;
+- `compaction-executor.ts`: 4 of 37.
+
+The per-file numbers, every survivor's triage, and the files not reached are in the agent's
+`REPORT.md`.
+
+**Test gaps closed.**
+
+- **The commit lock** (`db-writer.ts`: `commitLock` with two permits) survived every writer test.
+  The mutant acknowledged a write sent while a seal's commit was in flight, and the sealed manifest
+  lacked it: an acknowledged write lost. `db-writer.test.ts`, "DbWriter commit lock", holds the
+  seal's manifest commit, sends a write, and requires `DatabaseSealedError` with nothing else
+  durable.
+- **The memtable's stored row kinds** (`ROW_KIND`: value 0, merge 1, tombstone 2) could change
+  with no test failing, though a writer's SQLite outlives a deploy. `mem-table.test.ts` pins them.
+
+**Reported to the formal agents.** Survivors in other locks: `initLock`, `flushLock`, and the
+compactor's `planLock`, `collectionLock`, and `stateLock`.
