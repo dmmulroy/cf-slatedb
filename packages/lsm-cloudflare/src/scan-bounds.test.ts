@@ -9,7 +9,7 @@ import {
   type Row,
   type SstHandle,
 } from "@shaledb/lsm-core";
-import { Effect, Exit, Layer, Option, type Scope, Stream } from "effect";
+import { Effect, Exit, Layer, Option, Result, type Scope, Stream } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -531,6 +531,11 @@ describe("a long run of one key's merge operands (D125)", () => {
       Effect.gen(function* () {
         yield* u64AddDatabase;
         const db = yield* DbClient;
+        // Key 1, flushed: the SSTs hold a key after the settled one, read once.
+        yield* db.write(DB, {
+          operations: [{ _tag: "Put", key: key(1), value: u64(7), ttlMillis: Option.none() }],
+        });
+        yield* db.flush(DB);
         // Key 0: 600 older values, a base of 1,000, then 1,500 increments, all unflushed. The first
         // writer page is operands only; the second holds the rest of them, the base that settles
         // the key, and older versions, with more to come: the scan skips those.
@@ -553,10 +558,21 @@ describe("a long run of one key's merge operands (D125)", () => {
         const transaction = yield* client
           .scanAtPage(DB, FULL_KEY_RANGE, readSeq, 5, manifestId)
           .pipe(Effect.provideService(ScanPageBudget, BUDGET));
-        return [regular, transaction].map((page) => page.rows.map((row) => sumOf(row)));
+        return [regular, transaction].map((page) =>
+          page.rows.map((row) => [row.key[2], sumOf(row)]),
+        );
       }),
     );
-    expect(outcome).toEqual([[2500], [2500]]);
+    expect(outcome).toEqual([
+      [
+        [0, 2500],
+        [1, 7],
+      ],
+      [
+        [0, 2500],
+        [1, 7],
+      ],
+    ]);
   }, 180_000);
 
   it("a Latest scan reads a flushed operand once, though the writer still retains it (D130)", async () => {
@@ -604,3 +620,29 @@ const sumOf = (row: Row) =>
   row.value._tag === "Value"
     ? Number(new DataView(row.value.bytes.buffer, row.value.bytes.byteOffset).getBigUint64(0, true))
     : -1;
+
+describe("a Latest scan of a sealed database (D130)", () => {
+  it("refuses with DatabaseSealed when asked to, as a routed scan's stale map needs, and reads otherwise", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createDatabase;
+        const db = yield* DbClient;
+        yield* db.write(DB, {
+          operations: [{ _tag: "Put", key: key(0), value: u64(1), ttlMillis: Option.none() }],
+        });
+        yield* (yield* WriterClient).seal(DB, [DatabaseId.make("next")], false);
+        const scan = (refuseSealed: boolean) =>
+          Stream.runCollect(
+            db.scan(DB, FULL_KEY_RANGE, { ...latestOptions(10), refuseSealed }),
+          ).pipe(Effect.result);
+        const refused = yield* scan(true);
+        const read = yield* scan(false);
+        return {
+          refused: Result.isFailure(refused) && refused.failure._tag,
+          read: Result.isSuccess(read) && read.success.length,
+        };
+      }),
+    );
+    expect(outcome).toEqual({ refused: "DatabaseSealedError", read: 1 });
+  });
+});

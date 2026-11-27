@@ -173,3 +173,58 @@ describe("one budget for a routed page across shards (D125)", () => {
     expect(Math.abs(outcome.routed - outcome.unsplit)).toBeLessThanOrEqual(2);
   }, 120_000);
 });
+
+describe("a routed scan of a bounded range, and a routed batch (D130)", () => {
+  it("reads every shard the range covers up to its end, and routes a batch only within one shard", async () => {
+    const outcome = await Effect.gen(function* () {
+      yield* (yield* DatabaseLifecycle).create(FIRST, {
+        keyRange: Option.none(),
+        databaseOptions: DEFAULT_DATABASE_OPTIONS,
+      });
+      yield* (yield* ShardDirectory).create(GROUP, FIRST);
+      yield* (yield* DbClient).write(FIRST, {
+        operations: Array.from({ length: 10 }, (_, index) => ({
+          _tag: "Put" as const,
+          key: key(index),
+          value: Uint8Array.of(index),
+          ttlMillis: Option.none(),
+        })),
+      });
+      yield* (yield* ShardSplit).split(GROUP, FIRST, key(5));
+      const router = yield* makeShardRouter;
+      const scanned = yield* Stream.runCollect(
+        router.scan(
+          GROUP,
+          { start: key(2), end: Option.some(key(8)) },
+          {
+            consistency: { _tag: "Latest" },
+            snapshot: Option.none(),
+            refuseSealed: true,
+            limit: Option.none(),
+          },
+        ),
+      );
+      const put = (index: number) => ({
+        _tag: "Put" as const,
+        key: key(index),
+        value: Uint8Array.of(100),
+        ttlMillis: Option.none(),
+      });
+      const within = yield* Effect.result(router.write(GROUP, { operations: [put(6), put(7)] }));
+      const across = yield* Effect.flip(router.write(GROUP, { operations: [put(1), put(7)] }));
+      return {
+        keys: scanned.map((row) => row.key[2]),
+        within: within._tag,
+        across: across._tag,
+      };
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(splitLayer),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.runPromise,
+    );
+    // Keys 2 to 7: the first shard's part, then the second's, which the range's end cuts.
+    expect(outcome.keys).toEqual([2, 3, 4, 5, 6, 7]);
+    expect([outcome.within, outcome.across]).toEqual(["Success", "CrossShardBatchError"]);
+  }, 120_000);
+});
