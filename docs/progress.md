@@ -407,7 +407,7 @@ hand-off is below.
   - **Test gap closed:** phantom protection. A write into a scanned range now fails a test.
   - **Not reached:** `compaction-executor`, `compaction-budget`, `sst-store`, `object-store`.
   - **Round 2:**
-    - `db-writer` swept: 183 mutants; 57 survived stage 2; 29 closed by tests; the rest
+    - `db-writer` swept: 183 mutants; 57 survived stage 2; 21 closed by tests; the rest
       classified.
     - `compactor` reswept after D116: 43 survive, 2 closed, all classified.
     - `compaction-budget` run in full.
