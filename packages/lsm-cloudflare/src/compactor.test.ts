@@ -877,6 +877,45 @@ describe("Compactor fence-in (D78)", () => {
     expect(outcome).toEqual({ started: 1, recorded: 1 });
   });
 
+  it("an SST drop waits for a poll that is starting a compaction of it, and is refused (D116, planLock)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createWithL0(ORDERS, 4);
+        const reader = yield* ManifestReader;
+        const oldest = (yield* reader.loadLatest(ORDERS)).manifest.l0.at(-1);
+        if (oldest === undefined) return yield* Effect.die("expected four L0 SSTs");
+        const { compactor, fire, holdNextLoad } = yield* startGatedCompactor;
+        yield* compactor.wake(ORDERS);
+        // The poll has loaded the manifest and is about to plan and launch a compaction of L0.
+        const pollGate = yield* holdNextLoad;
+        const polling = yield* Effect.forkChild(fire);
+        yield* Deferred.await(pollGate.loaded);
+        // An operator force-drops the oldest L0 SST meanwhile.
+        const dropping = yield* Effect.forkChild(
+          Effect.result(compactor.dropSst(ORDERS, { sstId: oldest.id, force: true })),
+        );
+        for (let step = 0; step < 100; step++) yield* Effect.yieldNow;
+        yield* Deferred.succeed(pollGate.resume, undefined);
+        yield* Fiber.join(polling);
+        const dropped = yield* Fiber.join(dropping);
+        const jobs = [...(yield* Ref.get(yield* CompactionLauncherRecord)).values()];
+        return {
+          drop:
+            dropped._tag === "Success"
+              ? "dropped"
+              : dropped.failure._tag === "SstDropRefusedError"
+                ? dropped.failure.reason
+                : dropped.failure._tag,
+          started: jobs.length,
+        };
+      }),
+    );
+    // The drop ran after the poll: the compaction it started reads the SST, so the drop is refused
+    // while it runs, or finds the SST already merged. It never drops an SST a started job reads.
+    expect(outcome.started).toBe(1);
+    expect(["CompactionRunning", "SstNotInManifestError"]).toContain(outcome.drop);
+  });
+
   it("a poll never writes its older epoch over a fence-in that happened while it ran (D78)", async () => {
     const outcome = await run(
       Effect.gen(function* () {
