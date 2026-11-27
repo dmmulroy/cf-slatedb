@@ -406,6 +406,14 @@ hand-off is below.
   - `db-writer`: the named candidates are tested. The full runner sweep was not run.
   - **Test gap closed:** phantom protection. A write into a scanned range now fails a test.
   - **Not reached:** `compaction-executor`, `compaction-budget`, `sst-store`, `object-store`.
+  - **Round 2:**
+    - `db-writer` swept: 183 mutants; 57 survived stage 2; 21 closed by tests; the rest
+      classified.
+    - `compactor` reswept after D116: 43 survive, 2 closed, all classified.
+    - `compaction-budget` run in full.
+    - `compaction-executor` and the object-store multipart paths are partial; `sst-store` was
+      not run.
+    - `lsm-cloudflare`: 333 tests, exit 0.
   - **Verified:** `vp check` exit 0. `vp test run` in `packages/lsm-cloudflare` exit 0 (270
     tests).
 
