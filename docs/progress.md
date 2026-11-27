@@ -399,6 +399,16 @@ hand-off is below.
     `packages/lsm-cloudflare` (247 tests).
   - **Not run:** workerd, scenarios, previews, TLC (no protocol code changed).
 
+- **Writer and compactor mutation sweep, partial (D127).**
+  - `mem-table`: 104 mutants. 15 survive, all equivalent.
+  - `compactor`: 134 mutants. 53 survived the direct tests. 39 of them were rerun on the wider
+    set and all survived. Tests were added for 5 of those sites.
+  - `db-writer`: the named candidates are tested. The full runner sweep was not run.
+  - **Test gap closed:** phantom protection. A write into a scanned range now fails a test.
+  - **Not reached:** `compaction-executor`, `compaction-budget`, `sst-store`, `object-store`.
+  - **Verified:** `vp check` exit 0. `vp test run` in `packages/lsm-cloudflare` exit 0 (270
+    tests).
+
 ## Remaining-work log
 
 - **D113 fix (formal audit, 2026-11-26).** A flush commit that landed with its response lost made

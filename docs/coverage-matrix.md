@@ -793,3 +793,8 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `manifest.test.ts` ("caps checkpoints so the manifests they pin fit one collection's read budget
   (D129)"), `database-lifecycle.test.ts` ("the most checkpoints and pinned snapshots a database may
   hold (D99, D129)"); 2 mutations caught.
+- **Mutation sweep of the writer, memtable, and compactor (D127)** — partial. `mem-table` swept
+  with every survivor triaged; compactor stage 1 complete and stage 2 two-thirds done; the
+  writer's named candidates (start-path scheduling, start-failure reasons, D95 successors,
+  `initLock`, `flushLock`) tested. Tests: `db-transaction-ranges.test.ts` (scanned ranges),
+  `db-writer-start.test.ts`, `mem-table.test.ts`, `compactor.test.ts`.

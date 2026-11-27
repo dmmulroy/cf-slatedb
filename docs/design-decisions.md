@@ -5034,6 +5034,46 @@ regular, transaction, and routed page. A routed page holds one shard's segment a
     - A malformed `put` is answered with D79's `InvalidRequest` envelope by the real runtime.
     - `@shaledb/sharding#test:workerd` runs it; `test` runs it after the unit tests.
 
+## D127. The writer and compactor mutation sweep: the gaps closed, and what is left
+
+- **Context.** The first sweep of the writer and compactor (D122) reached half its mutants, against
+  a narrow test set. This one reruns them with the D117 generator, which now also mutates locks:
+  `Semaphore.make(1)` to 2 permits and `.withPermits(1)` to 0. It has two stages: each file's
+  direct test importers first, then every other test file that reaches the module.
+- **A runner fix.** A package copied for mutation could not import its workspace siblings
+  (`@shaledb/lsm-core`), so every `lsm-cloudflare` mutant "failed" on import. The runner now links
+  the siblings into the copy directory and requires an unmutated baseline to pass before any
+  mutant counts.
+- **Gaps closed (each test fails on its mutant):**
+  - **Scanned ranges (phantom protection).** No test passed a non-empty `readRanges`, so
+    `MemTable.writtenAfter`'s range branch could answer "no conflict" with every test passing. A
+    SerializableSnapshot commit is now refused when another commit wrote into a range it
+    scanned: bounded or open, start inclusive, end exclusive (`db-transaction-ranges.test.ts`).
+  - **The writer's start path** (`db-writer-start.test.ts`):
+    - A writer restarted with unflushed rows schedules its flush at start, with no further
+      write, and the alarm flushes them.
+    - Start failures map to `StoredDataInvalid` and `ManifestContention`.
+    - A sealed writer refuses other successors of the same number, and the same ones reordered
+      (D95).
+    - Concurrent first requests (status reads and probes, which take no other lock) fence in
+      once (`initLock`).
+    - Concurrent flushes write the rows once (`flushLock`).
+  - **The memtable** (`mem-table.test.ts`):
+    - trim at exactly `retentionMs` and at exactly `maxRetainedBytes`;
+    - `seed` only raises;
+    - a stale smaller flush cut keeps the recorded flushed manifest.
+  - **The compactor** (`compactor.test.ts`):
+    - `destroy` cancels the alarm and clears the state.
+    - A collection is told the oldest of several running jobs' starts (D96).
+    - A sorted run's SST drops, refused only while a job reads that run.
+- **Locks no unit test reaches.** The test `CompactorStateCell` never yields between `get` and
+  `set`, so `stateLock` (and `collectionLock`, `planLock` around it) can be removed with every test
+  passing. Production storage does yield. `CROSS: formal`: model them in `CompactorObject`, or
+  give the test cell a yielding variant.
+- **Not finished.** Part of the compactor triage, the `db-writer` runner sweep,
+  `compaction-executor`, `compaction-budget`, `sst-store`, and `object-store`. The numbers and
+  the resume command are in `/tmp/shale-work/agents/mut-write2/REPORT.md`.
+
 ## D128. Mutation sweep of the request edge and the sharding services
 
 - **Scope.** The request bound (`db-http-request.ts`, D100), the public error translation
