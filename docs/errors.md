@@ -106,7 +106,7 @@ and the GC operator API.
 A limit the caller reached is `409` with a code naming the limit, its counts in `details`, and
 `retryable: false`; the message says what to remove or rewrite (D99):
 
-- `CheckpointLimitReached`: the database holds 1,000 checkpoints and pinned snapshots; delete one;
+- `CheckpointLimitReached`: the database holds 128 checkpoints and pinned snapshots; delete one;
 - `MergedValueTooLarge`: a key's merge operands resolve to more than 1 MiB; replace the key with a
   put.
 
