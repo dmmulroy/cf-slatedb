@@ -648,3 +648,42 @@ describe("transactions", () => {
     });
   });
 });
+
+describe("transaction reads that name no begin manifest (mutation sweep)", () => {
+  it("read at their sequence number from the writer and the newest manifest, not newer, not older", async () => {
+    const outcome = await Effect.runPromise(
+      provideWith({ transactionRetentionMs: 60_000 })(
+        Effect.gen(function* () {
+          yield* createDatabase;
+          const client = yield* DbClient;
+          // A caller may name no begin manifest (writer state from before D58 has none): the read
+          // uses the writer's rows and the newest manifest. On an empty database, nothing.
+          const empty = yield* client.beginTransaction(DB);
+          const nothing = yield* client.getAt(DB, key(1), empty.readSeq, Option.none());
+          yield* client.put(DB, key(1), Uint8Array.of(1));
+          const begin = yield* client.beginTransaction(DB);
+          // A newer write, still unflushed.
+          yield* client.put(DB, key(1), Uint8Array.of(2));
+          const read = yield* client.getAt(DB, key(1), begin.readSeq, Option.none());
+          const scanned = yield* client.scanAt(
+            DB,
+            { start: key(0), end: Option.some(key(9)) },
+            begin.readSeq,
+            10,
+            Option.none(),
+          );
+          return {
+            nothing: byte(Option.flatMap(nothing, valueBytes)),
+            read: byte(Option.flatMap(read, valueBytes)),
+            scanned: scanned.map((row) => byte(valueBytes(row))),
+          };
+        }),
+      ),
+    );
+    expect(outcome).toEqual({
+      nothing: undefined,
+      read: 1,
+      scanned: [1],
+    });
+  });
+});
