@@ -348,3 +348,71 @@ describe("retainKeyVersions with merge operands of mixed expiry (D81)", () => {
     }
   });
 });
+
+describe("row resolution at its edges (mutation sweep, D117)", () => {
+  const key = Uint8Array.of(4);
+  const u64 = (value: bigint) => {
+    const bytes = new Uint8Array(8);
+    new DataView(bytes.buffer).setBigUint64(0, value, true);
+    return bytes;
+  };
+  const merge = (seq: number, operand: Uint8Array): Row => ({
+    key,
+    seq: SeqNum.make(seq),
+    value: RowValue.Merge({ operand }),
+    createTs: Option.none(),
+    expireTs: Option.none(),
+  });
+  const u64Sum = (operands: ReadonlyArray<Uint8Array>) =>
+    Option.map(
+      Result.getOrThrow(
+        resolveVisibleRow(
+          operands.map((operand, index) => merge(operands.length - index, operand)),
+          {
+            snapshotSeq: SeqNum.make(100),
+            now: Timestamp.make(0),
+            mergeOperator: Option.some(MERGE_OPERATORS.U64Add),
+          },
+        ),
+      ),
+      (row) => (row.value._tag === "Value" ? keyToHex(row.value.bytes) : ""),
+    );
+
+  it("U64Add zero-extends a short operand, reads only the first 8 bytes of a long one, and wraps", () => {
+    // 0x0102 (2 bytes, little-endian 513) + 1.
+    expect(u64Sum([Uint8Array.of(1, 2), u64(1n)])).toEqual(Option.some(keyToHex(u64(514n))));
+    // A 10-byte operand: its last two bytes are not part of the number.
+    expect(u64Sum([Uint8Array.of(5, 0, 0, 0, 0, 0, 0, 0, 9, 9), u64(1n)])).toEqual(
+      Option.some(keyToHex(u64(6n))),
+    );
+    // 2^64 - 1 + 2 wraps to 1.
+    expect(u64Sum([u64(2n ** 64n - 1n), u64(2n)])).toEqual(Option.some(keyToHex(u64(1n))));
+  });
+
+  it("compaction drops an expired value at the bottom, and keeps exactly the versions above the floor", () => {
+    const value = (seq: number, expireTs: Option.Option<number>): Row => ({
+      key,
+      seq: SeqNum.make(seq),
+      value: RowValue.Value({ bytes: Uint8Array.of(seq) }),
+      createTs: Option.none(),
+      expireTs: Option.map(expireTs, (ms) => Timestamp.make(ms)),
+    });
+    const atBottom = retainKeyVersions([value(2, Option.some(50)), value(1, Option.none())], {
+      now: Timestamp.make(100),
+      retainAboveSeq: Option.none(),
+      isBottom: true,
+      mergeOperator: Option.none(),
+    });
+    // Expired: a delete, and at the bottom a delete is dropped. Nothing is stored.
+    expect(atBottom).toEqual([]);
+    const versions = [4, 3, 2, 1].map((seq) => value(seq, Option.none()));
+    const retained = retainKeyVersions(versions, {
+      now: Timestamp.make(0),
+      retainAboveSeq: Option.some(SeqNum.make(2)),
+      isBottom: false,
+      mergeOperator: Option.none(),
+    });
+    // 4 and 3 are above the floor and kept as written; 2 is the newest at or below it; 1 goes.
+    expect(retained.map((row) => row.seq)).toEqual([4, 3, 2]);
+  });
+});

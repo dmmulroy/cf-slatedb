@@ -140,7 +140,7 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 - **L2 Workers Cache in front of `BlockServer`; block/meta/manifest URLs; immutable headers;
   `Cache-Tag`** — done, confirmed live. `block-server-http-api.ts`,
   `block-server-http-handlers.ts` (D27, D28). Test: `block-server.test.ts` (status codes,
-  `Cache-Control`, `Cache-Tag: db:<owner>`, latest hint, no short bodies). Live: scenario
+  `Cache-Control`, `Cache-Tag: db:<owner>`, latest hint, no short bodies; D118: every error answer `no-store`, the largest and over-long byte ranges). Live: scenario
   `block-cache` on `preview-1` — `Cf-Cache-Status: HIT` (`cache.l2.status` on `BlockSource` spans)
   for a block another Worker read first; off in a restricted Stack (D49).
 - **`BlockServer`: separate Worker, `crossVersionCache`, `workersDev: false`, `fetch()` not RPC**
@@ -717,3 +717,8 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   committers, and recreation. Properties: `NoReaderNeedsDeleted`, `RemovedNeverReopens`,
   `NoOldIncarnationServed`, `HoldsReleased`, `PrefixEmptied`. The variants for D77 (both forms),
   D90 and D91 (both forms) each fail.
+- **Mutation sweep of `lsm-core` (D117)** — done. 800 mutants over the 15 core modules; every
+  survivor classified, the untested edges given tests in `write-batch`, `row-resolution`,
+  `merge-limits`, `garbage-collection-plan`, `size-tiered-compaction-scheduler`, `key-range`,
+  `bloom-filter`, `lsm-settings`, `manifest`, `sst-codec`, `byte-codec`, `merge-iterator`, and
+  `ulid` tests. Of the 82 that survive, 80 are equivalent and 2 change only how many rows a block seek decodes (`/tmp/shale-work/agents/mut-core/REPORT.md`).

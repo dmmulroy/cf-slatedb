@@ -2,7 +2,12 @@ import { Arbitrary, Bytes, Effect, Option, Result, Schema } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 
 import { bloomFilterMayContain } from "./bloom-filter.ts";
-import { DataBlockBuilder, decodeDataBlock, type DataBlock } from "./block-codec.ts";
+import {
+  BLOCK_RESTART_INTERVAL,
+  DataBlockBuilder,
+  decodeDataBlock,
+  type DataBlock,
+} from "./block-codec.ts";
 import { crc32c } from "./crc32c.ts";
 import { SeqNum, SstId, Timestamp } from "./ids.ts";
 import {
@@ -20,6 +25,7 @@ import {
 import { MERGE_OPERATORS, resolveVisibleRow } from "./row-resolution.ts";
 import { type Row, RowValue } from "./row.ts";
 import {
+  BLOCK_BYTES_PER_INDEX_KEY_BYTE,
   blocksOverlappingRange,
   decodeSstMeta,
   firstBlockForKey,
@@ -409,5 +415,67 @@ describe("groupBlockReads", () => {
     );
     const failure = Arbitrary.formatCheckFailure(result);
     if (failure !== undefined) throw new Error(failure);
+  });
+});
+
+describe("SST footer and filter at their edges (mutation sweep, D117)", () => {
+  const row = (key: number, seq: number): Row => ({
+    key: Uint8Array.of(key),
+    seq: SeqNum.make(seq),
+    value: RowValue.Value({ bytes: Uint8Array.of(seq) }),
+    createTs: Option.none(),
+    expireTs: Option.none(),
+  });
+  const build = (
+    rows: ReadonlyArray<Row>,
+    options: Partial<ConstructorParameters<typeof SstBuilder>[0]>,
+  ) => {
+    const builder = new SstBuilder({
+      kind: "Compacted",
+      blockSize: 64,
+      filterBitsPerKey: 10,
+      minFilterKeys: 0,
+      ...options,
+    });
+    const parts = rows.flatMap((each) => builder.add(each));
+    const { tail, info } = builder.finish();
+    return { meta: openSst(Bytes.concat([...parts, tail]), info.metaOffset), info };
+  };
+
+  it("records the lowest and highest seq of its rows, which become the change feed's entry bounds", () => {
+    // Rows sorted by key then newest first, so seqs arrive out of order.
+    const { info } = build([row(1, 5), row(2, 9), row(2, 3), row(3, 2), row(4, 7)], {});
+    expect([info.footer.minSeq, info.footer.maxSeq]).toEqual([2, 9]);
+    const single = build([row(1, 7)], {}).info.footer;
+    expect([single.minSeq, single.maxSeq]).toEqual([7, 7]);
+  });
+
+  it("writes a Bloom filter for exactly minFilterKeys distinct keys, counting a key's versions once", () => {
+    const hasFilter = (rows: ReadonlyArray<Row>, minFilterKeys: number) =>
+      Option.isSome(build(rows, { minFilterKeys }).meta.filter);
+    expect(hasFilter([row(1, 3), row(2, 2), row(3, 1)], 3)).toBe(true);
+    expect(hasFilter([row(1, 3), row(2, 2)], 3)).toBe(false);
+    // Three rows but two keys: no filter.
+    expect(hasFilter([row(1, 3), row(2, 2), row(2, 1)], 3)).toBe(false);
+    // A changelog SST is read in order, never probed: it gets none.
+    expect(
+      Option.isSome(
+        build([row(1, 3), row(2, 2)], { kind: "Changelog", minFilterKeys: 0 }).meta.filter,
+      ),
+    ).toBe(false);
+  });
+
+  it("pins the block layout constants D107 and the block format document", () => {
+    expect([BLOCK_BYTES_PER_INDEX_KEY_BYTE, BLOCK_RESTART_INTERVAL]).toEqual([32, 16]);
+  });
+
+  it("merges adjacent blocks into one read when they total exactly maxBytes", () => {
+    const index = [0, 1, 2].map((position) => ({
+      offset: position * 10,
+      length: 10,
+      firstKey: Uint8Array.of(position),
+      lastKey: Uint8Array.of(position),
+    }));
+    expect(groupBlockReads(index, [0, 1, 2], 20).map((read) => read.blocks)).toEqual([[0, 1], [2]]);
   });
 });

@@ -4425,6 +4425,72 @@ The safety run has 24,118 states. An exploration at larger bounds (228,918 state
 Two collections at once (D83) are not modeled. D60's argument and the collection's boundary
 re-read cover them, with tests.
 
+## D117. A mutation sweep of `lsm-core`: what a surviving mutant means, and the edges now tested
+
+- **Context.** The core's tests are mostly properties over generated histories. They pass for code
+  that is right, but a property whose inputs rarely reach an edge also passes for code that is
+  wrong there. A mutation sweep asks the opposite question: for each small change to the code
+  (a comparison flipped, a bound moved by one, a constant raised by one, an early return removed,
+  an `Option.some` replaced by `none`), does some test fail?
+- **The sweep.** 800 mutants over the 15 core modules (`/tmp/shale-work/scripts/mutants.py`, a
+  token-level generator that skips comments, strings, types, and imports). Each mutant runs the
+  test files that import its module, one worker, `nice -n 15`. 286 survived the first pass;
+  every survivor was classified.
+- **Classification.** Each survivor is one of:
+  - **Equivalent.** No input tells it apart: an index past the end that an `undefined` guard
+    stops, a choice between equal values, a buffer capacity, a leading zero byte in
+    `readU64`, a value the format rewrites anyway (mod 2^64), a branch an earlier check makes
+    unreachable.
+  - **Untested behavior.** The behavior is intended and nothing checked it. A test was added, and
+    each fails under its mutant.
+  - **Unintended behavior.** The code did something it should not. None found.
+- **What the new tests pin.**
+  - **Formats that are already on disk.** The Bloom filter's bits for keys of every length mod 4
+    (a changed hash answers `absent` for keys older SSTs hold), the probe clamp 1–30, the
+    builder's growth past 512 keys, and the SST footer's min and max seq (the change feed's entry
+    bounds, `db-writer.ts`).
+  - **Every limit at and one past its value.** Keys, values, operations, and bytes per batch;
+    the merged-value bound in compaction (a history exactly at the bound folds); TTLs; settings
+    rules at equality; the scheduler's `minCompactionSources` and `includeSizeThreshold`; a
+    manifest superseded exactly `gcMinAge` ago; `groupBlockReads` at exactly `maxBytes`; a
+    `ByteReader` read that ends at the last byte; a 9-byte varint refused.
+  - **Documented constants.** The write-batch limits, `DEFAULT_LSM_SETTINGS`,
+    `LSM_PLATFORM_LIMITS`, `MAX_MERGED_VALUE_BYTES`, `MAX_DROPPED_SST_HISTORY`,
+    `MAX_CHECKPOINTS_PER_DATABASE`, `MAX_CHANGELOG_ENTRIES`, and the scheduler defaults. A change
+    to one is then a deliberate edit to a test, not a slip.
+  - **Manifest edits nothing in the core checked.** The removal lifecycle (`markRemoved`,
+    `markRemovalCleared`, `removalExpiresAt`), checkpoint expiry at `now` and never without an
+    expiry, `removeExternalRef` matching both fields, a fork leaving out runs its range empties,
+    a pre-D103 retry recognized by its outputs, a pre-D80 `changelogAfterSeq`, the writer fence's
+    epoch step, and `sealedSuccessors`.
+  - **Order.** Key ranges against an exhaustive membership oracle over every two-byte key of
+    {0, 1, 2}. The merge with a chunk ending exactly on a 256-row batch (a mutant ended the stream
+    there), with 3 to 42 inputs at once, and with ties resolved to the earlier input. An L0 job's
+    output above every run while a run merge is running. A put and a merge of one key take the
+    sooner TTL. The merge refusals name their operation.
+- **Why the generated properties missed some of these.** Generated histories are short, so most of
+  40 inputs are empty and the merge heap rarely holds the five or more cursors a wrong parent index
+  needs before it misorders. The many-input merge test is seeded and sized for the heap instead.
+- **What survives:** 82 mutants. 80 are equivalent. Two, both in the block seek's binary search, change only how many rows a seek decodes, which no test can see without instrumenting the decoder. The report lists each with its reason
+  (`/tmp/shale-work/agents/mut-core/REPORT.md`).
+- **Precondition stated.** Key-range functions assume a non-empty range (`start < end`). Every
+  database range is non-empty. The oracle test covers non-empty ranges only.
+
+## D118. A `BlockServer` error answer is never cached
+
+- **Before.** A 400 or 404 from the `BlockServer` carried no `Cache-Control`. Workers Cache stores
+  nothing without a cache header by default, but nothing in the code said so.
+- **Now.** Every answer with status 400 or above carries `cache-control: no-store`
+  (`ERROR_CACHE_CONTROL`, set by a middleware in `block-server-http-handlers.ts`). A miss, for
+  example a block of an SST not yet visible to the bucket, therefore never outlives itself in a
+  cache.
+- **Byte ranges.** D100's pattern (`^\d{1,15}-\d{1,10}$`) already bounds offsets below 10^15 and
+  lengths below 10^10, so `1000000000000000000000-4` (which `Number` reads as 1e21) is refused
+  with 400 before any arithmetic.
+- **Test** (`block-server.test.ts`): a 404 and a 400 both carry `no-store`. The largest range the
+  pattern allows (`999999999999999-9999999999`) answers 404 for a missing SST. An over-long offset
+  and an over-long length answer 400. Commit `1ff8f4b` names this D117; it is recorded here.
+
 ## D121. `tokens ensure` and `rotate` fail when a written secret never turns active
 
 `awaitActive` waited up to about 10 s (20 reads, 500 ms apart) for a written secret to turn

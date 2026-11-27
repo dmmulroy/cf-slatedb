@@ -18,7 +18,7 @@ import {
   resolveVisibleRow,
   retainKeyVersions,
 } from "./row-resolution.ts";
-import type { Row } from "./row.ts";
+import { type Row, RowValue } from "./row.ts";
 
 /** Splits rows round-robin-ish into `parts` sorted inputs by each row's sequence number. */
 const partition = (rows: ReadonlyArray<Row>, parts: number): Array<Array<Row>> => {
@@ -183,5 +183,59 @@ describe("retainKeyVersions (compaction)", () => {
         );
       },
     );
+  });
+});
+
+describe("mergeRowStreams at batch and heap edges (mutation sweep, D117)", () => {
+  const row = (key: number, seq: number, value = seq): Row => ({
+    key: Uint8Array.of(key >> 8, key & 0xff),
+    seq: SeqNum.make(seq),
+    value: RowValue.Value({ bytes: Uint8Array.of(value & 0xff) }),
+    createTs: Option.none(),
+    expireTs: Option.none(),
+  });
+  const collect = (streams: ReadonlyArray<Stream.Stream<Row>>) =>
+    Array.from(Effect.runSync(Stream.runCollect(mergeRowStreams(streams))));
+
+  it("emits every row when an input's chunk ends exactly where a 256-row batch does", () => {
+    const rows = Array.from({ length: 600 }, (_, index) => row(index, 1));
+    for (const size of [256, 128, 512]) {
+      const merged = collect([Stream.fromIterable(rows).pipe(Stream.rechunk(size))]);
+      expect(merged.length).toBe(600);
+    }
+  });
+
+  it("merges 3 to 42 non-empty inputs, one row per chunk, into key order (the heap's sift-up and sift-down)", () => {
+    // Seeded, so each run checks the same 200 merges. Generated histories rarely fill this many
+    // inputs at once, and a heap with a wrong parent index misorders only with several cursors in it.
+    let seed = 12_345;
+    const next = (bound: number) => {
+      seed = (Math.imul(seed, 1_103_515_245) + 12_345) >>> 0;
+      return seed % bound;
+    };
+    for (let trial = 0; trial < 200; trial++) {
+      const inputs = Array.from({ length: 3 + next(40) }, (_, source) =>
+        Array.from({ length: 1 + next(6) }, () => next(65_536))
+          .sort((left, right) => left - right)
+          .map((key, index) => row(key, source * 10 + index + 1)),
+      );
+      const merged = collect(
+        inputs.map((input) => Stream.fromIterable(input).pipe(Stream.rechunk(1))),
+      );
+      expect(merged.map((each) => keyToHex(each.key))).toEqual(
+        sortRows(inputs.flat()).map((each) => keyToHex(each.key)),
+      );
+    }
+  });
+
+  it("keeps the earlier input's copy of a row two inputs both hold", () => {
+    const merged = collect([
+      Stream.fromIterable([row(1, 5, 10), row(2, 5, 10)]),
+      Stream.fromIterable([row(1, 5, 20), row(2, 5, 20)]),
+      Stream.fromIterable([row(1, 5, 30)]),
+    ]);
+    expect(merged.map((each) => (each.value._tag === "Value" ? each.value.bytes[0] : -1))).toEqual([
+      10, 10,
+    ]);
   });
 });

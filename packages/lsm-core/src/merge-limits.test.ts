@@ -73,4 +73,19 @@ describe("merged values are bounded (D99)", () => {
     });
     expect(small.map((row) => row.value._tag)).toEqual(["Value"]);
   });
+
+  it("compaction folds a history that is exactly at the bound, the same size a read returns (mutation sweep, D117)", () => {
+    const half = MAX_MERGED_VALUE_BYTES / 2;
+    const atBound = [operand(3, half), operand(2, half - 1), value(1, 1)];
+    const kept = retainKeyVersions(atBound, {
+      now,
+      retainAboveSeq: Option.none(),
+      isBottom: true,
+      mergeOperator: concat,
+    });
+    expect(kept.map((row) => row.value._tag)).toEqual(["Value"]);
+    expect(read(kept)).toEqual(read(atBound));
+    // The bound is the documented 1 MiB.
+    expect(MAX_MERGED_VALUE_BYTES).toBe(1_048_576);
+  });
 });

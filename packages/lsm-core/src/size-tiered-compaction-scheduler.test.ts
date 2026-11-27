@@ -326,6 +326,52 @@ describe("planCompactions", () => {
     );
   });
 
+  it("merges a group of exactly minCompactionSources runs, and lets a run exactly includeSizeThreshold times the smallest join it (mutation sweep, D117)", () => {
+    const options = DEFAULT_SIZE_TIERED_COMPACTION_OPTIONS;
+    const runsOf = (sizes: ReadonlyArray<number>) =>
+      withLsm(
+        [],
+        sizes.map((size, index) => ({
+          id: SortedRunId.make(sizes.length - index),
+          ssts: [handle(size)],
+        })),
+      );
+    // Four runs of one size, newest first: exactly the minimum.
+    const [four] = planCompactions(runsOf([1000, 1000, 1000, 1000]), [], options);
+    expect(four?.sources.length).toBe(4);
+    // Three runs are not enough.
+    expect(planCompactions(runsOf([1000, 1000, 1000]), [], options)).toEqual([]);
+    // The fourth run is exactly 4x the smallest: it still joins the group.
+    const [atThreshold] = planCompactions(runsOf([1000, 1000, 1000, 4000]), [], options);
+    expect(atThreshold?.sources.length).toBe(4);
+    // A run past 4x ends the group at three.
+    expect(planCompactions(runsOf([1000, 1000, 1000, 4001]), [], options)).toEqual([]);
+    // SlateDB's defaults (4, 8, 4.0), as documented.
+    expect(options).toEqual({
+      minCompactionSources: 4,
+      maxCompactionSources: 8,
+      includeSizeThreshold: 4,
+      maxConcurrentCompactions: 1,
+    });
+  });
+
+  it("puts an L0 job's output above every run, while a merge of the oldest runs is running", () => {
+    const l0 = [1, 2, 3, 4].map(() => handle(1000));
+    const runs = [5, 4, 3, 2, 1, 0].map((id) => ({
+      id: SortedRunId.make(id),
+      ssts: [handle(1000)],
+    }));
+    const running: CompactionJob = {
+      sources: [3, 2, 1, 0].map((id) => ({ _tag: "SortedRun" as const, id: SortedRunId.make(id) })),
+      destination: SortedRunId.make(0),
+      isBottom: true,
+    };
+    const options = { ...DEFAULT_SIZE_TIERED_COMPACTION_OPTIONS, maxConcurrentCompactions: 2 };
+    const [job] = planCompactions(withLsm(l0, runs), [running], options);
+    expect(job?.sources.every((source) => source._tag === "L0")).toBe(true);
+    expect(job?.destination).toBe(6);
+  });
+
   it("compacts all L0 SSTs (up to the maximum) into a new, newer sorted run", () => {
     let manifest = empty;
     for (const n of [1, 2, 3, 4, 5]) {
