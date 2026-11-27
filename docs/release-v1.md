@@ -472,7 +472,7 @@ Dillon delegated P1–P5 ("decide with best judgement"); each took the recommend
 | P5  | Plan and limits  | Workers Paid; `limits.cpu_ms` 30,000 (API and its writers) and 60,000 (compactor)                                                                                            | D61: `DEFAULT_API_CPU_MS`, `DEFAULT_COMPACTOR_CPU_MS` in `shaledb-stack-config.ts`. The account's plan is not visible in the repository; the previews ran with these limits                                            |
 | P6  | Release go-ahead | pending: this checklist                                                                                                                                                      | `plan:production` and `deploy:production` in `infra/shaledb/vite.config.ts`                                                                                                                                            |
 
-## 7. What changed late (D67 to D123)
+## 7. What changed late (D67 to D129)
 
 These landed after the first soaks. The release soaks (section 5) are the first long runs on all of
 them.
@@ -647,125 +647,254 @@ them.
   exported unfiltered; no call site put a key there, but nothing stopped one. Events now pass the
   same allowlist as attributes (this audit).
 
-PENDING(formal): the two formal-verification agents' models of the writer and compactor objects,
-liveness, the change feed, the split end to end, and the lifecycle (D109 and on), with their
-findings.
+- **D109, the writer Durable Object at await granularity.** `WriterObject.tla` (PlusCal): two
+  requests and the alarm, a label at every await, eviction and interruption anywhere. D74b, D84,
+  D85, D102, and D74's loop are each a broken variant that fails a named property. It found D115.
+  It also found a risk, not fixed: a write evicted after its SQLite commit and before
+  `scheduleFlush` leaves a durable, `Latest`-visible row with no alarm until the next request
+  (section 9).
+- **D110, the compactor Durable Object modeled.** Two wakes, the alarm's poll, Workflow jobs whose
+  commit may run twice, the budget's lease, and GC. D78, D94, D96, and D103 each fail a property.
+  Three lassos while building it were modeling errors that name what the code relies on (section 4).
+- **D111, liveness.** `AckedFlushed`, `AlarmQuiets`, `EventuallyFlushed`, and `EveryTxnCommits`,
+  each failed by the variant for D102, D74's loop, an unwoken writer, and D76.
+- **D112, a split end to end.** `ShardSplit.tla`: crashes after any step, stale routers, a stale
+  `Flushed` reader, a rogue seal, and a feed consumer. D80, D89, D95, and D101 each fail.
+- **D113, a defect found while placing a model's labels, not fixed.**
+  - **What is wrong.** After a flush commit whose response was lost, the change feed returns a
+    sequence number twice.
+  - **Where it comes from.** The next flush exports the same rows again, and the manifest holds
+    two entries.
+  - **Not affected:** L0, where the merge removes the duplicate rows.
+  - **State.** Recorded as an expected-failing test in `db-writer.test.ts`. Two fixes are proposed;
+    the owners decide which.
+- **D114, the lifecycle across three databases.** `Lifecycle.tla`: holds, rewrites, releases, GC,
+  `deleteCheckpoint`, removal, and recreation. D77 (both forms), D90, and D91 (both forms) each
+  fail. It found D116's fork-hold race.
+- **D115, a writer fenced by its own restart.** A flush refused at an older epoch set the phase to
+  `Fenced` over the restarted writer's newer one. Every later request then failed with
+  `WriterFencedError` until the object was evicted. TLC found two paths, and both were replayed as
+  failing tests. `markFenced` now replaces only its own epoch's `Ready` phase, and a seal forgets
+  its phase only once its edit was applied.
+- **D116, found by the models (no decision entry yet; the tests and code cite it).**
+  - **The fork-hold race.** `deleteCheckpoint` between `forkRange`'s hold and the fork's first
+    manifest deleted the hold, so the fork could lose its data. A holder with no manifest now
+    counts as gone only once the hold is `gcMinAge` old (`ccd48db`).
+  - **A job launched before it was recorded.** If the poll was evicted between the launch and the
+    record, the job ran unrecorded, and `dropSst` could commit while it read the dropped SST, so
+    the dropped rows came back. Now a job is recorded before it is launched (`f83cd56`).
+  - **The locks.** `stateLock` and `planLock` are pinned by unit tests.
+- **D117, D118, the mutation sweep of `lsm-core`.** 800 mutants. No wrong behavior found. Tests now
+  pin the Bloom filter's stored bits, the footer's seq bounds, and every limit. `BlockServer` error
+  answers are `no-store`.
+- **D119, a reused id's chain continues past its tombstone.** Two hazards D90 had left as risks,
+  each with a failing test: an old snapshot read the new database's value, and an old compaction's
+  commit passed its checks against the new chain. A chain created over a tombstone now starts
+  past it. Found by working through D90's open list (`mut-read`).
+- **D121.** `tokens ensure` and `rotate` fail when a written secret never turns active.
+- **D122, D127, the mutation sweeps of the writer, the compactor, and the memtable** (both
+  partial). Test gaps closed: the commit lock against a seal, the stored row kinds, the start
+  failures, concurrent first requests, concurrent flushes, the trim's bounds, and a restarted
+  writer scheduling its flush. No wrong behavior found.
+- **D123, span events pass the trace policy.**
+- **D125, every scan surface is bounded** (the second review, above).
+- **D128, the mutation sweep of the request edge and sharding.** 165 mutants. It found one defect,
+  by reading the code beside a survivor: a read of a corrupted SST answered `InternalFailure`,
+  not the `StoredDataInvalid` the runbook promises. The fix is on `proto/audit-api` (`edfe57b`),
+  not merged.
+- **D129, the checkpoint cap is 128 per database.**
+  - **Why.** At D99's maxima, a collection would read 1,000 pinned manifests of 4 MiB, 4 GiB in
+    all: about 41 s of decoding (derived) against the compactor's 60 s CPU limit. No SST would be
+    deleted again.
+  - **The rule.** The cap is 512 MiB of pinned reads divided by the 4 MiB manifest budget.
+  - **Found by** a test with 1,000 checkpoints and its arithmetic (`mut-read`).
 
-PENDING(mutation): the three mutation sweeps (`lsm-core`; the reader, manifest, and GC services;
-the writer, compactor, and public API: D117 to D122), with their survivors and fixes.
-
-## 8. Defects found in the last day, and what that says
+## 8. Defects found, and what that says
 
 **What the gates did.** On `f3b2ad2`, every gate passed: the 132-minute soak on `preview-1`, the
 20-minute `eu` soak on `preview-2` (section 5), the 13 scenarios, `vp run ready`, and `vp run
-verify` (28 runs). Every defect below except D70 was in that code. Gates that run the system and
-check its answers (soaks, scenarios, unit and property tests, the existing models) found none of
-them. Every one was found by reading code against a stated rule, or by extending a model or a
-measurement past what the gates did.
+verify` (28 runs). 31 of the 40 defects below were in that code. D70 had been fixed before it.
+Eight came with fixes made after it: the two found in the runtime (with D100 and D90), D115a and
+D115b (with D85's forget), D116a (the case D91's liveness check left open; before D91 any hold could be deleted), D119a and D119b (with D90's reuse
+after `gcMinAge`), and D129 (with D99's cap). Gates that run the system and check its answers (soaks, scenarios, unit and property tests,
+the atomic-step models) found none of them. The workerd tests and one live scenario found two at
+integration; everything else was found by reading code against a stated rule, or by a model, a
+measurement, or a sweep that went past what the gates did.
 
-| Defect                                        | What a caller would have seen                                                    | Found by                                | What catches it now                                                                              |
-| --------------------------------------------- | -------------------------------------------------------------------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| D70: read past its snapshot                   | "not found" for a key that had a value                                           | a model extended with compaction        | `noSnapshotUpperBound`; `db-client.test.ts`                                                      |
-| D74b: counter refresh race                    | a row unflushed until a later write                                              | review of a diff                        | `db-writer.test.ts` (`runWithHookedStats`)                                                       |
-| D76: begin manifest collected                 | every transaction read refused, every retry                                      | guide checked against code              | `db-transaction.test.ts`; `ReadsAtBegin`                                                         |
-| D77: fork hold released early                 | `StorageUnavailable` on every retry, fork snapshots and transactions             | interaction audit                       | `GcSafetyFork.cfg` `earlyForkRelease`; `database-lifecycle.test.ts`, `garbage-collector.test.ts` |
-| D78: compactor fenced against itself          | every write refused, permanently                                                 | a measurement (`measure manifest-cas`)  | `compactor.test.ts`, two overlapping cold wakes                                                  |
-| D80: change feed skipped changes              | changes lost without an error                                                    | interaction audit                       | `change-feed.test.ts`, `manifest.test.ts`                                                        |
-| D81: compaction folded expiries               | a key absent after a compaction                                                  | interaction audit                       | `row-resolution.test.ts`, `compaction-merge.test.ts`                                             |
-| D83: collection without a retained manifest   | SSTs a reader needed deleted                                                     | interaction audit                       | `garbage-collector.test.ts`                                                                      |
-| D84: `Snapshot` commit across a trim          | a lost update                                                                    | area audit (Durable Objects)            | `db-writer.test.ts`; `Transactions.tla` `Commit`                                                 |
-| D85: seal the writer never saw                | acknowledged writes that never flushed, in no successor                          | area audit (Durable Objects)            | `db-writer.test.ts`                                                                              |
-| D86: `prepare` result over 1 MiB              | a large merge never runs; runs pile up                                           | area audits (Workflow, limits)          | `compaction-executor.test.ts`                                                                    |
-| D87: `l0MaxSsts` below `minCompactionSources` | writes refused forever                                                           | area audit (Workflow)                   | `size-tiered-compaction-scheduler.test.ts`; a settings rule                                      |
-| D88: TTL near 2^53                            | every flush failed, writes stalled                                               | area audit (API)                        | `db-http-limits.test.ts`, `db-http-boundary.property.test.ts`                                    |
-| D89: stale router at `Flushed`                | a sealed shard's old data, without bound                                         | area audit (API)                        | `shard-router-staleness.test.ts`                                                                 |
-| D90: recreated id                             | a removed database's data under the new one                                      | area audit (lifecycle)                  | `database-lifecycle.test.ts`; `ManifestCasFencingRemove.cfg`                                     |
-| D91: commit after a removal                   | a removed database back, acknowledging writes                                    | area audit (lifecycle)                  | `database-lifecycle.test.ts`; `ManifestCasFencingRemove.cfg`                                     |
-| D93a: `Latest` scan held all unflushed rows   | `exceededMemory` on an allowed scan                                              | area audit (limits)                     | `db-client-scan.test.ts`                                                                         |
-| D93b: change feed split a large batch         | 500 of 1,500 changes skipped silently                                            | area audit (Durable Objects)            | `change-feed.test.ts`, `mem-table.test.ts`                                                       |
-| D94: job with no Workflow instance            | its sources never compacted again                                                | area audits (Workflow, Durable Objects) | `compactor.test.ts`                                                                              |
-| D95: seal with other successors               | success, with the old successors kept                                            | area audit (API)                        | `db-writer.test.ts`                                                                              |
-| D96: compaction longer than `gcMinAge`        | a large merge never commits                                                      | area audit (Workflow)                   | `garbage-collector.test.ts`, `compactor.test.ts`                                                 |
-| D97: step over dropped rows                   | compaction stuck after mass deletes; writes refused                              | area audit (limits)                     | `compaction-executor.test.ts`                                                                    |
-| D101: abandoned split                         | a key range unwritable forever                                                   | area audit (API)                        | `shard-split-faults.test.ts`                                                                     |
-| D107: metadata grew with key size             | gets re-reading huge metadata; at 16 KiB keys every flush failed, writes stalled | area audit (read)                       | `sst-codec.test.ts`                                                                              |
-| D107b: damaged SST metadata untyped           | a read died as `InternalFailure` (500), naming no SST                            | area audit (read)                       | `sst-codec.test.ts` property                                                                     |
-| D108: scan page over deleted versions         | every request for that range timed out                                           | area audit (read)                       | `db-reader-limits.test.ts`, `db-http-scan.test.ts`                                               |
-| D108b: damaged block cached                   | a block unreadable for as long as Workers Cache kept the bad copy (up to a year) | area audit (read)                       | `block-cache.test.ts`                                                                            |
+| Defect                                        | What a caller would have seen                                                      | Found by                                                                | What catches it now                                                                              |
+| --------------------------------------------- | ---------------------------------------------------------------------------------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| D70: read past its snapshot                   | "not found" for a key that had a value                                             | a model extended (D70)                                                  | `noSnapshotUpperBound`; `db-client.test.ts`                                                      |
+| D74b: counter refresh race                    | a row unflushed until a later write                                                | review of a diff                                                        | `db-writer.test.ts` (`runWithHookedStats`)                                                       |
+| D76: begin manifest collected                 | every transaction read refused, every retry                                        | a guide checked against code                                            | `db-transaction.test.ts`; `ReadsAtBegin`                                                         |
+| D77: fork hold released early                 | `StorageUnavailable` on every retry, fork snapshots and transactions               | interaction audit                                                       | `GcSafetyFork.cfg` `earlyForkRelease`; `database-lifecycle.test.ts`, `garbage-collector.test.ts` |
+| D78: compactor fenced against itself          | every write refused, permanently                                                   | a measurement                                                           | `compactor.test.ts`, two overlapping cold wakes                                                  |
+| D80: change feed skipped changes              | changes lost without an error                                                      | interaction audit                                                       | `change-feed.test.ts`, `manifest.test.ts`                                                        |
+| D81: compaction folded expiries               | a key absent after a compaction                                                    | interaction audit                                                       | `row-resolution.test.ts`, `compaction-merge.test.ts`                                             |
+| D83: collection without a retained manifest   | SSTs a reader needed deleted                                                       | interaction audit                                                       | `garbage-collector.test.ts`                                                                      |
+| D84: `Snapshot` commit across a trim          | a lost update                                                                      | area audit, round 2 (Durable Objects)                                   | `db-writer.test.ts`; `Transactions.tla` `Commit`                                                 |
+| D85: seal the writer never saw                | acknowledged writes that never flushed, in no successor                            | area audit, round 2 (Durable Objects)                                   | `db-writer.test.ts`                                                                              |
+| D86: `prepare` result over 1 MiB              | a large merge never runs; runs pile up                                             | area audits, round 2 (Workflow, limits)                                 | `compaction-executor.test.ts`                                                                    |
+| D87: `l0MaxSsts` below `minCompactionSources` | writes refused forever                                                             | area audit, round 2 (Workflow)                                          | `size-tiered-compaction-scheduler.test.ts`; a settings rule                                      |
+| D88: TTL near 2^53                            | every flush failed, writes stalled                                                 | area audit, round 2 (API)                                               | `db-http-limits.test.ts`, `db-http-boundary.property.test.ts`                                    |
+| D89: stale router at `Flushed`                | a sealed shard's old data, without bound                                           | area audit, round 2 (API)                                               | `shard-router-staleness.test.ts`                                                                 |
+| D90: recreated id                             | a removed database's data under the new one                                        | area audit, round 2 (lifecycle)                                         | `database-lifecycle.test.ts`; `ManifestCasFencingRemove.cfg`                                     |
+| D91: commit after a removal                   | a removed database back, acknowledging writes                                      | area audit, round 2 (lifecycle)                                         | `database-lifecycle.test.ts`; `ManifestCasFencingRemove.cfg`                                     |
+| D93a: `Latest` scan held all unflushed rows   | `exceededMemory` on an allowed scan                                                | area audit, round 2 (limits)                                            | `db-client-scan.test.ts`                                                                         |
+| D93b: change feed split a large batch         | 500 of 1,500 changes skipped silently                                              | area audit, round 2 (Durable Objects)                                   | `change-feed.test.ts`, `mem-table.test.ts`                                                       |
+| D94: job with no Workflow instance            | its sources never compacted again                                                  | area audits, round 2 (Workflow, Durable Objects)                        | `compactor.test.ts`                                                                              |
+| D95: seal with other successors               | success, with the old successors kept                                              | area audit, round 2 (API)                                               | `db-writer.test.ts`                                                                              |
+| D96: compaction longer than `gcMinAge`        | a large merge never commits                                                        | area audit, round 2 (Workflow)                                          | `garbage-collector.test.ts`, `compactor.test.ts`                                                 |
+| D97: step over dropped rows                   | compaction stuck after mass deletes; writes refused                                | area audit, round 2 (limits)                                            | `compaction-executor.test.ts`                                                                    |
+| D101: abandoned split                         | a key range unwritable forever                                                     | area audit, round 2 (API)                                               | `shard-split-faults.test.ts`                                                                     |
+| D107: metadata grew with key size             | gets re-reading huge metadata; at 16 KiB keys every flush failed, writes stalled   | area audit, round 2 (read)                                              | `sst-codec.test.ts`                                                                              |
+| D107b: damaged SST metadata untyped           | a read died as `InternalFailure` (500), naming no SST                              | area audit, round 2 (read)                                              | `sst-codec.test.ts` property                                                                     |
+| D108: scan page over deleted versions         | every request for that range timed out                                             | area audit, round 2 (read)                                              | `db-reader-limits.test.ts`, `db-http-scan.test.ts`                                               |
+| D108b: damaged block cached                   | a block unreadable for as long as Workers Cache kept the bad copy (up to a year)   | area audit, round 2 (read)                                              | `block-cache.test.ts`                                                                            |
+| D100c: body read twice                        | every `POST` to the API failed, in the Workers runtime only; the unit tests passed | integration in the real runtime (`writer.workerd.ts`)                   | `writer.workerd.ts` (`2ea228a`)                                                                  |
+| create error span (`e147572`)                 | nothing; an operator saw an error span on every create                             | integration in the real runtime (`block-cache` scenario on `preview-2`) | `database-lifecycle.test.ts`                                                                     |
+| D115a: seal interrupted before its edit       | every later request `WriterFencedError`, until the object was evicted              | TLA+ model at await granularity (`WriterObject`)                        | `db-writer.test.ts`; `beforeD115`                                                                |
+| D115b: seal with nothing to flush             | the same, by a second path                                                         | TLA+ model at await granularity (`WriterObject`)                        | `db-writer.test.ts`; `markFencedAnyPhase`                                                        |
+| D116a: `deleteCheckpoint` during `forkRange`  | a fork losing its data                                                             | TLA+ model (`Lifecycle`)                                                | `database-lifecycle.test.ts`; `beforeD116`                                                       |
+| D116b: job launched before recorded           | a dropped SST's rows coming back                                                   | TLA+ model at await granularity (`CompactorObject`)                     | `compactor.test.ts` (`f83cd56`)                                                                  |
+| D113: feed repeats after a lost response      | a change-feed consumer getting a change twice                                      | TLA+ model, while placing its labels                                    | `db-writer.test.ts`, an expected failure: **not fixed**                                          |
+| D119a: old snapshot after an id's reuse       | the new database's value at an old snapshot                                        | a recorded risk worked through (`mut-read`, D90's list)                 | `database-lifecycle.test.ts`                                                                     |
+| D119b: old compaction after an id's reuse     | an old job's outputs replacing the new chain's run                                 | a recorded risk worked through (`mut-read`)                             | `database-lifecycle.test.ts`                                                                     |
+| D125a: transaction scan unbounded             | one row over 5,000 unflushed keys read 6 writer pages and held 5,000 rows          | the owner's review                                                      | `scan-bounds.test.ts`, `scan-oracle.property.test.ts`, `writer.workerd.ts`                       |
+| D125b: sharded scan unbounded                 | a routed page read its whole shard (11 writer pages for one row)                   | the owner's review                                                      | `shard-scan-bounds.test.ts`, `shard-scan-oracle.property.test.ts`                                |
+| D128: corrupted SST answer                    | `InternalFailure` (500), not the runbook's `StoredDataInvalid`                     | mutation sweep (`mut-edge`, reading a survivor's code)                  | `db-public-error-translation.test.ts` (`it.fails`); fix on `proto/audit-api`, not merged         |
+| D129: checkpoint cap against GC               | at the most checkpoints allowed, no SST deleted again (derived)                    | a measurement in a test, with its arithmetic (`mut-read`)               | `manifest.test.ts`, `database-lifecycle.test.ts`                                                 |
 
 Risks fixed alongside (not counted above): D98 (GC cost by commit rate), D99 (unbounded caller
-growth), D100 (unbounded bodies), D102 (alarm retry), D103 (a retried zero-output commit).
+growth), D100 (unbounded bodies), D102 (alarm retry), D103 (a retried zero-output commit), D118 (a
+`BlockServer` error answer cacheable), D121 (a token secret never active), D123 (span events
+outside the trace policy), and D125's one key overwritten 2,500 times. Recorded and not fixed: the
+risk D109 found (section 9).
 
-**By class** (the classes of `/tmp/shale-work/agents/AUDIT-COMMON.md`, plus one it does not
+**By class** (the classes of `/tmp/shale-work/agents/AUDIT-COMMON.md`, plus three it does not
 name):
 
-| Class                                                              | Defects                                 |  Count |
-| ------------------------------------------------------------------ | --------------------------------------- | -----: |
-| Two features each correct alone                                    | D70, D77, D80, D83, D87, D89, D91, D93b |      8 |
-| State shared across an await inside one Durable Object             | D74b, D78, D84, D85                     |      4 |
-| Liveness after long idle periods and after GC                      | D76, D90, D94, D101                     |      4 |
-| Time (TTL, `gcMinAge`, retention)                                  | D81, D88, D96                           |      3 |
-| A limit a caller or the platform sets (not in AUDIT-COMMON's list) | D86, D93a, D97, D107, D108              |      5 |
-| Corruption not handled as corruption (not in AUDIT-COMMON's list)  | D107b, D108b                            |      2 |
-| A property checked at only one moment                              | D95                                     |      1 |
-| **Total**                                                          |                                         | **27** |
+| Class                                                              | Defects                                              |  Count |
+| ------------------------------------------------------------------ | ---------------------------------------------------- | -----: |
+| Two features each correct alone                                    | D70, D77, D80, D83, D87, D89, D91, D93b, D113, D116a |     10 |
+| State shared across an await inside one Durable Object             | D74b, D78, D84, D85, D115a, D115b, D116b             |      7 |
+| Liveness after long idle periods and after GC                      | D76, D90, D94, D101                                  |      4 |
+| Time (TTL, `gcMinAge`, retention)                                  | D81, D88, D96, D119a, D119b                          |      5 |
+| A limit a caller or the platform sets (not in AUDIT-COMMON's list) | D86, D93a, D97, D107, D108, D125a, D125b, D129       |      8 |
+| Corruption not handled as corruption (not in AUDIT-COMMON's list)  | D107b, D108b, D128                                   |      3 |
+| A property checked at only one moment                              | D95                                                  |      1 |
+| Only the Workers runtime shows it (not in AUDIT-COMMON's list)     | D100c, the create error span                         |      2 |
+| **Total**                                                          |                                                      | **40** |
 
-**By how each was found:** 19 by the round-2 area audits (4 of them by the read audit), 4 by the round-1 interaction audit, and
-1 each by an extended model (D70), a guide checked against the code (D76), a review of a diff
-(D74b), and a measurement (D78).
+**By how each was found:**
 
-**The rounds.** Rates come from the `STATUS.md` timestamps of each agent. They are approximate,
-because finding and fixing overlap.
+| Method                                                                             | Defects                                                       | Count |
+| ---------------------------------------------------------------------------------- | ------------------------------------------------------------- | ----: |
+| Area audits, round 2: API, Durable Objects, lifecycle, Workflow, limits, read path | D84–D97 (but D92), D93a, D93b, D101, D107, D107b, D108, D108b |    19 |
+| Interaction audit, round 1                                                         | D77, D80, D81, D83                                            |     4 |
+| TLA+ models at await granularity and end to end (D109–D116)                        | D113, D115a, D115b, D116a, D116b                              |     5 |
+| The owner's review of `d89beba`                                                    | D125a, D125b                                                  |     2 |
+| Integration in the real runtime                                                    | D100c, the create error span                                  |     2 |
+| A recorded risk worked through                                                     | D119a, D119b                                                  |     2 |
+| A measurement (`measure manifest-cas`; a 1,000-checkpoint test and its arithmetic) | D78, D129                                                     |     2 |
+| A mutation sweep                                                                   | D128                                                          |     1 |
+| A model extended (compaction added to `NoAckedWriteLost`)                          | D70                                                           |     1 |
+| A guide checked against the code                                                   | D76                                                           |     1 |
+| A review of a diff                                                                 | D74b                                                          |     1 |
 
-- **Round 1: review and interaction audit of the last day's diff.** It found D76, D77, D80, D81,
-  D83, and the counter race: six defects in about 67 auditor-minutes of finding (the invariants
-  agent 22:40–23:00 UTC; the review agent's passes 22:40–22:51, 23:18–23:28, and 23:38–00:04).
-  That is about 5 an auditor-hour.
-- **The measurement.** `measure manifest-cas` found D78 at 23:05 UTC.
-- **Round 2: five auditors by area from 00:12 UTC, and a sixth (the read path) from 01:09.** Their first briefs found 12 defects in about
-  79 auditor-minutes, about 9 an auditor-hour:
-  - API: 2 (D88, D89);
-  - Durable Objects: 2 (D84, D85);
-  - lifecycle: 3, D90 and D91;
-  - Workflow: 3 (D86, D87, D96);
-  - limits: 2 new (D93a, D97) and D86 again.
+The round-2 row is D84, D85, D86, D87, D88, D89, D90, D91, D93a, D93b, D94, D95, D96, D97, D101,
+D107, D107b, D108, and D108b. The owner's review also asked for the snapshot and TTL statement
+(the second review, above). It was a statement to write down: the code already did it, so it is
+not a defect.
 
-  Their second briefs, while fixing, confirmed four more (D93b, D94, D95, D101). The read audit
-  found four (D107, D107b, D108, D108b) in 21 minutes, 01:09–01:30 UTC.
+**The mutation sweeps.** Each mutant ran against the test files that cover its module, one vitest
+worker, `nice -n 15` (D117's method). A survivor is equivalent, unobservable, a test gap, or a
+defect.
 
-- **The production audit** (00:59–01:30 UTC, D104 and D105) found risks and documentation errors,
-  no defect: an interrupted smoke run's leftovers, the deployment guard overstated, and a rollback
-  across D91 that reopens D91's race for a removed database.
-- **No area round has yet ended without a defect-class finding.** The production audit is the
-  first audit without one; it read deployment and rollback, not the engine. The mutation sweeps are
-  running, and one has already reported a defect (PENDING(mutation)).
+| Sweep (decision)        | Scope                                                                                  | Mutants run |               Survived the first pass | Survive now                                                                          | Tests added                                                                                | Defects       |
+| ----------------------- | -------------------------------------------------------------------------------------- | ----------- | ------------------------------------: | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------ | ------------- |
+| `mut-core` (D117, D118) | `lsm-core`, 15 modules                                                                 | 800 of 800  | 286 (270 against every covering file) | 82: 80 equivalent, 2 performance-only (the block seek)                               | known answers, limits, merge, manifest edits (`/tmp/shale-work/agents/mut-core/REPORT.md`) | 0             |
+| `mut-read` (D119, D129) | reader, manifest, GC, lifecycle, block cache and source                                | 400 of 507  |                                   162 | 130, each classed in its report; 12 of `db-client.ts`'s untriaged                    | 6 survivors killed by new tests                                                            | 0 by a mutant |
+| `mut-write` (D122)      | writer, memtable, compactor, compaction executor                                       | 318 of 580  |                                   121 | 2 test gaps closed, 6 named, 4 groups equivalent or unobservable, about 90 untriaged | the commit lock against a seal; the stored row kinds                                       | 0             |
+| `mut-write2` (D127)     | the same files, and `object-store.ts`, `sst-store.ts`, the budget                      | running     |             `mem-table.ts`: 30 of 104 | PENDING(mutation)                                                                    | start, start failures, locks, trim bounds, range conflicts (`ac1603a` to `3bb39a4`)        | 0 so far      |
+| `mut-edge` (D128)       | request bound, error translation, access gate, trace policy, shard directory and split | 165 of 165  |                                    37 | 6: 2 equivalent, 2 need workerd, 2 no contract                                       | 3 new test files, 3 extended                                                               | 1 (D128)      |
 
-**What has had a pass over every await or every field, and what has not** (each report's "Not
-reached"):
+In all: 1,683 mutants run in the four sweeps that have reported, and `mut-write2`'s still running. One
+defect came from a sweep, D128, and it was found by reading the code beside a survivor, not by
+the mutant itself. Every other killed survivor was intended behavior that no test checked. The
+largest classes of gap were stored formats with no known-answer test (the Bloom filter's bits, the
+memtable's row kinds), `retryable` on 20 of 32 public error sites, and the locks (`commitLock`,
+`initLock`, `flushLock`, `stateLock`, `planLock`). The lock gaps were closed with unit tests and,
+for D116, model variants.
 
-- **Every await of every Durable Object:** the writer, compactor, compaction budget, and shard
-  directory (audit-do). Not reached: `MemTable` migrations, the `LATEST`-hint writes after
-  eviction, and the Workflow's own steps.
-- **Every field of every request schema:** a schema walker that fails on any unbounded field
-  (audit-api, D100). Not reached: the `BlockServer` under a hostile caller, and HTTP round trips
-  that reach a writer in-process.
-- **Every Cloudflare limit the design touches** (audit-limits, D92). Not reached: Worker startup
-  time, what Tail Workers drop, and any live run of a derived limit.
-- **Compaction and GC** (audit-workflow). Not reached: a compaction step's memory with 8 inputs,
-  which needs workerd.
-- **Lifecycle** (audit-lifecycle): D90 and D91 merged; its report is not in this tree.
-- **The read path** (audit-read, D107, D108). Not reached: offsets that pass D100's digit pattern
-  as floats, `no-store` on `BlockServer` error responses, and live memory and scan-budget
-  measurements.
-- **Not audited by area at all:** the tools (`scenario-cli`, `trace-cli`, `preview-cli`). The
-  telemetry policy had this audit's pass over every attribute, log line, and error message added
-  since `f3b2ad2` (D123).
+**Which methods have been applied where:**
 
-**What that says.** The checks that run the system at its normal timing found none of these in
-soaks of 132 and 21 minutes. The two rounds' first passes, reading the code against a stated
-rule, found 18 in about 2.4 auditor-hours, and the read audit four more in 21 minutes. The rate went up from round 1 to round 2, not down. Each fix has a
-regression test, which closes that defect, not its class. These are the facts as they stand; they
-make no prediction.
+| Package or area                                    | Area audit                          | Interaction audit         | Model                                                           | Mutation sweep                                                                     | Soak workload (D106)                       |
+| -------------------------------------------------- | ----------------------------------- | ------------------------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------------- | ------------------------------------------ |
+| `lsm-core`                                         | read, limits                        | yes                       | `ManifestCasFencing`, `GcSafety`, `Transactions` (atomic)       | complete (800)                                                                     | yes                                        |
+| Writer Durable Object and memtable                 | Durable Objects                     | yes                       | `WriterObject`, `NoAckedWriteLost`, `Transactions`, `SealSplit` | partial: `db-writer.ts` 98 of 221, `mem-table.ts` 115 of 138; `mut-write2` running | yes                                        |
+| Compactor Durable Object and Workflow              | Workflow, Durable Objects, limits   | no (D78 by a measurement) | `CompactorObject`                                               | partial: `compactor.ts` 101 of 181, executor 4 of 37; `mut-write2` running         | yes (flush bursts)                         |
+| Reader, manifest, GC, lifecycle                    | read, lifecycle                     | yes                       | `GcSafety`, `GcSafetyFork`, `Lifecycle`, `ManifestCasFencing`   | partial: 400 of 507 (`db-client.ts` 16 of 123; its round 2 running)                | yes                                        |
+| `BlockServer` and the block cache                  | read (a hostile caller not reached) | no                        | none                                                            | block cache and source only                                                        | reads only                                 |
+| Request edge (HTTP, errors, access gate, tracing)  | API                                 | no                        | none                                                            | complete (165), except `db-http-handlers.ts`                                       | partial: aborted requests, no hostile body |
+| `lsm-sharding`                                     | API                                 | no                        | `ShardSplit`, `SealSplit`                                       | directory and split complete; `shard-router.ts` not swept                          | yes (splits, the feed across a split)      |
+| `infra` (Stack, tokens, deploy)                    | production (read, never run)        | no                        | none                                                            | none                                                                               | deploy and redeploy only                   |
+| Tools (`scenario-cli`, `trace-cli`, `preview-cli`) | none                                | no                        | none                                                            | none                                                                               | the soak is one of them                    |
+
+**The rounds, as numbers.** Times come from each agent's `STATUS.md`. `formal`, `formal2`, and
+`mut-write2` write local time (UTC − 5), converted here. Rates are approximate, because finding
+and fixing overlap.
+
+| Round                                                  | When (UTC, 2026-11-26/27) | Agent time finding                | Defects |          Per agent-hour |
+| ------------------------------------------------------ | ------------------------- | --------------------------------- | ------: | ----------------------: |
+| 1: review and interaction audit of the last day's diff | 22:40–00:04               | about 67 minutes                  |       6 |                 about 5 |
+| The measurement (`measure manifest-cas`)               | 23:05                     | —                                 |       1 |                       — |
+| 2: six area audits                                     | 00:12–01:30               | about 100 minutes in first briefs |      19 | about 9 in first briefs |
+| 3: models at await granularity (two agents)            | 01:26–03:24               | about 217 minutes                 |       5 |               about 1.4 |
+| 3: mutation agents (five), with their open lists       | 01:33–03:25               | about 270 minutes                 |       4 |               about 0.9 |
+| 3: the owner's review                                  | before 02:23              | —                                 |       2 |                       — |
+| 3: integration (workerd tests, a live scenario)        | 01:25–01:43               | —                                 |       2 |                       — |
+
+Round 3's four from the mutation agents are D128 from a sweep, D119a and D119b from `mut-read`'s
+open list, and D129 from its 1,000-checkpoint test. The production audit (00:59–01:30) and the
+telemetry audit (D123, 01:34–01:53) found risks and documentation errors, no defect.
+
+**What remains unexamined** (each report's "Not reached" that nobody has picked up):
+
+- **Durable Objects:** `MemTable` migrations; the `LATEST`-hint writes after an eviction (the
+  `WriterObject` model has no manifest view); D115's two view-install guards, which no test reaches.
+- **The API:** the `BlockServer` under a hostile caller; HTTP round trips that reach a writer
+  in-process; the sharded scan in workerd (D125).
+- **Limits:** Worker startup time; what Tail Workers drop; any live run of a derived limit; a
+  compaction step's memory with 8 inputs (needs workerd); live memory and scan-budget measurements.
+- **Models:** two collections at once (D83); a second split of a successor before its rewrite;
+  routers two generations behind; `dropSst`, corruption, and budget fairness in `CompactorObject`.
+- **Mutation:** `db-client.ts` (its round 2 is running); about 90 untriaged survivors and the
+  unrun mutants of `db-writer.ts`, `compactor.ts`, and `compaction-executor.ts` (`mut-write2` is
+  running); `object-store.ts`, `sst-store.ts`, `compaction-budget*.ts`, `db-http-handlers.ts`, and
+  `shard-router.ts`.
+- **Production:** what `alchemy plan --stage production` prints (read, never run); a smoke step
+  that hangs past 60 s.
+- **The tools:** no area audit.
+
+**What that says.**
+
+- **The count.** 40 defects since `f3b2ad2`: 6 in round 1, 1 by a measurement, 19 in round 2,
+  and 13 in round 3, plus D70 before round 1.
+- **The gates.** The soaks of 132 and 21 minutes on `f3b2ad2` passed with 31 of them in the code.
+  The 21.6-minute soak on `d89beba`, with the D106 workload, passed with 11 in the code: D113,
+  D115a, D115b, D116a, D116b, D119a, D119b, D125a, D125b, D128, and D129. Their fixes are on the
+  integration branch (`git merge-base --is-ancestor`), and D113's is not written.
+- **Each method's first pass found defects:** the interaction audit, the area audits, the object
+  models, the owner's review, and the runtime integration. The mutation sweeps found one in about
+  1,700 mutants. What they mostly found were gaps in the tests, now closed.
+- **The rate fell in round 3.** By agent-hour: about 5 in round 1, about 9 in round 2's first
+  briefs, and about 1.4 and 0.9 in round 3.
+- **Round 3's defects were of the same classes as before,** except the two only the runtime shows,
+  and they were found by new methods.
+- **What a fix closes.** Each fix has a regression test, which closes that defect, not its class.
+  D113 and D128 are not fixed at `c149afb`.
+
+These are the facts as they stand. They make no prediction.
 
 ## 9. Known limitations
 
