@@ -89,13 +89,27 @@ const withStore = <A, E, R>(directory: string, effect: Effect.Effect<A, E, R>) =
   effect.pipe(Effect.provide(traceStoreLayer(directory)));
 
 /** Reads every stored trace, most recently written first. */
-const readAllTraces = Effect.gen(function* () {
-  const store = yield* TraceStore;
-  const ids = yield* store.listTraceIds;
-  const traces = new Map<string, ReadonlyArray<CollectedSpan>>();
-  for (const id of ids) traces.set(id, yield* store.readTrace(id));
-  return traces;
-});
+/**
+ * How much older than a `grep --since` time a trace file may be and still be read: the spans'
+ * times come from the clock that made them (Cloudflare's, or a local Worker's), a file's from this
+ * machine's, and the two may disagree by this much.
+ */
+export const STORE_CLOCK_MARGIN_MS = 10 * 60_000;
+
+const readAllTraces = Effect.suspend(() => readTracesWrittenSince(Option.none()));
+
+/** Every stored trace, or (with a time) only those whose files were written since it, less the margin. */
+const readTracesWrittenSince = (sinceMs: Option.Option<number>) =>
+  Effect.gen(function* () {
+    const store = yield* TraceStore;
+    const ids = yield* Option.match(sinceMs, {
+      onNone: () => store.listTraceIds,
+      onSome: (ms) => store.listTraceIdsWrittenSince(ms - STORE_CLOCK_MARGIN_MS),
+    });
+    const traces = new Map<string, ReadonlyArray<CollectedSpan>>();
+    for (const id of ids) traces.set(id, yield* store.readTrace(id));
+    return traces;
+  });
 
 const printJson = (value: unknown) => Console.log(JSON.stringify(value, null, 2));
 
@@ -205,21 +219,36 @@ const toSpanFilter = (flags: {
   error: flags.error ? true : undefined,
 });
 
-const grep = Command.make("grep", { store: storeFlag, json: jsonFlag, ...filterFlags }, (flags) =>
-  withStore(
-    flags.store,
-    Effect.gen(function* () {
-      const filter = toSpanFilter(flags);
-      const traces = yield* readAllTraces;
-      const matches = [...traces.values()].flat().filter((span) => matchesSpanFilter(filter, span));
-      if (flags.json) return yield* printJson(encodeCollectedSpans(matches));
-      for (const span of matches) {
-        yield* Console.log(
-          `${span.traceId} ${span.spanId} ${span.name} ${span.durationMs.toFixed(2)}ms ${span.status.code}${Option.match(span.status.message, { onNone: () => "", onSome: (message) => ` (${message})` })}`,
-        );
-      }
-    }),
+const grepSinceFlag = Flag.Int("since").pipe(
+  Flag.withDescription(
+    "Only spans that started at or after this Unix millisecond time; trace files last written well before it are not read",
   ),
+  Flag.optional,
+);
+
+const grep = Command.make(
+  "grep",
+  { store: storeFlag, json: jsonFlag, ...filterFlags, since: grepSinceFlag },
+  (flags) =>
+    withStore(
+      flags.store,
+      Effect.gen(function* () {
+        const filter = toSpanFilter(flags);
+        const traces = yield* readTracesWrittenSince(flags.since);
+        const startedSince = (span: CollectedSpan) =>
+          Option.isNone(flags.since) ||
+          BigInt(span.startTimeUnixNano) >= BigInt(flags.since.value) * 1_000_000n;
+        const matches = [...traces.values()]
+          .flat()
+          .filter((span) => startedSince(span) && matchesSpanFilter(filter, span));
+        if (flags.json) return yield* printJson(encodeCollectedSpans(matches));
+        for (const span of matches) {
+          yield* Console.log(
+            `${span.traceId} ${span.spanId} ${span.name} ${span.durationMs.toFixed(2)}ms ${span.status.code}${Option.match(span.status.message, { onNone: () => "", onSome: (message) => ` (${message})` })}`,
+          );
+        }
+      }),
+    ),
 ).pipe(Command.withDescription("Find spans by name, attribute, error status, or database id"));
 
 const stats = Command.make(

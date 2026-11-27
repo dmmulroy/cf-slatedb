@@ -1,6 +1,13 @@
-import { Duration, Effect, Fiber, Option } from "effect";
+import { Duration, Effect, Fiber, Option, Semaphore } from "effect";
 
-import { invocationsRepresentedBy, tailCursorAt, type InvocationRecord } from "./measurements.ts";
+import {
+  invocationsRepresentedBy,
+  pullCursorTimeMs,
+  tailCursorAt,
+  type InvocationRecord,
+} from "./measurements.ts";
+
+export { pullCursorTimeMs };
 
 /** The result of a read given a time budget: its value, or `OutOfTime` when the budget ran out first. */
 export type BoundedRead<A> =
@@ -187,3 +194,106 @@ export const every = <R>(interval: Duration.Input, effect: Effect.Effect<unknown
       yield* effect;
     }
   });
+
+/** How the soak's span pulls are going (D132): how far they got, and how each pull ended. */
+export class SpanPullProgress {
+  /** The arrival time of the last export stored, from the store's cursor. */
+  pulledThroughMs: Option.Option<number> = Option.none();
+  /** Pulls that finished (caught up with the collector). */
+  pullsFinished = 0;
+  /** Pulls cut off at their budget; the next one resumes from the cursor. */
+  pullsCutOff = 0;
+  /** Pulls that failed. */
+  pullsFailed = 0;
+  /** How far the pulls lagged behind the workload's end, in seconds, once it has ended. */
+  lagAtWorkloadEndSeconds: Option.Option<number> = Option.none();
+
+  /** Records how far the pulls lagged when the workload ended at `endedAtMs`. */
+  markWorkloadEnd(endedAtMs: number) {
+    this.lagAtWorkloadEndSeconds = Option.map(this.pulledThroughMs, (through) =>
+      Math.max(0, Math.round((endedAtMs - through) / 1000)),
+    );
+  }
+
+  /** The progress as the report shows it. */
+  toReport() {
+    return {
+      spansPulledThrough: Option.getOrNull(
+        Option.map(this.pulledThroughMs, (at) => new Date(at).toISOString()),
+      ),
+      spanPullLagAtWorkloadEndSeconds: Option.getOrNull(this.lagAtWorkloadEndSeconds),
+      spanPulls: {
+        finished: this.pullsFinished,
+        cutOff: this.pullsCutOff,
+        failed: this.pullsFailed,
+      },
+    };
+  }
+}
+
+/** How one span pull ended. */
+export type SpanPullRead =
+  | { readonly _tag: "CaughtUp" }
+  | { readonly _tag: "OutOfTime" }
+  | { readonly _tag: "Failed"; readonly message: string };
+
+/**
+ * Pulls the stage's spans into the soak's store, one pull at a time (D132).
+ *
+ * **Details**
+ *
+ * - **One at a time.** Every pull holds `lock`: a pull appends to the store and saves its cursor
+ *   after each export, so two at once would store exports twice. The final catch-up waits for a
+ *   watcher pull still running.
+ * - **A pull cut off loses nothing.** Its budget interrupts it (the trace CLI process is killed);
+ *   the cursor stands after the last export stored, and the next pull starts there.
+ * - **Progress is read from the cursor** after every pull, finished or not, so the report shows how
+ *   far the pulls got.
+ */
+export class SpanPuller<E extends { readonly message: string }, R, R2> {
+  readonly progress = new SpanPullProgress();
+  readonly #lock: Semaphore.Semaphore;
+  readonly #pull: Effect.Effect<unknown, E, R>;
+  readonly #pulledThrough: Effect.Effect<Option.Option<number>, never, R2>;
+
+  constructor(
+    lock: Semaphore.Semaphore,
+    pull: Effect.Effect<unknown, E, R>,
+    pulledThrough: Effect.Effect<Option.Option<number>, never, R2>,
+  ) {
+    this.#lock = lock;
+    this.#pull = pull;
+    this.#pulledThrough = pulledThrough;
+  }
+
+  /** One pull within `budget`, then the cursor read back into {@link SpanPuller.progress}. */
+  pullWithin(budget: Duration.Input): Effect.Effect<SpanPullRead, never, R | R2> {
+    const progress = this.progress;
+    const pulledThrough = this.#pulledThrough;
+    return this.#lock.withPermits(1)(
+      readWithin(budget, this.#pull).pipe(
+        Effect.map((read): SpanPullRead =>
+          read._tag === "Finished" ? { _tag: "CaughtUp" } : read,
+        ),
+        Effect.catch((error) =>
+          Effect.succeed<SpanPullRead>({ _tag: "Failed", message: error.message }),
+        ),
+        Effect.tap((read) =>
+          Effect.gen(function* () {
+            if (read._tag === "CaughtUp") progress.pullsFinished += 1;
+            else if (read._tag === "OutOfTime") progress.pullsCutOff += 1;
+            else progress.pullsFailed += 1;
+            const through = yield* pulledThrough;
+            if (Option.isSome(through)) progress.pulledThroughMs = through;
+          }),
+        ),
+      ),
+    );
+  }
+}
+
+/** Makes a {@link SpanPuller} with its own lock. */
+export const makeSpanPuller = <E extends { readonly message: string }, R, R2>(
+  pull: Effect.Effect<unknown, E, R>,
+  pulledThrough: Effect.Effect<Option.Option<number>, never, R2>,
+) => Effect.map(Semaphore.make(1), (lock) => new SpanPuller(lock, pull, pulledThrough));

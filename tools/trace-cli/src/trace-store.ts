@@ -45,6 +45,16 @@ export interface ITraceStore {
    */
   readonly listTraceIds: Effect.Effect<ReadonlyArray<string>, TraceStoreError>;
   /**
+   * Lists the trace ids whose files were last written at or after `sinceMs` (epoch ms, the local
+   * clock), most recently written first, reading no file. A span is written when it arrives, so a
+   * file last written before `sinceMs` holds only spans that arrived before it.
+   *
+   * @returns Trace ids, or `TraceStoreError` (`StoreUnavailable`).
+   */
+  readonly listTraceIdsWrittenSince: (
+    sinceMs: number,
+  ) => Effect.Effect<ReadonlyArray<string>, TraceStoreError>;
+  /**
    * Reads every span of one trace, in the order they arrived.
    *
    * @returns The spans, or `TraceStoreError` (`TraceNotFound`, `StoreUnavailable`, or
@@ -96,6 +106,28 @@ export const makeTraceStore = (directory: string) =>
       .pipe(Effect.mapError(unavailable("append")));
 
     const traceFile = (traceId: string) => path.join(spansDirectory, `${traceId}.ndjson`);
+    /** Trace ids whose files were last written at or after `sinceMs`, newest first. */
+    const listWrittenSince = (sinceMs: number) =>
+      Effect.gen(function* () {
+        const names = yield* fs
+          .readDirectory(spansDirectory)
+          .pipe(Effect.mapError(unavailable("listTraceIds")));
+        const entries = yield* Effect.forEach(
+          names.filter((name) => name.endsWith(".ndjson")),
+          (name) =>
+            fs.stat(path.join(spansDirectory, name)).pipe(
+              Effect.map((info) => ({
+                traceId: name.slice(0, -".ndjson".length),
+                modified: info.mtime._tag === "Some" ? info.mtime.value.getTime() : 0,
+              })),
+              Effect.mapError(unavailable("listTraceIds")),
+            ),
+        );
+        return entries
+          .filter((entry) => entry.modified >= sinceMs)
+          .sort((left, right) => right.modified - left.modified)
+          .map((entry) => entry.traceId);
+      });
 
     return TraceStore.of({
       directory,
@@ -116,25 +148,8 @@ export const makeTraceStore = (directory: string) =>
           ),
         );
       }),
-      listTraceIds: Effect.gen(function* () {
-        const names = yield* fs
-          .readDirectory(spansDirectory)
-          .pipe(Effect.mapError(unavailable("listTraceIds")));
-        const entries = yield* Effect.forEach(
-          names.filter((name) => name.endsWith(".ndjson")),
-          (name) =>
-            fs.stat(path.join(spansDirectory, name)).pipe(
-              Effect.map((info) => ({
-                traceId: name.slice(0, -".ndjson".length),
-                modified: info.mtime._tag === "Some" ? info.mtime.value.getTime() : 0,
-              })),
-              Effect.mapError(unavailable("listTraceIds")),
-            ),
-        );
-        return entries
-          .sort((left, right) => right.modified - left.modified)
-          .map((entry) => entry.traceId);
-      }),
+      listTraceIds: Effect.suspend(() => listWrittenSince(Number.NEGATIVE_INFINITY)),
+      listTraceIdsWrittenSince: listWrittenSince,
       readTrace: Effect.fn("TraceStore.readTrace")(function* (traceId) {
         const file = traceFile(traceId);
         const exists = yield* fs

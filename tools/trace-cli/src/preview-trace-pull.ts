@@ -139,7 +139,8 @@ const savedPosition = (pullsDirectory: string, url: string) =>
  * `show`, `grep`, `stats`, `diff`, and `assert` see the stage's spans. The cursor is kept in
  * `<store>/pulls/<name>.json` (the collector's {@link TraceCollector} name) and is matched by
  * collector URL (a recreated collector starts from the beginning; see {@link savedPosition}). It
- * advances after each export is stored, so a failed pull resumes where it stopped.
+ * advances after each export is stored, so a failed or interrupted pull resumes where it stopped
+ * and stores no export twice.
  *
  * @returns What was downloaded, or `PreviewTracePullError`: `CollectorUnauthorized` (the token was
  *   refused), `CollectorUnavailable` (unreachable or an error status; pull again), or `ExportInvalid`
@@ -261,6 +262,9 @@ export const pullPreviewTraces = (
         exports += 1;
         spans += decoded.length;
         after = Option.some(batch.key);
+        // After every export, not every page: a pull cut off mid-page (a soak's watcher, at its
+        // budget) resumes after the last export it stored, so none is stored twice.
+        yield* saveCursor(batch.key);
       }
       after = nextAfter;
       if (Option.isSome(after)) yield* saveCursor(after.value);

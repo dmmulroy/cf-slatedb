@@ -102,6 +102,48 @@ describe("pullPreviewTraces", () => {
     expect(result.counts).toEqual([1, 2, 3, 4]);
   });
 
+  it("resumes a pull cut off mid-page after the last export it stored, storing none twice (D132)", async () => {
+    const collector = makeCollector(10);
+    const target = {
+      name: "preview-1",
+      url: COLLECTOR_URL,
+      token: TOKEN,
+      stage: Option.some("preview-1"),
+    };
+    const result = await Effect.gen(function* () {
+      yield* exportSpans(collector.client, OtlpSerialization.layerJson, 1);
+      yield* exportSpans(collector.client, OtlpSerialization.layerJson, 2);
+      yield* exportSpans(collector.client, OtlpSerialization.layerJson, 3);
+      const store = yield* TraceStore;
+      // The first pull dies storing its second export, in the middle of its one page.
+      let appends = 0;
+      const dying = TraceStore.of({
+        ...store,
+        append: (spans) =>
+          Effect.suspend(() => {
+            appends += 1;
+            return appends === 2 ? Effect.die("killed mid-page") : store.append(spans);
+          }),
+      });
+      const first = yield* Effect.exit(
+        pullPreviewTraces(target).pipe(
+          Effect.provideService(HttpClient.HttpClient, collector.client),
+          Effect.provideService(TraceStore, dying),
+        ),
+      );
+      const resumed = yield* pullPreviewTraces(target).pipe(
+        Effect.provideService(HttpClient.HttpClient, collector.client),
+      );
+      const counts: Array<number> = [];
+      for (const id of yield* store.listTraceIds) counts.push((yield* store.readTrace(id)).length);
+      return { died: first._tag === "Failure", resumed, counts: counts.sort((a, b) => a - b) };
+    }).pipe(Effect.provide([traceStoreTestLayer, NodeServices.layer]), Effect.runPromise);
+    expect(result.died).toBe(true);
+    expect(result.resumed).toEqual({ collector: "preview-1", exports: 2, spans: 5 });
+    // Each trace holds its spans once: the export stored before the cut is not stored again.
+    expect(result.counts).toEqual([1, 2, 3]);
+  });
+
   it("resumes one collector's pulls whether it is named by stage or by URL", async () => {
     const collector = makeCollector(10);
     const result = await Effect.gen(function* () {
