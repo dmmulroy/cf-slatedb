@@ -525,4 +525,82 @@ describe("a long run of one key's merge operands (D125)", () => {
     expect(outcome.regularPages).toBeGreaterThanOrEqual(3);
     expect(outcome.transactionPages).toBeGreaterThanOrEqual(3);
   }, 180_000);
+
+  it("a key settled by a Put below a writer page of operands keeps the Put and every operand above it (D130)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* u64AddDatabase;
+        const db = yield* DbClient;
+        // Key 0: 600 older values, a base of 1,000, then 1,500 increments, all unflushed. The first
+        // writer page is operands only; the second holds the rest of them, the base that settles
+        // the key, and older versions, with more to come: the scan skips those.
+        for (let older = 0; older < 600; older++) {
+          yield* db.write(DB, {
+            operations: [{ _tag: "Put", key: key(0), value: u64(5), ttlMillis: Option.none() }],
+          });
+        }
+        yield* db.write(DB, {
+          operations: [{ _tag: "Put", key: key(0), value: u64(1000), ttlMillis: Option.none() }],
+        });
+        for (let increment = 0; increment < 1500; increment++) {
+          yield* db.write(DB, {
+            operations: [{ _tag: "Merge", key: key(0), operand: u64(1), ttlMillis: Option.none() }],
+          });
+        }
+        const { client } = yield* countingClient;
+        const regular = yield* regularPage(client, 5);
+        const { readSeq, manifestId } = yield* client.beginTransaction(DB);
+        const transaction = yield* client
+          .scanAtPage(DB, FULL_KEY_RANGE, readSeq, 5, manifestId)
+          .pipe(Effect.provideService(ScanPageBudget, BUDGET));
+        return [regular, transaction].map((page) => page.rows.map((row) => sumOf(row)));
+      }),
+    );
+    expect(outcome).toEqual([[2500], [2500]]);
+  }, 180_000);
+
+  it("a Latest scan reads a flushed operand once, though the writer still retains it (D130)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* u64AddDatabase;
+        const db = yield* DbClient;
+        for (let increment = 0; increment < 3; increment++) {
+          yield* db.write(DB, {
+            operations: [{ _tag: "Merge", key: key(0), operand: u64(1), ttlMillis: Option.none() }],
+          });
+        }
+        yield* db.flush(DB);
+        yield* db.write(DB, {
+          operations: [{ _tag: "Merge", key: key(0), operand: u64(1), ttlMillis: Option.none() }],
+        });
+        const rows = yield* Stream.runCollect(
+          db.scan(DB, FULL_KEY_RANGE, { ...latestOptions(10), limit: Option.none() }),
+        );
+        return rows.map((row) => sumOf(row));
+      }),
+    );
+    expect(outcome).toEqual([4]);
+  });
 });
+
+const u64AddDatabase = Effect.flatMap(ManifestStore, (store) =>
+  store.initialize(
+    initialManifest(DB, {
+      keyRange: Option.none(),
+      databaseOptions: { ...DEFAULT_DATABASE_OPTIONS, mergeOperator: Option.some("U64Add") },
+    }),
+  ),
+);
+
+/** A little-endian u64 of `value`. */
+const u64 = (value: number) => {
+  const bytes = new Uint8Array(8);
+  new DataView(bytes.buffer).setBigUint64(0, BigInt(value), true);
+  return bytes;
+};
+
+/** A row's u64 value, or -1 when it holds none. */
+const sumOf = (row: Row) =>
+  row.value._tag === "Value"
+    ? Number(new DataView(row.value.bytes.buffer, row.value.bytes.byteOffset).getBigUint64(0, true))
+    : -1;

@@ -1,23 +1,40 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
 import {
   CheckpointId,
+  CompactorEpoch,
   DatabaseId,
+  dropSstFromManifest,
   FULL_KEY_RANGE,
   ManifestId,
+  replaceManifestFields,
   SeqNum,
+  SortedRunId,
   SstId,
+  Timestamp,
 } from "@shaledb/lsm-core";
 import { RuntimeContext } from "alchemy/RuntimeContext";
-import { Effect, type Layer, Option, type Scope } from "effect";
+import { Effect, Layer, Option, Ref, Result, type Scope } from "effect";
 import { HttpRouter, HttpServerRequest } from "effect/http";
 import { HttpApiClient } from "effect/http-api";
 import { describe, expect, it } from "vite-plus/test";
 
+import { backgroundWorkTestLayer } from "./background-work.ts";
+import { blockSourceTestLayer } from "./block-source.ts";
+import {
+  CompactorClient,
+  type CompactorClientCalls,
+  CompactorClientRecord,
+  type ICompactorClient,
+} from "./compactor-client.ts";
+import { CompactorUnavailableError } from "./compactor.ts";
+import { databaseLifecycleLayerWithoutDependencies } from "./database-lifecycle.ts";
+import { dbClientTestLayer } from "./db-client.ts";
 import { DbHttpApi } from "./db-http-api.ts";
 import { dbHttpRouterLayer } from "./db-http-handlers.ts";
 import { dbServicesTestLayer } from "./db-services.ts";
 import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
 import { ManifestReader } from "./manifest-reader.ts";
+import { ManifestStore } from "./manifest-store.ts";
 import { manifestKey } from "./object-keys.ts";
 import { ObjectStore } from "./object-store.ts";
 import { WriterClient } from "./writer-client.ts";
@@ -34,7 +51,10 @@ import { WriterClient } from "./writer-client.ts";
  * router that cannot decode its payloads (D130, open): each database here is warmed by one
  * direct writer call before its first request. Workerd does not have this limit.
  */
-const run = <A, E>(body: (client: DbApiClient) => Effect.Effect<A, E, TestServices>) =>
+const run = <A, E>(
+  body: (client: DbApiClient) => Effect.Effect<A, E, TestServices>,
+  compactors: Option.Option<ICompactorClient> = Option.none(),
+) =>
   Effect.gen(function* () {
     const app = yield* HttpRouter.toHttpEffect(dbHttpRouterLayer);
     const runtime = yield* RuntimeContext;
@@ -52,7 +72,29 @@ const run = <A, E>(body: (client: DbApiClient) => Effect.Effect<A, E, TestServic
     return yield* body(client);
   }).pipe(
     Effect.scoped,
-    Effect.provide(dbServicesTestLayer()),
+    Effect.provide(
+      Option.match(compactors, {
+        onNone: () => dbServicesTestLayer(),
+        // As `dbServicesTestLayer`, with `stub` as every service's compactor client.
+        onSome: (stub) =>
+          databaseLifecycleLayerWithoutDependencies.pipe(
+            Layer.provide(blockSourceTestLayer),
+            Layer.provide(backgroundWorkTestLayer),
+            Layer.provideMerge(Layer.succeed(CompactorClient, CompactorClient.of(stub))),
+            Layer.provideMerge(dbClientTestLayer()),
+            Layer.provideMerge(
+              Layer.effect(
+                CompactorClientRecord,
+                Ref.make<CompactorClientCalls>({
+                  destroyed: [],
+                  woken: [],
+                  collectionsRequested: [],
+                }),
+              ),
+            ),
+          ),
+      }),
+    ),
     Effect.provide(lsmTestRuntimeContextLayer),
     Effect.runPromise,
   );
@@ -511,5 +553,144 @@ describe("the public database API's routes (D130)", () => {
       }),
     );
     expect(codes).toEqual(["StoredDataInvalid", "StoredDataInvalid"]);
+  });
+
+  it("seals without taking the successors' holds", async () => {
+    const holds = await run((client) =>
+      Effect.gen(function* () {
+        const databaseId = DatabaseId.make("sealed");
+        yield* created(client, databaseId);
+        yield* client.databases.seal({
+          params: { databaseId },
+          payload: { successors: [DatabaseId.make("next-a")] },
+        });
+        // A split's seal takes each successor's hold (`holdForSuccessors`); the API's does not.
+        return (yield* client.databases.listCheckpoints({ params: { databaseId } })).checkpoints
+          .length;
+      }),
+    );
+    expect(holds).toBe(0);
+  });
+
+  it("reports the newest manifest's L0, sorted runs, and drops on status and compaction", async () => {
+    const observed = await run((client) =>
+      Effect.gen(function* () {
+        const databaseId = DatabaseId.make("compacted");
+        yield* created(client, databaseId);
+        for (const key of ["a", "b"]) {
+          yield* put(client, databaseId, key, key);
+          yield* client.databases.flush({ params: { databaseId } });
+        }
+        // A compaction behind the writer's back: both L0 SSTs become one sorted run (oldest key
+        // first), then one of them is dropped. The writer still holds its own manifest.
+        const store = yield* ManifestStore;
+        const before = yield* (yield* ManifestReader).loadLatest(databaseId);
+        const [newer, older] = before.manifest.l0;
+        if (newer === undefined || older === undefined) return yield* Effect.die("two L0 SSTs");
+        yield* store.update(databaseId, (manifest) =>
+          Result.succeed(
+            replaceManifestFields(manifest, {
+              l0: [],
+              sortedRuns: [{ id: SortedRunId.make(0), ssts: [older, newer] }],
+            }),
+          ),
+        );
+        yield* store.update(databaseId, (manifest) =>
+          dropSstFromManifest(manifest, {
+            sstId: older.id,
+            reason: "Forced",
+            droppedAt: Timestamp.make(0),
+          }),
+        );
+        const status = yield* client.databases.status({ params: { databaseId } });
+        const compaction = yield* client.databases.compaction({ params: { databaseId } });
+        return {
+          l0Count: status.l0Count,
+          l0Ssts: compaction.l0Ssts,
+          sortedRuns: compaction.sortedRuns.map((sortedRun) => [
+            sortedRun.ssts,
+            sortedRun.sizeBytes,
+          ]),
+          remaining: newer.sizeBytes,
+          dropped: compaction.droppedSsts.map((dropped) => dropped.sstId),
+          older: older.id,
+        };
+      }),
+    );
+    expect([observed.l0Count, observed.l0Ssts]).toEqual([0, 0]);
+    expect(observed.sortedRuns).toEqual([[1, observed.remaining]]);
+    expect(observed.remaining).toBeGreaterThan(0);
+    expect(observed.dropped).toEqual([observed.older]);
+  });
+
+  it("drops an SST only when confirm repeats its id, forcing only when asked, and reports every corrupted SST", async () => {
+    const first = SstId.make("01JD0000000000000000000AAA");
+    const second = SstId.make("01JD0000000000000000000BBB");
+    const corrupt = (sstId: SstId) => ({
+      sstId,
+      source: Option.none(),
+      section: "DataBlock",
+      reason: "ChecksumMismatch",
+      message: "checksum",
+      detectedAt: Timestamp.make(1),
+    });
+    const drops = Ref.makeUnsafe<
+      ReadonlyArray<{ readonly sstId: string; readonly force: boolean }>
+    >([]);
+    const stub: ICompactorClient = {
+      wake: () => Effect.die(new Error("not called")),
+      destroy: () => Effect.void,
+      status: (databaseId) =>
+        Effect.succeed(
+          Option.some({
+            formatVersion: 1,
+            databaseId,
+            compactorEpoch: CompactorEpoch.make(1),
+            running: [],
+            fenced: false,
+            corruptSsts: [corrupt(first), corrupt(second)],
+            collectionDueAt: Option.none(),
+          }),
+        ),
+      collect: () => Effect.die(new Error("not called")),
+      requestCollection: () => Effect.void,
+      dropSst: (databaseId, request) =>
+        Ref.update(drops, (all) => [...all, { sstId: request.sstId, force: request.force }]).pipe(
+          Effect.andThen(
+            Effect.fail(new CompactorUnavailableError({ databaseId, message: "recorded" })),
+          ),
+        ),
+    };
+    const observed = await run(
+      (client) =>
+        Effect.gen(function* () {
+          const databaseId = DatabaseId.make("drops");
+          yield* created(client, databaseId);
+          const drop = (confirm: string, force?: boolean) =>
+            failureOf(
+              client.databases.dropSst({
+                params: { databaseId, sstId: first },
+                payload: force === undefined ? { confirm } : { confirm, force },
+              }),
+              "code",
+            );
+          const mismatched = yield* drop(second);
+          yield* drop(first);
+          yield* drop(first, true);
+          const compaction = yield* client.databases.compaction({ params: { databaseId } });
+          return {
+            mismatched,
+            drops: yield* Ref.get(drops),
+            corrupt: compaction.corruptSsts.map((reported) => reported.sstId),
+          };
+        }),
+      Option.some(stub),
+    );
+    expect(observed.mismatched).toBe("SstDropRefused");
+    expect(observed.drops).toEqual([
+      { sstId: first, force: false },
+      { sstId: first, force: true },
+    ]);
+    expect(observed.corrupt).toEqual([first, second]);
   });
 });
