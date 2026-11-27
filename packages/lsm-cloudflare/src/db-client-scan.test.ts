@@ -72,6 +72,9 @@ const createDatabase = Effect.flatMap(ManifestStore, (store) =>
   ),
 );
 
+// Each compaction commits under its own job id, as each Workflow instance does (D103).
+let jobCounter = 0;
+
 /** Compacts L0 (and the sorted run) the way the Workflow does, when there is anything to compact. */
 const compact = Effect.gen(function* () {
   const { manifest } = yield* (yield* ManifestReader).loadLatest(DB);
@@ -93,7 +96,7 @@ const compact = Effect.gen(function* () {
         outputs.push(...Option.toArray(step.output));
         start = step.resumeFrom;
       } while (Option.isSome(start));
-      return yield* executor.commit(prepared, outputs);
+      return yield* executor.commit(prepared, outputs, `job-${++jobCounter}`);
     });
   yield* runJob(job, manifest.compactorEpoch);
 });
