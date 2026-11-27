@@ -7,6 +7,7 @@
  * The first run downloads a pinned JDK (Temurin 21) and `tla2tools.jar` 1.7.4 into `.tlc/`
  * (gitignored) and checks their SHA-256 digests. Set `JAVA` and `TLA2TOOLS` to use existing ones.
  * Every TLC run has a hard time limit, so an oversized bound fails fast instead of hanging.
+ * `TLC_WORKERS` sets TLC's worker threads (default `auto`, one per core).
  */
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -130,7 +131,7 @@ const runTlc = (
         tools.jar,
         "tlc2.TLC",
         "-workers",
-        "auto",
+        process.env["TLC_WORKERS"] ?? "auto",
         "-config",
         "run.cfg",
         check.spec,
@@ -147,9 +148,17 @@ const runTlc = (
     }, run.timeLimitSeconds * 1000);
     child.on("close", () => {
       clearTimeout(timer);
-      const violated = /(?:Invariant|Temporal property|Action property) (\w+) is violated/.exec(
-        output,
-      )?.[1];
+      // TLC names a violated invariant, but reports a liveness failure only as "Temporal
+      // properties were violated": that is the config's one property (a config whose broken run
+      // must fail a liveness property lists exactly one).
+      const properties = /PROPERTIES?\s+((?:\s*\w+)+?)\s*(?:\n[A-Z_]+|$)/.exec(config)?.[1];
+      const singleProperty =
+        properties?.trim().split(/\s+/).length === 1 ? properties.trim() : undefined;
+      const violated =
+        /(?:Invariant|Temporal property|Action property) (\w+) is violated/.exec(output)?.[1] ??
+        (output.includes("Temporal properties were violated")
+          ? (singleProperty ?? "an unnamed temporal property")
+          : undefined);
       const passed = output.includes("Model checking completed. No error has been found.");
       const states = /(\d[\d,]*) distinct states found/.exec(
         output.split("\n").reverse().join("\n"),

@@ -4079,6 +4079,42 @@ caps are limits in code, and the others do not exist. They are not in the fixtur
 - A further test shows today's code dropping an unknown field, which is why the format rule
   exists.
 
+## D109. The writer Durable Object is model-checked at await granularity
+
+**Why.** The writer models before this one (`NoAckedWriteLost`, `Transactions`, `SealSplit`) make
+each code step atomic. Five of the defects found on 2026-11-26 lived between two awaits of one
+Durable Object: D74b, D84, D85, D102, and D74's alarm loop. No atomic model can show them.
+
+**The model.** `WriterObject.tla` is written in PlusCal. The TLA+ translation sits in the same
+file, so `verify.ts` runs it like the others.
+
+- **Processes.** Two requests (write, transaction commit, flush, seal, probe) and the alarm.
+- **Labels.** One per `yield*` that leaves the object (R2), one per lock, and one between two
+  SQLite statements that are not in one `MemTable.consistently`.
+- **Eviction** loses the phase, the counters, the locks, and every request. SQLite and the alarm
+  stay.
+- **Interruption** can come at any label outside the commit's uninterruptible region. It runs the
+  finalizers.
+- **R2** may fail before a manifest commit lands, or after it lands with the response lost.
+- **Time** is abstract: the alarm is set whenever the counters show an unflushed row.
+
+**Each known defect is a `Broken` value that fails a named property.** `noGeneration` and
+`interruptedWrite` (D74b) fail `CountersCover`. `noHorizonReread` (D84) fails `Serializable`.
+`sealKeepsPhase` (D85) fails `SealNotHalf`. `noAlarmRetry` (D102) fails `AlarmCovers` and
+`AckedFlushed`. `noSettle` (D74's loop) fails `AlarmQuiets`. The code as written passes four
+configs, with bounds in `.agents/skills/verify-writer-object`.
+
+**What it found.**
+
+- **D115**, a defect: a flush refused at an older epoch marked the restarted writer `Fenced`.
+- **A gap, a risk rather than a defect.** A write evicted after its SQLite commit and before
+  `scheduleFlush` leaves an unacknowledged row with no alarm until the next request to the
+  object. The row is durable and `Latest` reads see it (a probe starts the writer, which sets the
+  alarm). A database that gets no further writer request never flushes it. Whether the platform
+  can evict between the two depends on the output gate: `scheduleFlush` awaits `getAlarm` first.
+  `AlarmCovers` excepts these rows. A fix would set the alarm in the same storage turn as the
+  commit; it is left to the writer's owner.
+
 ## D115. A refused flush marks only its own phase fenced; a seal forgets its phase only after applying its edit
 
 **Found by the `WriterObject` model (D109)**, not by an audit. Two TLC counterexamples, both

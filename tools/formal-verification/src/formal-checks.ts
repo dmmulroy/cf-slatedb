@@ -225,4 +225,73 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
       },
     ],
   },
+  {
+    name: "writer-object",
+    spec: "WriterObject.tla",
+    runs: [
+      { config: "WriterObjectSeal.cfg", broken: "none", expect: "pass", timeLimitSeconds: 240 },
+      {
+        config: "WriterObjectSeal.cfg",
+        broken: "sealKeepsPhase",
+        expect: "SealNotHalf",
+        timeLimitSeconds: 60,
+      },
+      {
+        config: "WriterObjectSeal.cfg",
+        broken: "beforeD115",
+        expect: "NeverSelfFenced",
+        timeLimitSeconds: 60,
+      },
+      {
+        config: "WriterObjectSeal.cfg",
+        broken: "markFencedAnyPhase",
+        expect: "NeverSelfFenced",
+        timeLimitSeconds: 90,
+      },
+      {
+        config: "WriterObjectSeal.cfg",
+        broken: "noAlarmRetry",
+        expect: "AlarmCovers",
+        timeLimitSeconds: 60,
+      },
+      { config: "WriterObjectTxn.cfg", broken: "none", expect: "pass", timeLimitSeconds: 180 },
+      {
+        config: "WriterObjectTxn.cfg",
+        broken: "noHorizonReread",
+        expect: "Serializable",
+        timeLimitSeconds: 90,
+      },
+      {
+        config: "WriterObjectTxn.cfg",
+        broken: "noGeneration",
+        expect: "CountersCover",
+        timeLimitSeconds: 60,
+      },
+      {
+        config: "WriterObjectTxn.cfg",
+        broken: "interruptedWrite",
+        expect: "CountersCover",
+        timeLimitSeconds: 60,
+      },
+      { config: "WriterObjectLive.cfg", broken: "none", expect: "pass", timeLimitSeconds: 120 },
+      {
+        config: "WriterObjectLive.cfg",
+        broken: "noAlarmRetry",
+        expect: "AckedFlushed",
+        timeLimitSeconds: 60,
+      },
+      {
+        config: "WriterObjectAlarmLoop.cfg",
+        broken: "none",
+        expect: "pass",
+        timeLimitSeconds: 120,
+      },
+      {
+        config: "WriterObjectAlarmLoop.cfg",
+        broken: "noSettle",
+        expect: "AlarmQuiets",
+        timeLimitSeconds: 60,
+      },
+    ],
+  },
 ];
