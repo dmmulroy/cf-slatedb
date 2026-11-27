@@ -1975,7 +1975,7 @@ export const soak = (options: SoakOptions) =>
         `trace pull: not finished within ${budgetText}; pulled through ${spanPuller.progress.toReport().spansPulledThrough ?? "nothing"}`,
       );
     yield* saveReport;
-    const healthRead = yield* Effect.result(readWithin(budget, measureHealth(15)));
+    const healthRead = yield* Effect.result(readWithin(budget, measureHealth(15, { pull: false })));
     if (healthRead._tag === "Failure") {
       ledger.failures.push(`health report: ${healthRead.failure.message}`);
     } else if (healthRead.success._tag === "OutOfTime") {
