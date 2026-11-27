@@ -46,7 +46,7 @@ import { ObjectStore } from "./object-store.ts";
  * **Details**
  *
  * The in-process writers (`writerClientTestLayer`) start cold, on a database's first writer call,
- * as a Durable Object does, and in their own context (D131).
+ * as a Durable Object does, and in their own context (D120).
  */
 const run = <A, E>(
   body: (client: DbApiClient) => Effect.Effect<A, E, TestServices>,

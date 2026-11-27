@@ -104,7 +104,7 @@ describe("random bodies around every bound (D100)", () => {
           if (Exit.isSuccess(decoded)) {
             // An accepted write runs through the API to the writer: it commits, or fails with a
             // typed 4xx answer, never a 5xx (the in-process writer starts as a Durable Object does,
-            // D131).
+            // D120).
             const batch = Schema.decodeUnknownExit(RequestWriteBatch)(candidate);
             if (path.endsWith("/batches") && Exit.isSuccess(batch)) {
               const written = yield* serveLsmTestRequest(

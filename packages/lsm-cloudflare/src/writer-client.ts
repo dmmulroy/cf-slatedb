@@ -341,7 +341,7 @@ export const writerClientTestLayer = Layer.effect(
     /**
      * Runs `effect` with only the services a Durable Object's own invocation has: this layer's
      * dependencies and the runtime. Nothing of the calling fiber's context reaches a writer call,
-     * nor the writer router a database's first call builds (D131). An in-process public API request
+     * nor the writer router a database's first call builds (D120). An in-process public API request
      * that was a database's first writer call used to lend that build its context:
      *
      * - its layer memo map, from which `HttpRouter.toHttpEffect` took the API's own `HttpRouter`

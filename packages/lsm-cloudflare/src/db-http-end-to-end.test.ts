@@ -13,7 +13,7 @@ import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
 
 /**
  * Every public route, through the real router, its middleware, and a generated client, against
- * databases whose writers start cold on their first request, as a Durable Object does (D131). Each
+ * databases whose writers start cold on their first request, as a Durable Object does (D120). Each
  * answer is recorded as the route, its HTTP status, and for a failure its public code, so a route
  * that answers 503 where workerd answers 2xx or 404 fails here.
  */
@@ -96,7 +96,7 @@ const step = <A>(
 const bytes = (text: string) => new TextEncoder().encode(text);
 const all = { start: new Uint8Array(0), end: Option.none<Uint8Array>() };
 
-describe("every public route against cold databases (D131)", () => {
+describe("every public route against cold databases (D120)", () => {
   it("answers as workerd does: 2xx on a database, 404 DatabaseNotFound on a missing one", async () => {
     const answers = await run((client, answers, route) =>
       Effect.gen(function* () {

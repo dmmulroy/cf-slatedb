@@ -5290,3 +5290,60 @@ limit. That is D98's limit, not this one's; it is left to D98's owner.
     `MAX_BATCH_BYTES`, which equals `MAX_MEMTABLE_PAGE_BYTES`, counted the same way, so a
     first batch alone never passes the bound. No consumer stalls.
   - **The row limit with `>`.** `DbClient.changes` cuts again at the limit.
+
+## D120. An in-process writer call runs in the writer's own context
+
+**The defect, in the test harness.** `writerClientTestLayer` (`writer-client.ts`) stands in for
+the writer Durable Objects in every in-process test. It builds a database's writer router on that
+database's first writer call, in the calling fiber. When that call came from inside an in-process
+public API request, the router build and the writer request inherited the API request's context,
+and the API answered 503 `StorageUnavailable`:
+
+- **The layer memo map.** `HttpRouter.toHttpEffect` builds its app layer with
+  `Layer.CurrentMemoMap.forkOrCreate` of the current context (`effect/src/http/HttpRouter.ts`).
+  Inside an API request that context holds the memo map the API's own router was built with. A
+  fork looks entries up in its parent (`MemoMapImpl.get`, `effect/src/Layer.ts`), so the writer
+  app was given the API's `HttpRouter` and failed with "Method 'POST' already declared for route
+  '/v1/databases/:/batches'".
+- **The request's services.** `Effect.provideContext` merges, it does not replace, so isolating
+  the build with it was not enough. The writer router captures its build context, and a writer
+  route then decoded its query from the API request's `ParsedSearchParams`
+  (`HttpApiBuilder.handlerToHttpEffect`). The result was `HttpApiSchemaError` "Missing key at
+  ["afterSeq"]" for the change feed, and the same for scans, probes, and seals.
+
+The harness hid it: every in-process HTTP test either warmed each database's writer with a direct
+call first, or sent accepted bodies around the API. D100's first form passed such tests and
+failed every POST in workerd. Workerd was never affected: a Durable Object call has its own
+context.
+
+**The fix.** Each writer call, and so the router build its first call triggers (`Cache.get`
+looks it up in that fiber), runs with `Effect.updateContext(() => ownContext)`. `ownContext` is
+the layer's own dependencies and the runtime, and nothing of the caller's. That is the context a
+Durable Object invocation has.
+
+**Tests.**
+
+- **Warm-ups removed.** `db-http-routes.test.ts` no longer warms writers, and its 13 cases pass
+  cold. `db-http-boundary.property.test.ts` sends accepted random batches through the API
+  (status below 500) instead of to the writer directly.
+- **`db-http-end-to-end.test.ts`** runs every public route through the real router, its
+  middleware, and a generated client, against databases whose writers start cold:
+  - on a live database: create (201), batches, get at `Latest`, `AtLeast`, and `Flushed`, a scan
+    and its `resumeFrom`, transaction begin, get, scan, and commit, changes, flush, status,
+    compaction, checkpoint create, list, and delete, a snapshot read, a pinned snapshot, a fork
+    and a read on it, seal, and remove;
+  - every route on a database that never existed answers 404 `DatabaseNotFound`.
+  - The test pins each status and code.
+- **Mutations.** Merging the writer's context instead of replacing it, and leaving the call in
+  the caller's context, are each caught by all three files.
+
+**Still only workerd shows:**
+
+- request bodies and streaming responses as the Workers runtime parses and sends them (the
+  harness hands over parsed web `Request` objects in one isolate);
+- Durable Object input and output gates, and one writer instance per id across isolates;
+- alarms firing on their own schedule, and eviction;
+- the `BlockServer` binding and Workers Cache;
+- Workflow steps;
+- the compactor: `compactorClientTestLayer` is a stub, so `dropSst`, and the compactor part of
+  the compaction status, are not exercised end to end in-process.
