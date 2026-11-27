@@ -265,4 +265,37 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
       },
     ],
   },
+  {
+    // D112: a shard split end to end, with crashes, stale routers, and the change feed.
+    name: "shard-split",
+    spec: "ShardSplit.tla",
+    runs: [
+      { config: "ShardSplit.cfg", broken: "none", expect: "pass", timeLimitSeconds: 60 },
+      {
+        config: "ShardSplit.cfg",
+        broken: "noFlushedRefresh",
+        expect: "NoStaleBeyondBound",
+        timeLimitSeconds: 60,
+      },
+      {
+        config: "ShardSplit.cfg",
+        broken: "resealOthers",
+        expect: "HoldsMatchSeal",
+        timeLimitSeconds: 60,
+      },
+      {
+        config: "ShardSplit.cfg",
+        broken: "feedGap",
+        expect: "ConsumerMissesNothing",
+        timeLimitSeconds: 60,
+      },
+      { config: "ShardSplitLiveness.cfg", broken: "none", expect: "pass", timeLimitSeconds: 60 },
+      {
+        config: "ShardSplitLiveness.cfg",
+        broken: "noResume",
+        expect: "WaitingWritesLand",
+        timeLimitSeconds: 60,
+      },
+    ],
+  },
 ];
