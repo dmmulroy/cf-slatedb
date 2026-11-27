@@ -104,7 +104,7 @@ All models assume three things: one writer instance per database (the Durable Ob
 durable SQLite commits before an acknowledgement, and R2 create-if-absent. The last is confirmed on
 real R2 by the `create-race` scenario.
 
-The table is `formal-checks.ts` as integrated (`fec2698`, 29 runs listed).
+The table is `formal-checks.ts` as integrated (`ddb63dd`, 31 runs listed).
 
 | Spec and config              | What it proves                                                                                                                                                                                                                     | Bounds                                                                      | Broken variants (must fail)                                                                                                                                               | Runs |
 | ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---: |
@@ -113,6 +113,7 @@ The table is `formal-checks.ts` as integrated (`fec2698`, 29 runs listed).
 | `ManifestCasFencingGc.cfg`   | The same while GC deletes manifests at or below an advancing boundary and hint writes land late or never                                                                                                                           | 1 writer, 1 compactor, 1 job, ids up to 7, 2 flushes, GC on                 | `noBoundaryReread` → `CommitOnce`; `hintOnlyProbe` → `LoadFindsHead`; `knownIgnoresBoundary` → `LoadFromKnownFindsHead`                                                   |    4 |
 | `NoAckedWriteLost.cfg`       | No acknowledged write is lost across eviction, crash between upload and commit, flush, trim, and compaction; a `Latest` read sees every acknowledged write                                                                         | 4 writes, 2 crashes, 2 reads                                                | `truncateBeforeCommit` → `NoAckedWriteLost`; `nonAtomicProbe` → `LatestSeesAcked`; `trimUnflushed` → `NoAckedWriteLost`; `noSnapshotUpperBound` → `LatestSeesAcked` (D70) |    5 |
 | `GcSafety.cfg`               | GC never deletes an SST that the newest manifest, a manifest a reader may still hold, or a checkpoint references, nor an upload whose commit can still succeed; SST drops included                                                 | 2 SSTs (symmetric), clock 0–3, min age 1, 5 manifests                       | `noBoundaryCheck`, `ownUploadAge`, `dropDeletesObject` → `ReadableManifestsComplete`; `ignorePins` → `PinnedManifestsComplete`                                            |    5 |
+| `GcSafetyFork.cfg`           | With one fork of the database: a fork releases its hold only once no manifest a reader of the fork may hold names the database's SSTs (D77)                                                                                        | 1 SST, clock 0–3, min age 1, up to 6 manifests, `WithFork`                  | `earlyForkRelease` → `ForkReadsComplete`                                                                                                                                  |    2 |
 | `SealSplit.cfg`              | After a seal no write commits; a split leaves every write acknowledged before the seal in exactly one successor                                                                                                                    | 3 keys (1 to the left successor), 4 writes                                  | `sealWithoutLock`, `checkpointBeforeSeal`, `overlappingRanges` → `EveryAckedWriteInExactlyOneSuccessor`; `writerNotFenced` → `NoCommitAfterSeal`                          |    5 |
 | `Transactions.cfg`           | `SerializableSnapshot` transactions admit only serializable histories, and every read returns what the database held at the transaction's begin (`ReadsAtBegin`, D76), with retained rows, trims, and the begin or newest manifest | 2 keys, 2 transactions (symmetric), sequence numbers up to 5                | `snapshotOnly`, `trimWithoutAbort` → `Serializable`; `noReadHorizonCheck`, `noReadUpperBound` → `ReadsAtBegin`                                                            |    5 |
 
@@ -123,15 +124,12 @@ Code-level properties are property tests with mutation checks (`docs/coverage-ma
 cover codecs, the merge, the compaction merge, GC plans, the client and transactions against
 oracles, and fault injection.
 
-PENDING(d77): D77 adds `GcSafetyFork.cfg` on `proto/fork-hold` (`WithFork`: one SST, up to 6
-manifests, invariant `ForkReadsComplete`, broken variant `earlyForkRelease`). Its row and run count
-go here once merged.
-
-PENDING(d78): whether D78 changes `ManifestCasFencing.tla` (re-fencing after being fenced), and
-its rows if it does.
+D78 changed no model step. A compactor that fences in again is one more compactor with its own
+epoch in `ManifestCasFencing.tla`, and the overwritten epoch was local state of the Durable Object,
+which the D78 tests check (D78, "Model").
 
 PENDING(final-commit): the number of runs `vp run verify` reports on the release commit, observed
-at exit 0. The last count observed was 28/28, on the D70–D74 code (`docs/progress.md`). The 29 runs
+at exit 0. The last count observed was 28/28, on the D70–D74 code (`docs/progress.md`). The 31 runs
 listed today have not been observed in one run.
 
 ## 5. Soaks
@@ -227,17 +225,48 @@ ended at 22:50:33, exit 0 (`/tmp/shale-work/release/log`). The command was
 These latencies are client-side. The client was in the US and the stage in `eu`, so every call
 crosses the Atlantic.
 
-**`preview-1`, 130 minutes, `f3b2ad2`:**
+**`preview-1`, 132 minutes, `f3b2ad2`: passed.** The soak ran from 22:25:52 to 00:43:35 UTC, exit
+0, with 6 databases of 4,000 keys, splits at minutes 20 and 80, and a redeploy at minute 65 (23:31).
+The report is `/tmp/shale-work/release/soak-p1.json`, summarized in `soak-p1.summary.txt`.
 
-PENDING(soak-preview-1-f3b2ad2): the outcome of the 130-minute soak on `f3b2ad2` that started at
-22:25:52 UTC (`/tmp/shale-work/release/soak-p1.json`). Fill in: passed or not, the same fields as
-above, and whether it saw D78's stuck compactor or any other defect fixed since.
+- `passed: true` after 132.1 minutes. No mismatch, no failure, and no unexpected error span.
+- Every key of the 6 databases and of the sharded group was read at the end, at `Latest` and
+  `Flushed`. The 6 counters committed 3,457 to 3,525 increments each, none uncertain.
+- **Retries:** 9 operations, each retried once and then answered. Six were `HttpClientError` at
+  the redeploy (23:32:08–13), two `StorageUnavailable` at 00:06, and one timeout at 00:12.
+- **Storage:** no SST older than the bound beyond what each manifest uses.
+- **Invocations,** as estimated from the sample: 554,110 API Worker invocations ended `ok` and 11
+  `canceled`; 2,320 compactor `ok` and 7 `canceled`. None hit a limit. `measure health`: healthy,
+  deepest L0 backlog 4, flushes p50 474 ms and max 802 ms.
+- It did not see D78's stuck compactor, nor any other defect fixed since.
+
+| Operation (client, ms) |      n |   p50 |   p99 |    max |
+| ---------------------- | -----: | ----: | ----: | -----: |
+| get `Latest`           | 81,519 |    56 |   382 | 11,928 |
+| get `AtLeast`          | 33,954 |    56 |   380 |  7,917 |
+| get `Flushed`          | 20,578 |   102 |   425 |  9,470 |
+| scan                   |  9,086 |   128 |   474 |  8,916 |
+| write                  | 59,914 |    73 |   237 |  1,944 |
+| sharded put            | 34,590 |    69 |   160 |  1,794 |
+| transaction commit     | 20,987 |    62 |   174 |    711 |
+| split                  |      2 | 1,241 | 1,241 |  1,241 |
 
 **`preview-3`, `measure manifest-cas`, `f3b2ad2`: failed, which found D78.** The measurement made
 30 small flushes back to back. It exited 1 at 23:05:30 UTC (`/tmp/shale-work/release/log`) with
 `WriteStalled` at 16 L0 SSTs. Twelve minutes later the database `ms-cas-mwy5ujbj` was still
-stuck, with its compactor fenced against itself (section 7, D78). It is kept on `preview-3` as a
-fixture to prove D78's recovery live.
+stuck, with its compactor fenced against itself (section 7, D78).
+
+**`preview-3`, D78's recovery, `ed4e787`: recovered** (`/tmp/shale-work/release2/NOTES.md`). The
+fixture had been stuck since 23:05:29 UTC: 16 L0 SSTs, compactor epoch 1 `fenced: true`, manifest
+epoch 2. After the D78 deploy at 23:32:56 its status did not change until something woke it.
+
+- 23:34:48: one write was refused with `WriteStalled` (`L0Backlog`), which wakes the compactor.
+- 23:34:52: epoch 3, `fenced: false`, one compaction running.
+- 23:34:59: L0 at 0, with 2 sorted runs.
+- 23:35:16: the next write was acknowledged.
+
+Two runs of `measure manifest-cas` on `ed4e787` then exited 0. `ManifestStore.update` p50 was
+248 and 282 ms, and a small flush p50 was 400 and 478 ms (D56 measured 709 ms).
 
 ## 6. Decisions P1 to P6
 
@@ -253,7 +282,7 @@ Dillon delegated P1–P5 ("decide with best judgement"); each took the recommend
 | P5  | Plan and limits  | Workers Paid; `limits.cpu_ms` 30,000 (API and its writers) and 60,000 (compactor)                                                                                            | D61: `DEFAULT_API_CPU_MS`, `DEFAULT_COMPACTOR_CPU_MS` in `shaledb-stack-config.ts`. The account's plan is not visible in the repository; the previews ran with these limits                                            |
 | P6  | Release go-ahead | pending: this checklist                                                                                                                                                      | `plan:production` and `deploy:production` in `infra/shaledb/vite.config.ts`                                                                                                                                            |
 
-## 7. What changed late (D67 to D78)
+## 7. What changed late (D67 to D103)
 
 These landed after the first soaks. The release soaks (section 5) are the first long runs on all of
 them.
@@ -319,103 +348,195 @@ them.
   - **The fix.** A transaction reads the newest manifest when it fits its bounds, else the begin
     manifest when stored, else `SnapshotTooOld`. A snapshot is taken at the newest manifest, loaded
     then. Model: `Transactions.tla` gained `ReadsAtBegin` and the broken variant `noReadUpperBound`.
-- **D77, a fork released its hold on its source too early** (`proto/fork-hold`, in progress; brief
-  at `/tmp/shale-work/agents/forkhold/BRIEF.md`).
-  - **What was wrong.** A fork released its checkpoint on its source as soon as its newest manifest
-    and its pinned manifests no longer named the source. Its own manifests replaced less than
-    `gcMinAge` ago were ignored, though readers may still hold them.
-  - **How it was found.** By the interaction audit (`/tmp/shale-work/agents/invariants/INTERACTIONS.md`,
-    finding 1), proven with two scratch tests.
-  - **What it could do to a caller.** After the source was collected, or removed, as a split's
-    cleanup does once the holds are gone, three things failed. A snapshot of the fork taken
-    seconds before its rewrite failed with `StorageUnavailable` on every retry. So did a
-    transaction on the fork whose begin manifest named the source, until the fork's first flush. A
-    read through a cached fork manifest failed once, then recovered. No answer was wrong.
-  - **A second early release, found while fixing it.** A fork of a fork released its hold on the
-    middle database before rewriting (`/tmp/shale-work/agents/forkhold/STATUS.md`).
-  - **The fix, as designed so far.** The release moves into the fork's own garbage collection. A
-    hold is released only when no manifest GC keeps names another database's SST. GcSafety gains a
-    fork (`GcSafetyFork.cfg`, broken variant `earlyForkRelease`).
-
-  PENDING(d77): the final design, the commit, the tests and mutation results, the model runs, and
-  what it costs a split (the source lives about `gcMinAge` longer, 1 hour in production).
-
-- **D78, a compactor fenced against itself, for good** (`proto/compactor-fence`, in progress; brief
-  at `/tmp/shale-work/agents/compactorfence/BRIEF.md`).
-  - **What was wrong.** Two wakes of a cold compactor overlapped inside its first fence-in, which
-    has no lock (`ensureState`). Both committed `fenceCompactor`, giving epochs 1 and 2. A poll
-    then wrote back state it had read before the second wake stored epoch 2. The next poll saw the
-    epochs differ and stored `fenced: true`. A fenced compactor does nothing on a wake or an alarm,
-    and there is only one compactor per database.
-  - **How it was found.** By `measure manifest-cas` on `preview-3` on `f3b2ad2`: 30 small flushes
-    back to back. The second wake came 0.65 s after the first because D73 made the wake background
-    work. It was reproduced in `compactor.test.ts` on `main`
-    (`/tmp/shale-work/agents/compactorfence/STATUS.md`).
-  - **What it could do to a caller.** The database never compacts again. After 16 L0 SSTs every
-    write is refused with `WriteStalled`, permanently. Database `ms-cas-mwy5ujbj` on `preview-3`
-    has been in that state since 2026-11-26 23:05 UTC (`l0Ssts: 16`, `"fenced": true`, compactor
-    epoch 1 against the manifest's 2). Before D73 the race was hidden for flushes, but reachable
-    through the maintenance sweep, collection requests, `dropSst`, and the stalled-write wake.
-  - **The fix, as briefed.** One fence-in per start (single-flight), no lost state updates, and a
-    fenced compactor that fences in again on its next start. That last part revives a database
-    already stuck.
-
-  PENDING(d78): the final design, the commit, the tests and mutation results, any model change,
-  the audit of the same pattern in other Durable Objects, and the live revival of
-  `ms-cas-mwy5ujbj`.
+- **D77, a fork released its hold on its source too early.**
+  - **What was wrong.** A fork released its checkpoint on its source once its newest manifest and
+    its pinned manifests no longer named the source. Its own manifests replaced less than
+    `gcMinAge` ago were ignored, though readers may still hold them. A fork of a fork released its
+    hold on the middle database before rewriting at all.
+  - **How it was found.** The interaction audit, with two scratch tests; the second case was found
+    while fixing the first.
+  - **What it could do to a caller.** After the source was collected or removed (a split's
+    cleanup), a fork snapshot taken just before the rewrite failed with `StorageUnavailable` on
+    every retry, as did a transaction whose begin manifest named the source.
+  - **The fix.** The release moved into the fork's own collection: a hold is released only when no
+    manifest GC keeps names another database's SST. Model: `GcSafetyFork.cfg` with
+    `earlyForkRelease`.
+  - **What it costs.** A split's sealed source cannot be removed until about `gcMinAge` (1 hour)
+    after both halves' rewrites; nothing in a split waits on it.
+- **D78, a compactor fenced against itself, for good.**
+  - **What was wrong.** Two overlapping first wakes both fenced in, a poll wrote back the older
+    epoch, and the compactor stored itself as fenced. A fenced compactor did nothing, ever.
+  - **How it was found.** `measure manifest-cas` on `preview-3`, 30 small flushes back to back.
+  - **What it could do to a caller.** That database never compacted again: after 16 L0 SSTs every
+    write was refused, permanently.
+  - **The fix.** One fence-in per start, every state update a read-modify-write, and a fenced
+    compactor fences in again on its next start. Six mutations caught; no model step changed.
+  - **Shown live.** The stuck fixture on `preview-3` recovered within 11 s of its first write after
+    the deploy (section 5).
+- **D79.** The sharded API answers refused requests with the public envelope; it is not part of
+  `/v1`'s contract.
+- **D80, the change feed skipped changes silently.** When retention had pruned every entry above
+  a consumer's position, or for a fork before its first flush, the feed returned nothing and moved
+  the consumer's cursor past changes it never delivered. It now answers only what its changelog
+  provably holds, and fails with `ChangelogUnavailable` (`Expired`) otherwise. Found by the review's
+  scratch test.
+- **D81, compaction changed what a key reads.** It folded operands with different expiries into one
+  value that expired with the earliest, so after a compaction a key could read as absent. Now only
+  rows that expire together fold. Found by the review's scratch test.
+- **D82.** Every signal the operations guide names is read from a span or a tail record; metrics are
+  emitted and not collected.
+- **D83, review of D76.** A transaction read may use any cached manifest that fits. Two concurrent
+  collections, and a collection that went on when a manifest it retained had vanished, are now
+  safe. Also TTL and clock checks.
+- **D84, a lost update in `Snapshot` commits.** A trim between the horizon check and the conflict
+  queries hid a newer write. The check now re-reads the horizon after its queries. Found by the
+  Durable Object audit.
+- **D85, a seal the writer never saw.** If a seal's caller hung up after its commit landed, the
+  writer still believed it was open and acknowledged writes that could never flush and were in no
+  successor. Such a seal now forgets the writer's phase. An alarm for a removed database stops.
+  Found by the Durable Object audit.
+- **D86, a large compaction's first step result passed 1 MiB.** `prepare` now records its inputs'
+  ids, not their handles. Found by the Workflow and limits audits.
+- **D87, settings with `l0MaxSsts` below `minCompactionSources` stalled writes forever.** Refused at
+  plan time. Found by the Workflow audit.
+- **D88, a TTL near 2^53 made a database unflushable.** `ttlMillis` and `lifetimeMs` are at most 100
+  years, and retried requests get truthful answers. Found by the API audit.
+- **D89, a stale router served a sealed shard at `Flushed` indefinitely.** It now refreshes a map
+  older than a second before such a read. Found by the API audit.
+- **D90, D91, a removed database's id.** PENDING(d90): a reader that cached the removed database's
+  manifest served it as the new one's, and a commit landing after the removal brought the database
+  back. The fix keeps the `Removed` manifest at the head for `gcMinAge`, and `create` refuses the id
+  until then (`DatabaseRecentlyRemoved`). Found by the lifecycle audit; not yet merged.
+- **D92.** Cloudflare's platform limits against shaledb's demand; settings the platform cannot hold
+  are refused.
+- **D93, a `Latest` scan held every unflushed row; the change feed split large batches.** Scans pull
+  writer pages as they need them, and every memtable page is bounded by bytes (8 MiB). The feed
+  pages whole batches; before, an unflushed batch of more than 1,000 rows lost its rest silently.
+  Found by the limits and Durable Object audits.
+- **D94, a compaction job whose Workflow instance was gone stayed running for good,** reserving its
+  sources. Now a job unseen for `compactionLeaseMs` is finished. Found by the Workflow and Durable
+  Object audits.
+- **D95, a seal naming other successors succeeded.** It now fails, naming the recorded ones. Found
+  by the API audit.
+- **D96, a compaction longer than `gcMinAge` lost its early outputs to GC** and never committed. A
+  collection now keeps what a running compaction may have written. Found by the Workflow audit.
+- **D97, one compaction step could read all of a job's dropped rows.** A step now also ends after
+  merging 1.5 × its output size of input. Found by the limits audit.
+- **D98, a collection's cost grew with the commit rate.** It now folds references as it reads, and
+  past 5,000 retained manifests it defers SST deletion. Found by the limits audit.
+- **D99.** Bounds on checkpoints, the changelog, merged values, and names; the manifest's budget
+  and the database size limit; the compactor's subrequests.
+- **D100, every request is bounded.** The body (16 MiB), and every string, bytes, and array field.
+  Found by the API audit.
+- **D101, an abandoned split left its range unwritable forever.** A request that waits it out now
+  finishes it. Found by the API audit.
+- **D102, the writer's alarm.** PENDING(d102): a failing flush retried every second forever, and an
+  unreadable `writer_meta` set no alarm. Now there is a backoff; the stalled-write reload and two
+  concurrent schedulers no longer move the writer's view or its alarm back. Found by the Durable
+  Object audit; not yet merged.
+- **D103, a retried commit of a compaction with no outputs, and the size of a large compaction.**
+  PENDING(d103): a commit records its job id, so a retry is recognized whatever its outputs. A
+  missing Workflow instance is finished. The derived needs of a large compaction are tabled. Found
+  by the Workflow audit; not yet merged.
 
 ## 8. Defects found in the last day, and what that says
 
-Four defects (D70, D76, D77, D78) and one race (the D74 counters) were found after the system had
-passed `vp run ready`, `vp run verify`, its scenarios, and its 5-minute soaks. Each was found by a
-different method, and none by the release gate as it then was.
+**What the gates did.** On `f3b2ad2`, every gate passed: the 132-minute soak on `preview-1`, the
+20-minute `eu` soak on `preview-2` (section 5), the 13 scenarios, `vp run ready`, and `vp run
+verify` (28 runs). Every defect below except D70 was in that code. Gates that run the system and
+check its answers (soaks, scenarios, unit and property tests, the existing models) found none of
+them. Every one was found by reading code against a stated rule, or by extending a model or a
+measurement past what the gates did.
 
-| Defect                                    | Effect on a caller                                                       | Found by                                                              | Why the gates missed it                                                                                                                                                                                    | What catches it now                                                                                                                                                                                                                                                                        |
-| ----------------------------------------- | ------------------------------------------------------------------------ | --------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| D70: read past its snapshot               | wrong answer: "not found" for a key that had a value                     | extending `NoAckedWriteLost.tla` with compaction                      | The model left compaction out. The window is tens of milliseconds. The client-versus-oracle property test generated histories too short to rewrite a key between flushes (D70, "Tests")                    | `noSnapshotUpperBound` → `LatestSeesAcked`; `db-client.test.ts` (a writer overtaken after it answers, for a get, a scan, and a two-page scan); the oracle test at 20–60 steps                                                                                                              |
-| D76: transaction begin manifest collected | every transaction read refused, every retry; snapshots half-lived        | checking `docs/invariants.md` line by line against the code           | The soaks write continuously, so a flush always comes before `gcMinAge` runs out. No test waited out `gcMinAge` after a compaction without flushing                                                        | `db-transaction.test.ts` "a transaction begun after GC deleted the last flush's manifest still reads and commits (D76)"; `db-client.test.ts` "a snapshot is taken at the newest manifest, not at one this reader still holds (D76)"; `Transactions.tla` `ReadsAtBegin`, `noReadUpperBound` |
-| D77: fork hold released early             | `StorageUnavailable` on every retry, for fork snapshots and transactions | the interaction audit, with scratch tests                             | `GcSafety.tla` models one database, with holds as `Pin`/`Unpin` at any time. `SealSplit.tla` stops at the forks' creation. No soak or scenario read a fork's older manifest after its source was collected | PENDING(d77): the tests from the two repro tests, the fork-of-fork test, and `GcSafetyFork.cfg` with `earlyForkRelease`                                                                                                                                                                    |
-| D78: compactor fenced against itself      | every write refused, permanently, on that database                       | a measurement that happened to flush quickly (`measure manifest-cas`) | Unit tests never overlapped two first wakes. The model treats each compactor's fence-in as one atomic step. The soaks' flushes are spaced out                                                              | PENDING(d78): the `compactor.test.ts` reproduction (two overlapping cold wakes) and the revival test                                                                                                                                                                                       |
-| D74 counters: refresh race                | a row left unflushed until a later write                                 | code review                                                           | A commit has to land inside one scan. No test interleaved the two                                                                                                                                          | `db-writer.test.ts`, four tests driven by `runWithHookedStats` (`/tmp/shale-work/agents/review/REPORT-2.md`)                                                                                                                                                                               |
+| Defect                                        | What a caller would have seen                                        | Found by                                | What catches it now                                                                              |
+| --------------------------------------------- | -------------------------------------------------------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| D70: read past its snapshot                   | "not found" for a key that had a value                               | a model extended with compaction        | `noSnapshotUpperBound`; `db-client.test.ts`                                                      |
+| D74b: counter refresh race                    | a row unflushed until a later write                                  | review of a diff                        | `db-writer.test.ts` (`runWithHookedStats`)                                                       |
+| D76: begin manifest collected                 | every transaction read refused, every retry                          | guide checked against code              | `db-transaction.test.ts`; `ReadsAtBegin`                                                         |
+| D77: fork hold released early                 | `StorageUnavailable` on every retry, fork snapshots and transactions | interaction audit                       | `GcSafetyFork.cfg` `earlyForkRelease`; `database-lifecycle.test.ts`, `garbage-collector.test.ts` |
+| D78: compactor fenced against itself          | every write refused, permanently                                     | a measurement (`measure manifest-cas`)  | `compactor.test.ts`, two overlapping cold wakes                                                  |
+| D80: change feed skipped changes              | changes lost without an error                                        | interaction audit                       | `change-feed.test.ts`, `manifest.test.ts`                                                        |
+| D81: compaction folded expiries               | a key absent after a compaction                                      | interaction audit                       | `row-resolution.test.ts`, `compaction-merge.test.ts`                                             |
+| D83: collection without a retained manifest   | SSTs a reader needed deleted                                         | interaction audit                       | `garbage-collector.test.ts`                                                                      |
+| D84: `Snapshot` commit across a trim          | a lost update                                                        | area audit (Durable Objects)            | `db-writer.test.ts`; `Transactions.tla` `Commit`                                                 |
+| D85: seal the writer never saw                | acknowledged writes that never flushed, in no successor              | area audit (Durable Objects)            | `db-writer.test.ts`                                                                              |
+| D86: `prepare` result over 1 MiB              | a large merge never runs; runs pile up                               | area audits (Workflow, limits)          | `compaction-executor.test.ts`                                                                    |
+| D87: `l0MaxSsts` below `minCompactionSources` | writes refused forever                                               | area audit (Workflow)                   | `size-tiered-compaction-scheduler.test.ts`; a settings rule                                      |
+| D88: TTL near 2^53                            | every flush failed, writes stalled                                   | area audit (API)                        | `db-http-limits.test.ts`, `db-http-boundary.property.test.ts`                                    |
+| D89: stale router at `Flushed`                | a sealed shard's old data, without bound                             | area audit (API)                        | `shard-router-staleness.test.ts`                                                                 |
+| D90: recreated id                             | a removed database's data under the new one                          | area audit (lifecycle)                  | PENDING(d90)                                                                                     |
+| D91: commit after a removal                   | a removed database back, acknowledging writes                        | area audit (lifecycle)                  | PENDING(d90)                                                                                     |
+| D93a: `Latest` scan held all unflushed rows   | `exceededMemory` on an allowed scan                                  | area audit (limits)                     | `db-client-scan.test.ts`                                                                         |
+| D93b: change feed split a large batch         | 500 of 1,500 changes skipped silently                                | area audit (Durable Objects)            | `change-feed.test.ts`, `mem-table.test.ts`                                                       |
+| D94: job with no Workflow instance            | its sources never compacted again                                    | area audits (Workflow, Durable Objects) | `compactor.test.ts`                                                                              |
+| D95: seal with other successors               | success, with the old successors kept                                | area audit (API)                        | `db-writer.test.ts`                                                                              |
+| D96: compaction longer than `gcMinAge`        | a large merge never commits                                          | area audit (Workflow)                   | `garbage-collector.test.ts`, `compactor.test.ts`                                                 |
+| D97: step over dropped rows                   | compaction stuck after mass deletes; writes refused                  | area audit (limits)                     | `compaction-executor.test.ts`                                                                    |
+| D101: abandoned split                         | a key range unwritable forever                                       | area audit (API)                        | `shard-split-faults.test.ts`                                                                     |
 
-**What the gates demonstrably catch.**
+Risks fixed alongside (not counted above): D98 (GC cost by commit rate), D99 (unbounded caller
+growth), D100 (unbounded bodies), D102 (alarm retry), D103 (a retried zero-output commit).
 
-- **A lost or hidden acknowledged write, within the models' bounds.** Every broken variant in
-  section 4 fails its invariant.
-- **A defect that shows under sustained, varied load within minutes.** The soaks and measurements
-  found the block cache's cross-request hang (D66), the writer's alarm loop (D74), a flush over its
-  CPU limit, and compaction over its request limit (D61).
-- **A regression of each defect above.** Each named test fails on the code before its fix, and
-  survives the mutations its report lists.
+**By class** (the classes of `/tmp/shale-work/agents/AUDIT-COMMON.md`, plus one it does not
+name):
 
-**What they demonstrably did not catch.**
+| Class                                                              | Defects                                 |  Count |
+| ------------------------------------------------------------------ | --------------------------------------- | -----: |
+| Two features each correct alone                                    | D70, D77, D80, D83, D87, D89, D91, D93b |      8 |
+| State shared across an await inside one Durable Object             | D74b, D78, D84, D85                     |      4 |
+| Liveness after long idle periods and after GC                      | D76, D90, D94, D101                     |      4 |
+| Time (TTL, `gcMinAge`, retention)                                  | D81, D88, D96                           |      3 |
+| A limit a caller or the platform sets (not in AUDIT-COMMON's list) | D86, D93a, D97                          |      3 |
+| A property checked at only one moment                              | D95                                     |      1 |
+| **Total**                                                          |                                         | **23** |
 
-- **Races with windows of milliseconds** (D70, D78, the counters). A soak reaches them only when its
-  workload happens to produce the timing. Two of these three were found by a model or by review, and one by
-  luck in a measurement.
-- **Liveness after an idle hour** (D76, D77). The soaks write constantly and run at most 130
-  minutes against a `gcMinAge` of 1 hour. Scenarios run with dev timings. No gate idles a database
-  past `gcMinAge` and then reads it.
-- **Interactions between components that different models cover** (D77). Each model is
-  scoped to one protocol. Nothing checks a fork's readers against its source's GC except the new
-  `GcSafetyFork.cfg`.
-- **Concurrency inside one Durable Object across an await** (D78, the counters). The models assume
-  each step is one atomic effect. A Durable Object's input gate does not serialize two requests
-  across an R2 call.
+**By how each was found:** 15 by the round-2 area audits, 4 by the round-1 interaction audit, and
+1 each by an extended model (D70), a guide checked against the code (D76), a review of a diff
+(D74b), and a measurement (D78).
 
-**What that implies.** These classes are where further defects are most likely, because they are
-where the last five were. The regression tests close each defect, not its class. Three things
-were done against the classes:
+**The rounds.** Rates come from the `STATUS.md` timestamps of each agent. They are approximate,
+because finding and fixing overlap.
 
-- the interaction audit of 33 pairs of features (`/tmp/shale-work/agents/invariants/INTERACTIONS.md`);
-- `docs/invariants.md`, which ties each invariant to the code that enforces it and the test or
-  model that checks it;
-- D78's audit of first-call initialization in every Durable Object (writer, compaction budget,
-  shard directory, maintenance sweep, database create): PENDING(d78).
+- **Round 1: review and interaction audit of the last day's diff.** It found D76, D77, D80, D81,
+  D83, and the counter race: six defects in about 67 auditor-minutes of finding (the invariants
+  agent 22:40–23:00 UTC; the review agent's passes 22:40–22:51, 23:18–23:28, and 23:38–00:04).
+  That is about 5 an auditor-hour.
+- **The measurement.** `measure manifest-cas` found D78 at 23:05 UTC.
+- **Round 2: five auditors by area, from 00:12 UTC.** Their first briefs found 12 defects in about
+  79 auditor-minutes, about 9 an auditor-hour:
+  - API: 2 (D88, D89);
+  - Durable Objects: 2 (D84, D85);
+  - lifecycle: 3, D90 and D91;
+  - Workflow: 3 (D86, D87, D96);
+  - limits: 2 new (D93a, D97) and D86 again.
 
-No gate yet idles a database past `gcMinAge` with production timings before reading it, forking it,
-or splitting it. No soak runs long enough to hit a narrow race reliably. The audit's two open risks
-are in section 9.
+  Their second briefs, while fixing, confirmed four more (D93b, D94, D95, D101).
+
+- **No round has yet ended without a defect-class finding.** A third round (audit-prod, on the
+  production deploy) started at 00:59 UTC; its result is not in.
+
+**What has had a pass over every await or every field, and what has not** (each report's "Not
+reached"):
+
+- **Every await of every Durable Object:** the writer, compactor, compaction budget, and shard
+  directory (audit-do). Not reached: `MemTable` migrations, the `LATEST`-hint writes after
+  eviction, and the Workflow's own steps.
+- **Every field of every request schema:** a schema walker that fails on any unbounded field
+  (audit-api, D100). Not reached: the `BlockServer` under a hostile caller, and HTTP round trips
+  that reach a writer in-process.
+- **Every Cloudflare limit the design touches** (audit-limits, D92). Not reached: Worker startup
+  time, what Tail Workers drop, and any live run of a derived limit.
+- **Compaction and GC** (audit-workflow). Not reached: a compaction step's memory with 8 inputs,
+  which needs workerd.
+- **Lifecycle** (audit-lifecycle): still finishing D90 and D91; no report yet.
+- **Not audited by area at all:** the tools (`scenario-cli`, `trace-cli`, `preview-cli`), the
+  telemetry policy, and the read path's block cache beyond D72's review.
+
+**What that says.** The checks that run the system at its normal timing found none of these in
+soaks of 132 and 21 minutes. The two rounds' first passes, reading the code against a stated
+rule, found 18 in about 2.4 auditor-hours. The rate went up from round 1 to round 2, not down. Each fix has a
+regression test, which closes that defect, not its class. These are the facts as they stand; they
+make no prediction.
 
 ## 9. Known limitations
 
