@@ -1,5 +1,5 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
-import { Effect, Layer, Option, Schema } from "effect";
+import { Cause, Effect, Layer, Option, Schema } from "effect";
 
 import { CompactionExecutor } from "./compaction-executor.ts";
 import {
@@ -82,6 +82,28 @@ export const compactionJobProgressOf = (
   };
 };
 
+/**
+ * Whether `cause` is Workflows reporting that an instance does not exist: the binding's `get`
+ * rejects with an error whose message is `instance.not_found`, which Alchemy raises as a defect
+ * (possibly wrapped in an `UnknownError`).
+ */
+export const isWorkflowInstanceNotFound = (cause: Cause.Cause<unknown>): boolean => {
+  const mentionsNotFound = (value: unknown, depth: number): boolean =>
+    depth < 4 &&
+    value instanceof Error &&
+    // An `UnknownError` may carry no message of its own, only the rejection as its cause.
+    ((typeof value.message === "string" && value.message.includes(WORKFLOW_INSTANCE_NOT_FOUND)) ||
+      mentionsNotFound(value.cause, depth + 1));
+  return cause.reasons.some(
+    (reason) =>
+      (Cause.isDieReason(reason) && mentionsNotFound(reason.defect, 0)) ||
+      (Cause.isFailReason(reason) && mentionsNotFound(reason.error, 0)),
+  );
+};
+
+/** The message Workflows' `get` rejects with for an instance it does not hold. */
+const WORKFLOW_INSTANCE_NOT_FOUND = "instance.not_found";
+
 /** Workflow statuses after which a job can still commit. */
 const RUNNING_STATUSES: ReadonlySet<string> = new Set([
   "queued",
@@ -121,13 +143,26 @@ export const compactionLauncherLayer = Layer.effect(
       progress: Effect.fn("CompactionLauncher.progress")(function* (jobId: string) {
         const status = yield* workflow.get(jobId).pipe(
           Effect.flatMap((instance) => instance.status()),
-          Effect.catchCause(unavailable(jobId, "report the status of")),
+          Effect.map(Option.some),
+          // An instance Workflows no longer holds (purged after its retention) cannot commit:
+          // the job is finished, with no outcome. Any other failure may be transient.
+          Effect.catchCause((cause) =>
+            isWorkflowInstanceNotFound(cause)
+              ? Effect.succeed(Option.none())
+              : unavailable(jobId, "report the status of")(),
+          ),
         );
         yield* Effect.annotateCurrentSpan({
           "compaction.job_id": jobId,
-          "workflow.status": status.status,
+          "workflow.status": Option.match(status, {
+            onNone: () => "not_found",
+            onSome: (found) => found.status,
+          }),
         });
-        return compactionJobProgressOf(status.status, status.output);
+        return Option.match(status, {
+          onNone: (): CompactionJobProgress => ({ _tag: "Finished", outcome: Option.none() }),
+          onSome: (found) => compactionJobProgressOf(found.status, found.output),
+        });
       }),
     });
   }),
