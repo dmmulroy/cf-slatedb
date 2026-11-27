@@ -704,3 +704,7 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 - **Abandoned splits finished by a waiting request (D101)** — done. `ShardSplit.resumePending`,
   `withAbandonedSplitFinished`. Tests: `shard-split-faults.test.ts` (each step killed, concurrent
   splits, a two-generation stale router), `health-report.test.ts`.
+- **Bounded scan pages on every surface (D125)** — partial. `ScanPageBudget`, `DbClient.scanAtPage`,
+  `settledVersions`, and the routed page's shared budget (`shard-router.ts`). Tests:
+  `scan-bounds.test.ts`, `shard-scan-bounds.test.ts`. Open: the three-surface oracle property test,
+  and the cross-page and phantom transaction tests.

@@ -4424,3 +4424,94 @@ it. The policy governs only what shaledb exports to its collector.
 - The schema issues of malformed bytes fields.
 - **Four mutations caught:** the event filter removed (the code before), the event name kept whole,
   object values kept under allowed names, and every event attribute kept.
+
+## D125. Every scan surface does a bounded amount of work per page and says where to continue
+
+Dillon's second review: limited regular scans could end on the work budget (D108), but the
+transaction scan collected every writer page and passed no budget, and the sharded scan passed
+`limit: none` to each shard.
+
+**Measured first** (counting fakes, `scan-bounds.test.ts`, `shard-scan-bounds.test.ts`):
+
+- **The transaction scan.** For one row over 5,000 unflushed keys it read 6 writer pages and held
+  all 5,000 rows; a `Latest` scan of the same reads one page.
+- **The routed scan.** For one row over 4,999 unflushed tombstones, with a 2 KiB page budget, it
+  read 11 writer pages, its whole shard; the database's own page ends after one, with
+  `resumeFrom`.
+- **One key overwritten 2,500 times.** One page of the regular or the transaction scan read three
+  writer pages and held all 2,500 versions. A segment ended only at a second key, so one key's
+  unflushed versions, up to `maxUnflushedBytes` (256 MiB), could be held at once.
+
+**The rule, for all three.** A page gets one examined-bytes budget: `ScanPageBudget`, a
+`Context.Reference`, defaulting to `SCAN_PAGE_EXAMINED_BYTES`, 16 MiB, and set by tests. A page
+has exactly three outcomes:
+
+- **rows up to its limit, and `resumeFrom`;**
+- **fewer rows, or none, and `resumeFrom`,** because the budget was spent: not an error;
+- **a typed refusal:** `SnapshotTooOld`, a routing error, or D93's retryable restart.
+
+A null `resumeFrom` means the range is exhausted. `ReaderUnavailableError` now says why a scan
+ended with `resumeFrom` (`pageEnd`: `BudgetSpent` or `OvertakenByFlush`).
+
+- **The transaction scan** (`DbClient.scanAtPage`, `transactions/scan`):
+  - It pulls writer pages as its merge needs them, in segments as D93's `Latest` scan does, all at
+    `readSeq`.
+  - Each segment uses a manifest within the transaction's bounds (D58, D70). By D70's argument any
+    such manifest answers the same at `readSeq`, so segments and pages may use different ones.
+  - The response gains `resumeFrom`, nullable, an additive change. The next page is another request
+    with the same `readSeq` and `manifestId`.
+  - The commit's `readRanges` must name the whole range scanned, not each page's part (OpenAPI
+    description).
+  - The in-Worker `DbClient.scanAt` keeps its signature and has no budget, but no longer collects
+    every page first.
+- **The routed scan** (`ShardRouter.scan`, the sharded `scan` endpoint):
+  - Each shard gets the page's remaining rows and the one shared budget.
+  - A shard's `BudgetSpent` ends the routed page, and its `resumeFrom` is the routed continuation
+    (the key also names the shard).
+  - Only `OvertakenByFlush` continues within the shard, as D93 did.
+  - The sharded response gains `resumeFrom`, nullable.
+  - A routed scan is not one snapshot across shards.
+- **A settled key.** Once one key's unflushed versions already settle it (a value or a delete; older
+  versions cannot change what any read at or above them sees), a segment ends at that key and the
+  next starts after it (`settledVersions`, `keySuccessor`). One page of a key overwritten 2,500
+  times then reads two writer pages and holds about 1,000 rows. Merge operands do not settle a key:
+  a long run of them is still read whole (D99 bounds the merged result).
+
+**Memory for one page, from named constants.** What one page holds at once is the sum of:
+
+- the segment's writer rows: one writer page, at most `MAX_MEMTABLE_PAGE_BYTES` (8 MiB) and 1,000
+  rows, plus the unsettled merge operands of one key that span pages;
+- the rows returned, at most `SCAN_PAGE_EXAMINED_BYTES` (16 MiB, since every returned row was
+  examined) plus one key's versions;
+- the reader's blocks in flight, as D108 bounds them.
+
+So the bound is 8 MiB + 16 MiB + one key's versions + the reader's blocks, the same for the
+regular, transaction, and routed page. A routed page holds one shard's segment at a time.
+
+**Tests.**
+
+- **`scan-bounds.test.ts`:**
+  - limit 1 over 2,999 deleted, and over 2,999 expired, keys, in the writer, in L0, and in a sorted
+    run (where compaction at the bottom has dropped them). On the regular and the transaction scan,
+    every page reads at most two writer pages, and following `resumeFrom` reaches exactly the live
+    key.
+  - a key overwritten 2,500 times;
+  - a transaction scan for one row reads one writer page.
+- **`shard-scan-bounds.test.ts`:**
+  - the routed page ends at its budget after one writer page;
+  - over two shards, it ends where one database's page over the same rows ends (one budget, not
+    one per shard).
+- **Five mutations caught:**
+  - the transaction page without a budget;
+  - no skip past a settled key;
+  - a whole shard per routed page;
+  - the budget not shared;
+  - a budget end treated as a flush overtaking.
+
+**Not done in this pass, open:**
+
+- the oracle property test over the three surfaces with random budgets and writes, flushes, and
+  compactions between pages;
+- the tests of two transaction pages separated by a flush and a compaction, and of a phantom
+  beyond an early page's end but inside the scanned range;
+- the workerd assertions of the HTTP shapes.

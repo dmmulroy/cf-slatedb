@@ -428,7 +428,7 @@ export class DbHttpApiGroup extends HttpApiGroup.make("databases")
       OpenApi.annotations({
         summary: "Scan a range in a transaction",
         description:
-          "Scans a key range as of the transaction's `readSeq` and `manifestId` (both from `transactions/begin`), at most `limit` rows. Send the range to `transactions/commit` as one of `readRanges`.",
+          "Scans a key range as of the transaction's `readSeq` and `manifestId` (both from `transactions/begin`): at most `limit` rows, and `resumeFrom`, where the next page starts (null when the range is exhausted). A page may hold fewer rows than `limit`, or none, and still have a `resumeFrom`: it examined its share of work. Continue with the same `readSeq` and `manifestId` and `range.start` set to `resumeFrom`; every page reads the same snapshot. Send `transactions/commit` the whole range scanned as one of `readRanges`, not each page's part.",
       }),
     ),
   )

@@ -117,7 +117,15 @@ from `DbHttpApi`, with examples of every request and response. It covers:
 - **Reads:** `get` and `scan` at `Latest` (sees every acknowledged write), `AtLeast` a sequence
   number, or `Flushed`; at a snapshot; pinned snapshots that outlive GC. A scan page ends at its
   limit or after examining 16 MiB of versions, whichever comes first, so a page may hold fewer
-  rows than asked, or none: follow `resumeFrom` until it is null (D108).
+  rows than asked, or none: follow `resumeFrom` until it is null (D108). The same loop serves the
+  transaction scan (same `readSeq` and `manifestId` on every page) and the sharded scan, whose
+  pages are not one snapshot across shards (D125):
+
+  ```text
+  start = range.start
+  loop: page = scan(range with start); use page.rows; if page.resumeFrom is null: done; start = page.resumeFrom
+  ```
+
 - **Transactions:** `Snapshot` or `SerializableSnapshot` isolation, with conflicts detected at
   commit.
 - **Change feed:** committed changes in sequence order, when the database's changelog is on.
