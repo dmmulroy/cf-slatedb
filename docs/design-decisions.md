@@ -4462,7 +4462,6 @@ agent's `Lifecycle` and `CompactorObject` work (D110, D114).
 
 The safety run has 24,118 states. An exploration at larger bounds (228,918 states) found nothing.
 
-## D113. The change feed can repeat changes after a flush commit whose response was lost
 ## D113. A flush is exact about where it starts; the change feed reads each change once
 
 **Found** while placing the labels of the change-feed model. A failing test showed it before any
