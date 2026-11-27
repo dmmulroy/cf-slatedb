@@ -334,6 +334,7 @@ export const makeDbWriter = Effect.gen(function* () {
   const initLock = yield* Semaphore.make(1);
   const commitLock = yield* Semaphore.make(1);
   const flushLock = yield* Semaphore.make(1);
+  const scheduleLock = yield* Semaphore.make(1);
 
   const unavailable =
     (databaseId: DatabaseId, operation: string) => (error: { readonly message: string }) =>
@@ -434,15 +435,20 @@ export const makeDbWriter = Effect.gen(function* () {
    * (D61).
    */
   const scheduleFlush = (_databaseId: DatabaseId) =>
-    Effect.gen(function* () {
-      const counters = yield* Ref.get(unflushed);
-      if (Option.isNone(counters.oldest)) return;
-      const now = yield* Clock.currentTimeMillis;
-      const due =
-        counters.bytes >= settings.l0SstSize ? now : counters.oldest.value + settings.maxL0Age;
-      const scheduled = yield* alarm.scheduled;
-      if (Option.isNone(scheduled) || scheduled.value > due) yield* alarm.scheduleAt(due);
-    });
+    // One scheduler at a time (D102): two that both read the alarm before either set it could
+    // leave the one holding older counters (a later time) last. Innermost lock: only the counters
+    // and the alarm are read and written inside it.
+    scheduleLock.withPermits(1)(
+      Effect.gen(function* () {
+        const counters = yield* Ref.get(unflushed);
+        if (Option.isNone(counters.oldest)) return;
+        const now = yield* Clock.currentTimeMillis;
+        const due =
+          counters.bytes >= settings.l0SstSize ? now : counters.oldest.value + settings.maxL0Age;
+        const scheduled = yield* alarm.scheduled;
+        if (Option.isNone(scheduled) || scheduled.value > due) yield* alarm.scheduleAt(due);
+      }),
+    );
 
   /**
    * Starts the writer for `databaseId` once per instance: fences in with a new writer epoch, seeds
@@ -763,9 +769,21 @@ export const makeDbWriter = Effect.gen(function* () {
               const latest = yield* manifests
                 .update(databaseId, (manifest) => Result.succeed(manifest))
                 .pipe(Effect.catchTags(manifestFailures(databaseId, "write")));
-              ready = { ...ready, manifest: latest };
-              yield* Ref.set(phase, ready);
-              if (latest.manifest.l0.length >= settings.l0MaxSsts) {
+              // Installed only over an older view: a flush may have committed a newer manifest
+              // while this one loaded, and a fence-out must stay (D102).
+              const current = yield* Ref.modify(
+                phase,
+                (current): readonly [WriterPhase, WriterPhase] => {
+                  if (current._tag !== "Ready" || current.manifest.id >= latest.id) {
+                    return [current, current];
+                  }
+                  const next: WriterPhase = { ...current, manifest: latest };
+                  return [next, next];
+                },
+              );
+              if (current._tag === "Fenced") return yield* Effect.fail(current.error);
+              if (current._tag === "Ready") ready = current;
+              if (ready.manifest.manifest.l0.length >= settings.l0MaxSsts) {
                 yield* Metric.update(writeStalls, 1);
                 yield* Effect.annotateCurrentSpan({ "writer.stall_reason": "L0Backlog" });
                 // Compaction is behind: make sure the compactor is awake (a lost wake would stall forever).
@@ -775,7 +793,7 @@ export const makeDbWriter = Effect.gen(function* () {
                     databaseId,
                     reason: "L0Backlog",
                     retryAfterMs: 5_000,
-                    message: `Database ${databaseId} has ${latest.manifest.l0.length} L0 SSTs waiting for compaction, at its ${settings.l0MaxSsts} limit, so the write was refused. Retry the same batch later; nothing was written.`,
+                    message: `Database ${databaseId} has ${ready.manifest.manifest.l0.length} L0 SSTs waiting for compaction, at its ${settings.l0MaxSsts} limit, so the write was refused. Retry the same batch later; nothing was written.`,
                   }),
                 );
               }
