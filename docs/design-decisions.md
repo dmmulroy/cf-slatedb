@@ -5187,7 +5187,7 @@ limit. That is D98's limit, not this one's; it is left to D98's owner.
     client. It checks each route's own `operation`, the create fields, paging, the transaction
     reads at their begin manifest, seal without holds, the newest manifest on status and
     compaction, and dropSst's `confirm` and `force`.
-  - After it, 3 of 70 survive, all equivalent.
+  - After it, 2 of 70 survive, both equivalent.
 - **The in-process harness cannot serve a writer route on first use from inside an API request**
   (open). `writerClientTestLayer` builds a database's writer router on its first call. Built inside
   an in-process API request, that router first collides with the API's own router, then fails to
