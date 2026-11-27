@@ -9,7 +9,12 @@ import { Base64 } from "effect/encoding";
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 import { HttpApiClient } from "effect/http-api";
 
-import { percentile, summarizeHealth, summarizeValues } from "./health-report.ts";
+import {
+  OBJECT_READ_SPAN_NAMES,
+  percentile,
+  summarizeHealth,
+  summarizeValues,
+} from "./health-report.ts";
 
 export { exceptionType, percentile } from "./health-report.ts";
 
@@ -1531,6 +1536,9 @@ export const measureHealth = (minutes: number) =>
       failedFlushes: yield* named("DbWriter.flush", "--error"),
       polls: yield* named("Compactor.poll"),
       uploads: yield* named("ObjectStore.putMultipart"),
+      objectReads: (yield* spansSince(store, sinceMs, ["--name-prefix", "Object"])).filter((span) =>
+        OBJECT_READ_SPAN_NAMES.has(span.name),
+      ),
       failedCollections: yield* named("GarbageCollector.collect", "--error"),
       collections: yield* named("GarbageCollector.collect"),
       failedSweeps: yield* named("MaintenanceSweep.sweepPage", "--error"),

@@ -47,6 +47,12 @@ export interface HealthSpans {
   readonly polls: ReadonlyArray<HealthSpan>;
   /** `ObjectStore.putMultipart` spans. */
   readonly uploads: ReadonlyArray<HealthSpan>;
+  /**
+   * Object reads: `ObjectStore.get`, `getRange`, `getVersioned`, `head`, `list`, `listPrefixes`,
+   * and `ObjectReader.get`, `getRange` (the `BlockServer`'s). A read R2 failed transiently and
+   * that was retried carries `object.read_retried` (D134).
+   */
+  readonly objectReads: ReadonlyArray<HealthSpan>;
   /** `GarbageCollector.collect` spans with an error status. */
   readonly failedCollections: ReadonlyArray<HealthSpan>;
   /** Every `GarbageCollector.collect` span. */
@@ -65,12 +71,36 @@ export interface HealthThresholds {
   readonly l0MaxSsts: number;
   /** A flush p99 above this is an issue (`docs/operations.md`: "about 30 s"). */
   readonly flushP99Ms: number;
+  /**
+   * The fraction of object reads that needed a retry above which retries are an issue (D134), once
+   * at least {@link HealthThresholds.readRetriesMinimum} reads were retried.
+   */
+  readonly readRetryRate: number;
+  /** Retried reads below this count are never an issue: too few to measure a rate. */
+  readonly readRetriesMinimum: number;
 }
+
+/** The span names {@link HealthSpans.objectReads} holds. */
+export const OBJECT_READ_SPAN_NAMES: ReadonlySet<string> = new Set([
+  "ObjectStore.get",
+  "ObjectStore.getRange",
+  "ObjectStore.getVersioned",
+  "ObjectStore.head",
+  "ObjectStore.list",
+  "ObjectStore.listPrefixes",
+  "ObjectReader.get",
+  "ObjectReader.getRange",
+]);
 
 /** Production's thresholds: the engine's default `l0MaxSsts` and the guide's 30 s flush. */
 export const DEFAULT_HEALTH_THRESHOLDS: HealthThresholds = {
   l0MaxSsts: DEFAULT_LSM_SETTINGS.l0MaxSsts,
   flushP99Ms: 30_000,
+  // R2's own rate is about one transient failure in 150,000 reads (the 130-minute soak, D134); one
+  // in 10,000 is still noise. One in 1,000 is ten times below one in 100, where a retry's 25-75 ms
+  // reaches the read p99 and failures that come together start to exhaust the retries.
+  readRetryRate: 0.001,
+  readRetriesMinimum: 10,
 };
 
 /** Percentile (nearest rank) of `values`, in their unit; `0` when empty. */
@@ -145,8 +175,13 @@ const later = (left: HealthSpan, right: HealthSpan) =>
  *   `GarbageCollector.collect`): it retains more manifests than one collection reads, so its
  *   garbage SSTs are not being deleted (D98).
  *
+ * - object reads retried after a transient R2 failure (`object.read_retried`, D134) above
+ *   `readRetryRate` of the reads, once at least `readRetriesMinimum` were retried: R2 is failing
+ *   far more often than its normal rate.
+ *
  * **Reported, not issues:** uploads with a re-sent part (`object.part_retried`; transient unless
- * frequent), flush durations, the deepest L0 backlogs, and the most frequent error spans.
+ * frequent), retried object reads below the rate, flush durations, the deepest L0 backlogs, and
+ * the most frequent error spans.
  *
  * Spans are sampled in production (P4), so every span count is a sample of the stage's.
  */
@@ -205,6 +240,9 @@ export const summarizeHealth = (
     (span) => count(span.attributes["object.parts_unverified"]) > 0,
   );
   const retried = spans.uploads.filter((span) => isTrue(span.attributes["object.part_retried"]));
+  const reads = spans.objectReads.filter((span) => OBJECT_READ_SPAN_NAMES.has(span.name));
+  const retriedReads = reads.filter((span) => count(span.attributes["object.read_retried"]) > 0);
+  const readRetryRate = reads.length === 0 ? 0 : retriedReads.length / reads.length;
   const flushMs = summarizeValues(spans.flushes.map((span) => span.durationMs));
   const deepestBacklog = [...backlog].sort((left, right) => right[1] - left[1]).slice(0, 5);
   const issues = [
@@ -234,6 +272,12 @@ export const summarizeHealth = (
     ...(unverified.length > 0
       ? [
           `${unverified.length} multipart uploads stored parts whose ETag was not an MD5: parts are no longer checked`,
+        ]
+      : []),
+    ...(retriedReads.length >= thresholds.readRetriesMinimum &&
+    readRetryRate > thresholds.readRetryRate
+      ? [
+          `${retriedReads.length} of ${reads.length} object reads were retried after a transient R2 failure (object.read_retried), above ${thresholds.readRetryRate * 100}%: see docs/operations.md, "What to watch"`,
         ]
       : []),
     ...(flushMs.count > 0 && flushMs.p99 > thresholds.flushP99Ms
@@ -281,6 +325,11 @@ export const summarizeHealth = (
       multipart: spans.uploads.length,
       withRetriedPart: retried.length,
       withUnverifiedPart: unverified.length,
+    },
+    objectReads: {
+      reads: reads.length,
+      retried: retriedReads.length,
+      retryRate: readRetryRate,
     },
     gc: {
       failedCollections: spans.failedCollections.length,

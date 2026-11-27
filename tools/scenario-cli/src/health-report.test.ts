@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { type HealthSpan, type HealthSpans, summarizeHealth } from "./health-report.ts";
+import {
+  DEFAULT_HEALTH_THRESHOLDS,
+  type HealthSpan,
+  type HealthSpans,
+  summarizeHealth,
+} from "./health-report.ts";
 
 let clock = 0n;
 /** A span that started after every span made before it. */
@@ -27,6 +32,7 @@ const none: HealthSpans = {
   failedFlushes: [],
   polls: [],
   uploads: [],
+  objectReads: [],
   failedCollections: [],
   collections: [],
   failedSweeps: [],
@@ -101,7 +107,8 @@ describe("summarizeHealth (D82)", () => {
     const polls = [poll("orders", { "manifest.l0_ssts": 15 })];
     expect(summarizeHealth([], { ...none, polls }).issues).toEqual([]);
     expect(
-      summarizeHealth([], { ...none, polls }, { l0MaxSsts: 8, flushP99Ms: 30_000 }).issues,
+      summarizeHealth([], { ...none, polls }, { ...DEFAULT_HEALTH_THRESHOLDS, l0MaxSsts: 8 })
+        .issues,
     ).toEqual([
       "database orders has 15 L0 SSTs, at its 8 limit: writes are refused until compaction catches up",
     ]);
@@ -238,5 +245,37 @@ describe("summarizeHealth: a writer that cannot flush (D102)", () => {
     expect(report.issues).toEqual([
       '1 reads met a corrupted SST (SstCorruptedError), answered StoredDataInvalid: see docs/operations.md, "Corruption runbook"',
     ]);
+  });
+});
+
+describe("summarizeHealth: retried object reads (D134)", () => {
+  const reads = (total: number, retried: number) =>
+    Array.from({ length: total }, (_, index) =>
+      span(
+        index % 2 === 0 ? "ObjectReader.getRange" : "ObjectStore.get",
+        index < retried ? { "object.read_retried": 1 } : {},
+      ),
+    );
+
+  it("reports R2's normal rate of retried reads as information, not an issue", () => {
+    const report = summarizeHealth([], { ...none, objectReads: reads(20_000, 2) });
+    expect(report.issues).toEqual([]);
+    expect(report.objectReads).toEqual({ reads: 20_000, retried: 2, retryRate: 0.0001 });
+  });
+
+  it("is an issue above one retried read in 1,000, once enough were retried", () => {
+    expect(summarizeHealth([], { ...none, objectReads: reads(5_000, 20) }).issues).toEqual([
+      '20 of 5000 object reads were retried after a transient R2 failure (object.read_retried), above 0.1%: see docs/operations.md, "What to watch"',
+    ]);
+    // Too few retried reads to judge a rate.
+    expect(summarizeHealth([], { ...none, objectReads: reads(100, 5) }).issues).toEqual([]);
+  });
+
+  it("counts only object read spans", () => {
+    const report = summarizeHealth([], {
+      ...none,
+      objectReads: [...reads(10, 0), span("ObjectStore.putIfAbsent", { "object.read_retried": 1 })],
+    });
+    expect(report.objectReads).toEqual({ reads: 10, retried: 0, retryRate: 0 });
   });
 });
