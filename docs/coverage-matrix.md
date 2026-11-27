@@ -524,6 +524,10 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   (`DEFAULT_COMPACTOR_SUBREQUESTS`, `SHALEDB_COMPACTOR_SUBREQUESTS`). Tests: `manifest-size.test.ts`
   (the budget), `manifest-limits.test.ts`, `merge-limits.test.ts`, `db-public-error-limits.test.ts`,
   `shaledb-stack-config.test.ts`.
+- **No key, value, or secret in telemetry or an error (D123)** — done. `lsmPolicyTracer` filters
+  span events as well as attributes (`exportedEventName`, `isExportedEventAttribute`). Tests:
+  `telemetry-leaks.test.ts` (random markers through the policy and through public error bodies;
+  schema issues of bytes fields), `lsm-trace-policy.test.ts`.
 - **Production readiness (v1 workstream 9)** — done (D64).
   - **Tokens.** `lsmAccessGateFrom`, `lsmAccessGateOver`, `LsmAccessTokenSource`, and
     `lsmStageAccessTokens` (`lsm-access-gate.ts`). In infra: `shaledbAccessTokens`

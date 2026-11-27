@@ -4292,3 +4292,75 @@ needs a decision of its own (`CROSS:` to the API owner).
 first page answers 200 with no rows and a `resumeFrom`, and following `resumeFrom` returns exactly
 the live key, with every page answered. Three mutations caught: no budget, the handler requiring a
 row to end early, and versions not counted.
+
+## D123. Span events pass the trace policy; no key, value, or secret in telemetry or an error
+
+**Found while auditing every attribute, log line, and error added since `f3b2ad2`.** D63's policy
+(`lsmPolicyTracer`) checked every span attribute against an allowlist, but not span events. Effect
+turns every log line into an event on the current span (its tracer logger):
+
+- **The event's name is the whole message.** A message of several parts, such as
+  `Effect.logError("text", { cause })`, is serialized with every object's fields.
+- **The event's attributes are the log annotations,** under any name.
+
+A probe under the policy exported `Effect.logWarning("…", { cause: { resumeFrom: "MARKERKEY" } })`
+with the marker in the event's name, and `annotateLogs({ key: "MARKERKEY" })` as an attribute. No
+call site at the integration head logs a key or a value. Each one was read: they log ids, R2 object
+keys (`db/<id>/…`, no caller key), an `HttpServerError` (its headers redacted by Effect, the
+authorization header included), or `Cause.pretty` output, which prints messages and stacks, never
+an error's fields. So this was a bypass of the policy, not an observed leak.
+
+**The rule.** Events pass the same policy as attributes:
+
+- **The name** keeps a message's string parts; every other part becomes `[omitted]`
+  (`exportedEventName`).
+- **The attributes** must be primitive values. Their names must be allowlisted span attribute
+  names, `effect.*`, `exception.*`, or the request middleware's `cause`, `requestId`, `method`, and
+  `path` (`isExportedEventAttribute`).
+- **Exception events** are built by the OTLP exporter from each error's name, message, and stack.
+  Every typed error's message is code-written and names ids, counts, and sizes, never a key.
+  Fields such as a scan's `resumeFrom` are not exported.
+
+**What was checked and holds.**
+
+- **Span attributes added in D76 to D108.** All carry ids, counts, enums, or booleans:
+  `database.id`, `sst.id`, `manifest.id`, `block.offset`, `compaction.*`, `gc.*`, `alarm.failures`,
+  `writer.stall_reason`, `shard.*`, `changelog.page_cut`, `cache.damaged_copy`, `object.part_retried`.
+- **Error messages with an interpolated `key`** name R2 object keys, never a caller's key.
+  `KeyOutOfRange` names the operation's index, not the key.
+- **Schema issues repeated to the caller (D69).** A malformed bytes field's issue says what was
+  expected and where, and does not quote the input (tested for `GetRequest` and `ScanRequest`).
+- **The D86 `prepare` result** holds SST ids only.
+- **Health and soak reports** are built from exported spans and tail records, which carry only what
+  the policy lets through. The soak's mismatch list names the soak's own synthetic keys, in a local
+  report file.
+- **No span bypasses the policy.** No code outside `lsm-trace-policy.ts` builds a tracer, and every
+  Worker's telemetry goes through `withLsmTracePolicy` (D63).
+
+**Where a response returns the caller's own data on purpose.** The access token is the tenant
+boundary (`docs/api-compatibility.md`). In each case below, the data belongs to a database the
+caller's token already reads:
+
+- **get, scan, and transaction reads** return rows;
+- **the change feed** returns changes;
+- **a scan page's `resumeFrom`** is the next key of the caller's own range;
+- **the compaction status and an SST drop's report** give SST handles with their first and last
+  keys, for the operator who holds the token;
+- **Workflow step results** hold output SST handles with their keys, in the account's own Workflow
+  state, like the manifest in R2.
+
+**Not covered.** The Workers runtime's own console output (Workers Logs, `wrangler tail`) gets each
+log line's full message, objects included. It is unchanged, and the call sites above put no key in
+it. The policy governs only what shaledb exports to its collector.
+
+**Tests** (`telemetry-leaks.test.ts`):
+
+- 25 random markers, each placed where a careless line would put a key: a log line's object part,
+  an unknown annotation, a known annotation holding an object, an unknown attribute, and a typed
+  error's `resumeFrom`. Each exported attribute, event, and exception is searched for the marker as
+  UTF-8, base64, hex, and serialized bytes.
+- Public error bodies from failing operations on marked keys and values: a key out of range, a key
+  over the limit, and a merged value over the bound.
+- The schema issues of malformed bytes fields.
+- **Four mutations caught:** the event filter removed (the code before), the event name kept whole,
+  object values kept under allowed names, and every event attribute kept.

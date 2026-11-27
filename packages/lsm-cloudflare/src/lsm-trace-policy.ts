@@ -77,6 +77,55 @@ export const isExportedSpanAttribute = (key: string): boolean => {
   return dot > 0 && LSM_SPAN_ATTRIBUTE_NAMESPACES.has(key.slice(0, dot));
 };
 
+/**
+ * Attributes a span event (a log line, or an exception) may carry besides
+ * {@link isExportedSpanAttribute}'s (D123): Effect's own (`effect.fiberId`, `effect.logLevel`,
+ * `effect.cause`), the exception's type, message, and stack, and the request middleware's log
+ * annotations. Their values are code-written: ids, levels, `Cause.pretty` output, which prints
+ * messages and stacks, never an error's fields.
+ */
+const EXPORTED_EVENT_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set([
+  "cause",
+  "requestId",
+  "method",
+  "path",
+]);
+
+/** Whether a span event attribute may leave the Worker (D123): see {@link EXPORTED_EVENT_ATTRIBUTE_KEYS}. */
+export const isExportedEventAttribute = (key: string, value: unknown): boolean =>
+  isPrimitive(value) &&
+  (isExportedSpanAttribute(key) ||
+    key.startsWith("effect.") ||
+    key.startsWith("exception.") ||
+    EXPORTED_EVENT_ATTRIBUTE_KEYS.has(key));
+
+const isPrimitive = (value: unknown): boolean =>
+  typeof value === "string" ||
+  typeof value === "number" ||
+  typeof value === "boolean" ||
+  typeof value === "bigint";
+
+/** Stands for a part of a log message that was not a string, which is never exported (D123). */
+export const OMITTED_LOG_PART = "[omitted]";
+
+/**
+ * A span event's name as exported (D123). Effect names a log line's event after the whole message:
+ * a message of several parts (`Effect.log("text", { cause })`) becomes the parts serialized, an
+ * object's fields included. The string parts are kept and every other part becomes
+ * {@link OMITTED_LOG_PART}; a name that is not such a serialization is kept as it is.
+ */
+export const exportedEventName = (name: string): string => {
+  if (!name.startsWith("[")) return name;
+  let parts: unknown;
+  try {
+    parts = JSON.parse(name);
+  } catch {
+    return name;
+  }
+  if (!Array.isArray(parts)) return name;
+  return parts.map((part) => (typeof part === "string" ? part : OMITTED_LOG_PART)).join(" ");
+};
+
 /** How a Worker samples and redacts its spans. */
 export interface LsmTracePolicy {
   /** Fraction of traces kept (1: every trace). */
@@ -108,6 +157,10 @@ export const traceIdSampled = (traceId: string, sampleRate: number): boolean => 
  *   Spans under a local parent inherit its decision, as Effect does.
  * - **Redaction at the source.** Every attribute set on a span, by shaledb or by the HTTP
  *   middleware, is checked with {@link isExportedSpanAttribute}; anything else is never recorded.
+ * - **Events too** (D123). A log line becomes a span event: its name keeps only the message's
+ *   string parts ({@link exportedEventName}) and its attributes pass
+ *   {@link isExportedEventAttribute}. An exception event is built by the exporter from the error's
+ *   name, message, and stack, never its fields.
  */
 export const lsmPolicyTracer = (inner: Tracer.Tracer, policy: LsmTracePolicy): Tracer.Tracer =>
   Tracer.make({
@@ -127,6 +180,22 @@ export const lsmPolicyTracer = (inner: Tracer.Tracer, policy: LsmTracePolicy): T
       const record = span.attribute.bind(span);
       span.attribute = (key, value) => {
         if (isExportedSpanAttribute(key)) record(key, value);
+      };
+      // Log lines reach the span as events (Effect's tracer logger), with the message as the name
+      // and the log annotations as attributes: they pass the same policy (D123).
+      const recordEvent = span.event.bind(span);
+      span.event = (name, startTime, attributes) => {
+        recordEvent(
+          exportedEventName(name),
+          startTime,
+          attributes === undefined
+            ? undefined
+            : Object.fromEntries(
+                Object.entries(attributes).filter(([key, value]) =>
+                  isExportedEventAttribute(key, value),
+                ),
+              ),
+        );
       };
       return span;
     },
