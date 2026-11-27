@@ -1,45 +1,94 @@
-# shaledb
+<p align="center">
+  <img src="https://shaledb.mulroy.workers.dev/favicon.svg" alt="shaledb logo" width="96" height="96" />
+</p>
 
-A SlateDB-style LSM key-value store on Cloudflare R2 and Durable Objects.
+<h1 align="center">shaledb</h1>
 
-shaledb keeps SlateDB's model:
+<p align="center">A log-structured merge tree key-value store on Cloudflare Durable Objects, R2, and Workflows.</p>
 
-- one writer and many readers per database;
-- immutable SSTs in object storage;
-- a manifest versioned by compare-and-swap;
-- size-tiered compaction.
+<p align="center">
+  <a href="https://shaledb.mulroy.workers.dev">How it works</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="docs/openapi/shaledb-v1.json">API contract</a> ·
+  <a href="docs/measurements.md">Measurements</a> ·
+  <a href="docs/invariants.md">Invariants</a>
+</p>
 
-It swaps two pieces for Cloudflare-native ones:
+- **Writes are durable when the call returns.** Each database has one writer Durable Object, and its SQLite table is the write-ahead log and the memtable.
+- **Data lives in R2, not in the Durable Object.** The writer flushes immutable SSTs to R2, and a Cloudflare Workflow compacts them.
+- **Reads scale with readers.** Every read except `Latest` runs in the caller's Worker and never touches the writer.
+- **Databases are cheap to copy and split.** A fork or a range split references the source's SSTs and copies no data.
 
-- **The writer** is a Durable Object, and its SQLite table is both the write-ahead log and the
-  memtable. A write is durable when the call returns.
-- **Compaction** runs in a Workflow.
+```sh
+# Write a row to the database `orders`, then read it back. Keys and values are base64.
+curl -X POST localhost:1337/v1/databases/orders/batches -H 'content-type: application/json' \
+  -d '{"operations":[{"_tag":"Put","key":"dXNlcjo0Mg==","value":"QWRh","ttlMillis":null}]}'
+# {"seq":1,"createTs":1764230400000}
 
-The unit is a **database**: one id with its own writer, compactor, manifest chain, R2 prefix
-(`db/<id>/`), and cache tag. Databases are created, checkpointed, forked, sealed, split, and
-removed through the API. Optional range sharding (`packages/lsm-sharding`) splits a key space
-across databases.
+curl -X POST localhost:1337/v1/databases/orders/get -H 'content-type: application/json' \
+  -d '{"key":"dXNlcjo0Mg==","consistency":{"_tag":"Latest"},"snapshot":null}'
+```
 
-The design is [`docs/show-me-r2-lsm-design.html`](docs/show-me-r2-lsm-design.html).
-[`docs/design-decisions.md`](docs/design-decisions.md) records every judgment call it did not make.
+shaledb follows [SlateDB](https://slatedb.io)'s model, one writer and many readers, immutable SSTs, a manifest versioned by compare-and-swap, size-tiered compaction, and replaces two parts of it with Cloudflare ones: the writer is a Durable Object, and compaction is a Workflow.
 
-## Who it is for
+## Contents
 
-shaledb is for many independent writers spread across many databases, not one global hot writer.
-The unit of scale is the database, and each database has one writer Durable Object. Throughput
-grows by adding databases (and, for one key space, by splitting it with range sharding), not by
-making one database's writer faster.
+- [How it fits together](#how-it-fits-together)
+- [Writes](#writes)
+- [Reads](#reads)
+- [Background work](#background-work)
+- [Database lifecycle](#database-lifecycle)
+- [Who it is for](#who-it-is-for)
+- [Compared with a plain Durable Object table](#compared-with-a-plain-durable-object-table)
+- [Quick start](#quick-start)
+- [The API](#the-api)
+- [Repository](#repository)
+- [Verifying a change](#verifying-a-change)
+- [Documentation](#documentation)
 
-One database holds at most about 312 GiB (derived, not measured: the largest compaction run live
-was about 0.5 GiB): past that, a compaction of the whole database outgrows what one Cloudflare
-Workflow may run (D103). Long keys lower it, because the manifest lists every
-SST's first and last key (D99). Larger data is split into several databases with range sharding.
-Every limit a caller can meet is listed in [`docs/api-compatibility.md`](docs/api-compatibility.md),
-"Limits of v1".
+## How it fits together
 
-One database's write rate is bounded by its writer, which commits one batch at a time. Every
-measured number in this README names the commit it was measured on; none is yet on the release
-commit ([`docs/release-v1.md`](docs/release-v1.md) §3). The rates measured on one writer:
+The unit is a **database**: one id with its own writer, its own compactor, its own manifest chain, and everything it stores under `db/<id>/` in R2.
+
+```mermaid
+flowchart LR
+  client([Client]) --> api
+  subgraph api [DbApiWorker]
+    reader[DbReader<br/>manifest cache, L1 block cache]
+  end
+  api -->|writes, Latest probes| writer[("WriterServer<br/>one per database<br/>SQLite memtable")]
+  writer -->|L0 SSTs, manifest CAS| r2[("R2<br/>db/#60;id#62;/")]
+  writer -.->|wake| compactor[("CompactorServer<br/>one per database")]
+  compactor --> workflow{{"CompactionWorkflow<br/>one per job"}}
+  workflow --> r2
+  reader -->|blocks| blocks[BlockServer<br/>Workers Cache] --> r2
+  cron[["GC cron, every 5 min"]] -.-> compactor
+```
+
+The [interactive guide](https://shaledb.mulroy.workers.dev) animates every request path through this diagram, simulates the timers, and lists every endpoint with its call tree.
+
+## Writes
+
+A write commits to the writer's SQLite table and returns. A flush later uploads the unflushed rows to R2 as one L0 SST and commits a new manifest.
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant W as WriterServer
+  participant S as SQLite
+  participant R as R2
+  C->>W: POST /batches
+  W->>S: commit rows
+  W-->>C: seq, createTs (durable)
+  Note over W: 60 s after the oldest row, or at 64 MiB
+  W->>R: upload the L0 SST
+  W->>R: commit the manifest (compare-and-swap)
+  W->>S: mark the rows flushed
+```
+
+Every manifest is written with put-if-absent, so two writers can never both commit the same version. Each start of a writer increments its epoch in the manifest, so a commit from an older instance fails. A crash between the upload and the commit leaves an SST that no manifest references, and garbage collection deletes it. [`docs/invariants.md`](docs/invariants.md) lists every such case, with the tests and TLA+ models that check it.
+
+One database's write rate is bounded by its writer, which commits one batch at a time. Every measured number here names the commit it was measured on; none is yet on the release commit.
 
 <!-- STEP4 readme-writes: begin -->
 
@@ -54,32 +103,78 @@ Writer busy below 1 means these are the rates measured, not a proven ceiling ([`
 
 <!-- STEP4 readme-writes: end -->
 
-Reads cost the writer differently by consistency:
+## Reads
 
-- **`Latest`** sees every acknowledged write, and costs its database's writer one probe on every
-  read (the probe took 10 ms at p50 measured in the API Worker). Every `Latest` read of a database
-  is served by that one writer, and pays the distance to it.
-- **`AtLeast`, `Flushed`, snapshots, and scans of flushed data** run in the caller's Worker and do
-  not touch the writer (`AtLeast` asks it only when the caller's cached manifest does not yet
-  cover the sequence number). They scale with readers, and a `Flushed` read may lag the newest
-  flush by about a second and unflushed writes by up to a minute.
+Reads run in the caller's Worker. The consistency level decides whether a read asks the writer:
 
-Both are measured in [`docs/measurements.md`](docs/measurements.md), "Read latency", at
-`9776317` (D70–D73). The read path has changed since (D93, D108, D125).
-[`docs/invariants.md`](docs/invariants.md) states exactly what each read may see.
+```text
+get(key, consistency)
+  if a snapshot is given      read at the snapshot             # never asks the writer
+  if consistency is Flushed   read the cached manifest         # may lag the newest flush by about 1 s
+  if consistency is AtLeast   read the cached manifest if it covers seq, else ask the writer
+  if consistency is Latest    ask the writer for unflushed versions, then read the manifest
+```
+
+- **`Latest`** sees every acknowledged write. Every `Latest` read of a database costs that database's writer one probe, and pays the network distance to it. The probe took 10 ms at p50.
+- **`AtLeast`, `Flushed`, snapshots, and scans of flushed data** never load the writer, so they scale with readers. A `Flushed` read may miss writes that are not flushed yet, for up to a minute.
+
+Block bytes come from the isolate's L1 cache, then Workers Cache, then R2. Read latencies are in [`docs/measurements.md`](docs/measurements.md), "Read latency".
+
+A scan page stops at its limit or after examining 16 MiB of versions, so a page may hold fewer rows than asked, or none. Follow `resumeFrom` until it is null:
+
+```text
+start = range.start
+loop
+  page = scan(range from start)
+  use page.rows
+  if page.resumeFrom is null: done
+  start = page.resumeFrom
+```
+
+A transaction's commit must name the whole range it scanned in `readRanges`. The commit checks only the ranges it is sent, so naming just the rows the pages returned lets a conflicting write beyond the last page pass unseen.
+
+## Background work
+
+Nothing polls. Every periodic process is a Durable Object alarm, a cron, or a Workflow, and an idle database has no alarm set.
+
+| Process            | Trigger                                                         | Does                                                              |
+| ------------------ | --------------------------------------------------------------- | ----------------------------------------------------------------- |
+| Flush              | Writer alarm: 60 s after the oldest unflushed row, or at 64 MiB | Uploads an L0 SST and commits the manifest                        |
+| Compaction         | Compactor alarm, every 5 s while there is work                  | Plans size-tiered jobs of 4 to 8 SSTs and runs each as a Workflow |
+| Garbage collection | Compactor alarm, 1 hour after a job finishes                    | Deletes SSTs and manifests that nothing references                |
+| Maintenance sweep  | Cron, every 5 minutes, 50 databases per run                     | Cleans up removed databases and repairs lost wakes                |
+
+## Database lifecycle
+
+Every lifecycle change is a manifest compare-and-swap.
+
+```mermaid
+stateDiagram-v2
+  direction LR
+  [*] --> Open: create
+  Open --> Open: write, checkpoint, fork
+  Open --> Sealed: seal (flush and seal in one commit)
+  Sealed --> Removed: remove
+  Open --> Removed: remove
+  Removed --> [*]: after 1 hour, the id can be reused
+```
+
+A **fork** creates a new database from a checkpoint and a key range. It references the source's SSTs, copies nothing, and holds the source until its own compactions have rewritten them. Range sharding (`packages/lsm-sharding`) splits one key space across databases with a seal and two forks.
+
+## Who it is for
+
+shaledb is for many independent writers spread across many databases, not one global hot writer. Throughput grows by adding databases, and, for one key space, by splitting it with range sharding.
+
+One database holds at most about 312 GiB. Past that, a compaction of the whole database outgrows what one Workflow may run. This is derived, not measured: the largest compaction run live was about 0.5 GiB. Long keys lower the limit, because the manifest lists every SST's first and last key. Every limit a caller can meet is in [`docs/api-compatibility.md`](docs/api-compatibility.md), "Limits of v1".
 
 It is not a fit for:
 
 - one hot key range that needs more than one writer's throughput, without range sharding;
-- workloads that need atomic writes or transactions across databases: batches and transactions are
-  atomic within one database only;
-- `Latest` reads under 10 ms from far away: with the writer in the EU and the API Worker in the
-  US, a `Latest` get took about 130 ms at p50 in the API Worker (measured at `9776317`), against 19 ms on `preview-3`, whose
-  writers answered probes in 10 ms;
-- anything [`docs/measurements.md`](docs/measurements.md) does not cover (its "Not measured" list
-  names what is open).
+- atomic writes or transactions across databases: batches and transactions are atomic within one database;
+- `Latest` reads under 10 ms from far away: with the writer in the EU and the API Worker in the US, a `Latest` get took about 130 ms at p50;
+- anything [`docs/measurements.md`](docs/measurements.md) does not cover. Its "Not measured" list names what is open.
 
-### Compared with a plain Durable Object SQLite table
+## Compared with a plain Durable Object table
 
 <!-- STEP4 readme-baseline: begin -->
 
@@ -100,38 +195,24 @@ Each target's runs, the stage-side counts, and the price arithmetic are in [`doc
 
 <!-- STEP4 readme-baseline: end -->
 
-**What that buys, and how far each claim is measured.**
+- **Data leaves the Durable Object.** A plain table lives inside one object's SQLite storage, with its size limit and storage price. shaledb's flushed data is in R2.
+- **Reads do not load the writer.** A `Flushed` read runs in the API Worker and asks no Durable Object.
+- **Forks, checkpoints, pinned snapshots, and splits** have no counterpart in a plain table. Their costs are measured separately and are not in this comparison.
+- **Not measured here:** storage cost over time, a dataset near a Durable Object's storage limit, readers in other regions, and more than 8 clients.
 
-- **Data leaves the Durable Object.** A plain table lives inside one object's SQLite storage,
-  with that product's size limit and storage price; shaledb's flushed data is in R2. The price
-  and the limit are Cloudflare's published figures, not measurements
-  ([`docs/operations.md`](docs/operations.md), "Platform limits").
-- **Reads that do not load the writer.** A `Flushed` read runs in the API Worker and asks no
-  Durable Object (the read path, D67); above, the tail records agree, as far as they show.
-  `AtLeast`, snapshots, and scans of flushed data take the same path.
-- **Forks, checkpoints, pinned snapshots, and splits** have no counterpart in a plain table.
-  Their costs are measured separately ([`docs/measurements.md`](docs/measurements.md), "Split
-  write pause"); this comparison does not include them.
-- **Not measured here:** storage cost over time, a dataset near a Durable Object's storage
-  limit, readers in other regions, and either system above 8 clients.
+If one Durable Object's table holds the data and its writer can serve every read, the plain table is simpler and cheaper to write to.
 
-If one Durable Object's table holds the data and its writer can serve every read, the plain
-table is simpler and cheaper to write to. The numbers, the commands, and the price arithmetic
-are in [`docs/measurements.md`](docs/measurements.md), "Baseline: a plain Durable Object SQLite
-table".
-
-## Quick start (local)
+## Quick start
 
 Requirements: Node 24 and [Vite+](https://viteplus.dev) (`vp`).
 
 ```sh
 vp install
-vp run dev                                    # the whole Stack on local R2, Durable Objects, Workflows
+vp run dev                                    # the whole Stack on local R2, Durable Objects, and Workflows
 node tools/trace-cli/src/trace-cli.ts serve   # optional: receive every span on 127.0.0.1:4318
 ```
 
-The API is at `http://localhost:1337/v1`. Local stages need no token. Keys and values are base64
-in JSON.
+The API is at `http://localhost:1337/v1`. Local stages need no token. Create a database, then write and read:
 
 ```sh
 curl -X POST localhost:1337/v1/databases -H 'content-type: application/json' \
@@ -142,88 +223,65 @@ curl -X POST localhost:1337/v1/databases/orders/get -H 'content-type: applicatio
   -d '{"key":"dXNlcjo0Mg==","consistency":{"_tag":"Latest"},"snapshot":null}'
 ```
 
-`node tools/scenario-cli/src/scenario-cli.ts run all` runs every end-to-end scenario against the
-local Stack, with trace assertions.
+`node tools/scenario-cli/src/scenario-cli.ts run all` runs every end-to-end scenario against the local Stack, with trace assertions.
 
 ## The API
 
-The contract is [`docs/openapi/shaledb-v1.json`](docs/openapi/shaledb-v1.json), generated
-from `DbHttpApi`, with examples of every request and response. It covers:
+The contract is [`docs/openapi/shaledb-v1.json`](docs/openapi/shaledb-v1.json), generated from `DbHttpApi`, with an example of every request and response.
 
-- **Databases:** create, status, remove. A removed database's id can be created again only an
-  hour (`gcMinAge`) after its removal; before that, create answers `DatabaseRecentlyRemoved` (D90).
-- **Writes:** batches of puts, deletes, and merges, with an optional TTL each. `flush` makes
-  everything acknowledged durable in R2. A TTL is judged by the reader's clock: a value expires
-  within clock skew of its expiry time, readers on different machines may disagree for up to that
-  skew, and a value compaction has removed does not return to reads of later manifests (D83). A
-  snapshot, a pinned snapshot, and a transaction fix which writes are visible, not the time TTLs
-  are judged at: a value read at one of them can expire between two reads
-  ([`docs/invariants.md`](docs/invariants.md)).
-- **Reads:** `get` and `scan` at `Latest` (sees every acknowledged write), `AtLeast` a sequence
-  number, or `Flushed`; at a snapshot; pinned snapshots that outlive GC. A scan page ends at its
-  limit or after examining 16 MiB of versions, whichever comes first, so a page may hold fewer
-  rows than asked, or none: follow `resumeFrom` until it is null (D108). The same loop serves the
-  transaction scan (same `readSeq` and `manifestId` on every page) and the sharded scan, whose
-  pages are not one snapshot across shards (D125). A transaction's commit must name the whole
-  range it scanned in `readRanges`: it checks only the ranges it is sent, so naming just what the
-  pages returned lets a write after `readSeq` beyond the last page's end pass unseen:
+| Area         | Endpoints                                                                         |
+| ------------ | --------------------------------------------------------------------------------- |
+| Databases    | create, status, remove                                                            |
+| Writes       | batches of puts, deletes, and merges, each with an optional TTL; flush            |
+| Reads        | get and scan at `Latest`, `AtLeast`, or `Flushed`; snapshots; pinned snapshots    |
+| Transactions | `Snapshot` or `SerializableSnapshot` isolation, with conflicts detected at commit |
+| Change feed  | committed changes in sequence order, when the database's changelog is on          |
+| Lifecycle    | checkpoints, forks of a key range, seal                                           |
+| Repair       | compaction status, and dropping an SST that compaction reported corrupt           |
 
-  ```text
-  start = range.start
-  loop: page = scan(range with start); use page.rows; if page.resumeFrom is null: done; start = page.resumeFrom
-  ```
-
-- **Transactions:** `Snapshot` or `SerializableSnapshot` isolation, with conflicts detected at
-  commit. Conflicts are writes: a value that expires during a transaction is not one.
-- **Change feed:** committed changes in sequence order, when the database's changelog is on.
-  It says `Expired` rather than skip changes retention dropped. A fork's or split successor's
-  feed starts at its fork point, where the sealed source's feed ends.
-- **Lifecycle:** checkpoints, forks of a key range from a checkpoint, and seal (for splits).
-- **Repair:** the compaction status, and dropping an SST that compaction reported corrupted.
-
-Every response carries `x-request-id`. Errors share one envelope:
+Every response carries `x-request-id`, and every error shares one envelope:
 
 ```json
 { "code": "...", "message": "...", "details": {}, "requestId": "...", "retryable": false }
 ```
 
-[`docs/api-compatibility.md`](docs/api-compatibility.md) states what `/v1` promises.
+A few behaviors to know:
 
-Live stages require `Authorization: Bearer <token>`. Each stage has two rotatable tokens (see
-[`docs/operations.md`](docs/operations.md)).
+- **TTLs are judged by the reader's clock.** Readers on different machines may disagree for up to their clock skew. A snapshot fixes which writes are visible, not the time TTLs are judged at.
+- **A removed database's id** can be created again one hour after the removal.
+- **The change feed** answers `Expired` rather than skip changes that retention dropped. A fork's feed starts at its fork point.
+
+Live stages require `Authorization: Bearer <token>`. [`docs/api-compatibility.md`](docs/api-compatibility.md) states what `/v1` promises.
 
 ## Repository
 
-| Path                      | What it is                                                                                                                                         |
-| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `packages/lsm-core`       | Pure LSM logic: ids, rows, codecs, Bloom filters, the merge iterator, the manifest and its edits, the compaction scheduler. No Cloudflare imports. |
-| `packages/lsm-cloudflare` | The engine on Workers: object store, manifest store, writer, reader, compactor, compaction Workflow, GC, lifecycle, the HTTP APIs.                 |
-| `packages/lsm-sharding`   | Optional range sharding over the public API.                                                                                                       |
-| `infra/shaledb`           | The Alchemy Stack: buckets, Durable Objects, Workers, the Workflow, telemetry, access tokens.                                                      |
-| `tools/*`                 | Trace CLI, scenario and measurement CLI, preview CLI, writer benchmark, formal verification (TLA+).                                                |
+```text
+packages/
+├── lsm-core/         # pure LSM logic: codecs, Bloom filters, merge iterator, manifest edits, scheduler
+├── lsm-cloudflare/   # the engine: writer, reader, compactor, Workflow, GC, lifecycle, HTTP APIs
+└── lsm-sharding/     # optional range sharding over the public API
+infra/
+├── shaledb/          # the Alchemy Stack: buckets, Durable Objects, Workers, the Workflow
+└── docs-site/        # the interactive guide at shaledb.mulroy.workers.dev
+tools/                # trace CLI, scenario CLI, preview CLI, writer benchmark, TLA+ models
+```
 
-## Documentation
-
-- [`docs/invariants.md`](docs/invariants.md): what makes a write acknowledged and what makes it
-  flushed, what each kind of read may see, and when GC may reclaim an SST, with the code, tests,
-  and models that hold each. Read it before changing a write path, a read path, or GC.
-- [`docs/operations.md`](docs/operations.md): deploying, rolling back, tokens, telemetry, what to
-  watch, and the corruption runbook.
-- [`docs/measurements.md`](docs/measurements.md): throughput, latency, and limits, measured on
-  live stages.
-- [`docs/design-decisions.md`](docs/design-decisions.md): decisions D1 onward.
-- [`docs/coverage-matrix.md`](docs/coverage-matrix.md): each design section mapped to its code and
-  tests.
-- [`docs/testing.md`](docs/testing.md), [`docs/coding-standards.md`](docs/coding-standards.md),
-  [`docs/errors.md`](docs/errors.md): how to change it.
+`lsm-core` has no Cloudflare imports, and `tools/workspace-boundaries` enforces it.
 
 ## Verifying a change
 
 ```sh
-vp run ready    # format, lint, type checks, every workspace's tests (unit, property, workerd)
+vp run ready    # format, lint, type checks, and every workspace's tests (unit, property, workerd)
 vp run verify   # every TLA+ model, including its deliberately broken variants
 ```
 
-A release is also gated by `scenario-cli soak` on a preview stage (D65, D106): mixed writes,
-reads, scans, transactions, the change feed, splits, removals, and a redeploy, checked against a
-model of every acknowledged write ([`docs/testing.md`](docs/testing.md)).
+A release is also gated by `scenario-cli soak` on a preview stage: mixed writes, reads, scans, transactions, the change feed, splits, removals, and a redeploy, checked against a model of every acknowledged write. See [`docs/testing.md`](docs/testing.md).
+
+## Documentation
+
+- [Interactive guide](https://shaledb.mulroy.workers.dev): every process, path, and timer, animated
+- [`docs/invariants.md`](docs/invariants.md): what makes a write acknowledged and flushed, what each read may see, and when GC may reclaim an SST
+- [`docs/operations.md`](docs/operations.md): deploying, rolling back, tokens, telemetry, and the corruption runbook
+- [`docs/measurements.md`](docs/measurements.md): throughput, latency, and limits measured on live stages
+- [`docs/design-decisions.md`](docs/design-decisions.md): every judgment call the design did not make
+- [`docs/testing.md`](docs/testing.md), [`docs/coding-standards.md`](docs/coding-standards.md), [`docs/errors.md`](docs/errors.md): how to change it

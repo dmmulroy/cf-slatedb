@@ -934,3 +934,7 @@ per Stack (Dillon's choice, D49); the §12 write, flush, and split measurements 
   `og-v2.png` so X does not keep its cached copy of the simplified card.
 - `vp run ready` exit 0 (14 tasks). The first run failed when parallel test tasks raced to clear
   `node_modules/.vitest-cache`; the run after clearing it passed.
+- **README rewritten** for readers new to shaledb, in the style of `better-result`'s: a short
+  pitch, a first example, then one diagram or code block per section (architecture, writes,
+  reads, background work, lifecycle). It names no decision numbers. The two `STEP4` blocks that
+  `scenario-cli` rewrites are kept as they were.
