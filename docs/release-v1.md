@@ -8,7 +8,7 @@ until the line is replaced.
 PENDING(final-commit): the release commit hash on `main` that this checklist describes, with
 `vp run ready` and `vp run verify` observed at exit 0 on it.
 
-This pass describes the integration head, `proto/integration-2` at `0d8039d` (2026-11-27). Where a
+This pass describes the integration head, `proto/integration-2` at `c149afb` (2026-11-27 03:25 UTC). Where a
 statement holds only at an earlier commit, it names that commit.
 
 ## 1. Decision asked
@@ -83,15 +83,15 @@ below with its decision, its tests, and what is still open.
 
 - **On `main`:** workstreams 1 to 9 and most of 10, up to `d89beba` (2026-11-26 21:12 EST): 148
   commits since `f3b2ad2` (`git log --oneline f3b2ad2..main`), through D108.
-- **On `proto/integration-2` only:** 69 commits past `main` (`git log --oneline
-  main..proto/integration-2`), merged up to `0d8039d`. They hold:
-  - the formal models D109, D110, D112, and D114, and the fixes they found, D115 and D116 (the
-    fork-hold race);
-  - the mutation sweeps D117, D118, D122, and D128;
-  - D119, D121, D123, and D125.
-- **Still on their own branches:** D116's compactor fix (`proto/audit-do`, `f83cd56`), D127
-  (`proto/audit-workflow`), D129 (`proto/mut-read`, `a4db51e`), and the formal agent's D111 and
-  D113, which are not committed yet.
+- **On `proto/integration-2` only:** 82 commits past `main` (`git log --oneline
+  main..proto/integration-2`), merged up to `c149afb`. They hold:
+  - the formal models D109 to D114, and the fixes they found, D115 and D116;
+  - D113, a defect recorded by an expected-failing test and not fixed;
+  - the mutation sweeps D117, D118, D122, D127 (tests only), and D128;
+  - D119, D121, D123, D125, and D129.
+- **Still on their own branches:** the `scan-bounds` agent's round 3 (`proto/audit-api`, `edfe57b`: the
+  corrupted-SST answer, D128's defect) and one more D127 test (`proto/audit-workflow`, `3bb39a4`). D116 and D127 have no entry in, and D116 and D127 have no entry in
+  `docs/design-decisions.md` yet: their tests and code cite them.
 
 The status of each workstream comes from the workstream table in `docs/progress.md`.
 
@@ -106,7 +106,7 @@ The status of each workstream comes from the workstream table in `docs/progress.
 | 7   | Corruption: prevent, detect, repair   | yes                           | `2cb5116`                                                                                                                                                                                                                                                                                                   | D62                              |
 | 8   | Production telemetry                  | yes                           | `62eab3d`                                                                                                                                                                                                                                                                                                   | D63                              |
 | 9   | Production readiness                  | yes                           | `8a96667`                                                                                                                                                                                                                                                                                                   | D64                              |
-| 10  | Soak, release checklist, the go-ahead | no: soaks pending, P6 pending | `a506228`, `fe552f0`, `18aa655`, `a98eb15`, `93c337c`, `04df0f9`, `9776317`, `5bedcbd`, `c72e0f3`, `c9e7487`, `4082f97`, `335b775`, `af51ae2`, `3d9f70f`, `dddd49a`, `8a36402`, `6f9c4ab`, `fec2698`, `ab5b929`; then the merges through `d89beba` on `main` and through `0d8039d` on `proto/integration-2` | D65–D129                         |
+| 10  | Soak, release checklist, the go-ahead | no: soaks pending, P6 pending | `a506228`, `fe552f0`, `18aa655`, `a98eb15`, `93c337c`, `04df0f9`, `9776317`, `5bedcbd`, `c72e0f3`, `c9e7487`, `4082f97`, `335b775`, `af51ae2`, `3d9f70f`, `dddd49a`, `8a36402`, `6f9c4ab`, `fec2698`, `ab5b929`; then the merges through `d89beba` on `main` and through `c149afb` on `proto/integration-2` | D65–D129                         |
 
 ## 3. Targets
 
@@ -119,7 +119,7 @@ three labels, in the "Basis" column here and inline elsewhere:
 - **release commit:** measured on the release commit. None is yet. Each such number is a
   `PENDING` line until it is.
 - **earlier commit `<c>`:** measured on commit `<c>`. The label says whether the code on that
-  path has changed since, from `git diff <c>..0d8039d -- <the path's files>`. "Path changed"
+  path has changed since, from `git diff <c>..c149afb -- <the path's files>`. "Path changed"
   means the number is evidence about `<c>`, not about the release.
 - **derived:** computed from other numbers or from Cloudflare's published limits, not measured.
 
@@ -166,7 +166,7 @@ PENDING(baseline): the comparison with plain Durable Object SQLite: what was mea
 ## 4. Formal checks
 
 `vp run verify` runs every entry of `FORMAL_CHECKS` in
-`tools/formal-verification/src/formal-checks.ts`: at `0d8039d`, **9 specs and 69 TLC runs**
+`tools/formal-verification/src/formal-checks.ts`: at `c149afb`, **9 specs and 73 TLC runs**
 (counted from the list). The code as written must pass. Each broken variant (a value of the spec's
 `Broken` constant) must violate the named property. Bounds are the `CONSTANTS` of the `.cfg` files
 in `tools/formal-verification/specs/`. Each check has a skill under `.agents/skills/verify-*` that
@@ -178,7 +178,7 @@ real R2 by the `create-race` scenario. The four object models (D109 to D114) als
 D110 lists: the runtime retries an alarm an eviction cut off, a lease expires on time, and
 `gcMinAge` is far longer than a job's launch.
 
-**Atomic-step models** (each code step is one model step):
+**Atomic-step models** (each code step is one model step), with their liveness configs (D111):
 
 | Spec and config                | What it proves                                                                                                                      | Bounds                                                                      | Broken variant → property it fails                                                                                                               | Runs |
 | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | ---: |
@@ -191,6 +191,8 @@ D110 lists: the runtime retries an alarm an eviction cut off, a lease expires on
 | `GcSafetyFork.cfg`             | A fork releases its hold only once no manifest a reader of the fork may hold names the source's SSTs (D77)                          | 1 SST, clock 0–3, min age 1, up to 6 manifests                              | `earlyForkRelease` → `ForkReadsComplete`                                                                                                         |    2 |
 | `SealSplit.cfg`                | After a seal no write commits; a split leaves every write acknowledged before the seal in exactly one successor                     | 3 keys, 4 writes                                                            | `sealWithoutLock`, `checkpointBeforeSeal`, `overlappingRanges` → `EveryAckedWriteInExactlyOneSuccessor`; `writerNotFenced` → `NoCommitAfterSeal` |    5 |
 | `Transactions.cfg`             | `SerializableSnapshot` admits only serializable histories, and every read returns the begin state (D76)                             | 2 keys, 2 transactions (symmetric), sequence numbers up to 5                | `snapshotOnly`, `trimWithoutAbort` → `Serializable`; `noReadHorizonCheck`, `noReadUpperBound` → `ReadsAtBegin`                                   |    5 |
+| `NoAckedWriteLostLive.cfg`     | Every acknowledged write is eventually readable at `Flushed` (liveness, D111)                                                       | as `NoAckedWriteLost.cfg`                                                   | `noWake` (nothing starts an evicted writer) → `EventuallyFlushed`                                                                                |    2 |
+| `TransactionsLive.cfg`         | A transaction retried after each abort eventually commits, with GC deleting a flush's manifest (liveness, D111)                     | 2 keys, 2 transactions, sequence numbers up to 3, `Live` on                 | `beforeD76` → `EveryTxnCommits`                                                                                                                  |    2 |
 
 **Await-granularity and end-to-end models** (D109 to D116): a label at every `yield*` that leaves
 the object, every lock, and every gap between two SQLite statements; eviction and interruption at
@@ -214,13 +216,13 @@ any label.
 `LifecycleDeepLiveness.cfg` and `LifecycleDeepPrefix.cfg` (with `ForkRace` on) are in `specs/` but
 not in `FORMAL_CHECKS`, so `vp run verify` does not run them.
 
-**Not in the list yet** (on branches or uncommitted, so not counted above):
+**Not in the list:**
 
-- `TransactionsLive.cfg` (D111, `EveryTxnCommits`; `beforeD76` fails it): the formal agent's,
-  uncommitted (`/tmp/shale-work/agents/formal/STATUS.md`).
-- The change feed and paged reads (D113): in progress. Building it found a defect (section 8).
-- formal2's `noStateLock` variant (D116): its STATUS records it, and it is not in
-  `formal-checks.ts` at `0d8039d`.
+- **The change feed and paged reads (D113):** no model. Placing its labels found a defect, which
+  `db-writer.test.ts` records as an expected failure (section 8).
+- **formal2's `noStateLock` variant** (D116) is recorded in its STATUS, not in `formal-checks.ts`.
+  The compactor's `stateLock` and `planLock` are covered by unit tests instead (`compactor.test.ts`,
+  D116).
 
 The models are bounded. They check every interleaving within these bounds, not beyond them. What
 they leave out is part of section 8.
@@ -233,9 +235,10 @@ section 8.
 PENDING(final-commit): the number of runs `vp run verify` reports on the release commit, observed at
 exit 0. Observed so far: 28/28 on the D70–D74 code (`docs/progress.md`); on `7dfed3f`, 32 of 33
 with `transactions` past its time limit under load, then 5/5 alone in 413 s, after which the limit
-was raised to 900 s (`/tmp/shale-work/release2/NOTES.md`, `29eb3d2`). The 69 runs listed at
-`0d8039d` have not been observed in one run. The formal agents ran each new spec's runs alone (D109
-to D116).
+was raised to 900 s (`/tmp/shale-work/release2/NOTES.md`, `29eb3d2`). The 73 runs listed at
+`c149afb` have not been observed in one run. The formal agents ran each new spec's runs alone (D109
+to D116). For D111, `Transactions.cfg` with the code as written timed out at 420 s with 2 TLC
+workers under load (14.4M of its 40.6M states) and is to be rerun (`docs/progress.md`).
 
 ## 5. Soaks
 
@@ -253,6 +256,21 @@ to D116).
 - a redeploy at `--redeploy-at`.
 
 A model records every acknowledged write.
+
+Since D106 the workload also does what the audits' defects needed, each with a model checked during
+the soak (`tools/scenario-cli/src/soak-checks.ts`; the list and its `checks` keys are in
+`docs/testing.md`, "The soak's workload"):
+
+| Workload                                            | Defect class it exercises                     | Checked by                                                                                      |
+| --------------------------------------------------- | --------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| follows the change feed, across a split             | D80, D93b: changes skipped or split           | `ChangeLedger`, `FeedFollower`: pages above the cursor in order; every acknowledged batch whole |
+| merge operands with TTLs, read across their expiry  | D81: compaction folding expiries              | `MergeKeyModel`: each part expires on its own, within 5 s of clock skew                         |
+| scans continued page by page                        | D93, D108: paged scans                        | `ScanTraversal`: keys strictly increase; a key live throughout is returned                      |
+| bursts of flushes                                   | D78: compactor wakes overlapping              | `burst.flushes`, `burst.compactor`                                                              |
+| an idle database, read every 20 s                   | D76: liveness after GC (reached past ~65 min) | `idle.get`, `idle.transaction`, `idle.transaction_after_gc_age`                                 |
+| forks from a checkpoint; deleting a fork's hold     | D77, D91                                      | `fork.read`, `final.fork`, `fork.hold_delete_refused`                                           |
+| recreating a removed id                             | D90                                           | `remove.recreate_refused`                                                                       |
+| aborted writes and transaction commits; big batches | D85, D88: requests cut off                    | `write.aborted`, `transaction.aborted`, `final.aborted_key`, `write.big_batch`                  |
 
 As rebuilt (`/tmp/shale-work/agents/soaktool/REPORT.md`, D65 "Telemetry never holds up the soak"),
 it runs in phases: `workload`, `final-reads`, `storage`, `telemetry`, `done`.
@@ -275,7 +293,14 @@ it runs in phases: `workload`, `final-reads`, `storage`, `telemetry`, `done`.
 span, and a health report with no issue (`soakPassed`, `soak-report.ts`). A health issue is any
 `exceededCpu`, `exceededMemory`, or `exception`, any current corruption, a GC or sweep failure, or
 a stalled write. Tests: `soak-telemetry.test.ts`, `soak-report.test.ts`, and `scenario.test.ts` in
-`tools/scenario-cli`. The rebuilt tool has not yet run live (`docs/progress.md`).
+`tools/scenario-cli`.
+
+- **Exit status.** The soak exits non-zero unless the report says `passed: true` (`1da8049`,
+  `soakFailureMessage`). Before that fix, a failed soak exited 0; the first live test of the rebuilt
+  tool found it.
+- **Telemetry budget.** `--telemetry-budget-minutes`, default 10. The release soaks run with 20
+  (`/tmp/shale-work/scripts/final-soaks.sh`). At 100% sampling, 10 minutes was too short for the
+  health report on the first D106 run (below).
 
 ### The release runs, on the final commit
 
@@ -291,10 +316,70 @@ and any error span outside the expected list.
 PENDING(soak-preview-2): the 20-minute soak on the release commit on `preview-2` (`eu`), with the
 same fields.
 
-### Evidence about `f3b2ad2`, not the release gate
+### Evidence, not the release gate
 
-These soaks ran the code before D76, D77, D78, and the counter fix. They say nothing about those
-changes, and they use the soak tool from before its rebuild.
+Each run below is labeled with its commit. None ran the release commit.
+
+**`preview-2` (`eu`), 21.6 minutes, `d89beba`: passed** (`/tmp/shale-work/final/soak-p2-d89beba.report.json`).
+
+- **Basis:** earlier commit `d89beba`, the head of `main`. The path changed since: 47 files in the three packages' `src` differ at `c149afb`, 12 of them not tests, among them the writer (D115), the lifecycle (D116), the
+  scans (D125), and the checkpoint cap (D129).
+- **The run.** Started 02:14:31 UTC and ended 02:46:16, exit 0 (`/tmp/shale-work/final/log`).
+  The command was `soak --stage preview-2 --minutes 20 --databases 3 --keys-per-database 1000
+  --redeploy-at 10 --split-at 5,14 --trace-sample-rate 0.1 --telemetry-budget-minutes 20`, after
+  a deploy with `--jurisdiction eu --trace-sample-rate 0.1` (`final-soaks.sh`).
+- **Result.** `passed: true`, phase `done`. No mismatch, no failure, no unexpected error span. The
+  one error span by exception was a `DatabaseHasDependentsError`, which is expected.
+- **The D106 checks.** 2,417 feed pages, 30 batches delivered, and 6 final feed checks. 705 merge
+  reads and 510 after an expiry. 103 paged scans. 5 flush bursts. 57 idle reads and 6 idle
+  transactions. 4 fork reads, and the hold delete refused once. The recreate refused twice. 83
+  aborted writes, 78 aborted commits, 64 big batches, and 234 aborted keys checked at the end.
+- **Other checks.** Gets: 4,147 at `Latest`, 1,741 at `AtLeast`, and 1,124 at `Flushed`. 636 scans,
+  1,252 transaction commits, 2 splits, 2 removals, and 1 redeploy. Every key of the 3 databases and
+  of the sharded group was read at the end at `Latest` and `Flushed`.
+- **Retries.** All 78 were transaction commits that timed out and were retried: the aborted-commit
+  workload. The 3 counters committed 427, 413, and 412 increments, with 21, 24, and 33 uncertain.
+- **Storage.** No SST older than the bound beyond what each manifest uses.
+- **Telemetry.** 888 spans and 6,205 invocation records checked. From the sample: 53,090 API Worker
+  invocations `ok` and 284 `canceled`, 590 compactor `ok` and 1 `canceled`, and no `exceeded*`.
+- **`measure health`, last 15 minutes:** healthy, no issue, 23 flushes (p50 495 ms, max 1,457 ms),
+  deepest L0 backlog 5, no corruption, no GC failure.
+
+| Operation (client, ms, US client to `eu`) |     n |   p50 |   p99 |    max |
+| ----------------------------------------- | ----: | ----: | ----: | -----: |
+| get `Latest`                              | 4,147 |   160 |   918 |  1,490 |
+| get `AtLeast`                             | 1,741 |   161 |   878 |  1,409 |
+| get `Flushed`                             | 1,124 |   301 | 1,118 |  1,470 |
+| scan                                      |   636 |   451 | 1,675 |  2,054 |
+| write                                     | 3,888 |   192 |   582 |  1,229 |
+| sharded put                               | 3,602 |   167 |   242 |  2,416 |
+| feed page                                 | 2,417 |   177 | 1,316 | 22,188 |
+| transaction commit                        | 1,252 |   176 |   322 |    873 |
+| split                                     |     2 | 2,553 | 2,553 |  2,553 |
+
+PENDING(soak-preview-1-d89beba): the 130-minute soak on `d89beba` on `preview-1`, started 02:14:31
+UTC with 6 databases, splits at minutes 20 and 80, a redeploy at 65, and `--telemetry-budget-minutes
+20`. At 03:23 UTC its report file said phase `workload`, 68 minutes in, no mismatch and no failure
+(`/tmp/shale-work/final/soak-p1.report.json`). It is evidence about `d89beba`, as above.
+
+**The first live run of the D106 workload: `preview-3`, `7dfed3f`, 12 minutes, 100% sampling,
+01:46–02:10 UTC** (`/tmp/shale-work/release2/NOTES.md`).
+
+- **Data checks:** all passed, no mismatch. Among them: 1,268 feed pages, 555 merge reads and 368
+  after an expiry, 60 paged scans, 3 flush bursts, 34 idle reads, 3 fork reads, the hold delete and
+  the recreate refused, and 37 aborted writes.
+- **Not passed, for two tool reasons.** The remover's own check met D91's tombstone
+  (`DatabaseRemovedError`, now expected: `d89beba`). And the health report did not finish within
+  10 minutes at 100% sampling.
+- **It exited non-zero with `passed: false`,** as it should. The failure line comes after the JSON
+  on stdout, so read `--report-file`, not stdout.
+- **On the same deploy:** 13/13 scenarios on `preview-2` (`eu`, dev timings) at `e147572`. On
+  `7dfed3f`, `block-cache` had failed its `NoErrorStatus` check: D90's create check left an error
+  span on every create (section 8).
+
+The runs on `f3b2ad2` below ran the code before D76, D77, D78, and the counter fix. They say
+nothing about those changes, and they used the soak tool from before its rebuild. The path has
+changed since: 117 files in the three packages' `src` differ at `c149afb`, 49 of them not tests.
 
 **`preview-2` (`eu`), 20 minutes, `f3b2ad2`: passed.** The run was started at 22:25:52 UTC and
 ended at 22:50:33, exit 0 (`/tmp/shale-work/release/log`). The command was
