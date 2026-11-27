@@ -2,6 +2,7 @@ import { DatabaseId, DEFAULT_DATABASE_OPTIONS, FULL_KEY_RANGE } from "@shaledb/l
 import {
   DatabaseLifecycle,
   DbClient,
+  ReaderUnavailableError,
   dbServicesTestLayer,
   ManifestReader,
   lsmTestRuntimeContextLayer,
@@ -377,4 +378,54 @@ describe("sharding", () => {
     expect(outcome.refused).toBe("DatabaseSealedError");
     expect(outcome.waitedMs).toBeLessThan(5_000);
   }, 60_000);
+});
+
+describe("sharded scans resume a scan overtaken after it returned rows (D93)", () => {
+  it("resumes from resumeFrom in the same shard and goes on across the shard boundary", async () => {
+    const outcome = await Effect.runPromise(
+      provide(
+        Effect.gen(function* () {
+          yield* createGroup;
+          const router = yield* ShardRouter;
+          for (let n = 0; n < 12; n++) yield* router.put(GROUP, key(n), key(n));
+          yield* (yield* ShardSplit).split(GROUP, FIRST, key(6));
+          // The first shard's scan returns keys 0..2, then fails as overtaken, naming key 3.
+          const client = yield* DbClient;
+          let failed = false;
+          const overtakingClient = DbClient.of({
+            ...client,
+            scan: (databaseId, range, options) =>
+              failed || range.start.length > 0
+                ? client.scan(databaseId, range, options)
+                : Stream.concat(
+                    client.scan(
+                      databaseId,
+                      { start: range.start, end: Option.some(key(3)) },
+                      options,
+                    ),
+                    Stream.suspend(() => {
+                      failed = true;
+                      return Stream.fail(
+                        new ReaderUnavailableError({
+                          databaseId,
+                          reason: "StorageUnavailable",
+                          message: "overtaken by a flush after returning rows",
+                          resumeFrom: key(3),
+                        }),
+                      );
+                    }),
+                  ),
+          });
+          const resuming = yield* makeShardRouter.pipe(
+            Effect.provideService(DbClient, overtakingClient),
+          );
+          const rows = yield* Stream.runCollect(
+            resuming.scan(GROUP, FULL_KEY_RANGE, { ...latest, limit: Option.none() }),
+          );
+          return { failed, keys: [...rows].map((row) => row.key[0]) };
+        }),
+      ),
+    );
+    expect(outcome).toEqual({ failed: true, keys: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] });
+  });
 });

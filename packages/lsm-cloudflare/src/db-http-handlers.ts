@@ -1,5 +1,5 @@
-import { DEFAULT_DATABASE_OPTIONS, SstId, sstCreatedAt } from "@shaledb/lsm-core";
-import { Chunk, Stream } from "effect";
+import { DEFAULT_DATABASE_OPTIONS, type Row, SstId, sstCreatedAt } from "@shaledb/lsm-core";
+import { Cause, Stream } from "effect";
 import { Effect, Layer, Option } from "effect";
 import { HttpApiBuilder } from "effect/http-api";
 
@@ -236,25 +236,41 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
           ),
       )
       .handle("scan", ({ params, payload }) =>
-        Stream.runCollect(
-          client.scan(params.databaseId, payload.range, {
-            consistency: payload.consistency,
-            snapshot: payload.snapshot,
-            refuseSealed: false,
-            // One extra row tells whether another page follows.
-            limit: Option.some(payload.limit + 1),
-          }),
-        ).pipe(
-          Effect.map((collected) => {
-            const rows = Chunk.toReadonlyArray(Chunk.fromIterable(collected));
-            const next = rows[payload.limit];
-            return {
-              rows: rows.slice(0, payload.limit),
-              resumeFrom: next === undefined ? Option.none() : Option.some(next.key),
-            };
-          }),
-          publicFailures("scan"),
-        ),
+        Effect.gen(function* () {
+          const rows: Array<Row> = [];
+          const scanned = yield* Effect.exit(
+            Stream.runForEach(
+              client.scan(params.databaseId, payload.range, {
+                consistency: payload.consistency,
+                snapshot: payload.snapshot,
+                refuseSealed: false,
+                // One extra row tells whether another page follows.
+                limit: Option.some(payload.limit + 1),
+              }),
+              (row) => Effect.sync(() => void rows.push(row)),
+            ),
+          );
+          if (scanned._tag === "Failure") {
+            const failure = Cause.findErrorOption(scanned.cause);
+            // Overtaken by a flush after it returned rows (D93): the page ends early, and the
+            // caller continues from `resumeFrom` as from any page.
+            if (
+              Option.isSome(failure) &&
+              failure.value._tag === "ReaderUnavailableError" &&
+              failure.value.resumeFrom !== undefined &&
+              rows.length > 0 &&
+              rows.length <= payload.limit
+            ) {
+              return { rows, resumeFrom: Option.some(failure.value.resumeFrom) };
+            }
+            return yield* Effect.failCause(scanned.cause);
+          }
+          const next = rows[payload.limit];
+          return {
+            rows: rows.slice(0, payload.limit),
+            resumeFrom: next === undefined ? Option.none() : Option.some(next.key),
+          };
+        }).pipe(publicFailures("scan")),
       )
       .handle("snapshot", ({ params }) =>
         client.snapshot(params.databaseId).pipe(publicFailures("get")),
