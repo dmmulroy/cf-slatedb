@@ -30,6 +30,7 @@ import {
 } from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import {
+  Cause,
   Clock,
   Context,
   Effect,
@@ -866,16 +867,16 @@ export const makeDbWriter = Effect.gen(function* () {
     });
     const conflict = (reason: TransactionConflictError["reason"], message: string) =>
       Effect.fail(new TransactionConflictError({ databaseId, reason, message }));
+    const tooOld = conflict(
+      "SnapshotTooOld",
+      `Database ${databaseId} no longer keeps every write after the transaction's reads (sequence number ${commit.readSeq}), so its snapshot can no longer be checked: it ran longer than the writer keeps flushed rows. Begin a new transaction and run it again; nothing was written.`,
+    );
+    const readMeta = memTable.meta.pipe(Effect.mapError(unavailable(databaseId, "transaction")));
     const check = Effect.gen(function* () {
-      const meta = yield* memTable.meta.pipe(
-        Effect.mapError(unavailable(databaseId, "transaction")),
-      );
+      const meta = yield* readMeta;
       // Every write after readSeq must still be in SQLite (retained or unflushed) to be checked.
       if (meta.retainedFromSeq > commit.readSeq || commit.readSeq > meta.lastSeq) {
-        return yield* conflict(
-          "SnapshotTooOld",
-          `Database ${databaseId} no longer keeps every write after the transaction's reads (sequence number ${commit.readSeq}), so its snapshot can no longer be checked: it ran longer than the writer keeps flushed rows. Begin a new transaction and run it again; nothing was written.`,
-        );
+        return yield* tooOld;
       }
       const writtenAfter = (keys: ReadonlyArray<Uint8Array>, ranges: ReadonlyArray<KeyRange>) =>
         memTable
@@ -897,6 +898,10 @@ export const makeDbWriter = Effect.gen(function* () {
           `Another commit wrote a key this transaction read in database ${databaseId} after the transaction began, so committing it would not be serializable. Begin a new transaction and run it again; nothing was written.`,
         );
       }
+      // A flush's trim takes no commit lock, so one may have run between the horizon check and
+      // the queries above and deleted rows they needed (D84). Trims only raise the horizon: if it
+      // is still at or below readSeq, every row the queries looked for was there.
+      if ((yield* readMeta).retainedFromSeq > commit.readSeq) return yield* tooOld;
     });
     return yield* commitBatch(databaseId, commit.batch, check);
   });
@@ -1129,7 +1134,19 @@ export const makeDbWriter = Effect.gen(function* () {
           flushedSeq,
           successorHolds: holdForSuccessors ? successorHoldsOf(sealed.manifest, successors) : [],
         };
-      }),
+      }).pipe(
+        // A seal that does not return may still have committed (its caller hung up, or the read
+        // after the create-if-absent failed): the manifest may be sealed, with a new writer epoch,
+        // while this writer still believes it is open. Forget the phase while the commit lock is
+        // still held, so the next request starts again from the manifest and sees the seal (D85).
+        Effect.onExit((exit) =>
+          exit._tag === "Success"
+            ? Effect.void
+            : Ref.update(phase, (current): WriterPhase =>
+                current._tag === "Ready" ? { _tag: "Uninitialized" } : current,
+              ),
+        ),
+      ),
     );
   });
 
@@ -1178,6 +1195,16 @@ export const makeDbWriter = Effect.gen(function* () {
     }).pipe(Effect.exit);
     if (outcome._tag === "Failure") {
       const current = yield* Ref.get(phase);
+      // A database that no longer exists (removed, its writer's state not yet deleted) has nothing
+      // to flush: retrying every second would wake the object forever (D85).
+      const gone = Cause.findErrorOption(outcome.cause).pipe(
+        Option.exists((error) => error._tag === "DatabaseNotFoundError"),
+      );
+      if (gone) {
+        return yield* Effect.logWarning(
+          "Writer alarm found its database gone; it stops until the removal deletes its state.",
+        ).pipe(Effect.annotateLogs({ "database.id": id }));
+      }
       if (current._tag !== "Fenced") {
         const now = yield* Clock.currentTimeMillis;
         yield* alarm.scheduleAt(now + FLUSH_RETRY_MILLIS);
