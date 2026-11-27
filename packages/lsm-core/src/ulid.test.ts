@@ -49,4 +49,21 @@ describe("ULIDs", () => {
     expect(ids.first < ids.second).toBe(true);
     expect(Schema.is(CheckpointId)(ids.checkpoint)).toBe(true);
   });
+
+  it("generate 26-character SST ids whose 80 random bits differ from one id to the next (mutation sweep, D117)", async () => {
+    const ids = await Effect.gen(function* () {
+      const generated: Array<string> = [];
+      for (let index = 0; index < 64; index++) generated.push(yield* generateSstId);
+      return generated;
+    }).pipe(Effect.provide(TestClock.layer()), Effect.runPromise);
+    expect(ids.every((id) => id.length === 26 && Schema.is(SstId)(id))).toBe(true);
+    // One millisecond for all: only the random part tells them apart.
+    expect(new Set(ids.map((id) => id.slice(10))).size).toBe(64);
+    expect(
+      encodeUlid(
+        0,
+        Array.from({ length: 16 }, (_, index) => index * 2),
+      ),
+    ).toBe("000000000002468ACEGJMPRTWY");
+  });
 });

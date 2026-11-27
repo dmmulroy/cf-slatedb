@@ -2,7 +2,12 @@ import { Arbitrary, Bytes, Effect, Option, Result, Schema } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 
 import { bloomFilterMayContain } from "./bloom-filter.ts";
-import { DataBlockBuilder, decodeDataBlock, type DataBlock } from "./block-codec.ts";
+import {
+  BLOCK_RESTART_INTERVAL,
+  DataBlockBuilder,
+  decodeDataBlock,
+  type DataBlock,
+} from "./block-codec.ts";
 import { crc32c } from "./crc32c.ts";
 import { SeqNum, SstId, Timestamp } from "./ids.ts";
 import {
@@ -20,6 +25,7 @@ import {
 import { MERGE_OPERATORS, resolveVisibleRow } from "./row-resolution.ts";
 import { type Row, RowValue } from "./row.ts";
 import {
+  BLOCK_BYTES_PER_INDEX_KEY_BYTE,
   blocksOverlappingRange,
   decodeSstMeta,
   firstBlockForKey,
@@ -457,6 +463,10 @@ describe("SST footer and filter at their edges (mutation sweep, D117)", () => {
         build([row(1, 3), row(2, 2)], { kind: "Changelog", minFilterKeys: 0 }).meta.filter,
       ),
     ).toBe(false);
+  });
+
+  it("pins the block layout constants D107 and the block format document", () => {
+    expect([BLOCK_BYTES_PER_INDEX_KEY_BYTE, BLOCK_RESTART_INTERVAL]).toEqual([32, 16]);
   });
 
   it("merges adjacent blocks into one read when they total exactly maxBytes", () => {

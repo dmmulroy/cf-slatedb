@@ -175,6 +175,29 @@ describe("collapseWriteBatch at its limits (mutation sweep, D117)", () => {
     ).toBe(1);
   });
 
+  it("collapses a put and a merge of one key into a value that expires with the sooner of their TTLs", () => {
+    const key = Uint8Array.of(3);
+    const ttlOf = (putTtl: Option.Option<number>, mergeTtl: Option.Option<number>) => {
+      const collapsed = Result.getOrThrow(
+        collapseWriteBatch(
+          {
+            operations: [
+              { _tag: "Put", key, value: Uint8Array.of(1), ttlMillis: putTtl },
+              { _tag: "Merge", key, operand: Uint8Array.of(2), ttlMillis: mergeTtl },
+            ],
+          },
+          context,
+        ),
+      );
+      return collapsed.map((write) => Option.getOrNull(write.ttlMillis));
+    };
+    expect(ttlOf(Option.some(100), Option.some(50))).toEqual([50]);
+    expect(ttlOf(Option.some(50), Option.some(100))).toEqual([50]);
+    expect(ttlOf(Option.none(), Option.some(70))).toEqual([70]);
+    expect(ttlOf(Option.some(70), Option.none())).toEqual([70]);
+    expect(ttlOf(Option.none(), Option.none())).toEqual([null]);
+  });
+
   it("pins the documented limits: 16 KiB keys, 1 MiB values, 10,000 operations, 8 MiB per batch", () => {
     // Public limits (the OpenAPI contract and docs/api-compatibility.md name them).
     expect([MAX_KEY_BYTES, MAX_VALUE_BYTES, MAX_BATCH_OPERATIONS, MAX_BATCH_BYTES]).toEqual([

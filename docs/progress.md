@@ -342,6 +342,18 @@ hand-off is below.
   - **Model:** `ManifestCasFencingRemove.cfg`.
   - **Not run:** workerd, scenarios, previews.
 
+- **Mutation sweep of `lsm-core` (D117, D118).**
+  - 800 mutants. 286 survived the first pass. Tests for the untested edges were added. 82 survive:
+    81 equivalent, 1 performance-only.
+  - **Found:** no wrong behavior. The weakest tests were the merge properties: short generated
+    histories never filled the heap enough for a wrong parent index to misorder rows.
+  - **Pinned:** the Bloom filter's stored bits, the SST footer's seq bounds, and the documented
+    limits and defaults.
+  - **`BlockServer`:** every error answer is `no-store` (D118).
+  - **Verified:** `vp check` exit 0. `vp test run` exit 0 in `packages/lsm-core` (140 tests) and
+    `packages/lsm-cloudflare` (247 tests).
+  - **Not run:** workerd, scenarios, previews, TLC (no protocol code changed).
+
 ## Remaining-work log
 
 - **Set up (new session).** Node 24.22, `vp` 1.8, pnpm 12.14; `repos/slatedb` and `.tlc/` present;

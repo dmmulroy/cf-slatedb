@@ -355,6 +355,23 @@ describe("planCompactions", () => {
     });
   });
 
+  it("puts an L0 job's output above every run, while a merge of the oldest runs is running", () => {
+    const l0 = [1, 2, 3, 4].map(() => handle(1000));
+    const runs = [5, 4, 3, 2, 1, 0].map((id) => ({
+      id: SortedRunId.make(id),
+      ssts: [handle(1000)],
+    }));
+    const running: CompactionJob = {
+      sources: [3, 2, 1, 0].map((id) => ({ _tag: "SortedRun" as const, id: SortedRunId.make(id) })),
+      destination: SortedRunId.make(0),
+      isBottom: true,
+    };
+    const options = { ...DEFAULT_SIZE_TIERED_COMPACTION_OPTIONS, maxConcurrentCompactions: 2 };
+    const [job] = planCompactions(withLsm(l0, runs), [running], options);
+    expect(job?.sources.every((source) => source._tag === "L0")).toBe(true);
+    expect(job?.destination).toBe(6);
+  });
+
   it("compacts all L0 SSTs (up to the maximum) into a new, newer sorted run", () => {
     let manifest = empty;
     for (const n of [1, 2, 3, 4, 5]) {
