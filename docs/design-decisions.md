@@ -2914,3 +2914,57 @@ with the output target.
   resumes, the job takes more than 10 steps, commits with no output, and reads find nothing.
 - `audit-limits`' test passes on this code.
 - Two mutations caught: no input bound, and input not counted.
+
+## D98. A collection that retains too many manifests still makes progress
+
+**Found by `audit-limits`** (failing test `zz-limits-gc-loads.test.ts`).
+
+- **The defect.** One collection loaded every manifest superseded less than `gcMinAge` ago, one R2
+  read each, and held them all. After 400 commits that was 404 loads against 24 after 20.
+- **What drives it.** The demand grows with the commit rate over the last hour, not with the data.
+- **The effect.** Above about 2.8 commits a second, sustained for an hour, a collection exceeds an
+  invocation's 10,000 subrequests. It then fails on every retry, so garbage is never collected and
+  the pile only grows.
+
+**The rule.**
+
+- **References are folded as each manifest is read.** Each retained manifest's SST references go
+  into one set (`RetainedReferences`, lsm-core), with a flag for "reads another database's SST",
+  and the manifest is dropped. Memory holds SST ids, not manifests.
+  `planSstCollection` and `nextCollectionTime` take that set.
+- **A budget on reads.** One collection reads at most `gcMaxRetainedManifestLoads` (5,000, a new
+  setting) retained manifests. That is half of the 10,000 subrequests; the rest is listings and
+  deletes. Over it, the collection:
+  - still deletes the manifests older than `gcMinAge`, which need no read, and advances GC's
+    manifest boundary;
+  - **defers SST deletion**: it deletes no SST, since an unread manifest may name one;
+  - **does not release a fork's hold** (D77), as for a manifest it could not load;
+  - records `gc.sst_collection_deferred` (the count left unread) and `gc.retained_manifests` on its
+    span and logs a warning that names them;
+  - still reports `nextCollectionAt`.
+- **The documented limit** (`docs/operations.md`, "Garbage collection and removal"): 5,000 per
+  `gcMinAge` is about 1.4 commits a second sustained for an hour. `measure health` reports a
+  database whose latest collection deferred as an issue (`health-report.ts`). The `gc.` namespace is
+  already among the trace policy's exported attribute namespaces, so no allowlist entry was needed.
+
+**Rejected for v1: each manifest records what it stopped referencing.** If each commit wrote down
+the SSTs it dropped, a collection would read only the newest manifest and the dropped lists of the
+last `gcMinAge`, with no full manifest reads. That removes the limit, but it changes the manifest
+format, every commit edit (`commitL0Flush`, `commitCompaction`, repairs, forks), and
+`GcSafety.tla`'s model of what a collection knows. Too large for v1; the budget bounds the failure
+to deferred deletion, which reverses itself when the commit rate falls.
+
+**Tests.**
+
+- `garbage-collector.test.ts`: twenty recent commits against a budget of five. The collection
+  deletes old manifests, deletes no SST, records the count left unread, and schedules the next run.
+  An hour later a collection deletes the four garbage SSTs, and reads return every row.
+- `health-report.test.ts`: the latest collection of each database decides the issue.
+- `garbage-collection-plan.test.ts`: `planSstCollection` over the folded set.
+- Mutations caught: the budget ignored, and SSTs deleted on partial knowledge.
+- One mutation survives, and is equivalent: releasing a fork's hold despite deferral. Retained
+  manifests are read oldest first, and a fork's manifests read its source only before its
+  rewrite, so when a deferred run's read manifests do not read the source, the unread newer ones
+  do not either. The guard stays as stated.
+- `audit-limits`' test still fails as written: it asks that loads not grow with commits. They now
+  grow only up to the budget, which is the decision for v1.

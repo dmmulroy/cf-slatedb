@@ -225,8 +225,10 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 - **`DatabaseLifecycle`, `GarbageCollector`, `CompactionBudget`** — done. `database-lifecycle.ts`
   (`create`, `createCheckpoint`, `deleteCheckpoint`, `seal`, `forkRange`, `remove`),
   `garbage-collector.ts`, `compaction-budget.ts` + `compaction-budget-server.ts` (lsm-core
-  `compaction-budget-ledger.ts`). Tests: `database-lifecycle.test.ts`, `garbage-collector.test.ts`,
-  `compactor.test.ts`, `writer.workerd.ts`.
+  `compaction-budget-ledger.ts`). Tests: `database-lifecycle.test.ts`, `garbage-collector.test.ts`
+  (D96: a running job's outputs are kept; D98: over the manifest-read budget, old manifests go and
+  SST deletion is deferred), `compactor.test.ts`, `writer.workerd.ts`; `health-report.test.ts`
+  (D98: a deferring database is an issue).
 
 ## §8 Public API and semantics
 

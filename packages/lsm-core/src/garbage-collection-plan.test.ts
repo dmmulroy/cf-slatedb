@@ -5,6 +5,7 @@ import {
   hasSstCollectionCandidates,
   planManifestCollection,
   planSstCollection,
+  retainedReferencesOf,
   prepareGarbageCollection,
   type StoredSst,
 } from "./garbage-collection-plan.ts";
@@ -83,7 +84,7 @@ describe("planSstCollection", () => {
       ({ manifests, objects, boundary }) => {
         const retained = manifests.map((l0) => manifestWith(l0));
         const deleted = planSstCollection({
-          retained,
+          live: retainedReferencesOf(retained).live,
           stored: stored(objects),
           boundary: Timestamp.make(boundary),
         });
@@ -116,7 +117,7 @@ describe("planSstCollection", () => {
       ],
     });
     const deleted = planSstCollection({
-      retained: [fork],
+      live: retainedReferencesOf([fork]).live,
       stored: stored([1, 2, 3, 4, 5]),
       boundary: Timestamp.make(10_000),
     });

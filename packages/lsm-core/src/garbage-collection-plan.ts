@@ -3,6 +3,7 @@ import { Option } from "effect";
 import { type ManifestId, type SstId, Timestamp } from "./ids.ts";
 import {
   advanceGcSstBoundary,
+  externalOwners,
   type Manifest,
   manifestSstHandles,
   pruneChangelog,
@@ -91,15 +92,43 @@ export const ownedSstIds = (manifest: Manifest): ReadonlySet<SstId> => {
  * listed, so SSTs a fork reads from its source are never candidates here.
  */
 export const planSstCollection = (input: {
-  readonly retained: ReadonlyArray<Manifest>;
+  /** Every SST a retained manifest references ({@link RetainedReferences.live}). */
+  readonly live: ReadonlySet<SstId>;
   readonly stored: ReadonlyArray<StoredSst>;
   readonly boundary: Timestamp;
-}): ReadonlyArray<StoredSst> => {
-  const live = new Set<SstId>();
-  for (const manifest of input.retained) for (const id of ownedSstIds(manifest)) live.add(id);
-  return input.stored.filter(
-    (object) => !live.has(object.sstId) && sstCreatedAt(object.sstId) < input.boundary,
+}): ReadonlyArray<StoredSst> =>
+  input.stored.filter(
+    (object) => !input.live.has(object.sstId) && sstCreatedAt(object.sstId) < input.boundary,
   );
+
+/**
+ * What a collection's retained manifests reference, folded in as each is read, so the manifests
+ * themselves are not held (D98).
+ */
+export interface RetainedReferences {
+  /** The SSTs of the database's own that some retained manifest references. */
+  readonly live: Set<SstId>;
+  /** Whether some retained manifest reads another database's SST (a fork's, D77). */
+  readsAnotherDatabase: boolean;
+}
+
+/** References of no manifest yet. */
+export const emptyRetainedReferences = (): RetainedReferences => ({
+  live: new Set(),
+  readsAnotherDatabase: false,
+});
+
+/** Folds one retained manifest's references into `references`. */
+export const addRetainedManifest = (references: RetainedReferences, manifest: Manifest): void => {
+  for (const id of ownedSstIds(manifest)) references.live.add(id);
+  if (externalOwners(manifest).size > 0) references.readsAnotherDatabase = true;
+};
+
+/** The references of `manifests`, as {@link addRetainedManifest} folds them. */
+export const retainedReferencesOf = (manifests: ReadonlyArray<Manifest>): RetainedReferences => {
+  const references = emptyRetainedReferences();
+  for (const manifest of manifests) addRetainedManifest(references, manifest);
+  return references;
 };
 
 /**
@@ -113,19 +142,17 @@ export const nextCollectionTime = (input: {
   readonly latest: Manifest;
   /** Manifests the collection kept, by id. */
   readonly retainedIds: ReadonlyArray<ManifestId>;
-  /** The manifests the collection kept, by content (for the SSTs they reference). */
-  readonly retained: ReadonlyArray<Manifest>;
+  /** Every SST the manifests the collection kept reference ({@link RetainedReferences.live}). */
+  readonly live: ReadonlySet<SstId>;
   readonly stored: ReadonlyArray<StoredSst>;
   /** SSTs created before it could be deleted this time. */
   readonly boundary: Timestamp;
   readonly now: Timestamp;
   readonly minAge: number;
 }): Option.Option<Timestamp> => {
-  const live = new Set<SstId>();
-  for (const manifest of input.retained) for (const id of ownedSstIds(manifest)) live.add(id);
   const pinned = new Set(input.latest.checkpoints.map((checkpoint) => checkpoint.manifestId));
   const youngSst = input.stored.some(
-    (object) => !live.has(object.sstId) && sstCreatedAt(object.sstId) >= input.boundary,
+    (object) => !input.live.has(object.sstId) && sstCreatedAt(object.sstId) >= input.boundary,
   );
   const youngManifest = input.retainedIds.some((id) => id !== input.latestId && !pinned.has(id));
   const times: Array<number> = [];

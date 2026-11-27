@@ -24,6 +24,7 @@ const LsmSettingsFields = Schema.Struct({
   compactionLeaseMs: PositiveInt,
   gcMinAge: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   gcInterval: PositiveInt,
+  gcMaxRetainedManifestLoads: PositiveInt,
   l1DataCacheBytes: PositiveInt,
   l1MetaCacheBytes: PositiveInt,
   l1GroupCacheShare: Schema.Number.check(Schema.isBetween({ minimum: 0.01, maximum: 1 })),
@@ -126,6 +127,10 @@ const lsmSettingsCombinationIssues = (settings: LsmSettingsFields) =>
  *   renews it on every poll), so a lost compaction frees its slot.
  * - `gcMinAge`: GC deletes an unreferenced object only once it is at least this old.
  * - `gcInterval`: how often the GC cron collects each database.
+ * - `gcMaxRetainedManifestLoads`: most retained manifests one collection reads. Above it the
+ *   collection still deletes old manifests but defers SST deletion (D98). 5,000 is half of an
+ *   invocation's 10,000 subrequests, and a database reaches it at about 1.4 commits a second
+ *   sustained over `gcMinAge` (one hour).
  * - `l1DataCacheBytes`, `l1MetaCacheBytes`: bytes of data blocks and of SST metadata (index, filter,
  *   stats) a reader isolate keeps in its L1 cache, counted as stored on R2.
  * - `l1GroupCacheShare`: the fraction of each L1 cache one `budgetGroup` may hold; under pressure the
@@ -168,6 +173,7 @@ export const DEFAULT_LSM_SETTINGS: LsmSettings = {
   compactionLeaseMs: 900_000,
   gcMinAge: 3_600_000,
   gcInterval: 300_000,
+  gcMaxRetainedManifestLoads: 5_000,
   // About a third of a 128 MB isolate for L1, the rest for decoding, merging, and requests.
   l1DataCacheBytes: 32 * MiB,
   l1MetaCacheBytes: 16 * MiB,

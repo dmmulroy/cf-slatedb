@@ -43,6 +43,8 @@ export interface HealthSpans {
   readonly uploads: ReadonlyArray<HealthSpan>;
   /** `GarbageCollector.collect` spans with an error status. */
   readonly failedCollections: ReadonlyArray<HealthSpan>;
+  /** Every `GarbageCollector.collect` span. */
+  readonly collections: ReadonlyArray<HealthSpan>;
   /** `MaintenanceSweep.sweepPage` spans with an error status. */
   readonly failedSweeps: ReadonlyArray<HealthSpan>;
   /** Every span with an error status. */
@@ -130,7 +132,10 @@ const later = (left: HealthSpan, right: HealthSpan) =>
  * - a multipart upload with an unverified part (`object.parts_unverified`): R2 stopped returning
  *   part digests, so parts are no longer checked;
  * - a flush p99 above the threshold;
- * - failed collections or maintenance sweeps.
+ * - failed collections or maintenance sweeps;
+ * - a database whose latest collection deferred SST deletion (`gc.sst_collection_deferred` on
+ *   `GarbageCollector.collect`): it retains more manifests than one collection reads, so its
+ *   garbage SSTs are not being deleted (D98).
  *
  * **Reported, not issues:** uploads with a re-sent part (`object.part_retried`; transient unless
  * frequent), flush durations, the deepest L0 backlogs, and the most frequent error spans.
@@ -159,6 +164,20 @@ export const summarizeHealth = (
     const seen = latestPoll.get(database);
     latestPoll.set(database, seen === undefined ? poll : later(poll, seen));
   }
+  // Deferral is judged by each database's latest collection: one that caught up no longer defers.
+  const latestCollection = new Map<string, HealthSpan>();
+  for (const collection of spans.collections) {
+    const database = databaseOf(collection);
+    const seen = latestCollection.get(database);
+    latestCollection.set(database, seen === undefined ? collection : later(collection, seen));
+  }
+  const deferred = [...latestCollection]
+    .filter(([, collection]) => count(collection.attributes["gc.sst_collection_deferred"]) > 0)
+    .map(([database, collection]) => ({
+      database,
+      unread: count(collection.attributes["gc.sst_collection_deferred"]),
+      retained: count(collection.attributes["gc.retained_manifests"]),
+    }));
   const corrupt = [...latestPoll]
     .filter(([, poll]) => count(poll.attributes["compaction.corrupt_ssts"]) > 0)
     .map(([database]) => database);
@@ -208,6 +227,10 @@ export const summarizeHealth = (
     ...(spans.failedSweeps.length > 0
       ? [`${spans.failedSweeps.length} maintenance sweeps failed`]
       : []),
+    ...deferred.map(
+      ({ database, unread, retained }) =>
+        `database ${database}'s collection deferred SST deletion: it retains ${retained} manifests and left ${unread} unread, so its garbage SSTs stay until it commits fewer manifests per gcMinAge (D98)`,
+    ),
   ];
   return {
     healthy: issues.length === 0,
@@ -227,6 +250,7 @@ export const summarizeHealth = (
     },
     gc: {
       failedCollections: spans.failedCollections.length,
+      sstCollectionDeferred: deferred.map(({ database }) => database),
       failedSweeps: spans.failedSweeps.length,
     },
     errorSpans: Object.fromEntries(

@@ -115,6 +115,27 @@ creating a new installation and forking or copying databases into it.
   collection, so it can take one full sweep cycle plus `gcMinAge`. A cycle is `ceil(P / 50)` runs
   5 minutes apart, for `P` databases: 100 minutes at 1,000 databases, 16 h 40 min at 10,000
   (D77). To release sooner, collect the middle database now (`POST /v1/gc/databases/<id>`).
+- **A long compaction keeps its outputs.** While a compaction job runs, a collection deletes
+  nothing it may have written and does not move the SST boundary past its start (D96). A job
+  running longer than `gcMinAge` can still commit. Its outputs are collected `gcMinAge` after they
+  were written if the job is discarded.
+- **The commit rate a collection keeps up with.** A collection reads every manifest superseded
+  less than `gcMinAge` ago, one R2 read each, up to `gcMaxRetainedManifestLoads` (5,000). That is
+  half of an invocation's 10,000 subrequests; the rest is listings and deletes. Every manifest
+  commit counts: flushes, compactions, checkpoints and pinned snapshots, collections, and repairs.
+  - **The limit.** 5,000 manifests per `gcMinAge` (3,600 s) is about 1.4 commits a second,
+    sustained for an hour. Back-to-back small flushes measured 709 ms at p50, about 1.4 commits a
+    second, so a database flushing continuously can reach it.
+  - **Above it**, a collection still deletes the manifests older than `gcMinAge`, which need no
+    read. It defers SST deletion: deleting with an unread manifest could remove an SST that
+    manifest names. Garbage SSTs then stay until the commit rate over the last hour falls back
+    below the limit; the next collection is still scheduled.
+  - **How it shows.** `gc.sst_collection_deferred` (the count left unread) and
+    `gc.retained_manifests` on `GarbageCollector.collect`, a warning log, and an issue in
+    `measure health` (D98).
+  - **What to do.** Slow the commits: fewer, larger flushes (`l0SstSize`, `maxL0Age`), and pinned
+    snapshots taken less often. Or raise `gcMaxRetainedManifestLoads` in `SHALEDB_LSM_SETTINGS` if
+    the compactor's subrequest limit was raised too.
 
 ## Capacity
 

@@ -8,6 +8,7 @@ import {
   fenceWriter,
   initialManifest,
   ManifestId,
+  removeCheckpoint,
   manifestSstHandles,
   replaceManifestFields,
   SeqNum,
@@ -15,7 +16,7 @@ import {
   SstId,
   Timestamp,
 } from "@shaledb/lsm-core";
-import { Clock, Deferred, Effect, Fiber, Layer, Option, Ref, Stream } from "effect";
+import { Clock, Deferred, Effect, Fiber, Layer, Option, Ref, Result, Stream, Tracer } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -386,6 +387,85 @@ describe("GarbageCollector", () => {
     expect(outcome.commit).toBe("Success");
     expect(outcome.orphanGone).toBe(true);
     expect(outcome.rows).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+  });
+
+  it("a collection retaining more manifests than it may read still deletes old manifests, defers SST deletion, and collects once the pile ages (D98)", async () => {
+    const attributes: Array<ReadonlyMap<string, unknown>> = [];
+    const tracer = Tracer.make({
+      span: (options) => {
+        const span = new Tracer.NativeSpan(options);
+        if (options.name === "GarbageCollector.collect") attributes.push(span.attributes);
+        return span;
+      },
+    });
+    const outcome = await Effect.gen(function* () {
+      yield* create;
+      // Garbage at 0 s: four L0 SSTs a compaction replaces.
+      yield* writeAndFlush([1, 2, 3, 4]);
+      const garbage = yield* storedKeys(compactedPrefix(DB));
+      yield* compactL0;
+      // Later, twenty commits that change no data (checkpoints taken and dropped): each leaves a
+      // superseded manifest younger than gcMinAge, more than the five a collection may read.
+      yield* TestClock.adjust(MIN_AGE + 1);
+      const store = yield* ManifestStore;
+      for (let index = 0; index < 10; index++) {
+        const id = CheckpointId.make(`01JD${String(index).padStart(22, "0")}`);
+        yield* store.update(DB, (manifest) =>
+          addCheckpoint(manifest, {
+            id,
+            manifestId: ManifestId.make(1),
+            createdAt: Timestamp.make(0),
+            expireAt: Option.none(),
+            holder: Option.none(),
+            name: Option.none(),
+          }),
+        );
+        yield* store.update(DB, (manifest) => Result.succeed(removeCheckpoint(manifest, id)));
+      }
+      const gc = yield* GarbageCollector;
+      const deferred = yield* gc.collect(DB, Option.none());
+      const afterDeferred = new Set(yield* storedKeys(compactedPrefix(DB)));
+      const deferredAttributes = attributes.at(-1) ?? new Map<string, unknown>();
+      // An hour on the pile is old: a collection reads few manifests and deletes the SSTs.
+      yield* TestClock.adjust(MIN_AGE + 1);
+      const later = yield* gc.collect(DB, Option.none());
+      const afterLater = new Set(yield* storedKeys(compactedPrefix(DB)));
+      return {
+        deferredSsts: deferred.deletedSsts,
+        deferredManifests: deferred.deletedManifests,
+        garbageKept: garbage.every((key) => afterDeferred.has(key)),
+        unread: deferredAttributes.get("gc.sst_collection_deferred"),
+        scheduled: Option.isSome(deferred.nextCollectionAt),
+        laterSsts: later.deletedSsts,
+        garbageGone: garbage.every((key) => !afterLater.has(key)),
+        rows: yield* readAll,
+      };
+    }).pipe(
+      Effect.withTracer(tracer),
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.effect(CompactionExecutor, makeCompactionExecutor),
+          Layer.effect(GarbageCollector, makeGarbageCollector),
+        ).pipe(
+          Layer.provideMerge(sstStoreLayerWithoutDependencies),
+          Layer.provideMerge(
+            dbClientTestLayer({ blockSize: 64, gcMinAge: MIN_AGE, gcMaxRetainedManifestLoads: 5 }),
+          ),
+        ),
+      ),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.provide(TestClock.layer()),
+      Effect.runPromise,
+    );
+    expect(outcome.deferredSsts).toBe(0);
+    expect(outcome.deferredManifests).toBeGreaterThan(0);
+    expect(outcome.garbageKept).toBe(true);
+    expect(outcome.unread).toBeGreaterThan(0);
+    expect(outcome.scheduled).toBe(true);
+    expect(outcome.laterSsts).toBe(4);
+    expect(outcome.garbageGone).toBe(true);
+    expect(outcome.rows).toEqual([1, 2, 3, 4]);
   });
 
   it("keeps young manifests and their SSTs, then collects them once older than gcMinAge", async () => {

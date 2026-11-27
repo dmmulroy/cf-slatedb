@@ -2,12 +2,12 @@ import {
   DatabaseId,
   hasSstCollectionCandidates,
   nextCollectionTime,
-  type Manifest,
   ManifestId,
   planManifestCollection,
   planSstCollection,
+  addRetainedManifest,
+  emptyRetainedReferences,
   prepareGarbageCollection,
-  releasableExternalRefs,
   removeCheckpoint,
   removeExternalRef,
   SstId,
@@ -290,15 +290,36 @@ export const makeGarbageCollector = Effect.gen(function* () {
       now,
       minAge: settings.gcMinAge,
     });
-    const retained: Array<Manifest> = [committed.manifest];
+    // Each retained manifest's references are folded in as it is read, and the manifest dropped:
+    // a busy database retains thousands (D98). Past the load budget the rest are not read, and SST
+    // deletion waits for a run that can read them all.
+    const references = emptyRetainedReferences();
+    addRetainedManifest(references, committed.manifest);
     const missing: Array<ManifestId> = [];
+    let loads = 0;
+    let unread = 0;
     for (const id of plan.retained) {
       if (id === committed.id) continue;
+      if (loads >= settings.gcMaxRetainedManifestLoads) {
+        unread++;
+        continue;
+      }
+      loads++;
       const manifest = yield* reader
         .load(databaseId, id)
         .pipe(Effect.catchTags({ ManifestReadError: unavailable(databaseId) }));
       if (Option.isNone(manifest)) missing.push(id);
-      retained.push(...Option.toArray(manifest));
+      else addRetainedManifest(references, manifest.value);
+    }
+    const sstCollectionDeferred = unread > 0;
+    if (sstCollectionDeferred) {
+      yield* Effect.annotateCurrentSpan({
+        "gc.sst_collection_deferred": unread,
+        "gc.retained_manifests": plan.retained.length,
+      });
+      yield* Effect.logWarning(
+        `Garbage collection of database ${databaseId} retains ${plan.retained.length} manifests, more than the ${settings.gcMaxRetainedManifestLoads} one collection reads, so it left ${unread} unread and deleted no SST: deleting on partial knowledge could remove an SST an unread manifest names. Old manifests were still deleted. SST collection resumes once the database commits fewer manifests per gcMinAge (docs/operations.md, "Garbage collection and removal").`,
+      );
     }
     const everyRetainedLoaded = missing.length === 0;
     // A retained manifest listed a moment ago and gone now. Another collection deletes manifests
@@ -321,9 +342,12 @@ export const makeGarbageCollector = Effect.gen(function* () {
     // A fork releases its hold on its source once no manifest kept here names another database's
     // SST (D77). Each step is an idempotent CAS: first the owner's checkpoint, then the reference,
     // so a crash between them leaves the reference, and the next collection releases again.
-    const released = everyRetainedLoaded
-      ? releasableExternalRefs(committed.manifest, retained)
-      : [];
+    // `releasableExternalRefs` over the folded references: none while any kept manifest reads
+    // another database's SST, or while one was not read.
+    const released =
+      everyRetainedLoaded && !sstCollectionDeferred && !references.readsAnotherDatabase
+        ? committed.manifest.externalRefs
+        : [];
     for (const ref of released) {
       yield* manifests
         .update(ref.owner, (manifest) =>
@@ -347,7 +371,9 @@ export const makeGarbageCollector = Effect.gen(function* () {
     }
     const sstBoundary =
       committed.manifest.gcSstBoundary < cutoff ? committed.manifest.gcSstBoundary : cutoff;
-    const deletedSsts = planSstCollection({ retained, stored: ssts, boundary: sstBoundary });
+    const deletedSsts = sstCollectionDeferred
+      ? []
+      : planSstCollection({ live: references.live, stored: ssts, boundary: sstBoundary });
     yield* objects
       .delete(deletedSsts.map((object) => object.key))
       .pipe(Effect.catchTags(objectFailed));
@@ -376,7 +402,7 @@ export const makeGarbageCollector = Effect.gen(function* () {
       latestId: committed.id,
       latest: committed.manifest,
       retainedIds: plan.retained,
-      retained,
+      live: references.live,
       stored: ssts,
       boundary: sstBoundary,
       now,
