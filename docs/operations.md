@@ -73,15 +73,23 @@ the field out (`manifest-format-fixtures.test.ts`). A new field whose loss would
 must therefore raise the format, which older code refuses. A field that only adds information may
 stay at the same format if dropping it is safe.
 
-The rollback-safe fields so far:
+What a rollback to the last soaked commit (`f3b2ad2`) or the previews' commit (`c3807f7`) does with
+each field added since, with the tests that show it (D105):
 
-- `changelogAfterSeq`: it reads back on the safe side, D80.
-- `droppedSsts`.
-- `lastProgressAt` and `collectionDueAt`.
-
-The release's shapes are checked in as fixtures (`manifest-v1-release-shape.json`,
-`compactor-state-v1-release-shape.json`, `shard-map-v1-release-shape.json`). A change to any of
-those records fails its fixture test until the fixture is updated deliberately (D105).
+- **`changelogAfterSeq`** (manifest, missing at `f3b2ad2` only): dropped on the next commit. The
+  change feed then reads on the safe side: `Expired` sooner, never a gap.
+- **`recentCompactionJobIds`** (manifest): dropped on the next commit. A compaction commit retried
+  later reports `Discarded`, as before D103; nothing is lost.
+- **A removal's `removedAt` and `cleared`** (manifest):
+  - A rewrite drops them. Today's code then reads the tombstone as removed when it reads it, and
+    as not cleared, so it keeps it `gcMinAge` longer and clears it again.
+  - While rolled back, the older sweep leaves tombstones alone. A remove retried there deletes the
+    tombstone too, which reopens the race D91 closed for that database.
+  - Avoid removing databases while rolled back across D91.
+- **`lastProgressAt`** (compactor state): dropped on the next write. A running job is then judged
+  from `startedAt`, as before D94.
+- **`droppedSsts` and `collectionDueAt`:** present at both commits.
+- **The shard directory's map:** unchanged since both.
 
 **The writer's SQLite** has three tables (`memtable_rows`, `writer_meta`, `flush_marks`), created
 with `CREATE TABLE IF NOT EXISTS` on every start, and no column has changed since the first preview
