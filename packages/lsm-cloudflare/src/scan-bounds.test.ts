@@ -6,6 +6,7 @@ import {
   FULL_KEY_RANGE,
   initialManifest,
   planCompactions,
+  type Row,
   type SstHandle,
 } from "@shaledb/lsm-core";
 import { Effect, Exit, Layer, Option, type Scope, Stream } from "effect";
@@ -189,6 +190,29 @@ const latestOptions = (limit: number) => ({
   refuseSealed: false,
   limit: Option.some(limit),
 });
+
+/** One regular page of `limit` rows with the 2 KiB budget, as the public handler makes it. */
+const regularPage = (client: Effect.Success<typeof countingClient>["client"], limit: number) =>
+  Effect.gen(function* () {
+    const rows: Array<Row> = [];
+    const exit = yield* Effect.exit(
+      Stream.runForEach(client.scan(DB, FULL_KEY_RANGE, latestOptions(limit + 1)), (row) =>
+        Effect.sync(() => void rows.push(row)),
+      ).pipe(Effect.provideService(ScanPageBudget, BUDGET)),
+    );
+    if (Exit.isFailure(exit)) {
+      const failure = Option.getOrUndefined(Exit.findErrorOption(exit));
+      if (failure?._tag === "ReaderUnavailableError" && failure.resumeFrom !== undefined) {
+        return { rows, resumeFrom: Option.some(failure.resumeFrom) };
+      }
+      return yield* Effect.failCause(exit.cause);
+    }
+    const next = rows[limit];
+    return {
+      rows: rows.slice(0, limit),
+      resumeFrom: next === undefined ? Option.none<Uint8Array>() : Option.some(next.key),
+    };
+  });
 
 /** Follows a regular scan's pages (limit 1) to the end: each page, its rows, and its writer pages. */
 const regularPages = Effect.gen(function* () {
@@ -430,4 +454,75 @@ describe("one transaction scan in several pages (D125)", () => {
   it("naming only the part a page returned misses that phantom: the commit succeeds (what the docs warn of)", async () => {
     expect(await phantom("page only")).toBe("committed");
   }, 120_000);
+});
+
+describe("a long run of one key's merge operands (D125)", () => {
+  it("a page holds the whole run, never splits it, and ends right after the key with where to continue", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* Effect.flatMap(ManifestStore, (store) =>
+          store.initialize(
+            initialManifest(DB, {
+              keyRange: Option.none(),
+              databaseOptions: {
+                ...DEFAULT_DATABASE_OPTIONS,
+                mergeOperator: Option.some("U64Add"),
+              },
+            }),
+          ),
+        );
+        const db = yield* DbClient;
+        const one = new Uint8Array(8);
+        one[0] = 1;
+        // Key 0: 2,500 increments, unflushed (three writer pages of operands); key 1 after it.
+        for (let increment = 0; increment < 2500; increment++) {
+          yield* db.write(DB, {
+            operations: [{ _tag: "Merge", key: key(0), operand: one, ttlMillis: Option.none() }],
+          });
+        }
+        yield* db.write(DB, {
+          operations: [
+            { _tag: "Put", key: key(1), value: Uint8Array.of(7), ttlMillis: Option.none() },
+          ],
+        });
+        const sum = (bytes: Uint8Array) =>
+          bytes.reduce((total, byte, index) => total + byte * 2 ** (8 * index), 0);
+        const { client, seen } = yield* countingClient;
+        const regular = yield* regularPage(client, 5);
+        const regularPages = seen.pages;
+        seen.pages = 0;
+        const { readSeq, manifestId } = yield* client.beginTransaction(DB);
+        const transaction = yield* client
+          .scanAtPage(DB, FULL_KEY_RANGE, readSeq, 5, manifestId)
+          .pipe(Effect.provideService(ScanPageBudget, BUDGET));
+        const describe = (page: {
+          rows: ReadonlyArray<{ key: Uint8Array; value: { _tag: string } }>;
+          resumeFrom: Option.Option<Uint8Array>;
+        }) => ({
+          rows: page.rows.map((row) => [
+            row.key[2],
+            row.value._tag === "Value" &&
+            "bytes" in row.value &&
+            row.value.bytes instanceof Uint8Array
+              ? sum(row.value.bytes)
+              : -1,
+          ]),
+          resumeFrom: Option.map(page.resumeFrom, (bytes) => bytes[2]),
+        });
+        return {
+          regular: describe(regular),
+          regularPages,
+          transaction: describe(transaction),
+          transactionPages: seen.pages,
+        };
+      }),
+    );
+    // The run's value is whole (2,500), and the page ends before key 1 with key 1 to continue at.
+    for (const page of [outcome.regular, outcome.transaction]) {
+      expect(page).toEqual({ rows: [[0, 2500]], resumeFrom: Option.some(1) });
+    }
+    // Every page of the run was read: operands cannot be split across pages.
+    expect(outcome.regularPages).toBeGreaterThanOrEqual(3);
+    expect(outcome.transactionPages).toBeGreaterThanOrEqual(3);
+  }, 180_000);
 });
