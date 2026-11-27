@@ -1,7 +1,7 @@
 import { type DatabaseId, ManifestId, type SstId } from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Context, Effect, Layer, Option, Ref, Schema } from "effect";
-import { HttpServerResponse } from "effect/http";
+import { HttpRouter, HttpServerResponse } from "effect/http";
 import { HttpApiBuilder } from "effect/http-api";
 
 import {
@@ -155,8 +155,28 @@ export const blockServerHttpHandlersLayer = HttpApiBuilder.group(
     }),
 );
 
+/** `Cache-Control` of every `BlockServer` answer that is not a success. */
+export const ERROR_CACHE_CONTROL = "no-store";
+
+/**
+ * Marks every answer of 400 or above `no-store`, so Workers Cache never keeps one (read audit). A
+ * missing SST does not come back, but a 503 from an unavailable bucket, or a 404 for an object
+ * read before a slow write was visible, must not answer later requests from the cache; and what
+ * Workers Cache does with an error that names no caching was not determined.
+ */
+const noStoreOnErrorsLayer = HttpRouter.middleware()(
+  (httpEffect) =>
+    Effect.map(httpEffect, (response) =>
+      response.status >= 400
+        ? HttpServerResponse.setHeader(response, "cache-control", ERROR_CACHE_CONTROL)
+        : response,
+    ),
+  { global: true },
+);
+
 /** Every `BlockServer` route, needing the object reader and the cache purge. */
 export const blockServerHttpRouterLayer = HttpApiBuilder.layer(BlockServerHttpApi).pipe(
   Layer.provide(blockServerHttpHandlersLayer),
+  Layer.provide(noStoreOnErrorsLayer),
   Layer.provide(lsmHttpServerLayer),
 );

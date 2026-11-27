@@ -13,6 +13,7 @@ import { blockPath, metaPath } from "./block-server-http-api.ts";
 import {
   blockCachePurgeTestLayer,
   blockServerHttpRouterLayer,
+  ERROR_CACHE_CONTROL,
   IMMUTABLE_CACHE_CONTROL,
   LATEST_HINT_CACHE_CONTROL,
 } from "./block-server-http-handlers.ts";
@@ -66,6 +67,12 @@ describe("BlockServer", () => {
         manifest: yield* call("GET", `/v1/databases/${DB}/manifests/${ManifestId.make(1)}`),
         latest: yield* call("GET", `/v1/databases/${DB}/manifests/latest`),
         pastEnd: yield* call("GET", blockPath(DB, SST, 95, 10)),
+        // The largest offset and length the path allows (15 and 10 digits, D100): still safe
+        // integers, so the read is a plain miss, not a failure.
+        farPastEnd: yield* call(
+          "GET",
+          `/v1/databases/${DB}/ssts/${SST}/blocks/999999999999999-9999999999`,
+        ),
         missing: yield* call("GET", blockPath(DB, SstId.make("01JD0000000000000000000BBB"), 0, 4)),
         purge: yield* call("POST", `/v1/databases/${DB}/purge`),
       };
@@ -94,6 +101,12 @@ describe("BlockServer", () => {
     // A range past the end is not served as a short (cacheable) body.
     expect(outcome.pastEnd.status).toBe(404);
     expect(outcome.missing.status).toBe(404);
+    // Errors are never kept by Workers Cache (read audit).
+    expect([outcome.pastEnd.cacheControl, outcome.missing.cacheControl]).toEqual([
+      ERROR_CACHE_CONTROL,
+      ERROR_CACHE_CONTROL,
+    ]);
+    expect(outcome.farPastEnd.status).toBe(404);
     expect(outcome.purge.status).toBe(200);
   });
 });
@@ -109,6 +122,9 @@ describe("BlockServer paths a crafted request might try (D100)", () => {
         `/v1/databases/..%2Fsecret/ssts/${SST}/blocks/0-3`,
         `/v1/databases/${DB}/ssts/..%2F..%2Fsecret%2Felsewhere/blocks/0-3`,
         `/v1/databases/${DB}/ssts/${SST}/blocks/-1-3`,
+        // An offset of 1e21 and a length past 10 digits: refused, never turned into floats.
+        `/v1/databases/${DB}/ssts/${SST}/blocks/1000000000000000000000-4`,
+        `/v1/databases/${DB}/ssts/${SST}/blocks/0-10000000000`,
         `/v1/databases/${DB}/ssts/${SST}/blocks/0-3%2F..`,
         `/v1/databases/ORDERS/ssts/${SST}/blocks/0-3`,
         `/v1/databases/${DB}/manifests/..%2F..%2Fsecret`,
