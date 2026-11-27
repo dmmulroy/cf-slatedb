@@ -38,12 +38,22 @@
 (*   "feedGap"           the consumer leaves the source once it is sealed, *)
 (*                       and a successor's feed below its fork point       *)
 (*                       answers silently (before D80)                     *)
+(*   "noDirectoryLock"   the directory's editMap without its lock: its      *)
+(*                       cell.get and cell.set are two awaits, so a second  *)
+(*                       beginSplit of the same shard can overwrite the     *)
+(*                       pending record with its own successor ids (D116)   *)
+(*                                                                         *)
+(* A second split request of the same shard and key (another client, or a *)
+(* retry with its own process) runs beginSplit beside the first: each draws *)
+(* fresh successor ids before editMap. Under the lock it adopts a pending   *)
+(* record; its request then ends.                                          *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets, TLC
 
 CONSTANTS MaxValues, MaxCrashes, Broken
 
-ASSUME Broken \in {"none", "noResume", "noFlushedRefresh", "resealOthers", "feedGap"}
+ASSUME Broken \in {"none", "noResume", "noFlushedRefresh", "resealOthers", "feedGap",
+                   "noDirectoryLock"}
 
 Keys == {"a", "b"}
 \* The split point: "a" goes left, "b" right.
@@ -68,11 +78,18 @@ VARIABLES
   staleRead,  \* a Flushed read through an old map returned an older value than a flushed one
   cons,       \* the feed consumer: "source" | "successors"
   drained,    \* its last read of the source came after the seal
-  seen        \* writes the consumer was given
+  seen,       \* writes the consumer was given
+  pids,       \* whose successor ids the pending record holds: 0 (none), 1, or 2
+  myIds,      \* the ids the split's process seals and forks with
+  b1,         \* its beginSplit: "idle" | "sawNone" | "sawPending" (noDirectoryLock: read, then write)
+  p2,         \* the second request's beginSplit: "idle" | "sawNone" | "sawPending" | "done"
+  misrouted   \* a published map names successors other than the ones the seal named
 
 vars == <<dirVersion, pending, spc, crashes, sSealed, holds, sData, sealedData, forked, own, cpc,
-          ckey, cval, cmap, nextValue, rmap, rold, staleRead, cons, drained, seen>>
-splitVars == <<dirVersion, pending, spc, crashes, sSealed, holds, sealedData, forked>>
+          ckey, cval, cmap, nextValue, rmap, rold, staleRead, cons, drained, seen, pids, myIds, b1,
+          p2, misrouted>>
+dirVars == <<pids, myIds, b1, p2, misrouted>>
+splitVars == <<dirVersion, pending, spc, crashes, sSealed, holds, sealedData, forked, dirVars>>
 clientVars == <<cpc, ckey, cval, cmap, nextValue>>
 readerVars == <<rmap, rold, staleRead>>
 feedVars == <<cons, drained, seen>>
@@ -84,6 +101,7 @@ Init ==
   /\ cpc = "idle" /\ ckey = "a" /\ cval = 0 /\ cmap = 1 /\ nextValue = 0
   /\ rmap = 1 /\ rold = FALSE /\ staleRead = FALSE
   /\ cons = "source" /\ drained = FALSE /\ seen = {}
+  /\ pids = 0 /\ myIds = 0 /\ b1 = "idle" /\ p2 = "idle" /\ misrouted = FALSE
 
 (* ----- The writer client and its router ----- *)
 ClientStart(k) ==
@@ -114,16 +132,57 @@ ClientRefresh ==
 \* finishes it from the directory's record (D101).
 ClientResume ==
   /\ cpc = "waiting" /\ pending /\ spc = "dead" /\ Broken # "noResume"
-  /\ spc' = "recorded"
+  /\ spc' = "recorded" /\ myIds' = pids
   /\ UNCHANGED <<dirVersion, pending, crashes, sSealed, holds, sealedData, forked, sData, own,
-                 clientVars, readerVars, feedVars>>
+                 clientVars, readerVars, feedVars, pids, b1, p2, misrouted>>
 
 (* ----- The split ----- *)
+\* beginSplit: editMap records the pending split with this process's ids, or, finding one for
+\* the same shard and key, returns it. Under the lock one step; without it, a read then a write.
+DirLocked == Broken # "noDirectoryLock"
+
 Begin ==
-  /\ spc = "idle"
-  /\ spc' = "recorded" /\ pending' = TRUE
+  /\ spc = "idle" /\ b1 = "idle" /\ DirLocked
+  /\ IF pending THEN myIds' = pids /\ UNCHANGED <<pending, pids>>
+                ELSE pending' = TRUE /\ pids' = 1 /\ myIds' = 1
+  /\ spc' = "recorded"
   /\ UNCHANGED <<dirVersion, crashes, sSealed, holds, sealedData, forked, sData, own, clientVars,
-                 readerVars, feedVars>>
+                 readerVars, feedVars, b1, p2, misrouted>>
+
+BeginRead ==
+  /\ spc = "idle" /\ b1 = "idle" /\ ~DirLocked
+  /\ b1' = IF pending THEN "sawPending" ELSE "sawNone"
+  /\ UNCHANGED <<dirVersion, pending, spc, crashes, sSealed, holds, sealedData, forked, sData, own,
+                 clientVars, readerVars, feedVars, pids, myIds, p2, misrouted>>
+
+BeginWrite ==
+  /\ b1 \in {"sawNone", "sawPending"}
+  /\ IF b1 = "sawNone" THEN pending' = TRUE /\ pids' = 1 /\ myIds' = 1
+                       ELSE myIds' = pids /\ UNCHANGED <<pending, pids>>
+  /\ spc' = "recorded" /\ b1' = "idle"
+  /\ UNCHANGED <<dirVersion, crashes, sSealed, holds, sealedData, forked, sData, own, clientVars,
+                 readerVars, feedVars, p2, misrouted>>
+
+\* The second request's beginSplit (its own ids, 2); its request then ends, leaving any record.
+Begin2 ==
+  /\ p2 = "idle" /\ DirLocked /\ dirVersion = 1
+  /\ IF pending THEN UNCHANGED <<pending, pids>> ELSE pending' = TRUE /\ pids' = 2
+  /\ p2' = "done"
+  /\ UNCHANGED <<dirVersion, spc, crashes, sSealed, holds, sealedData, forked, sData, own,
+                 clientVars, readerVars, feedVars, myIds, b1, misrouted>>
+
+Begin2Read ==
+  /\ p2 = "idle" /\ ~DirLocked /\ dirVersion = 1
+  /\ p2' = IF pending THEN "sawPending" ELSE "sawNone"
+  /\ UNCHANGED <<dirVersion, pending, spc, crashes, sSealed, holds, sealedData, forked, sData, own,
+                 clientVars, readerVars, feedVars, pids, myIds, b1, misrouted>>
+
+Begin2Write ==
+  /\ p2 \in {"sawNone", "sawPending"}
+  /\ IF p2 = "sawNone" THEN pending' = TRUE /\ pids' = 2 ELSE UNCHANGED <<pending, pids>>
+  /\ p2' = "done"
+  /\ UNCHANGED <<dirVersion, spc, crashes, sSealed, holds, sealedData, forked, sData, own,
+                 clientVars, readerVars, feedVars, myIds, b1, misrouted>>
 
 \* seal(shard, [L, R], holds): flushes and seals in one commit, taking both holds; a repeat finds it
 \* done.
@@ -133,34 +192,36 @@ Seal ==
        THEN UNCHANGED <<sSealed, holds, sealedData>>
        ELSE /\ sSealed' = TRUE /\ holds' = holds \cup Forks /\ sealedData' = sData
   /\ spc' = "sealed"
-  /\ UNCHANGED <<dirVersion, pending, crashes, forked, sData, own, clientVars, readerVars, feedVars>>
+  /\ UNCHANGED <<dirVersion, pending, crashes, forked, sData, own, clientVars, readerVars, feedVars, dirVars>>
 
 \* forkRange from its hold: the sealed data in its range (a repeat finds the fork).
 Fork(f) ==
   /\ spc = "sealed" /\ f \in holds /\ f \notin forked
   /\ forked' = forked \cup {f}
   /\ UNCHANGED <<dirVersion, pending, spc, crashes, sSealed, holds, sealedData, sData, own,
-                 clientVars, readerVars, feedVars>>
+                 clientVars, readerVars, feedVars, dirVars>>
 
+\* completeSplit publishes the successors the pending record names.
 Publish ==
   /\ spc = "sealed" /\ forked = Forks
   /\ dirVersion' = 2 /\ pending' = FALSE /\ spc' = "published"
+  /\ misrouted' = (misrouted \/ pids # myIds)
   /\ UNCHANGED <<crashes, sSealed, holds, sealedData, forked, sData, own, clientVars, readerVars,
-                 feedVars>>
+                 feedVars, pids, myIds, b1, p2>>
 
 \* The split's process dies after any step (its request ended, its Worker was evicted).
 Crash ==
   /\ spc \in {"recorded", "sealed"} /\ crashes < MaxCrashes
   /\ spc' = "dead" /\ crashes' = crashes + 1
   /\ UNCHANGED <<dirVersion, pending, sSealed, holds, sealedData, forked, sData, own, clientVars,
-                 readerVars, feedVars>>
+                 readerVars, feedVars, dirVars>>
 
 \* Another caller seals the shard naming other successors (D95: refused).
 ResealOthers ==
   /\ sSealed /\ Broken = "resealOthers" /\ "L2" \notin holds
   /\ holds' = holds \cup {"L2"}
   /\ UNCHANGED <<dirVersion, pending, spc, crashes, sSealed, sealedData, forked, sData, own,
-                 clientVars, readerVars, feedVars>>
+                 clientVars, readerVars, feedVars, dirVars>>
 
 (* ----- A Flushed reader ----- *)
 \* What a database holds for key k: the shard's writes, or a fork's pinned and own writes.
@@ -207,14 +268,15 @@ ConsumeSuccessors ==
 Next ==
   \/ \E k \in Keys : ClientStart(k) \/ ReadFlushed(k)
   \/ ClientWrite \/ ClientRefresh \/ ClientResume
-  \/ Begin \/ Seal \/ Publish \/ Crash \/ ResealOthers \/ \E f \in Forks : Fork(f)
+  \/ Begin \/ BeginRead \/ BeginWrite \/ Begin2 \/ Begin2Read \/ Begin2Write
+  \/ Seal \/ Publish \/ Crash \/ ResealOthers \/ \E f \in Forks : Fork(f)
   \/ ReaderTick
   \/ ConsumeSource \/ SwitchToSuccessors \/ ConsumeSuccessors
 
 \* The split's steps run while its process lives; a waiting request is eventually answered, and
 \* waits out the routing wait.
 Fairness ==
-  /\ WF_vars(Seal) /\ WF_vars(Publish) /\ \A f \in Forks : WF_vars(Fork(f))
+  /\ WF_vars(BeginWrite) /\ WF_vars(Seal) /\ WF_vars(Publish) /\ \A f \in Forks : WF_vars(Fork(f))
   /\ WF_vars(ClientWrite) /\ WF_vars(ClientRefresh) /\ WF_vars(ClientResume)
 
 Spec == Init /\ [][Next]_vars /\ Fairness
@@ -239,6 +301,9 @@ ConsumerMissesNothing == cons = "successors" => sData \subseteq seen
 \* A Flushed read through a map older than the bound never returns a value older than its
 \* successor's flushed one (D89).
 NoStaleBeyondBound == ~staleRead
+
+\* The published map names the successors the shard's seal named, which the forks created (D116).
+PublishedIsSealed == ~misrouted
 
 \* A write that waits on the split eventually lands (D101).
 WaitingWritesLand == (cpc = "waiting") ~> (cpc = "idle")
