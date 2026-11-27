@@ -541,4 +541,24 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
       },
     ],
   },
+  {
+    name: "paged-scan",
+    spec: "PagedScan.tla",
+    runs: [
+      { config: "PagedScanLatest.cfg", broken: "none", expect: "pass", timeLimitSeconds: 180 },
+      {
+        config: "PagedScanLatest.cfg",
+        broken: "restartAfterRows",
+        expect: "LatestPageAtSnapshot",
+        timeLimitSeconds: 60,
+      },
+      { config: "PagedScanTxn.cfg", broken: "none", expect: "pass", timeLimitSeconds: 180 },
+      {
+        config: "PagedScanTxn.cfg",
+        broken: "pageRangesOnly",
+        expect: "PhantomRefused",
+        timeLimitSeconds: 90,
+      },
+    ],
+  },
 ];
