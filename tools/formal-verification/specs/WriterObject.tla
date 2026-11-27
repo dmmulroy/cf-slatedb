@@ -20,7 +20,8 @@
 (*  - flushThen (flushLock): ensureReady, cut = last_seq, upload, the      *)
 (*    manifest commit (commitL0Flush, plus sealEdit for a seal: D57),      *)
 (*    markFlushed, trim, refresh; a WriterFencedError marks the phase      *)
-(*    Fenced. Nothing to flush: settleCountersWithNothingToFlush (D74).    *)
+(*    Fenced; refused as stale (D113): the manifest's lastL0Seq recorded   *)
+(*    and the flush runs again. Nothing to flush: settleCounters... (D74). *)
 (*  - refreshUnflushedCounters: scan, then install only if no commit ran   *)
 (*    (generation, committing); retried or given up when overtaken.        *)
 (*  - seal (commitLock): ensureReady, flushThen(sealEdit), or its own      *)
@@ -234,6 +235,11 @@ FlCommit:
     elsif mSealed then
       failed[self] := TRUE;
       return;
+    elsif mL0Seq > ffs then
+      \* FlushedSeqStaleError (D113): an earlier commit landed unrecorded; record the manifest's
+      \* lastL0Seq as flushed and flush again from it (this attempt's SST is an orphan).
+      flushedSeq := Max(flushedSeq, mL0Seq);
+      goto FlMeta;
     else
       mData := mData \cup sst || mL0Seq := Max(mL0Seq, cut);
       if sealing then
@@ -840,7 +846,7 @@ FlCommit(self) == /\ pc[self] = "FlCommit"
                         /\ sst' = [sst EXCEPT ![self] = Head(stack[self]).sst]
                         /\ sealing' = [sealing EXCEPT ![self] = Head(stack[self]).sealing]
                         /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
-                        /\ UNCHANGED <<mEpoch, mSealed, mL0Seq, mData, sealedAt, phase, committed>>
+                        /\ UNCHANGED <<flushedSeq, mEpoch, mSealed, mL0Seq, mData, sealedAt, phase, committed>>
                      \/ /\ IF mEpoch # fEpoch[self]
                               THEN /\ IF Broken \in {"markFencedAnyPhase", "beforeD115"} \/ (phase = "ready" /\ pEpoch = fEpoch[self])
                                          THEN /\ phase' = "fenced"
@@ -854,9 +860,10 @@ FlCommit(self) == /\ pc[self] = "FlCommit"
                                    /\ sst' = [sst EXCEPT ![self] = Head(stack[self]).sst]
                                    /\ sealing' = [sealing EXCEPT ![self] = Head(stack[self]).sealing]
                                    /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
-                                   /\ UNCHANGED << mEpoch, mSealed, mL0Seq, 
-                                                   mData, sealedAt, committed, 
-                                                   sealTried, failures >>
+                                   /\ UNCHANGED << flushedSeq, mEpoch, mSealed, 
+                                                   mL0Seq, mData, sealedAt, 
+                                                   committed, sealTried, 
+                                                   failures >>
                               ELSE /\ IF mSealed
                                          THEN /\ failed' = [failed EXCEPT ![self] = TRUE]
                                               /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
@@ -866,41 +873,61 @@ FlCommit(self) == /\ pc[self] = "FlCommit"
                                               /\ sst' = [sst EXCEPT ![self] = Head(stack[self]).sst]
                                               /\ sealing' = [sealing EXCEPT ![self] = Head(stack[self]).sealing]
                                               /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
-                                              /\ UNCHANGED << mEpoch, mSealed, 
+                                              /\ UNCHANGED << flushedSeq, 
+                                                              mEpoch, mSealed, 
                                                               mL0Seq, mData, 
                                                               sealedAt, 
                                                               committed, 
                                                               sealTried, 
                                                               failures >>
-                                         ELSE /\ /\ mData' = (mData \cup sst[self])
-                                                 /\ mL0Seq' = Max(mL0Seq, cut[self])
-                                              /\ IF sealing[self]
-                                                    THEN /\ sealTried' = [sealTried EXCEPT ![self] = TRUE]
-                                                         /\ /\ mEpoch' = mEpoch + 1
-                                                            /\ mSealed' = TRUE
-                                                            /\ sealedAt' = Max(mL0Seq', cut[self])
-                                                    ELSE /\ TRUE
+                                         ELSE /\ IF mL0Seq > ffs[self]
+                                                    THEN /\ flushedSeq' = Max(flushedSeq, mL0Seq)
+                                                         /\ pc' = [pc EXCEPT ![self] = "FlMeta"]
                                                          /\ UNCHANGED << mEpoch, 
                                                                          mSealed, 
+                                                                         mL0Seq, 
+                                                                         mData, 
                                                                          sealedAt, 
-                                                                         sealTried >>
-                                              /\ \/ /\ CanFail
-                                                    /\ failures' = failures + 1
-                                                    /\ failed' = [failed EXCEPT ![self] = TRUE]
-                                                    /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
-                                                    /\ fEpoch' = [fEpoch EXCEPT ![self] = Head(stack[self]).fEpoch]
-                                                    /\ cut' = [cut EXCEPT ![self] = Head(stack[self]).cut]
-                                                    /\ ffs' = [ffs EXCEPT ![self] = Head(stack[self]).ffs]
-                                                    /\ sst' = [sst EXCEPT ![self] = Head(stack[self]).sst]
-                                                    /\ sealing' = [sealing EXCEPT ![self] = Head(stack[self]).sealing]
-                                                    /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
-                                                    /\ UNCHANGED committed
-                                                 \/ /\ committed' = [committed EXCEPT ![self] = TRUE]
-                                                    /\ pc' = [pc EXCEPT ![self] = "FlMark"]
-                                                    /\ UNCHANGED <<failed, failures, stack, sealing, fEpoch, cut, ffs, sst>>
+                                                                         failed, 
+                                                                         committed, 
+                                                                         sealTried, 
+                                                                         failures, 
+                                                                         stack, 
+                                                                         sealing, 
+                                                                         fEpoch, 
+                                                                         cut, 
+                                                                         ffs, 
+                                                                         sst >>
+                                                    ELSE /\ /\ mData' = (mData \cup sst[self])
+                                                            /\ mL0Seq' = Max(mL0Seq, cut[self])
+                                                         /\ IF sealing[self]
+                                                               THEN /\ sealTried' = [sealTried EXCEPT ![self] = TRUE]
+                                                                    /\ /\ mEpoch' = mEpoch + 1
+                                                                       /\ mSealed' = TRUE
+                                                                       /\ sealedAt' = Max(mL0Seq', cut[self])
+                                                               ELSE /\ TRUE
+                                                                    /\ UNCHANGED << mEpoch, 
+                                                                                    mSealed, 
+                                                                                    sealedAt, 
+                                                                                    sealTried >>
+                                                         /\ \/ /\ CanFail
+                                                               /\ failures' = failures + 1
+                                                               /\ failed' = [failed EXCEPT ![self] = TRUE]
+                                                               /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
+                                                               /\ fEpoch' = [fEpoch EXCEPT ![self] = Head(stack[self]).fEpoch]
+                                                               /\ cut' = [cut EXCEPT ![self] = Head(stack[self]).cut]
+                                                               /\ ffs' = [ffs EXCEPT ![self] = Head(stack[self]).ffs]
+                                                               /\ sst' = [sst EXCEPT ![self] = Head(stack[self]).sst]
+                                                               /\ sealing' = [sealing EXCEPT ![self] = Head(stack[self]).sealing]
+                                                               /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
+                                                               /\ UNCHANGED committed
+                                                            \/ /\ committed' = [committed EXCEPT ![self] = TRUE]
+                                                               /\ pc' = [pc EXCEPT ![self] = "FlMark"]
+                                                               /\ UNCHANGED <<failed, failures, stack, sealing, fEpoch, cut, ffs, sst>>
+                                                         /\ UNCHANGED flushedSeq
                                    /\ phase' = phase
-                  /\ UNCHANGED << lastSeq, flushedSeq, retained, mem, keyOf, 
-                                  marks, alarmSet, pEpoch, pSealed, cnt, gen, 
+                  /\ UNCHANGED << lastSeq, retained, mem, keyOf, marks, 
+                                  alarmSet, pEpoch, pSealed, cnt, gen, 
                                   committing, commitLock, flushLock, initLock, 
                                   rEpoch, rSealed, acked, opsLeft, 
                                   writesStarted, evictions, interrupts, seals, 
