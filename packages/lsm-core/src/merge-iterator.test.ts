@@ -55,6 +55,30 @@ describe("mergeRowStreams", () => {
     );
   });
 
+  it("gives any prefix of the merge to a consumer that stops early, whatever each input's chunk sizes (read audit)", () => {
+    // The other merge properties chunk every input by 3 and drain the merge; a scan with a limit
+    // takes a prefix of inputs chunked one row at a time (the memtable) or by blocks.
+    assertProperty(
+      Arbitrary.all({
+        writes: historyArbitrary(120),
+        parts: smallInt(1, 6),
+        chunks: Arbitrary.array(smallInt(1, 9), { minLength: 6, maxLength: 6 }),
+        take: smallInt(0, 130),
+      }),
+      ({ writes, parts, chunks, take }) => {
+        const rows = rowsFromWrites(writes);
+        const inputs = partition(rows, parts).map((input, index) =>
+          Stream.fromIterable(input).pipe(Stream.rechunk(chunks[index] ?? 1)),
+        );
+        const prefix = Effect.runSync(
+          Stream.runCollect(mergeRowStreams(inputs).pipe(Stream.take(take))),
+        );
+        return rowListsEqual(prefix, sortRows(rows).slice(0, take));
+      },
+      { runs: 300 },
+    );
+  });
+
   it("handles no inputs and empty inputs", () => {
     expect(runMerge([])).toEqual([]);
     expect(runMerge([[], []])).toEqual([]);
