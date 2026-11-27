@@ -40,13 +40,16 @@
 (*   "trimUnflushed"         a trim deletes rows above flushed_seq         *)
 (*   "noSnapshotUpperBound"  the read accepts a manifest flushed past its  *)
 (*                           snapshot                                      *)
+(*   "noWake"                nothing starts an evicted writer again (no    *)
+(*                           alarm set, no request: D102's class); fails   *)
+(*                           EventuallyFlushed (NoAckedWriteLostLive.cfg)  *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
 CONSTANTS MaxWrites, MaxCrashes, MaxReads, Broken
 
 ASSUME Broken \in {"none", "truncateBeforeCommit", "nonAtomicProbe", "trimUnflushed",
-                   "noSnapshotUpperBound"}
+                   "noSnapshotUpperBound", "noWake"}
 
 VARIABLES
   lastSeq,      \* writer_meta.last_seq (durable)
@@ -198,6 +201,14 @@ Next ==
 
 Spec == Init /\ [][Next]_vars
 
+\* The writer keeps working (D111): a started flush runs to its end and an evicted writer starts
+\* again (its next request or its alarm); writes, compactions, trims, and reads are never forced.
+\* Whether the alarm is set at all is WriterObject's AlarmCovers and AckedFlushed.
+LiveSpec ==
+  /\ Spec
+  /\ WF_vars(FlushUpload \/ FlushCommit \/ FlushTruncate)
+  /\ (Broken # "noWake") => WF_vars(Restart)
+
 ---------------------------------------------------------------------------
 \* The newest acknowledged write (the key's current version; flushes and compactions drop the
 \* ones it superseded) is durable in the memtable or in the newest manifest's SSTs.
@@ -208,6 +219,9 @@ LatestSeesAcked == rpc = "done" => rResult = NewestOf(rAcked)
 
 \* The memtable never holds a row above last_seq (the sequence oracle never reuses a number).
 SeqOracleMonotonic == \A s \in mem : s <= lastSeq
+
+\* Liveness: every acknowledged write is eventually in the newest manifest (readable at Flushed).
+EventuallyFlushed == \A s \in 1..MaxWrites : (s \in acked) ~> (s <= Newest.lastL0Seq)
 
 TypeOK == wpc \in {"ready", "uploaded", "committed", "down"}
 =============================================================================
