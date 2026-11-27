@@ -22,7 +22,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import { CompactionExecutor, makeCompactionExecutor } from "./compaction-executor.ts";
 import { directStepRunner } from "./compaction-launcher.ts";
-import { runCompactionJob } from "./compaction-job.ts";
+import { type CompactionStepRunner, runCompactionJob } from "./compaction-job.ts";
 import { DbClient, dbClientTestLayer } from "./db-client.ts";
 import type { DbReaderServices } from "./db-reader.ts";
 import { CompactorClientRecord, compactorClientTestLayer } from "./compactor-client.ts";
@@ -466,6 +466,81 @@ describe("GarbageCollector", () => {
     expect(outcome.laterSsts).toBe(4);
     expect(outcome.garbageGone).toBe(true);
     expect(outcome.rows).toEqual([1, 2, 3, 4]);
+  });
+
+  it("a job whose every step runs twice (at-least-once) commits once, and GC removes the first attempts' outputs (Workflow audit)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* create;
+        yield* writeAndFlush([1, 2, 3, 4]);
+        const { manifest } = yield* (yield* ManifestReader).loadLatest(DB);
+        const job: CompactionJob = {
+          sources: manifest.l0.map((sst) => ({ _tag: "L0" as const, sstId: sst.id })),
+          destination: SortedRunId.make(0),
+          isBottom: true,
+        };
+        // Every step's first result is lost after it ran, as when a Workflow step's invocation
+        // dies before its result is stored: the step runs again, the commit included.
+        const steps: Array<string> = [];
+        const twice: CompactionStepRunner = (name, _schema, step) =>
+          Effect.andThen(step, step).pipe(Effect.tap(() => Effect.sync(() => steps.push(name))));
+        const outcome = yield* runCompactionJob(
+          { databaseId: DB, compactorEpoch: manifest.compactorEpoch, jobId: "twice", job },
+          twice,
+        );
+        const latest = (yield* (yield* ManifestReader).loadLatest(DB)).manifest;
+        const referenced = new Set(manifestSstHandles(latest).map((sst) => sstKey(DB, sst.id)));
+        const storedBefore = yield* storedKeys(compactedPrefix(DB));
+        yield* TestClock.adjust(MIN_AGE + 1);
+        yield* (yield* GarbageCollector).collect(DB, Option.none());
+        yield* TestClock.adjust(MIN_AGE + 1);
+        yield* (yield* GarbageCollector).collect(DB, Option.none());
+        const storedAfter = yield* storedKeys(compactedPrefix(DB));
+        return {
+          outcome: outcome._tag,
+          steps,
+          orphans: storedBefore.filter((key) => !referenced.has(key)).length,
+          leftOver: storedAfter.filter((key) => !referenced.has(key)),
+          referencedStored: [...referenced].every((key) => storedAfter.includes(key)),
+          rows: yield* readAll,
+        };
+      }),
+    );
+    expect(outcome.outcome).toBe("Committed");
+    expect(outcome.steps[0]).toBe("prepare");
+    expect(outcome.steps.at(-1)).toBe("commit");
+    // The four replaced L0 SSTs and each output step's first upload.
+    expect(outcome.orphans).toBeGreaterThan(4);
+    expect(outcome.leftOver).toEqual([]);
+    expect(outcome.referencedStored).toBe(true);
+    expect(outcome.rows).toEqual([1, 2, 3, 4]);
+  });
+
+  it("collects thousands of orphans across listing pages in one run (Workflow audit)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* create;
+        yield* writeAndFlush([1]);
+        // 2,500 orphan SSTs from 0 s, as crashed uploads leave: three pages of the listing.
+        const objects = yield* ObjectStore;
+        for (let index = 0; index < 2_500; index++) {
+          const id = SstId.make(`0000000000${String(index).padStart(16, "0")}`);
+          yield* objects.put(sstKey(DB, id), Uint8Array.of(1));
+        }
+        yield* TestClock.adjust(MIN_AGE + 1);
+        const report = yield* (yield* GarbageCollector).collect(DB, Option.none());
+        const latest = (yield* (yield* ManifestReader).loadLatest(DB)).manifest;
+        return {
+          deleted: report.deletedSsts,
+          left: (yield* storedKeys(compactedPrefix(DB))).length,
+          referenced: manifestSstHandles(latest).length,
+          rows: yield* readAll,
+        };
+      }),
+    );
+    expect(outcome.deleted).toBe(2_500);
+    expect(outcome.left).toBe(outcome.referenced);
+    expect(outcome.rows).toEqual([1]);
   });
 
   it("keeps young manifests and their SSTs, then collects them once older than gcMinAge", async () => {
