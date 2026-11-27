@@ -6,8 +6,9 @@ Vite+ owns repository checks and workspace task execution. The root `vite.config
 
 - `packages/*` contains libraries (`@shaledb/lsm-core`, `@shaledb/lsm-cloudflare`,
   `@shaledb/sharding`). Each exposes `src/index.ts` through `exports`.
-- `infra/*` contains independent composition roots, one Alchemy Stack each. They declare no
-  `exports` and never depend on each other.
+- `infra/*` contains independent composition roots, one Alchemy Stack each: `infra/shaledb` (the
+  database) and `infra/docs-site` (the static architecture page). They declare no `exports` and
+  never depend on each other.
 - `tools/*` contains repository tooling that nothing imports: `tools/trace-cli`,
   `tools/scenario-cli`, `tools/preview-cli`, `tools/formal-verification`, `tools/traits` (the Traits configuration the
   root `traits.ts` re-exports), and `tools/workspace-boundaries` (the test that enforces these

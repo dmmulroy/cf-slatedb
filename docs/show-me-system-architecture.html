@@ -15,38 +15,76 @@
         --font-sans: "InterVariable", ui-sans-serif, system-ui, sans-serif;
         --font-sans--font-feature-settings: "cv02", "cv03", "cv04", "cv11";
         --font-mono: "Geist Mono", ui-monospace, monospace;
+        /* Motion tokens. Every curve on the page comes from these three. */
+        --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+        --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+        --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
       }
+      @custom-variant reduce-transparency (@media (prefers-reduced-transparency: reduce));
+
+      /* The edge a flow is crossing right now. Stopped by JS once the dot lands. */
       @utility flowing {
         stroke-dasharray: 6 6;
         animation: dash 0.6s linear infinite;
       }
       @keyframes dash { to { stroke-dashoffset: -12; } }
-      @keyframes ping-once { 0% { transform: scale(1); opacity: 0.7; } 100% { transform: scale(1.8); opacity: 0; } }
-      @utility ping-once { animation: ping-once 0.7s ease-out 1; transform-box: fill-box; transform-origin: center; }
-      @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
-      @utility rise { animation: rise 0.35s ease-out both; }
+
+      /* Arrival feedback on a node: a faint ring that grows a few percent and fades. */
+      @keyframes ping-once { from { transform: scale(1); opacity: 0.8; } to { transform: scale(1.06); opacity: 0; } }
+      @utility ping-once { animation: ping-once 450ms var(--ease-out) both; transform-box: fill-box; transform-origin: center; }
+
+      /* Content swapped in place: a short crossfade, with a 2px blur to hide the double exposure. */
+      @keyframes swap { from { opacity: 0; transform: translateY(4px); filter: blur(2px); } }
+      @utility swap { animation: swap 220ms var(--ease-out) both; }
+
+      /* Log rows arrive often, so they only fade. */
+      @keyframes fade { from { opacity: 0; } }
+      @utility fade-in { animation: fade 150ms var(--ease-out) both; }
+
+      /* One-time page entrance. Each element sets --delay, --enter-y, and --enter-duration. */
+      @keyframes enter { from { opacity: 0; transform: translateY(var(--enter-y, 10px)); } }
+      @utility enter { animation: enter var(--enter-duration, 600ms) var(--ease-out) both; animation-delay: var(--delay, 0ms); }
+
       html { scroll-padding-top: 5rem; }
-      details::details-content { transition: height 0.25s ease, content-visibility 0.25s allow-discrete; height: 0; overflow: clip; }
-      details[open]::details-content { height: auto; }
       :root { interpolate-size: allow-keywords; }
+      details::details-content { transition: height 200ms var(--ease-out), content-visibility 200ms allow-discrete; height: 0; overflow: clip; }
+      details[open]::details-content { height: auto; }
+
+      /* Mobile menu: slides in from the left edge it lives on, and leaves faster than it arrived. */
+      #menu { transform: translateX(-100%); transition: transform 200ms var(--ease-out), overlay 200ms allow-discrete, display 200ms allow-discrete; }
+      #menu[open] { transform: none; transition-duration: 300ms; transition-timing-function: var(--ease-drawer); }
+      @starting-style { #menu[open] { transform: translateX(-100%); } }
+      #menu::backdrop { opacity: 0; transition: opacity 200ms var(--ease-out), overlay 200ms allow-discrete, display 200ms allow-discrete; }
+      #menu[open]::backdrop { opacity: 1; transition-duration: 300ms; }
+      @starting-style { #menu[open]::backdrop { opacity: 0; } }
+
+      /* Reduced motion: keep opacity changes that explain state, drop movement. */
       @media (prefers-reduced-motion: reduce) {
-        *, *::before, *::after { animation: none !important; transition: none !important; }
+        .flowing { animation: none; }
+        .ping-once { animation: none; opacity: 0; }
+        .swap, .enter { animation-name: fade; animation-delay: 0ms; }
+        details::details-content { transition: none; }
+        #menu { transform: none; opacity: 0; transition-property: opacity, overlay, display; }
+        #menu[open] { opacity: 1; }
+        @starting-style { #menu[open] { opacity: 0; } }
+        [data-fill], [data-thumb] { transition: none !important; }
+        html { scroll-behavior: auto; }
       }
     </style>
   </head>
   <body class="bg-white font-sans text-zinc-950 dark:bg-zinc-950 dark:text-zinc-100">
     <!-- Mobile top bar -->
-    <div class="sticky top-0 z-30 flex items-center justify-between border-b border-zinc-950/5 bg-white/90 px-4 py-3 backdrop-blur lg:hidden dark:border-white/10 dark:bg-zinc-950/90">
+    <div class="sticky top-0 z-30 flex items-center justify-between border-b border-zinc-950/5 bg-white/90 px-4 py-3 backdrop-blur lg:hidden reduce-transparency:bg-white reduce-transparency:backdrop-blur-none dark:border-white/10 dark:bg-zinc-950/90 dark:reduce-transparency:bg-zinc-950">
       <a href="#top" class="text-base font-semibold">shaledb architecture</a>
-      <button type="button" id="menu-open" class="relative rounded-md px-2.5 py-1.5 text-sm font-medium text-zinc-700 ring-1 ring-zinc-950/10 dark:text-zinc-300 dark:ring-white/15" aria-label="Open navigation">
+      <button type="button" id="menu-open" class="relative rounded-md px-2.5 py-1.5 text-sm font-medium text-zinc-700 ring-1 transition-transform duration-150 ease-out active:scale-97  ring-zinc-950/10 dark:text-zinc-300 dark:ring-white/15" aria-label="Open navigation">
         Menu
         <span class="absolute top-1/2 left-1/2 size-[max(100%,3rem)] -translate-1/2 pointer-fine:hidden" aria-hidden="true"></span>
       </button>
     </div>
-    <dialog id="menu" class="m-0 h-dvh max-h-none w-72 max-w-none bg-white p-6 backdrop:bg-zinc-950/40 dark:bg-zinc-900">
+    <dialog id="menu" class="m-0 h-dvh max-h-none w-72 max-w-none bg-white p-6 text-zinc-950 backdrop:bg-zinc-950/40 dark:bg-zinc-900 dark:text-zinc-100">
       <div class="flex items-center justify-between">
         <p class="text-base font-semibold">Sections</p>
-        <button type="button" id="menu-close" class="rounded-md px-2.5 py-1.5 text-sm text-zinc-600 ring-1 ring-zinc-950/10 dark:text-zinc-400 dark:ring-white/15">Close</button>
+        <button type="button" id="menu-close" class="transition-transform duration-150 ease-out active:scale-97 rounded-md px-2.5 py-1.5 text-sm text-zinc-600 ring-1 ring-zinc-950/10 dark:text-zinc-400 dark:ring-white/15">Close</button>
       </div>
       <nav class="mt-6" data-nav></nav>
     </dialog>
@@ -63,10 +101,10 @@
       <main id="top" class="min-w-0 flex-1 px-4 py-10 sm:px-8 lg:px-12">
         <!-- Header -->
         <header class="border-b border-zinc-950/5 pb-10 dark:border-white/10">
-          <p class="font-mono text-xs font-medium tracking-wide text-orange-700 uppercase dark:text-orange-400">A SlateDB-style log-structured merge tree on Cloudflare</p>
-          <h1 class="mt-3 max-w-[24ch] text-4xl font-semibold tracking-tight text-balance sm:text-5xl">How shaledb works</h1>
-          <p class="mt-5 max-w-[56ch] text-base/7 text-pretty text-zinc-600 sm:text-lg/8 dark:text-zinc-400">Each database has one writer and many readers. shaledb stores immutable SSTs in R2 and versions each database's manifest with compare-and-swap, or CAS. The writer is a Durable Object whose SQLite table is both the write-ahead log and the memtable. A Cloudflare Workflow runs compaction. Click the diagrams to step through them.</p>
-          <dl class="mt-10 grid grid-cols-2 gap-y-6 sm:grid-cols-4">
+          <p class="enter font-mono text-xs font-medium tracking-wide text-orange-700 uppercase [--enter-duration:400ms] [--enter-y:0px] dark:text-orange-400">A SlateDB-style log-structured merge tree on Cloudflare</p>
+          <h1 class="enter mt-3 max-w-[24ch] [--enter-y:12px] text-4xl font-semibold tracking-tight text-balance sm:text-5xl">How shaledb works</h1>
+          <p class="enter mt-5 max-w-[56ch] text-base/7 text-pretty text-zinc-600 [--delay:80ms] [--enter-duration:500ms] [--enter-y:8px] sm:text-lg/8 dark:text-zinc-400">Each database has one writer and many readers. shaledb stores immutable SSTs in R2 and versions each database's manifest with compare-and-swap, or CAS. The writer is a Durable Object whose SQLite table is both the write-ahead log and the memtable. A Cloudflare Workflow runs compaction. Click the diagrams to step through them.</p>
+          <dl class="enter mt-10 grid grid-cols-2 gap-y-6 [--delay:140ms] [--enter-duration:500ms] [--enter-y:6px] sm:grid-cols-4">
             <div class="pr-6 sm:border-r sm:border-zinc-950/10 dark:sm:border-white/10"><dt class="truncate text-sm text-zinc-500 dark:text-zinc-400">Workers</dt><dd class="mt-1 text-3xl font-semibold tracking-tight tabular-nums">5</dd></div>
             <div class="pl-6 sm:border-r sm:border-zinc-950/10 sm:px-6 dark:sm:border-white/10"><dt class="truncate text-sm text-zinc-500 dark:text-zinc-400">Durable Object classes</dt><dd class="mt-1 text-3xl font-semibold tracking-tight tabular-nums">4</dd></div>
             <div class="sm:border-r sm:border-zinc-950/10 sm:px-6 dark:sm:border-white/10"><dt class="truncate text-sm text-zinc-500 dark:text-zinc-400">Public endpoints</dt><dd class="mt-1 text-3xl font-semibold tracking-tight tabular-nums">23</dd></div>
@@ -89,14 +127,14 @@
             <div role="group" aria-label="Flows" id="flow-buttons" class="flex w-max gap-2 p-1"></div>
           </div>
 
-          <div class="mt-4 grid gap-8 2xl:grid-cols-[23fr_9fr]">
+          <div class="mt-4 grid gap-8">
             <div class="min-w-0">
               <p class="mb-2 text-sm text-zinc-500 sm:hidden">Scroll sideways to see the whole diagram.</p>
               <div class="-mx-4 overflow-x-auto sm:mx-0">
                 <svg id="topo" viewBox="0 0 1090 700" class="h-auto w-[68rem] max-w-none sm:w-full" role="img" aria-label="shaledb deployment topology"></svg>
               </div>
             </div>
-            <div class="min-w-0 border-t border-zinc-950/10 pt-6 2xl:border-t-0 2xl:border-l 2xl:pt-0 2xl:pl-6 dark:border-white/10">
+            <div class="min-w-0 border-t border-zinc-950/10 pt-6 dark:border-white/10">
               <div id="flow-panel" class="max-w-2xl"></div>
             </div>
           </div>
@@ -167,7 +205,7 @@
           <div class="mt-8 grid *:min-w-0 gap-x-12 gap-y-12 lg:grid-cols-2">
             <div>
               <h3 class="text-base font-semibold sm:text-sm">Consistency decides the path</h3>
-              <div role="group" aria-label="Consistency" id="consistency" class="mt-4 inline-flex rounded-lg bg-zinc-100 p-1 dark:bg-white/5"></div>
+              <div role="group" aria-label="Consistency" id="consistency" class="relative mt-4 inline-flex rounded-lg bg-zinc-100 p-1 dark:bg-white/5"><span data-thumb aria-hidden="true" class="pointer-events-none absolute inset-1 rounded-md bg-white shadow-xs transition-[clip-path] duration-[240ms] ease-in-out dark:bg-white/10 dark:shadow-none"></span></div>
               <p id="consistency-desc" class="mt-4 max-w-[56ch] text-base/7 text-pretty text-zinc-600 sm:text-sm/6 dark:text-zinc-400"></p>
               <ol role="list" id="read-steps" class="mt-6"></ol>
             </div>
@@ -187,8 +225,8 @@
           <p class="mt-2 max-w-[56ch] text-base/7 text-pretty text-zinc-600 sm:text-sm/6 dark:text-zinc-400">Nothing runs a polling loop. Every periodic process is a Durable Object alarm, a cron trigger, a Workflow, or <code class="font-mono">waitUntil</code>. An idle database has no alarm set. The simulation below plays ten minutes of steady writes. The write rate and the job durations are made up. The timers use the default settings.</p>
 
           <div class="mt-8 flex flex-wrap items-center gap-3">
-            <button type="button" id="sim-play" class="rounded-md bg-orange-600 px-3 py-2 text-sm font-semibold text-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-orange-600 dark:bg-orange-500 dark:text-zinc-950">Play simulation</button>
-            <button type="button" id="sim-reset" class="rounded-md px-3 py-2 text-sm font-medium text-zinc-700 ring-1 ring-zinc-950/10 dark:text-zinc-300 dark:ring-white/15">Reset</button>
+            <button type="button" id="sim-play" class="transition-transform duration-150 ease-out active:scale-97 rounded-md bg-orange-600 px-3 py-2 text-sm font-semibold text-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-orange-600 dark:bg-orange-500 dark:text-zinc-950">Play simulation</button>
+            <button type="button" id="sim-reset" class="transition-transform duration-150 ease-out active:scale-97 rounded-md px-3 py-2 text-sm font-medium text-zinc-700 ring-1 ring-zinc-950/10 dark:text-zinc-300 dark:ring-white/15">Reset</button>
             <div class="inline-grid grid-cols-[1fr_--spacing(8)]">
               <label for="sim-speed" class="sr-only">Speed</label>
               <select id="sim-speed" name="sim-speed" class="col-span-full row-start-1 appearance-none rounded-md bg-transparent py-2 pr-8 pl-3 text-base text-zinc-700 ring-1 ring-zinc-950/10 sm:text-sm dark:text-zinc-300 dark:ring-white/15">
@@ -301,15 +339,46 @@
       const esc = (t) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
       const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
       const sleep = (ms) => new Promise((r) => setTimeout(r, reduced ? 0 : ms));
+      // The same curves as the CSS tokens, for motion that JS drives along an SVG path.
+      const bezier = (x1, y1, x2, y2) => {
+        const at = (a, b, t) => ((1 - 3 * b + 3 * a) * t + (3 * b - 6 * a)) * t * t + 3 * a * t;
+        const slope = (a, b, t) => 3 * (1 - 3 * b + 3 * a) * t * t + 2 * (3 * b - 6 * a) * t + 3 * a;
+        return (x) => {
+          let t = x;
+          for (let i = 0; i < 6; i++) {
+            const d = slope(x1, x2, t);
+            if (Math.abs(d) < 1e-6) break;
+            t -= (at(x1, x2, t) - x) / d;
+          }
+          return at(y1, y2, Math.min(1, Math.max(0, t)));
+        };
+      };
+      const EASE_IN_OUT = bezier(0.77, 0, 0.175, 1);
+      // Moves `dot` along `path` (backwards when dir < 0). Resolves early when cancelled().
+      const travel = (path, dot, ms, dir, cancelled) =>
+        new Promise((res) => {
+          const len = path.getTotalLength();
+          const t0 = performance.now();
+          const tick = (now) => {
+            if (cancelled()) return res(false);
+            const k = Math.min(1, (now - t0) / ms);
+            const pt = path.getPointAtLength(len * (dir < 0 ? 1 - EASE_IN_OUT(k) : EASE_IN_OUT(k)));
+            dot.setAttribute("cx", pt.x);
+            dot.setAttribute("cy", pt.y);
+            k < 1 ? requestAnimationFrame(tick) : res(true);
+          };
+          requestAnimationFrame(tick);
+        });
       const code = (t) => `<code class="font-mono text-[0.92em] text-zinc-950 dark:text-white">${esc(t)}</code>`;
 
       // Segmented / pill button helpers (secondary styles; the page has one primary button)
+      const PRESS = "transition-transform duration-150 ease-out active:scale-97";
       const pillClass =
-        "rounded-full px-3 py-1.5 text-sm font-medium whitespace-nowrap text-zinc-600 ring-1 ring-zinc-950/10 hover:bg-zinc-50 aria-pressed:bg-orange-50 aria-pressed:text-orange-800 aria-pressed:ring-orange-600/30 dark:text-zinc-400 dark:ring-white/15 dark:hover:bg-white/5 dark:aria-pressed:bg-orange-400/10 dark:aria-pressed:text-orange-300 dark:aria-pressed:ring-orange-400/30";
+        PRESS + " rounded-full px-3 py-1.5 text-sm font-medium whitespace-nowrap text-zinc-600 ring-1 ring-zinc-950/10 hover:bg-zinc-50 aria-pressed:bg-orange-50 aria-pressed:text-orange-800 aria-pressed:ring-orange-600/30 dark:text-zinc-400 dark:ring-white/15 dark:hover:bg-white/5 dark:aria-pressed:bg-orange-400/10 dark:aria-pressed:text-orange-300 dark:aria-pressed:ring-orange-400/30";
       const segClass =
-        "rounded-md px-3 py-1.5 text-sm font-medium text-zinc-600 hover:text-zinc-950 aria-pressed:bg-white aria-pressed:text-zinc-950 aria-pressed:shadow-xs aria-pressed:ring-1 aria-pressed:ring-zinc-950/5 dark:text-zinc-400 dark:hover:text-white dark:aria-pressed:bg-white/10 dark:aria-pressed:text-white dark:aria-pressed:shadow-none dark:aria-pressed:ring-white/10";
+        PRESS + " relative rounded-md px-3 py-1.5 text-sm font-medium text-zinc-600 hover:text-zinc-950 aria-pressed:text-zinc-950 dark:text-zinc-400 dark:hover:text-white dark:aria-pressed:text-white";
       const ghostBtn =
-        "rounded-md px-2.5 py-1.5 text-sm font-medium text-zinc-700 ring-1 ring-zinc-950/10 hover:bg-zinc-50 disabled:opacity-40 dark:text-zinc-300 dark:ring-white/15 dark:hover:bg-white/5";
+        PRESS + " rounded-md px-2.5 py-1.5 text-sm font-medium text-zinc-700 ring-1 ring-zinc-950/10 hover:bg-zinc-50 disabled:opacity-40 dark:text-zinc-300 dark:ring-white/15 dark:hover:bg-white/5";
       const press = (group, btn) => {
         $$("button", group).forEach((b) => b.setAttribute("aria-pressed", String(b === btn)));
       };
@@ -357,7 +426,7 @@
       menu.addEventListener("click", (e) => e.target.closest("a") && menu.close());
 
       // ────────────────────────────────────────────────────────── topology
-      const C = { c0: [20, 120], c1: [180, 230], c2: [450, 210], c3: [700, 170] };
+      const C = { c0: [14, 138], c1: [180, 230], c2: [450, 210], c3: [688, 196] };
       const N = {
         client: { col: "c0", y: 50, kind: "actor", title: "Client", sub: "Bearer token" },
         operator: { col: "c0", y: 440, kind: "actor", title: "Operator", sub: "Collection API" },
@@ -415,18 +484,18 @@
       };
       const E = {
         "client-api": {},
-        "api-writer": {},
+        "api-writer": { d: () => curve(anchor(N.api, "r", 70), anchor(N.writer, "l", 70), true) },
         "api-dbclient": {},
-        "api-lifecycle": { d: () => bulge("api", "l", "lifecycle", "l", 150) },
-        "dbclient-writer": {},
+        "api-lifecycle": { d: () => bulge("api", "l", "lifecycle", "l", 164) },
+        "dbclient-writer": { d: () => curve(anchor(N.dbclient, "r"), anchor(N.writer, "l", 86), true) },
         "dbclient-reader": {},
         "reader-blocks": {},
         "reader-r2": {},
         "blocks-wcache": {},
         "wcache-r2": {},
         "writer-r2": {},
-        "writer-compactor": { async: true, d: () => bulge("writer", "r", "compactor", "r", 690) },
-        "lifecycle-writer": { d: () => { const a = anchor(N.lifecycle, "r", 356), b = anchor(N.writer, "l", 92); return `M${a[0]},${a[1]} C440,${a[1]} 420,${b[1]} ${b[0]},${b[1]}`; } },
+        "writer-compactor": { async: true, d: () => bulge("writer", "r", "compactor", "r", 674) },
+        "lifecycle-writer": { d: () => { const a = anchor(N.lifecycle, "r", 356), b = anchor(N.writer, "l", 100); return `M${a[0]},${a[1]} C440,${a[1]} 420,${b[1]} ${b[0]},${b[1]}`; } },
         "lifecycle-compactor": {},
         "compactor-budget": {},
         "compactor-workflow": {},
@@ -530,17 +599,18 @@
       const defs = s("defs");
       defs.innerHTML = `
         <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,1 L9,5 L0,9 z" class="fill-zinc-500 dark:fill-zinc-600"/></marker>
-        <marker id="arrow-on" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,1 L9,5 L0,9 z" class="fill-orange-600 dark:fill-orange-400"/></marker>`;
+        <marker id="arrow-on" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,1 L9,5 L0,9 z" class="fill-orange-600 dark:fill-orange-400"/></marker>
+        <marker id="arrow-done" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,1 L9,5 L0,9 z" class="fill-orange-600/50 dark:fill-orange-400/50"/></marker>`;
       topo.append(defs);
       // group frames
       const drawFrame = (x, y, w, h2, label) => {
         topo.append(s("rect", { x, y, width: w, height: h2, rx: 14, class: "fill-none stroke-zinc-950/10 dark:stroke-white/10", "stroke-dasharray": "4 4" }));
-        const t = s("text", { x: x + 10, y: y - 6, class: "fill-zinc-500 font-mono text-[10px]" });
+        const t = s("text", { x: x + 10, y: y - 7, class: "fill-zinc-500 font-mono text-[12px]" });
         t.textContent = label;
         topo.append(t);
       };
       drawFrame(168, 30, 254, 384, "DbApiWorker isolate");
-      drawFrame(438, 324, 444, 186, "CompactorWorker");
+      drawFrame(438, 324, 456, 186, "CompactorWorker");
       const edgeLayer = s("g"), nodeLayer = s("g"), dotLayer = s("g");
       topo.append(edgeLayer, nodeLayer, dotLayer);
       const edgeEls = {};
@@ -558,17 +628,17 @@
         const halo = s("rect", { x: n.x - 4, y: n.y - 4, width: n.w + 8, height: n.h + 8, rx: 14, class: "fill-none stroke-orange-500 opacity-0", "stroke-width": 2, "data-halo": "" });
         const r = s("rect", { x: n.x, y: n.y, width: n.w, height: n.h, rx: 10, "stroke-width": 1, class: KINDS[n.kind].node });
         const tx = id === "r2" ? n.x + n.w / 2 : n.x + 14;
-        const ty = id === "r2" ? n.y + n.h / 2 - 6 : n.y + 23;
+        const ty = id === "r2" ? n.y + n.h / 2 - 7 : n.y + 24;
         const anchorAttr = id === "r2" ? "middle" : "start";
-        const t1 = s("text", { x: tx, y: ty, "text-anchor": anchorAttr, class: `text-[14px] font-semibold ${KINDS[n.kind].text}` });
+        const t1 = s("text", { x: tx, y: ty, "text-anchor": anchorAttr, class: `text-[15.5px] font-semibold ${KINDS[n.kind].text}` });
         t1.textContent = n.title;
-        const t2 = s("text", { x: tx, y: ty + 17, "text-anchor": anchorAttr, class: "fill-zinc-500 text-[11.5px] dark:fill-zinc-400" });
+        const t2 = s("text", { x: tx, y: ty + 19, "text-anchor": anchorAttr, class: "fill-zinc-500 text-[13px] dark:fill-zinc-400" });
         t2.textContent = n.sub;
         const base = s("rect", { x: n.x, y: n.y, width: n.w, height: n.h, rx: 10, class: "fill-white dark:fill-zinc-950" });
         g.append(halo, base, r, t1, t2);
         if (id === "r2") {
           ["manifest/", "compacted/", "changelog/", "gc/"].forEach((p, i) => {
-            const pt = s("text", { x: n.x + 20, y: n.y + 40 + i * 20, class: "fill-violet-700/70 font-mono text-[10.5px] dark:fill-violet-300/70" });
+            const pt = s("text", { x: n.x + 18, y: n.y + 42 + i * 24, class: "fill-violet-700/70 font-mono text-[12.5px] dark:fill-violet-300/70" });
             pt.textContent = p;
             g.append(pt);
           });
@@ -611,7 +681,7 @@
         const n = N[id], d = DETAILS[id];
         setHalo(id);
         panel.innerHTML = `
-          <div class="rise">
+          <div class="swap">
             <div class="flex items-center justify-between gap-4">${kindBadge(n.kind)}<button type="button" class="${ghostBtn}" data-close>Back to flows</button></div>
             <h3 class="mt-3 text-lg font-semibold tracking-tight">${esc(n.title)}</h3>
             ${d.file ? `<p class="mt-1 font-mono text-xs text-zinc-500">${esc(d.file)}</p>` : ""}
@@ -628,109 +698,144 @@
           halo.classList.toggle("opacity-0", k !== id);
         });
       }
+      const BULLET = {
+        done: "bg-orange-600 text-white ring-orange-600 dark:bg-orange-500 dark:text-zinc-950 dark:ring-orange-500",
+        now: "bg-orange-50 text-orange-800 ring-orange-600 dark:bg-orange-400/10 dark:text-orange-300 dark:ring-orange-400",
+        next: "bg-white text-zinc-500 ring-zinc-950/10 dark:bg-zinc-900 dark:ring-white/15",
+      };
+      // Builds the step list once per flow, so the Prev, Play, and Next buttons keep focus between steps.
       function renderFlowPanel() {
         const f = FLOWS.find((x) => x.id === flowState.flow);
         if (!f) {
-          panel.innerHTML = `<p class="text-base/7 text-zinc-600 sm:text-sm/6 dark:text-zinc-400">Pick a flow above to watch a request move through the system one step at a time. Click a node to see what it does.</p>`;
+          panel.innerHTML = `<p class="swap text-base/7 text-zinc-600 sm:text-sm/6 dark:text-zinc-400">Pick a flow above to watch a request move through the system one step at a time. Click a node to see what it does.</p>`;
           return;
         }
         panel.innerHTML = `
-          <div class="flex items-center justify-between gap-3">
-            <h3 class="text-base font-semibold sm:text-sm">${f.label}</h3>
-            <div class="flex gap-1.5">
-              <button type="button" class="${ghostBtn}" data-act="prev" aria-label="Previous step">Prev</button>
-              <button type="button" class="${ghostBtn}" data-act="play">${flowState.running ? "Pause" : "Replay"}</button>
-              <button type="button" class="${ghostBtn}" data-act="next" aria-label="Next step">Next</button>
+          <div class="swap">
+            <div class="flex items-center justify-between gap-3">
+              <h3 class="text-base font-semibold sm:text-sm">${f.label}</h3>
+              <div class="flex gap-1.5">
+                <button type="button" class="${ghostBtn}" data-act="prev" aria-label="Previous step">Prev</button>
+                <button type="button" class="${ghostBtn} min-w-16" data-act="play">Play</button>
+                <button type="button" class="${ghostBtn}" data-act="next" aria-label="Next step">Next</button>
+              </div>
             </div>
-          </div>
-          <ol role="list" class="mt-5 flex flex-col">
-            ${f.steps.map((st, i) => `
-              <li class="relative flex gap-3 pb-4 last:pb-0" data-step="${i}">
-                <div class="flex flex-col items-center">
-                  <span data-bullet class="grid size-6 shrink-0 place-items-center rounded-full font-mono text-xs tabular-nums ring-1 ${i < flowState.i ? "bg-orange-600 text-white ring-orange-600 dark:bg-orange-500 dark:text-zinc-950 dark:ring-orange-500" : i === flowState.i ? "bg-orange-50 text-orange-800 ring-orange-600 dark:bg-orange-400/10 dark:text-orange-300 dark:ring-orange-400" : "bg-white text-zinc-500 ring-zinc-950/10 dark:bg-zinc-900 dark:ring-white/15"}">${i + 1}</span>
-                  ${i < f.steps.length - 1 ? `<span class="mt-1 w-px flex-1 ${i < flowState.i ? "bg-orange-600/50" : "bg-zinc-950/10 dark:bg-white/10"}"></span>` : ""}
-                </div>
-                <div class="min-w-0 pb-1">
-                  <p class="font-mono text-xs text-zinc-500">${st[0].startsWith("@") ? esc(N[st[0].slice(1)].title) : st[0].split("-").map((x) => N[x].title)[st[1] < 0 ? "reverse" : "slice"]().join(" to ")}</p>
-                  <p class="mt-0.5 text-base/6 text-pretty sm:text-sm/6 ${i <= flowState.i ? "text-zinc-950 dark:text-white" : "text-zinc-500"}">${esc(st[2])}</p>
-                </div>
-              </li>`).join("")}
-          </ol>`;
+            <ol role="list" class="mt-5 flex flex-col">
+              ${f.steps.map((st, i) => `
+                <li class="relative flex gap-3 pb-4 last:pb-0" data-step="${i}">
+                  <div class="flex flex-col items-center">
+                    <span data-bullet class="grid size-6 shrink-0 place-items-center rounded-full font-mono text-xs tabular-nums ring-1 ${BULLET.next}">${i + 1}</span>
+                    ${i < f.steps.length - 1 ? `<span class="relative mt-1 w-px flex-1 bg-zinc-950/10 dark:bg-white/10"><span data-fill class="absolute inset-0 origin-top scale-y-0 bg-orange-600/60 transition-transform duration-300 ease-out dark:bg-orange-400/60"></span></span>` : ""}
+                  </div>
+                  <div class="min-w-0 pb-1">
+                    <p class="font-mono text-[0.8125rem] text-zinc-500">${st[0].startsWith("@") ? esc(N[st[0].slice(1)].title) : st[0].split("-").map((x) => N[x].title)[st[1] < 0 ? "reverse" : "slice"]().join(" to ")}</p>
+                    <p data-text class="mt-0.5 text-base/6 text-pretty text-zinc-500 sm:text-sm/6">${esc(st[2])}</p>
+                  </div>
+                </li>`).join("")}
+            </ol>
+          </div>`;
         $$("[data-act]", panel).forEach((b) => (b.onclick = () => {
           const a = b.dataset.act;
-          if (a === "play") flowState.running ? stopFlow(true) : playFlow(flowState.i >= f.steps.length - 1 ? 0 : flowState.i + 1);
+          if (a === "play") {
+            if (flowState.running) { stopFlow(true); updateFlowPanel(); }
+            else playFlow(flowState.i >= f.steps.length - 1 ? 0 : flowState.i + 1);
+          }
           if (a === "next") { stopFlow(true); gotoStep(Math.min(f.steps.length - 1, flowState.i + 1), true); }
           if (a === "prev") { stopFlow(true); gotoStep(Math.max(0, flowState.i - 1), true); }
         }));
+        updateFlowPanel();
+      }
+      // Updates the step list in place: bullets, the rail between them, and the play button.
+      function updateFlowPanel() {
+        const play = $("[data-act=play]", panel);
+        if (!play) return;
+        const last = FLOWS.find((x) => x.id === flowState.flow).steps.length - 1;
+        play.textContent = flowState.running ? "Pause" : flowState.i >= last ? "Replay" : flowState.i >= 0 ? "Resume" : "Play";
+        $$("[data-step]", panel).forEach((li, i) => {
+          const state = i < flowState.i ? "done" : i === flowState.i ? "now" : "next";
+          const bullet = $("[data-bullet]", li);
+          bullet.className = `grid size-6 shrink-0 place-items-center rounded-full font-mono text-xs tabular-nums ring-1 ${BULLET[state]}`;
+          $("[data-fill]", li)?.classList.toggle("scale-y-0", i >= flowState.i);
+          const text = $("[data-text]", li);
+          text.classList.toggle("text-zinc-500", i > flowState.i);
+          text.classList.toggle("text-zinc-950", i <= flowState.i);
+          text.classList.toggle("dark:text-white", i <= flowState.i);
+        });
       }
       function clearEdges() {
         Object.values(edgeEls).forEach((p) => {
           p.setAttribute("class", "stroke-zinc-400 dark:stroke-zinc-700");
+          p.setAttribute("stroke-width", 1.5);
           p.setAttribute("marker-end", "url(#arrow)");
           p.removeAttribute("marker-start");
         });
         dotLayer.innerHTML = "";
       }
+      const pingNode = (id) => {
+        const n = N[id];
+        const ring = s("rect", { x: n.x, y: n.y, width: n.w, height: n.h, rx: 10, class: "fill-none stroke-orange-500 ping-once", "stroke-width": 2 });
+        dotLayer.append(ring);
+        setTimeout(() => ring.remove(), 500);
+      };
       async function gotoStep(i, animate) {
         const f = FLOWS.find((x) => x.id === flowState.flow);
+        const token = flowState.token;
         flowState.i = i;
         clearEdges();
         setHalo(null);
-        // mark visited edges
-        f.steps.slice(0, i + 1).forEach(([eid], k) => {
+        // Edges already crossed stay tinted; the current edge is drawn solid until the dot lands.
+        f.steps.slice(0, i).forEach(([eid, dir]) => {
           if (eid.startsWith("@")) return;
-          const p = edgeEls[eid];
-          p.setAttribute("class", k === i ? "stroke-orange-600 flowing dark:stroke-orange-400" : "stroke-orange-600/40 dark:stroke-orange-400/40");
-          p.setAttribute("stroke-width", k === i ? 2.5 : 1.75);
+          edgeLayer.append(edgeEls[eid]);
+          // A crossed edge keeps its direction: a dimmed orange head at the end it pointed to.
+          if (dir > 0) edgeEls[eid].setAttribute("marker-end", "url(#arrow-done)");
+          else { edgeEls[eid].removeAttribute("marker-end"); edgeEls[eid].setAttribute("marker-start", "url(#arrow-done)"); }
+          edgeEls[eid].setAttribute("class", "stroke-orange-600/40 dark:stroke-orange-400/40");
+          edgeEls[eid].setAttribute("stroke-width", 1.75);
         });
-        Object.values(edgeEls).forEach((p) => { if (!p.getAttribute("class").includes("orange")) p.setAttribute("stroke-width", 1.5); });
-        renderFlowPanel();
+        updateFlowPanel();
         const [eid, dir] = f.steps[i];
         if (eid.startsWith("@")) {
           const id = eid.slice(1);
           setHalo(id);
-          const n = N[id];
-          const ring = s("rect", { x: n.x, y: n.y, width: n.w, height: n.h, rx: 10, class: "fill-none stroke-orange-500 ping-once", "stroke-width": 2 });
-          dotLayer.append(ring);
-          return sleep(900);
+          if (!reduced) pingNode(id);
+          return sleep(800);
         }
         const p = edgeEls[eid];
-        p.setAttribute("marker-end", dir > 0 ? "url(#arrow-on)" : "url(#arrow)");
-        if (dir < 0) { p.removeAttribute("marker-end"); p.setAttribute("marker-start", "url(#arrow-on)"); }
-        if (!animate || reduced) return;
-        const len = p.getTotalLength();
+        edgeLayer.append(p);
+        p.setAttribute("stroke-width", 2.5);
+        if (dir > 0) p.setAttribute("marker-end", "url(#arrow-on)");
+        else { p.removeAttribute("marker-end"); p.setAttribute("marker-start", "url(#arrow-on)"); }
+        const to = dir > 0 ? eid.split("-")[1] : eid.split("-")[0];
+        if (!animate || reduced) {
+          p.setAttribute("class", "stroke-orange-600 dark:stroke-orange-400");
+          return;
+        }
+        p.setAttribute("class", "stroke-orange-600 flowing dark:stroke-orange-400");
         const dot = s("circle", { r: 5, class: "fill-orange-600 dark:fill-orange-400" });
         dotLayer.append(dot);
-        const token = flowState.token;
-        const dur = Math.max(600, len * 2.2);
-        const t0 = performance.now();
-        await new Promise((res) => {
-          const tick = (now) => {
-            if (token !== flowState.token) return res();
-            const k = Math.min(1, (now - t0) / dur);
-            const e = k < 0.5 ? 2 * k * k : 1 - (-2 * k + 2) ** 2 / 2;
-            const pt = p.getPointAtLength(len * (dir > 0 ? e : 1 - e));
-            dot.setAttribute("cx", pt.x);
-            dot.setAttribute("cy", pt.y);
-            k < 1 ? requestAnimationFrame(tick) : res();
-          };
-          requestAnimationFrame(tick);
-        });
-        const to = dir > 0 ? eid.split("-")[1] : eid.split("-")[0];
-        const n = N[to];
-        dotLayer.append(s("rect", { x: n.x, y: n.y, width: n.w, height: n.h, rx: 10, class: "fill-none stroke-orange-500 ping-once", "stroke-width": 2 }));
+        // Longer edges take longer, within a range that keeps a flow moving.
+        const ms = Math.min(1000, Math.max(450, p.getTotalLength() * 1.4));
+        const landed = await travel(p, dot, ms, dir, () => token !== flowState.token);
+        if (!landed) return;
+        // The dot has arrived: stop the dash loop, hold the edge, and ring the node it reached.
+        p.setAttribute("class", "stroke-orange-600 dark:stroke-orange-400");
+        dot.remove();
+        pingNode(to);
         await sleep(250);
       }
       async function playFlow(from = 0) {
         const f = FLOWS.find((x) => x.id === flowState.flow);
         const token = ++flowState.token;
         flowState.running = true;
+        updateFlowPanel();
         for (let i = from; i < f.steps.length; i++) {
           if (token !== flowState.token) return;
           await gotoStep(i, true);
-          await sleep(350);
+          // Under reduced motion nothing moves, so each step holds long enough to read.
+          await new Promise((r) => setTimeout(r, reduced ? 1400 : 300));
         }
-        if (token === flowState.token) { flowState.running = false; renderFlowPanel(); }
+        if (token === flowState.token) { flowState.running = false; updateFlowPanel(); }
       }
       function stopFlow(keep) {
         flowState.token++;
@@ -744,6 +849,7 @@
         renderFlowPanel();
         if (autoplay) playFlow(0);
       }
+
       renderFlowPanel();
 
       // ────────────────────────────────────────────────────────── layers
@@ -802,7 +908,7 @@
         row.innerHTML = `<div><p class="text-base font-medium sm:text-sm">${L.name}</p><p class="font-mono text-xs text-zinc-500">${L.note}</p></div>`;
         const chips = h("div", { class: "flex flex-wrap content-start items-start gap-1.5" });
         L.items.forEach(([name, desc]) => {
-          const b = h("button", { type: "button", class: "rounded-md bg-zinc-50 px-2 py-1 font-mono text-xs/5 text-zinc-700 ring-1 ring-zinc-950/5 hover:bg-orange-50 hover:text-orange-800 hover:ring-orange-600/20 focus-visible:outline-2 focus-visible:outline-orange-600 dark:bg-white/5 dark:text-zinc-300 dark:ring-white/10 dark:hover:bg-orange-400/10 dark:hover:text-orange-300" }, esc(name));
+          const b = h("button", { type: "button", class: PRESS + " rounded-md bg-zinc-50 px-2 py-1 font-mono text-xs/5 text-zinc-700 ring-1 ring-zinc-950/5 hover:bg-orange-50 hover:text-orange-800 hover:ring-orange-600/20 focus-visible:outline-2 focus-visible:outline-orange-600 dark:bg-white/5 dark:text-zinc-300 dark:ring-white/10 dark:hover:bg-orange-400/10 dark:hover:text-orange-300" }, esc(name));
           const show = () => setLayerDetail(name, desc, L.name);
           b.addEventListener("mouseenter", show);
           b.addEventListener("focus", show);
@@ -868,7 +974,7 @@
                 <span class="w-14 shrink-0 font-mono text-xs font-semibold ${METHOD[method]}">${method}</span>
                 <span class="min-w-0 flex-1 font-mono text-[0.8125rem] wrap-break-word text-zinc-950 sm:truncate dark:text-white">${esc(path).replace(/\//g, "/<wbr>")}</span>
                 <span class="hidden max-w-[40%] truncate text-sm text-zinc-500 md:block">${esc(handler)}</span>
-                <svg viewBox="0 0 16 16" class="size-4 shrink-0 fill-zinc-400 transition-transform duration-200 group-open:rotate-90"><path fill-rule="evenodd" d="M6.22 4.22a.75.75 0 0 1 1.06 0l3.25 3.25a.75.75 0 0 1 0 1.06l-3.25 3.25a.75.75 0 0 1-1.06-1.06L8.94 8 6.22 5.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd"/></svg>
+                <svg viewBox="0 0 16 16" class="size-4 shrink-0 fill-zinc-400 transition-transform duration-200 ease-out group-open:rotate-90"><path fill-rule="evenodd" d="M6.22 4.22a.75.75 0 0 1 1.06 0l3.25 3.25a.75.75 0 0 1 0 1.06l-3.25 3.25a.75.75 0 0 1-1.06-1.06L8.94 8 6.22 5.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd"/></svg>
               </summary>
               <div class="pb-5">
                 <div class="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm text-zinc-500"><span>${group}</span><span class="md:hidden">${esc(handler)}</span></div>
@@ -896,10 +1002,10 @@
             <p class="ml-2 text-sm text-zinc-500 tabular-nums" data-count></p>
           </div>
           <div class="-mx-4 mt-4 overflow-x-auto px-4 sm:mx-0 sm:px-0">
-            <div class="relative" style="min-width:${n * 9.5}rem">
+            <div class="relative" style="min-width:${n * 10.5}rem">
               <div class="pointer-events-none absolute inset-x-0 top-5 bottom-0 grid" style="grid-template-columns:repeat(${n},minmax(0,1fr))">${ids.map(() => `<div class="mx-auto w-px bg-zinc-950/10 dark:bg-white/10"></div>`).join("")}</div>
               <div class="relative grid gap-2" style="grid-template-columns:repeat(${n},minmax(0,1fr))">
-                ${participants.map(([id, label, kind]) => `<div class="flex justify-center px-1 pt-1 pb-2"><span class="inline-flex items-center gap-1.5 rounded-full bg-white px-2.5 py-1 text-xs/5 font-medium ring-1 ring-zinc-950/10 dark:bg-zinc-950 dark:ring-white/15"><span class="size-1.5 shrink-0 rounded-full ${KINDS[kind].dot}"></span>${esc(label)}</span></div>`).join("")}
+                ${participants.map(([id, label, kind]) => `<div class="flex justify-center px-1 pt-1 pb-2"><span class="inline-flex items-center gap-1.5 rounded-full bg-white px-2.5 py-1 text-[0.8125rem]/5 font-medium ring-1 ring-zinc-950/10 dark:bg-zinc-950 dark:ring-white/15"><span class="size-1.5 shrink-0 rounded-full ${KINDS[kind].dot}"></span>${esc(label)}</span></div>`).join("")}
               </div>
               <ol role="list" class="relative flex flex-col" data-rows></ol>
             </div>
@@ -907,13 +1013,13 @@
         el.append(wrap);
         const rows = $("[data-rows]", wrap);
         messages.forEach((m, i) => {
-          const li = h("li", { class: "relative transition-opacity duration-300", "data-row": i });
+          const li = h("li", { class: "relative transition-opacity duration-200 ease-out", "data-row": i });
           if (m.note) {
             li.innerHTML = `<div class="relative mx-2 my-2 rounded-md bg-zinc-50 px-3 py-2 text-center text-sm/6 text-zinc-600 ring-1 ring-zinc-950/5 dark:bg-zinc-900 dark:text-zinc-400 dark:ring-white/10">${esc(m.note)}</div>`;
           } else if (m.from === m.to) {
             const c = col(m.from);
             const w = Math.min(1.6, n) / n, l = Math.min(Math.max((c + 0.5) / n - w / 2, 0), 1 - w);
-            li.innerHTML = `<div class="px-2 py-1.5" style="margin-left:${l * 100}%;width:${w * 100}%"><div class="rounded-md bg-white px-2.5 py-1.5 text-center text-xs/5 text-balance text-zinc-700 ring-1 ring-zinc-950/10 dark:bg-zinc-900 dark:text-zinc-300 dark:ring-white/15" data-chip>${esc(m.text)}</div></div>`;
+            li.innerHTML = `<div class="px-2 py-1.5" style="margin-left:${l * 100}%;width:${w * 100}%"><div class="rounded-md bg-white px-2.5 py-1.5 text-center text-[0.8125rem]/5 text-balance text-zinc-700 ring-1 ring-zinc-950/10 dark:bg-zinc-900 dark:text-zinc-300 dark:ring-white/15" data-chip>${esc(m.text)}</div></div>`;
           } else {
             const a = col(m.from), b = col(m.to);
             const lo = Math.min(a, b), hi = Math.max(a, b);
@@ -921,7 +1027,7 @@
             const right = b > a;
             li.innerHTML = `
               <div class="relative pt-2 pb-3" style="margin-left:${left}%;width:${width}%">
-                <p class="px-2 text-center text-xs/5 text-balance text-zinc-700 dark:text-zinc-300">${esc(m.text)}</p>
+                <p class="px-2 text-center text-[0.8125rem]/5 text-balance text-zinc-700 dark:text-zinc-300">${esc(m.text)}</p>
                 <div class="relative mt-1.5">
                   <div class="h-px ${m.async ? "border-t border-dashed border-zinc-400 dark:border-zinc-500" : "bg-zinc-500 dark:bg-zinc-400"}" data-line></div>
                   <div class="absolute -top-[4.5px] size-0 border-y-[5px] border-y-transparent ${right ? "-right-px border-l-[8px] border-l-zinc-500 dark:border-l-zinc-400" : "-left-px border-r-[8px] border-r-zinc-500 dark:border-r-zinc-400"}" data-head></div>
@@ -1035,19 +1141,32 @@
         readSteps.innerHTML = READ_STEPS.map(([t, d], i) => {
           const on = c.on.includes(i);
           const last = i === READ_STEPS.length - 1;
-          return `<li class="relative flex gap-4 ${last ? "" : "pb-5"} transition-opacity duration-300 ${on ? "" : "opacity-35"}">
+          return `<li class="relative flex gap-4 ${last ? "" : "pb-5"} transition-opacity duration-200 ease-out ${on ? "" : "opacity-35"}">
             ${last ? "" : `<span class="absolute top-6 left-[0.6875rem] h-full w-px ${on && c.on.includes(i + 1) ? "bg-orange-600/50" : "bg-zinc-950/10 dark:bg-white/10"}"></span>`}
             <span class="relative grid size-6 shrink-0 place-items-center rounded-full font-mono text-xs tabular-nums ring-1 ${on ? "bg-orange-600 text-white ring-orange-600 dark:bg-orange-500 dark:text-zinc-950 dark:ring-orange-500" : "bg-white text-zinc-400 ring-zinc-950/10 dark:bg-zinc-950 dark:ring-white/15"}">${i + 1}</span>
             <div class="min-w-0"><p class="text-base font-medium sm:text-sm">${esc(t)}${on ? "" : ` <span class="ml-1 font-normal text-zinc-500">Skipped</span>`}</p><p class="mt-0.5 text-base/6 text-pretty text-zinc-600 sm:text-sm/6 dark:text-zinc-400">${esc(c.note[i] ?? d)}</p></div>
           </li>`;
         }).join("");
       }
+      const thumb = $("[data-thumb]", consBox);
+      // Clips the full-width highlight down to the pressed button. clip-path transitions on the compositor.
+      const moveThumb = () => {
+        const b = $("[aria-pressed=true]", consBox);
+        const inner = consBox.clientWidth - 8;
+        const left = b.offsetLeft - 4;
+        thumb.style.clipPath = `inset(0 ${inner - left - b.offsetWidth}px 0 ${left}px round 6px)`;
+      };
       Object.keys(CONS).forEach((name, i) => {
         const b = h("button", { type: "button", class: segClass, "aria-pressed": String(i === 0) }, name);
-        b.onclick = () => { press(consBox, b); renderCons(name); };
+        b.onclick = () => { press(consBox, b); moveThumb(); renderCons(name); };
         consBox.append(b);
       });
       renderCons("Latest");
+      // Place the highlight before it may transition, so the page does not open with a slide.
+      thumb.style.transition = "none";
+      moveThumb();
+      requestAnimationFrame(() => requestAnimationFrame(() => thumb.style.removeProperty("transition")));
+      new ResizeObserver(moveThumb).observe(consBox);
 
       // cache tiers
       const TIERS = [
@@ -1068,10 +1187,10 @@
         <div class="flex items-center gap-3" data-tier="${id}">
           <span class="grid size-6 shrink-0 place-items-center rounded-full font-mono text-xs text-zinc-500 tabular-nums ring-1 ring-zinc-950/10 dark:ring-white/15" data-tier-n>${i + 1}</span>
           <div class="relative min-w-0 flex-1 overflow-hidden rounded-lg px-3 py-2 ring-1 ring-zinc-950/10 dark:ring-white/10">
-            <div class="absolute inset-0 origin-left scale-x-0 bg-orange-50 transition-transform duration-500 ease-out dark:bg-orange-400/10" data-fill></div>
+            <div class="absolute inset-0 origin-left scale-x-0 bg-orange-50 transition-transform duration-300 ease-out dark:bg-orange-400/10" data-fill></div>
             <div class="relative flex items-center justify-between gap-3">
               <div class="min-w-0"><p class="truncate text-base font-medium sm:text-sm">${t}</p><p class="truncate text-sm text-zinc-500">${esc(sub)}</p></div>
-              <span class="shrink-0 rounded-full bg-orange-600 px-2 py-0.5 text-xs/5 font-medium text-white opacity-0 transition-opacity dark:bg-orange-500 dark:text-zinc-950" data-hit>hit</span>
+              <span class="shrink-0 rounded-full bg-orange-600 px-2 py-0.5 text-xs/5 font-medium text-white opacity-0 scale-95 transition-[opacity,scale] duration-150 ease-out dark:bg-orange-500 dark:text-zinc-950" data-hit>hit</span>
             </div>
           </div>
         </div>`).join("");
@@ -1083,7 +1202,7 @@
         $("#cache-caption").textContent = sc.cap;
         $$("[data-tier]", tierBox).forEach((r) => {
           $("[data-fill]", r).classList.add("scale-x-0");
-          $("[data-hit]", r).classList.add("opacity-0");
+          $("[data-hit]", r).classList.add("opacity-0", "scale-95");
           $("[data-hit]", r).textContent = "hit";
           $("[data-tier-n]", r).className = "grid size-6 shrink-0 place-items-center rounded-full font-mono text-xs text-zinc-500 tabular-nums ring-1 ring-zinc-950/10 dark:ring-white/15";
         });
@@ -1092,10 +1211,10 @@
           const r = $(`[data-tier="${id}"]`, tierBox);
           $("[data-fill]", r).classList.remove("scale-x-0");
           $("[data-tier-n]", r).className = "grid size-6 shrink-0 place-items-center rounded-full bg-orange-600 font-mono text-xs text-white tabular-nums ring-1 ring-orange-600 dark:bg-orange-500 dark:text-zinc-950";
-          await sleep(450);
+          await sleep(320);
           if (k === sc.path.length - 1) {
             $("[data-hit]", r).textContent = sc.hedge ? "won" : sc.audit ? "direct" : id === "r2" ? "read" : "hit";
-            $("[data-hit]", r).classList.remove("opacity-0");
+            $("[data-hit]", r).classList.remove("opacity-0", "scale-95");
           }
         }
       }
@@ -1165,7 +1284,7 @@
             <p class="flex items-center gap-2 truncate py-2.5 pr-3 text-sm"><span class="size-2 shrink-0 rounded-full ${KINDS[kind].dot}"></span>${label}</p>
             <div class="relative h-9" data-lane="${id}">${ticks.map((t) => `<span class="absolute inset-y-0 w-px bg-zinc-950/5 dark:bg-white/5" style="left:${(t / T_END) * 100}%"></span>`).join("")}</div>
           </div>`).join("")}
-        <div class="pointer-events-none absolute top-5 bottom-10 left-44 right-0"><div id="playhead" class="absolute inset-y-0 w-px bg-orange-600 dark:bg-orange-400" style="left:0%"><span class="absolute -top-1 -left-1 size-2 rounded-full bg-orange-600 dark:bg-orange-400"></span></div></div>
+        <div id="track" class="pointer-events-none absolute top-5 bottom-10 left-44 right-0"><div id="playhead" class="absolute inset-y-0 left-0 w-px bg-orange-600 dark:bg-orange-400"><span class="absolute -top-1 -left-1 size-2 rounded-full bg-orange-600 dark:bg-orange-400"></span></div></div>
         <p class="mt-3 text-sm text-zinc-500">The compactor's first collection is due at about <span class="font-mono tabular-nums" id="gc-due">1:05:00</span>. That is gcMinAge, 1 hour by default, after its first job finishes, so it falls outside this window.</p>`;
       const evEls = ev.map((e) => {
         const lane = $(`[data-lane="${e.lane}"]`, lanesEl);
@@ -1184,6 +1303,10 @@
         lane.append(el);
         return el;
       });
+      // The playhead moves with transform, never `left`, so a frame costs no layout.
+      let trackWidth = 0, simFraction = 0;
+      const setPlayhead = (f) => { simFraction = f; $("#playhead").style.transform = `translateX(${f * trackWidth}px)`; };
+      new ResizeObserver(([e]) => { trackWidth = e.contentRect.width; setPlayhead(simFraction); }).observe($("#track"));
       const stateEl = $("#sim-state");
       const logEl = $("#sim-log");
       const renderState = (st, t) => {
@@ -1207,7 +1330,7 @@
         simState = { ...sim };
         evEls.forEach((el) => { el.classList.add("opacity-25"); el.classList.remove("scale-150"); });
         logEl.innerHTML = `<li class="text-zinc-400">Press play to start the clock.</li>`;
-        $("#playhead").style.left = "0%";
+        setPlayhead(0);
         $("#sim-clock").textContent = fmt(0);
         renderState(simState, 0);
       }
@@ -1219,7 +1342,7 @@
           el.classList.remove("opacity-25");
           if (e.lane !== "writes") {
             if (logEl.firstElementChild?.classList.contains("text-zinc-400")) logEl.innerHTML = "";
-            const li = h("li", { class: "rise flex gap-3 border-b border-zinc-950/5 py-1 dark:border-white/5" }, `<span class="w-10 shrink-0 tabular-nums text-zinc-400">${fmt(e.t)}</span><span class="min-w-0">${esc(e.label)}</span>`);
+            const li = h("li", { class: "fade-in flex gap-3 border-b border-zinc-950/5 py-1 dark:border-white/5" }, `<span class="w-10 shrink-0 tabular-nums text-zinc-400">${fmt(e.t)}</span><span class="min-w-0">${esc(e.label)}</span>`);
             logEl.prepend(li);
           }
           simIdx++;
@@ -1231,7 +1354,7 @@
         const dt = (now - simLast) / 1000;
         simLast = now;
         simT = Math.min(T_END, simT + dt * Number($("#sim-speed").value));
-        $("#playhead").style.left = `${(simT / T_END) * 100}%`;
+        setPlayhead(simT / T_END);
         $("#sim-clock").textContent = fmt(simT);
         advance(simT);
         if (simT >= T_END) { simRunning = false; simPlayBtn.textContent = "Replay simulation"; return; }
@@ -1239,7 +1362,7 @@
       }
       simPlayBtn.onclick = () => {
         if (simT >= T_END) resetSim();
-        if (reduced) { simT = T_END; $("#playhead").style.left = "100%"; $("#sim-clock").textContent = fmt(T_END); advance(T_END); return; }
+        if (reduced) { simT = T_END; setPlayhead(1); $("#sim-clock").textContent = fmt(T_END); advance(T_END); return; }
         simRunning = !simRunning;
         simPlayBtn.textContent = simRunning ? "Pause" : "Resume";
         if (simRunning) { simLast = performance.now(); simRAF = requestAnimationFrame(frame); }
@@ -1318,56 +1441,82 @@
         const sEls = {};
         for (const [id, b] of Object.entries(cfg.states)) {
           const g = s("g");
-          const r = s("rect", { x: b.x, y: b.y, width: b.w, height: b.h, rx: b.h / 2, "stroke-width": 1.5, class: "fill-white stroke-zinc-300 transition-colors dark:fill-zinc-900 dark:stroke-zinc-700" });
-          const t = s("text", { x: b.x + b.w / 2, y: b.y + b.h / 2 + 5, "text-anchor": "middle", class: "fill-zinc-950 text-[14px] font-medium dark:fill-white" });
+          const r = s("rect", { x: b.x, y: b.y, width: b.w, height: b.h, rx: b.h / 2, "stroke-width": 1.5, class: "fill-white stroke-zinc-300 dark:fill-zinc-900 dark:stroke-zinc-700" });
+          const t = s("text", { x: b.x + b.w / 2, y: b.y + b.h / 2 + 5.5, "text-anchor": "middle", class: "fill-zinc-950 text-[15.5px] font-medium dark:fill-white" });
           t.textContent = b.label ?? id;
           g.append(r, t);
           svg.append(g);
           sEls[id] = { r, t };
         }
         const cur = $("[data-cur]", wrap), desc = $("[data-desc]", wrap), evBox = $("[data-events]", wrap), log = $("[data-log]", wrap);
-        let state = cfg.start;
-        const paint = (via) => {
+        let state = cfg.start;   // the logical state, which the buttons follow at once
+        let shown = cfg.start;   // the state drawn as current, which changes when the dot arrives
+        let token = 0;
+        const paintStates = () => {
           for (const [id, { r, t }] of Object.entries(sEls)) {
-            const on = id === state;
+            const on = id === shown;
             r.setAttribute("class", on ? "fill-orange-50 stroke-orange-600 dark:fill-orange-400/10 dark:stroke-orange-400" : "fill-white stroke-zinc-300 dark:fill-zinc-900 dark:stroke-zinc-700");
-            t.setAttribute("class", `text-[14px] font-medium ${on ? "fill-orange-900 dark:fill-orange-200" : "fill-zinc-950 dark:fill-white"}`);
+            t.setAttribute("class", `text-[15.5px] font-medium ${on ? "fill-orange-900 dark:fill-orange-200" : "fill-zinc-950 dark:fill-white"}`);
           }
+        };
+        const paintEdges = (via, moving) => {
           for (const [k, p] of Object.entries(tEls)) {
             const on = k === via;
             const avail = k.startsWith(`${state}>`);
-            p.setAttribute("class", on ? "stroke-orange-600 flowing dark:stroke-orange-400" : avail ? "stroke-zinc-500 dark:stroke-zinc-400" : "stroke-zinc-300 opacity-50 dark:stroke-zinc-700");
+            p.setAttribute("class", on ? `stroke-orange-600 dark:stroke-orange-400 ${moving ? "flowing" : ""}` : avail ? "stroke-zinc-500 dark:stroke-zinc-400" : "stroke-zinc-300 opacity-50 dark:stroke-zinc-700");
             p.setAttribute("stroke-width", on ? 2.25 : 1.5);
             p.setAttribute("marker-end", `url(#${cfg.id}-${on ? "on" : "a"})`);
           }
-          if (via) {
-            const b = cfg.states[state];
-            const ring = s("rect", { x: b.x, y: b.y, width: b.w, height: b.h, rx: b.h / 2, class: "fill-none stroke-orange-500 ping-once", "stroke-width": 2 });
-            svg.append(ring);
-            setTimeout(() => ring.remove(), 800);
-          }
+        };
+        const ring = (id) => {
+          const b = cfg.states[id];
+          const el = s("rect", { x: b.x, y: b.y, width: b.w, height: b.h, rx: b.h / 2, class: "fill-none stroke-orange-500 ping-once", "stroke-width": 2 });
+          svg.append(el);
+          setTimeout(() => el.remove(), 500);
+        };
+        const renderControls = () => {
           cur.textContent = cfg.states[state].label ?? state;
           desc.textContent = cfg.states[state].desc;
           evBox.innerHTML = "";
           const evs = cfg.events[state] ?? [];
           evs.forEach((e) => {
             const b = h("button", { type: "button", class: ghostBtn }, esc(e.label));
-            b.onclick = () => {
-              const from = state;
-              state = e.to;
-              log.prepend(h("li", { class: "rise" }, `${esc(cfg.states[from].label ?? from)} to ${esc(cfg.states[e.to].label ?? e.to)}, on ${esc(e.label)}.${e.note ? ` <span class="text-zinc-400">${esc(e.note)}</span>` : ""}`));
-              paint(edgeKey(from, e.to));
-            };
+            b.onclick = () => fire(e);
             evBox.append(b);
           });
           if (!evs.length) {
             const b = h("button", { type: "button", class: ghostBtn }, "Start over");
-            b.onclick = () => { state = cfg.start; log.innerHTML = ""; paint(); };
+            b.onclick = () => { token++; state = shown = cfg.start; log.innerHTML = ""; svg.querySelectorAll("[data-dot]").forEach((d) => d.remove()); renderControls(); paintStates(); paintEdges(null); };
             evBox.append(b);
           }
         };
-        paint();
+        // Cause, then effect: the dot crosses the edge, then the new state lights up.
+        // The buttons switch at once, so the next event can be fired mid-flight.
+        const fire = async (e) => {
+          const from = state, key = edgeKey(from, e.to), tok = ++token;
+          state = e.to;
+          log.prepend(h("li", { class: "fade-in" }, `${esc(cfg.states[from].label ?? from)} to ${esc(cfg.states[e.to].label ?? e.to)}, on ${esc(e.label)}.${e.note ? ` <span class="text-zinc-400">${esc(e.note)}</span>` : ""}`));
+          renderControls();
+          svg.querySelectorAll("[data-dot]").forEach((d) => d.remove());
+          shown = from;
+          paintStates();
+          if (reduced) { shown = state; paintStates(); paintEdges(key); return; }
+          paintEdges(key, true);
+          const dot = s("circle", { r: 4.5, "data-dot": "", class: "fill-orange-600 dark:fill-orange-400" });
+          svg.append(dot);
+          const landed = await travel(tEls[key], dot, 320, 1, () => tok !== token);
+          dot.remove();
+          if (!landed) return;
+          shown = state;
+          paintStates();
+          paintEdges(key);
+          ring(state);
+        };
+        renderControls();
+        paintStates();
+        paintEdges(null);
       }
+
 
       stateMachine($("#sm-compactor"), {
         id: "smc", label: "Compactor state machine", w: 640, h: 360, start: "Idle",
@@ -1404,7 +1553,7 @@
       stateMachine($("#sm-lifecycle"), {
         id: "sml", label: "Database lifecycle", w: 640, h: 300, start: "None",
         states: {
-          None: { x: 20, y: 130, w: 110, h: 44, label: "No database", desc: "No manifest exists under db/<id>/." },
+          None: { x: 10, y: 130, w: 132, h: 44, label: "No database", desc: "No manifest exists under db/<id>/." },
           Open: { x: 190, y: 50, w: 120, h: 44, desc: "The database accepts writes. Flushes, compactions, garbage collection, checkpoints, and forks all commit by manifest CAS." },
           Sealed: { x: 460, y: 50, w: 120, h: 44, desc: "One CAS committed the final flush and the Sealed state with its successors. Reads work. Writes fail with DatabaseSealedError, which names the successors." },
           Removed: { x: 455, y: 220, w: 130, h: 44, desc: "A CAS set the state to Removed, which stops every later commit. The writer state and the compactor state are destroyed, the objects are deleted, and the cache tag is purged. The newest manifest stays as a tombstone for gcMinAge." },
@@ -1473,7 +1622,7 @@
       const detail = $("#storage-detail");
       const showStore = (it) => {
         const col = (label, arr) => `<div class="border-t border-zinc-950/10 pt-3 dark:border-white/10"><dt class="text-sm font-medium">${label}</dt><dd class="mt-1 text-base/7 text-zinc-600 sm:text-sm/6 dark:text-zinc-400">${arr.length ? arr.map(esc).join("<br>") : "Nothing"}</dd></div>`;
-        detail.innerHTML = `<div class="rise"><p class="font-mono text-sm font-medium break-all">${esc(it.name)}</p><p class="mt-2 text-base/7 text-pretty text-zinc-600 sm:text-sm/6 dark:text-zinc-400">${esc(it.desc)}</p><dl class="mt-5 grid gap-4 sm:grid-cols-3">${col("Written by", it.w)}${col("Read by", it.r)}${col("Deleted by", it.d)}</dl></div>`;
+        detail.innerHTML = `<div class="swap"><p class="font-mono text-sm font-medium break-all">${esc(it.name)}</p><p class="mt-2 text-base/7 text-pretty text-zinc-600 sm:text-sm/6 dark:text-zinc-400">${esc(it.desc)}</p><dl class="mt-5 grid gap-4 sm:grid-cols-3">${col("Written by", it.w)}${col("Read by", it.r)}${col("Deleted by", it.d)}</dl></div>`;
       };
       STORE.forEach((it, i) => {
         const li = h("li");

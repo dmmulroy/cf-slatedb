@@ -912,3 +912,20 @@ per Stack (Dillon's choice, D49); the §12 write, flush, and split measurements 
   release until they are fixed and gated.
 - **Not merged, on purpose.** `proto/parallel-parts` (and `proto/integration`, which holds only
   that) is the concurrent part upload D73 measured and declined.
+
+## 2026-11-27: the architecture page and its site
+
+- **`docs/show-me-system-architecture.html`.** An interactive page that explains the system to
+  readers new to it: the topology with animated request flows, the layers, every endpoint and its
+  call tree, the write, read, compaction, and garbage collection paths, a simulation of the
+  timers and crons, the compactor and lifecycle state machines, and the storage layout. It names
+  no decision numbers. Its motion follows Emil Kowalski's skills (transform and opacity only, one
+  set of easing tokens, reduced motion kept gentle). It is hand-authored, so `vp fmt` skips it,
+  like the design page.
+- **`infra/docs-site` (`@shaledb/docs-site`).** A separate Alchemy Stack, `ShaledbDocs`, with one
+  assets-only Worker named `shaledb`. `vp run @shaledb/docs-site#deploy` copies the page into
+  `dist/index.html` and deploys stage `docs`; state is in the account's Cloudflare state store.
+  **Live** (approved by Dillon): <https://shaledb.mulroy.workers.dev>. It touches no shaledb
+  stage and costs only static-asset requests.
+- `vp run ready` exit 0 (14 tasks). The first run failed when parallel test tasks raced to clear
+  `node_modules/.vitest-cache`; the run after clearing it passed.

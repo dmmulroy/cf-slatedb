@@ -2,7 +2,8 @@ import { defineConfig } from "vite-plus";
 
 export default defineConfig({
   fmt: {
-    // Trait files are written by Traits' own serializer; the design page is kept as authored;
+    // Trait files are written by Traits' own serializer; the design and architecture pages are kept
+    // as authored;
     // `repos/` holds read-only reference clones; `.traces/` and `.tlc/` are local tool output.
     ignorePatterns: [
       ".agents/**",
@@ -11,6 +12,7 @@ export default defineConfig({
       ".traces/**",
       "**/.tlc/**",
       "docs/show-me-r2-lsm-design.html",
+      "docs/show-me-system-architecture.html",
     ],
   },
   lint: {
