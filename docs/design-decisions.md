@@ -4339,7 +4339,7 @@ row to end early, and versions not counted.
 - **Why the generated properties missed some of these.** Generated histories are short, so most of
   40 inputs are empty and the merge heap rarely holds the five or more cursors a wrong parent index
   needs before it misorders. The many-input merge test is seeded and sized for the heap instead.
-- **What survives:** 82 mutants. 81 are equivalent; one (the block seek's binary search) changes only how many rows a seek decodes, which no test can see without instrumenting the decoder. The report lists each with its reason
+- **What survives:** 82 mutants. 80 are equivalent. Two, both in the block seek's binary search, change only how many rows a seek decodes, which no test can see without instrumenting the decoder. The report lists each with its reason
   (`/tmp/shale-work/agents/mut-core/REPORT.md`).
 - **Precondition stated.** Key-range functions assume a non-empty range (`start < end`). Every
   database range is non-empty. The oracle test covers non-empty ranges only.

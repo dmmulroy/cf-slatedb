@@ -685,4 +685,4 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   survivor classified, the untested edges given tests in `write-batch`, `row-resolution`,
   `merge-limits`, `garbage-collection-plan`, `size-tiered-compaction-scheduler`, `key-range`,
   `bloom-filter`, `lsm-settings`, `manifest`, `sst-codec`, `byte-codec`, `merge-iterator`, and
-  `ulid` tests. The 82 that survive are equivalent, or (one) change only how many rows a block seek decodes (`/tmp/shale-work/agents/mut-core/REPORT.md`).
+  `ulid` tests. Of the 82 that survive, 80 are equivalent and 2 change only how many rows a block seek decodes (`/tmp/shale-work/agents/mut-core/REPORT.md`).

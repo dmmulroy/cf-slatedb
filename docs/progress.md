@@ -344,7 +344,7 @@ hand-off is below.
 
 - **Mutation sweep of `lsm-core` (D117, D118).**
   - 800 mutants. 286 survived the first pass. Tests for the untested edges were added. 82 survive:
-    81 equivalent, 1 performance-only.
+    80 equivalent, 2 performance-only (block seek).
   - **Found:** no wrong behavior. The weakest tests were the merge properties: short generated
     histories never filled the heap enough for a wrong parent index to misorder rows.
   - **Pinned:** the Bloom filter's stored bits, the SST footer's seq bounds, and the documented
