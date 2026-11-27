@@ -32,6 +32,9 @@ export const SHALEDB_API_CPU_MS_VARIABLE = "SHALEDB_API_CPU_MS";
 /** Name of the deploy variable that sets the compactor Worker's CPU limit per invocation, in ms. */
 export const SHALEDB_COMPACTOR_CPU_MS_VARIABLE = "SHALEDB_COMPACTOR_CPU_MS";
 
+/** Variable that overrides the compactor Worker's subrequest limit (D99). */
+export const SHALEDB_COMPACTOR_SUBREQUESTS_VARIABLE = "SHALEDB_COMPACTOR_SUBREQUESTS";
+
 /**
  * Default CPU limit of the API Worker and the writers it hosts (P5, D61): a 60 MiB flush peaked at
  * 3.5 s of CPU on `preview-1`, so twice that is well inside Workers Paid's 30 s default, kept
@@ -45,6 +48,22 @@ export const DEFAULT_API_CPU_MS = 30_000;
  */
 export const DEFAULT_COMPACTOR_CPU_MS = 60_000;
 
+/**
+ * Default subrequest limit of the compactor Worker (D99): Workers Paid's maximum, 10 million.
+ *
+ * **Details**
+ *
+ * Cloudflare counts a Workflow's subrequests per instance, 10,000 by default
+ * (developers.cloudflare.com/workflows/reference/limits, 2026-11-10), and one compaction job is one
+ * instance. A merge makes about 860 subrequests per GiB of input (2 MiB chunk reads, 8 MiB part
+ * uploads, SST metadata, and manifest reads; `audit-workflow`, 8,600 for 10 GiB), so the default
+ * fails every attempt of a job above about 11 GiB. At 10 million a job of about 11 TiB fits, beyond
+ * v1's database size limit (D99). The same Worker's Durable Objects run the compactors' garbage
+ * collections, about 5,000 subrequests an hour of commits at 1.4 a second (D92). The limit guards
+ * against nothing shaledb needs: a runaway loop is bounded by CPU first.
+ */
+export const DEFAULT_COMPACTOR_SUBREQUESTS = 10_000_000;
+
 /** Default fraction of production requests whose traces are kept (P4). */
 export const PRODUCTION_TRACE_SAMPLE_RATE = 0.1;
 
@@ -56,6 +75,9 @@ const TraceSampleRate = Schema.Number.check(Schema.isBetween({ minimum: 0, maxim
 
 /** Schema for a Worker's CPU limit per invocation: 10 ms to Workers Paid's 5-minute maximum. */
 const CpuLimitMs = Schema.Int.check(Schema.isBetween({ minimum: 10, maximum: 300_000 }));
+
+/** Schema for a Worker's subrequest limit per invocation: 1 to Workers Paid's 10 million. */
+const SubrequestLimit = Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 10_000_000 }));
 
 /** Schema for how many whole days a live stage keeps traces and tail records. */
 const TraceRetentionDays = Schema.Int.check(Schema.isGreaterThan(0));
@@ -110,7 +132,11 @@ export const ShaledbStackConfig = Schema.Struct({
     traceRetentionDays: TraceRetentionDays,
   }),
   access: Schema.Struct({ mode: ShaledbAccessMode }),
-  limits: Schema.Struct({ apiCpuMs: CpuLimitMs, compactorCpuMs: CpuLimitMs }),
+  limits: Schema.Struct({
+    apiCpuMs: CpuLimitMs,
+    compactorCpuMs: CpuLimitMs,
+    compactorSubrequests: SubrequestLimit,
+  }),
 });
 
 /** The complete configuration of one shaledb installation. */
@@ -144,6 +170,9 @@ const decodeTraceSampleRate = Schema.decodeEffect(
 const decodeCpuLimitMs = Schema.decodeEffect(
   Schema.NumberFromString.pipe(Schema.decodeTo(CpuLimitMs)),
 );
+const decodeSubrequestLimit = Schema.decodeEffect(
+  Schema.NumberFromString.pipe(Schema.decodeTo(SubrequestLimit)),
+);
 const decodeTraceRetentionDays = Schema.decodeEffect(
   Schema.NumberFromString.pipe(Schema.decodeTo(TraceRetentionDays)),
 );
@@ -172,6 +201,8 @@ const refused = (name: string, reason: string) =>
  *   Unknown names and contradictory combinations are refused.
  * - `SHALEDB_TRACE_SAMPLE_RATE`: 0 to 1 (default 1; 0.1 in production).
  * - `SHALEDB_TRACE_RETENTION_DAYS`: whole days (default 14).
+ * - `SHALEDB_COMPACTOR_SUBREQUESTS`: the compactor Worker's subrequest limit (default 10,000,000,
+ *   D99).
  * - `SHALEDB_API_CPU_MS`, `SHALEDB_COMPACTOR_CPU_MS`: CPU limits per invocation (defaults
  *   30 s and 60 s, from measurements).
  *
@@ -263,6 +294,21 @@ export const resolveShaledbStackConfig = Effect.fn("ShaledbStackConfig.resolve")
     SHALEDB_COMPACTOR_CPU_MS_VARIABLE,
     DEFAULT_COMPACTOR_CPU_MS,
   );
+  const compactorSubrequests = yield* Option.match(
+    variable(environment, SHALEDB_COMPACTOR_SUBREQUESTS_VARIABLE),
+    {
+      onNone: () => Effect.succeed(DEFAULT_COMPACTOR_SUBREQUESTS),
+      onSome: (text) =>
+        decodeSubrequestLimit(text.trim()).pipe(
+          Effect.mapError(() =>
+            refused(
+              SHALEDB_COMPACTOR_SUBREQUESTS_VARIABLE,
+              `"${text}" is not a whole number of subrequests from 1 to 10000000`,
+            ),
+          ),
+        ),
+    },
+  );
   const accessMode: ShaledbAccessMode = isLocalLsmStage(stage) ? "Open" : "BearerToken";
   // Every part was decoded by its own schema above.
   return {
@@ -272,7 +318,7 @@ export const resolveShaledbStackConfig = Effect.fn("ShaledbStackConfig.resolve")
     lsmSettings,
     telemetry: { traceSampleRate, traceRetentionDays },
     access: { mode: accessMode },
-    limits: { apiCpuMs, compactorCpuMs },
+    limits: { apiCpuMs, compactorCpuMs, compactorSubrequests },
   } satisfies ShaledbStackConfig;
 });
 
@@ -335,4 +381,10 @@ export const shaledbApiCpuLimit: Effect.Effect<number, never, Stage> = atPlanTim
 export const shaledbCompactorCpuLimit: Effect.Effect<number, never, Stage> = atPlanTime(
   (config) => config.limits.compactorCpuMs,
   DEFAULT_COMPACTOR_CPU_MS,
+);
+
+/** The subrequest limit per invocation the Stack configuration gives the compactor Worker (D99). */
+export const shaledbCompactorSubrequestLimit: Effect.Effect<number, never, Stage> = atPlanTime(
+  (config) => config.limits.compactorSubrequests,
+  DEFAULT_COMPACTOR_SUBREQUESTS,
 );

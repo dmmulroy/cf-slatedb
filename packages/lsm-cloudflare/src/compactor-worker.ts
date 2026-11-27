@@ -44,6 +44,11 @@ export interface CompactorWorkerOptions<R = never> {
    * Durable Objects run under the same limit.
    */
   readonly cpuLimitMs: Effect.Effect<number, never, R>;
+  /**
+   * Subrequest limit per invocation (D99). One compaction job is one Workflow instance, whose
+   * subrequests Cloudflare counts together; none: Workers Paid's default of 10,000.
+   */
+  readonly subrequestLimit?: Effect.Effect<number, never, R>;
   readonly devPort: number;
 }
 
@@ -67,7 +72,12 @@ export const compactorWorkerLayer = <R = never>(options: CompactorWorkerOptions<
         workersDev: false,
         compatibility: yield* lsmWorkerCompatibility,
         tailConsumers: yield* options.tailConsumers,
-        limits: { cpuMs: yield* options.cpuLimitMs },
+        limits: {
+          cpuMs: yield* options.cpuLimitMs,
+          ...(options.subrequestLimit === undefined
+            ? {}
+            : { subrequests: yield* options.subrequestLimit }),
+        },
         dev: { host: "127.0.0.1", port: options.devPort },
       };
     }),
