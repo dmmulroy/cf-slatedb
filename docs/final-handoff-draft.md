@@ -30,12 +30,23 @@ being produced.
   - **D76.** On a database read but not flushed for over an hour after a compaction, every
     transaction read failed with `SnapshotTooOld`, and so did every retry. Unpinned snapshots lived
     half the documented hour. Found by checking `docs/invariants.md` against the code.
-  - **D77 (in progress, `proto/fork-hold`).** A fork released its hold on its source while readers
-    of its recent manifests still needed the source's SSTs. Found by the interaction audit.
-  - **D78 (in progress, `proto/compactor-fence`).** Two overlapping first wakes fenced a compactor
-    against itself for good, so writes to that database were refused permanently. Found by
-    `measure manifest-cas` on `preview-3`.
-  - `docs/release-v1.md` §8 says what these five imply.
+  - **D77.** A fork released its hold on its source while readers of its recent manifests still
+    needed the source's SSTs. Found by the interaction audit. Model: `GcSafetyFork.cfg`.
+  - **D78.** Two overlapping first wakes fenced a compactor against itself for good, so writes to
+    that database were refused permanently. Found by `measure manifest-cas` on `preview-3`. The
+    stuck fixture recovered live within 11 s of its first write after the deploy.
+  - **D80, D81, D83** from the review and interaction audit: the change feed skipped changes
+    silently, compaction changed what a key with expiring operands reads, and a collection went
+    on without a manifest it retained.
+  - **Audit round 2** (five auditors by area): D84 to D101, with D90, D91, D102, and D103 still on
+    their branches. Among them: a lost update in `Snapshot` commits (D84); writes acknowledged
+    after an unseen seal (D85); compactions that could never run or never commit (D86, D96, D97);
+    a TTL that made a database unflushable (D88); a stale router serving a sealed shard (D89); a
+    removed database's id serving its old data (D90, D91); unbounded scans, pages, and bodies
+    (D93, D100); an abandoned split that blocked a range forever (D101).
+  - **What that says:** `docs/release-v1.md` §8. It covers 23 defects by class and by how each
+    was found. Every gate that runs the system passed with them in the code; reading the code
+    against a stated rule found them.
 - **Read path (D67, D72).**
   - A read reuses any cached manifest holding the writer's flushed rows, and a refresh takes one
     round trip from the manifest held.
@@ -75,7 +86,10 @@ being produced.
   passed. It found no mismatch and no failure, and every invocation ended `ok`
   (`docs/release-v1.md` §5). This is evidence about `f3b2ad2`, not the release gate.
 
-PENDING(soak-preview-1-f3b2ad2): the outcome of the 130-minute soak on `f3b2ad2` on `preview-1`.
+- **On `f3b2ad2`, the 132-minute soak on `preview-1` passed** (22:25:52–00:43:35 UTC; 6 databases,
+  two splits, a redeploy). It found no mismatch, no failure, and no unexpected error span; 9
+  operations were retried once and then answered (`docs/release-v1.md` §5). Every defect from D76 on
+  was in that code.
 
 PENDING(final-commit): the release commit, with `vp run ready` and `vp run verify` observed at
 exit 0 on it, and the number of TLC runs.
@@ -88,15 +102,21 @@ PENDING(soak-preview-2): the 20-minute `eu` soak on the release commit on `previ
 PENDING(step4): writes, split pause, compaction CPU, flush CPU, and read latency re-measured on the
 final code, each against its target.
 
-PENDING(d77): D77 merged, with its tests and model runs.
+- **D77 and D78 are merged** (`proto/integration-2`), with their tests, `GcSafetyFork.cfg`, and
+  D78's live recovery on `preview-3` (`ed4e787`, `/tmp/shale-work/release2/NOTES.md`).
+- **`docs/api-compatibility.md`** lists every limit of v1, pinned to the constants by
+  `api-compatibility-limits.test.ts`.
 
-PENDING(d78): D78 merged, with its tests, and `ms-cas-mwy5ujbj` on `preview-3` revived live.
+PENDING(d90), PENDING(d102), PENDING(d103): D90 and D91, D102, and D103 merged, with their tests.
 
 ## What is left
 
 - **P6.** Dillon decides with `docs/release-v1.md`. If he says go, the production deploy, its smoke
   test, and the production URLs (`apiUrl`, `traceCollectorUrl`) are recorded here.
-- **D77 and D78** are merged and verified, then the release soaks run on the release commit.
+- **D90, D91, D102, D103** are merged, then the release soaks run on the release commit.
+- **Not reached by the audits** (`docs/release-v1.md` §8): `MemTable` migrations, the `BlockServer`
+  under a hostile caller, a compaction step's memory with 8 inputs, and the tools.
+- **The public scan page is bounded by rows only** (1,000 rows of up to 1 MiB each); open.
 - **The deployment guard.** Its allowlist names only the pre-rename project path, which the guard
   skips. `scripts/allowlist-shaledb-deploys.sh` must be rerun from the main checkout, and its stage
   list does not keep agents off `production` (`docs/release-v1.md` §10 step 2).
@@ -148,12 +168,10 @@ It does **not** remove the stage's two token secrets. See step 3.
 
 Wait until the release soaks and any measurements on a stage are finished before destroying it.
 
-**Keep `preview-3` until D78's recovery is proven.** Database `ms-cas-mwy5ujbj` on `preview-3` is
-the live fixture for D78. Its compactor has been fenced against itself since 2026-11-26 23:05 UTC,
-with 16 L0 SSTs, every write refused, and `"fenced": true` against the manifest's compactor epoch 2.
-It is kept on purpose: after D78 is deployed, a wake must make it compact again and accept writes.
-Destroying `preview-3` deletes it. Destroy `preview-3` only after that result is recorded
-(PENDING(d78)).
+**D78's fixture on `preview-3` has served its purpose.** Database `ms-cas-mwy5ujbj` was stuck
+from 23:05 UTC. After D78 was deployed (`ed4e787`) it compacted and accepted writes again, at
+23:34:52–23:35:16 UTC (`/tmp/shale-work/release2/NOTES.md`). `preview-3` may be destroyed with the
+others once the release measurements on it are done.
 
 ### 2. The orphaned stacks from before the rename: `CfSlatedb/preview-1`, `-2`, `-3`
 
@@ -272,48 +290,37 @@ warns to delete a secret only once nothing deployed uses it, which steps 1 and 2
 
 ## Local worktrees and branches to remove after the merge
 
-The parallel round left 21 git worktrees under `/tmp/shale-work/wt/`, each on its own `proto/*`
-branch of the main repository (`git worktree list` at `fec2698`). They are on this laptop only and
-were never pushed. Once the release is merged into `main`, every branch below except the last two
-is contained in `main`, and its worktree can go.
+The parallel rounds left 27 git worktrees under `/tmp/shale-work/wt/`, each on its own `proto/*`
+branch of the main repository (`git worktree list`, after `proto/integration-2` reached `e33d1a0`).
+They are on this laptop only and were never pushed. Once the release is merged into `main`, every
+branch merged into `proto/integration-2` is contained in `main`, and its worktree can go.
 
-| Worktree (`/tmp/shale-work/wt/…`) | Branch                      | In `proto/integration-2` at `fec2698`                            |
-| --------------------------------- | --------------------------- | ---------------------------------------------------------------- |
-| `integ2`                          | `proto/integration-2`       | is it                                                            |
-| `candidate`                       | `proto/candidate`           | yes                                                              |
-| `docs`                            | `proto/docs`                | yes                                                              |
-| `baseline`                        | `proto/baseline`            | yes                                                              |
-| `prod-health`                     | `proto/prod-health`         | yes                                                              |
-| `review`                          | `proto/review`              | yes                                                              |
-| `txn-fix`                         | `proto/txn-fix`             | yes                                                              |
-| `soak-tool`                       | `proto/soak-tool`           | yes                                                              |
-| `writer-counters`                 | `proto/writer-counters`     | yes                                                              |
-| `tools`                           | `proto/tools`               | yes                                                              |
-| `newest-flush`                    | `proto/newest-flush`        | yes                                                              |
-| `flush-cpu`                       | `proto/flush-cpu`           | yes                                                              |
-| `background-wake`                 | `proto/background-wake`     | yes                                                              |
-| `hedged-reads`                    | `proto/hedged-reads`        | yes                                                              |
-| `limit-read-ahead`                | `proto/limit-read-ahead`    | yes                                                              |
-| `refresh-from-cached`             | `proto/refresh-from-cached` | yes                                                              |
-| `release-doc`                     | `proto/release-doc`         | this branch; merged at integration                               |
-| `fork-hold`                       | `proto/fork-hold`           | no: D77, in progress                                             |
-| `compactor-fence`                 | `proto/compactor-fence`     | no: D78, in progress                                             |
-| `parallel-parts`                  | `proto/parallel-parts`      | no: the declined concurrent part uploads (D73 names this branch) |
-| `integration`                     | `proto/integration`         | no: an earlier integration that merged `proto/parallel-parts`    |
+| Worktree (`/tmp/shale-work/wt/…`)                                                                                                                                                                                                                                   | Branch                                                           | In `proto/integration-2`                                         |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- | ---------------------------------------------------------------- |
+| `integ2`                                                                                                                                                                                                                                                            | `proto/integration-2`                                            | is it                                                            |
+| `audit-do`, `audit-workflow`                                                                                                                                                                                                                                        | `proto/audit-do`, `proto/audit-workflow`                         | yes (D102, D103 after their next merge)                          |
+| `audit-api`, `audit-lifecycle`, `audit-limits`                                                                                                                                                                                                                      | `proto/audit-api`, `proto/audit-lifecycle`, `proto/audit-limits` | not yet: work after their last merge (D90, D91; this checklist)  |
+| `review`, `prod-health`, `feed-ttl`, `fork-hold`, `compactor-fence`, `txn-fix`, `soak-tool`, `docs`, `baseline`, `candidate`, `writer-counters`, `tools`, `newest-flush`, `flush-cpu`, `background-wake`, `hedged-reads`, `limit-read-ahead`, `refresh-from-cached` | `proto/<the same name>`                                          | yes                                                              |
+| `release-doc`                                                                                                                                                                                                                                                       | `proto/release-doc`                                              | yes                                                              |
+| `parallel-parts`                                                                                                                                                                                                                                                    | `proto/parallel-parts`                                           | no: the declined concurrent part uploads (D73 names this branch) |
+| `integration`                                                                                                                                                                                                                                                       | `proto/integration`                                              | no: an earlier integration that merged `proto/parallel-parts`    |
 
 From the main checkout, on `main`, after the merge:
 
 ```sh
 cd /Users/dmmulroy/Code/personal/cf-slatedb
-for name in integ2 candidate docs baseline prod-health review txn-fix soak-tool writer-counters \
-  tools newest-flush flush-cpu background-wake hedged-reads limit-read-ahead refresh-from-cached \
-  release-doc fork-hold compactor-fence; do
+for name in integ2 audit-api audit-do audit-lifecycle audit-limits audit-workflow review \
+  prod-health feed-ttl fork-hold compactor-fence txn-fix soak-tool docs baseline candidate \
+  writer-counters tools newest-flush flush-cpu background-wake hedged-reads limit-read-ahead \
+  refresh-from-cached release-doc; do
   git worktree remove "/tmp/shale-work/wt/$name"
 done
-git branch -d proto/integration-2 proto/candidate proto/docs proto/baseline proto/prod-health \
-  proto/review proto/txn-fix proto/soak-tool proto/writer-counters proto/tools proto/newest-flush \
-  proto/flush-cpu proto/background-wake proto/hedged-reads proto/limit-read-ahead \
-  proto/refresh-from-cached proto/release-doc proto/fork-hold proto/compactor-fence
+for name in integration-2 audit-api audit-do audit-lifecycle audit-limits audit-workflow review \
+  prod-health feed-ttl fork-hold compactor-fence txn-fix soak-tool docs baseline candidate \
+  writer-counters tools newest-flush flush-cpu background-wake hedged-reads limit-read-ahead \
+  refresh-from-cached release-doc; do
+  git branch -d "proto/$name"
+done
 git worktree prune
 ```
 
