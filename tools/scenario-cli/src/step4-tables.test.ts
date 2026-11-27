@@ -110,11 +110,10 @@ describe("the arithmetic", () => {
     ).toEqual(["3.00", "3.00", "1.00"]);
   });
 
-  it("says a Flushed read reached no Durable Object only when the invocations do not pass the writes", () => {
-    expect(flushedReachSentence(1826, 1842)).toContain(
-      "no more than the writes, so no read reached a Durable Object",
-    );
-    expect(flushedReachSentence(2516, 2516)).toContain("no read reached");
+  it("proves a Flushed read reached a Durable Object only from more invocations than writes", () => {
+    expect(flushedReachSentence(1826, 1842)).toContain("no more than the writes");
+    expect(flushedReachSentence(1826, 1842)).toContain("It does not prove it");
+    expect(flushedReachSentence(2516, 2516)).not.toContain("some reads reached");
     expect(flushedReachSentence(2600, 2516)).toContain(
       "84 more than the writes, so some reads reached a Durable Object",
     );

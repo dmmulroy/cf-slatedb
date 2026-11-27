@@ -785,15 +785,15 @@ export const readmeWrites = (context: Step4Context, runs: Step4Runs) => {
 /**
  * What the `Flushed` run's Durable Object invocations say about its reads. Each write batch is one
  * writer invocation, so invocations above the batches are reads that reached a Durable Object.
- * Tail records can be dropped, so the count is a lower bound and only "more than" proves a read
- * reached one.
+ * Tail records can be dropped, so the count is a lower bound: "more than" proves a read reached
+ * one, and "no more than" is only consistent with none doing so.
  */
 export const flushedReachSentence = (invocations: number, batches: number) => {
   if (!Number.isFinite(invocations) || !Number.isFinite(batches))
     return "- **Durable Object invocations at `Flushed`:** no run has them.";
   const counts = `${num(invocations)} in the tail records, against ${num(batches)} write batches`;
   return invocations <= batches
-    ? `- **Durable Object invocations at \`Flushed\`:** ${counts}: no more than the writes, so no read reached a Durable Object. Tail records may be dropped, so the count is a lower bound.`
+    ? `- **Durable Object invocations at \`Flushed\`:** ${counts}: no more than the writes, which is what reads that never reach a Durable Object give. It does not prove it: tail records can be dropped, so the count is a lower bound.`
     : `- **Durable Object invocations at \`Flushed\`:** ${counts}: ${num(invocations - batches)} more than the writes, so some reads reached a Durable Object.`;
 };
 
