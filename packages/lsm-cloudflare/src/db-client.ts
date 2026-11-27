@@ -71,6 +71,28 @@ export const DbSnapshot = Schema.Struct({
 /** A snapshot. */
 export type DbSnapshot = typeof DbSnapshot.Type;
 
+/**
+ * The smallest key after `key`: a scan that has every version of `key` it needs continues there,
+ * past `key`'s older versions (D125).
+ */
+const keySuccessor = (key: Uint8Array): Uint8Array => {
+  const next = new Uint8Array(key.length + 1);
+  next.set(key);
+  return next;
+};
+
+/**
+ * Whether `rows`, every one a version of one key (newest first, as a memtable page orders them),
+ * already settle that key at any snapshot at or above them: a value or a delete ends a read's walk
+ * (`resolveVisibleRow`), so older versions cannot change the answer and need not be read (D125).
+ * Returns the versions a read needs: the newest down to and including the first that is not a
+ * merge operand.
+ */
+const settledVersions = (rows: ReadonlyArray<Row>): Option.Option<ReadonlyArray<Row>> => {
+  const settling = rows.findIndex((row) => row.value._tag !== "Merge");
+  return settling === -1 ? Option.none() : Option.some(rows.slice(0, settling + 1));
+};
+
 /** Options of a read. */
 export interface ReadOptions {
   readonly consistency: ReadConsistency;
@@ -499,6 +521,17 @@ export const makeDbClient = Effect.gen(function* () {
               !Bytes.Equivalence(first.key, last.key)
             )
               break;
+            // Every row so far is one key: once its versions settle it, skip the rest of them
+            // (D125). The segment is that key alone; the next starts after it.
+            const settled = settledVersions(rows);
+            if (first !== undefined && Option.isSome(settled)) {
+              const after = keySuccessor(first.key);
+              return {
+                rows: [...settled.value],
+                segment: { start, end: Option.some(after) },
+                next: Option.some(after),
+              };
+            }
           }
           if (complete) return { rows, segment: { start, end: range.end }, next: Option.none() };
           // The last key read may have more versions on the next page: it opens the next segment.
@@ -759,6 +792,21 @@ export const makeDbClient = Effect.gen(function* () {
             cursor = page.nextCursor;
             const [first] = rows;
             const last = rows[rows.length - 1];
+            // Every row so far is one key: once its versions settle it, skip the rest (D125).
+            const settled = settledVersions(rows);
+            if (
+              first !== undefined &&
+              last !== undefined &&
+              Bytes.Equivalence(first.key, last.key) &&
+              Option.isSome(settled)
+            ) {
+              const after = keySuccessor(first.key);
+              return {
+                rows: [...settled.value],
+                segment: { start, end: Option.some(after) },
+                next: Option.some(after),
+              };
+            }
             if (
               first !== undefined &&
               last !== undefined &&
