@@ -1,0 +1,14 @@
+{
+  "group": "orders",
+  "version": 3,
+  "shards": [
+    { "range": { "start": "", "end": "Bw==" }, "databaseId": "s-01jd0000000000000000000001" },
+    { "range": { "start": "Bw==", "end": null }, "databaseId": "s-01jd0000000000000000000002" }
+  ],
+  "pendingSplit": {
+    "databaseId": "s-01jd0000000000000000000002",
+    "atKey": "Cg==",
+    "left": "s-01jd0000000000000000000003",
+    "right": "s-01jd0000000000000000000004"
+  }
+}
