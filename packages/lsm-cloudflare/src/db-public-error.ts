@@ -183,6 +183,19 @@ export class ChangelogUnavailablePublicError extends Schema.TaggedError<Changelo
   },
 ) {}
 
+/**
+ * `409` — a key's merge operands resolve to more than a read returns, 1 MiB (D99). Replace the key
+ * with a put, or delete it.
+ */
+export class MergedValueTooLargePublicError extends Schema.TaggedError<MergedValueTooLargePublicError>()(
+  "MergedValueTooLargePublicError",
+  {
+    code: Schema.Literal("MergedValueTooLarge"),
+    details: Schema.Struct({ bytes: Schema.Int, limit: Schema.Int }),
+    ...common,
+  },
+) {}
+
 /** `409` — a merge operand cannot be resolved because the database has no merge operator. */
 export class MergeOperatorMissingPublicError extends Schema.TaggedError<MergeOperatorMissingPublicError>()(
   "MergeOperatorMissingPublicError",
@@ -279,6 +292,7 @@ export const DB_PUBLIC_ERRORS = [
   DatabaseSealedPublicError.pipe(HttpApiSchema.status(409)),
   DatabaseHasDependentsPublicError.pipe(HttpApiSchema.status(409)),
   MergeOperatorMissingPublicError.pipe(HttpApiSchema.status(409)),
+  MergedValueTooLargePublicError.pipe(HttpApiSchema.status(409)),
   TransactionConflictPublicError.pipe(HttpApiSchema.status(409)),
   SnapshotExpiredPublicError.pipe(HttpApiSchema.status(409)),
   ChangelogUnavailablePublicError.pipe(HttpApiSchema.status(409)),
@@ -303,6 +317,7 @@ export type DbPublicError =
   | DatabaseSealedPublicError
   | DatabaseHasDependentsPublicError
   | MergeOperatorMissingPublicError
+  | MergedValueTooLargePublicError
   | TransactionConflictPublicError
   | SnapshotExpiredPublicError
   | ChangelogUnavailablePublicError

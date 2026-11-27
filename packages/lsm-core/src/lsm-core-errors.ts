@@ -34,3 +34,17 @@ export class MergeOperatorMissingError extends Schema.TaggedError<MergeOperatorM
   "MergeOperatorMissingError",
   { message: Schema.String },
 ) {}
+
+/**
+ * A key's merge operands resolve to a value larger than a read returns (D99): more than
+ * `MAX_MERGED_VALUE_BYTES`, the largest value a put may write.
+ *
+ * **Details**
+ *
+ * Not retryable: the key stays unreadable until it is replaced. Write the key with a put (or delete
+ * it); later merges then apply to that value.
+ */
+export class MergedValueTooLargeError extends Schema.TaggedError<MergedValueTooLargeError>()(
+  "MergedValueTooLargeError",
+  { bytes: Schema.Int, limit: Schema.Int, message: Schema.String },
+) {}

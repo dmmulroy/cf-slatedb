@@ -4,6 +4,7 @@ import type {
   DatabaseHasDependentsError,
   DatabaseSealedError,
   KeyOutOfRangeError,
+  MergedValueTooLargeError,
   MergeOperatorMissingError,
   SstCorruptedError,
   SstNotInManifestError,
@@ -25,6 +26,7 @@ import {
   DatabaseSealedPublicError,
   InternalFailurePublicError,
   KeyOutOfRangePublicError,
+  MergedValueTooLargePublicError,
   MergeOperatorMissingPublicError,
   SnapshotExpiredPublicError,
   StorageUnavailablePublicError,
@@ -57,6 +59,7 @@ export type DbInternalError =
   | KeyOutOfRangeError
   | WriterUnavailableError
   | MergeOperatorMissingError
+  | MergedValueTooLargeError
   | SstCorruptedError
   | ReaderUnavailableError
   | CompactorUnavailableError
@@ -134,6 +137,15 @@ export const toPublicError =
           },
           requestId,
           retryable: true,
+        });
+      case "MergedValueTooLargeError":
+        return new MergedValueTooLargePublicError({
+          code: "MergedValueTooLarge",
+          operation,
+          message: `A key's merge operands resolve to ${error.bytes} bytes, more than the ${error.limit} a read returns. Replace the key with a put (or delete it), then merge onto that.`,
+          details: { bytes: error.bytes, limit: error.limit },
+          requestId,
+          retryable: false,
         });
       case "MergeOperatorMissingError":
         return new MergeOperatorMissingPublicError({

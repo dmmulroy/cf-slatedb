@@ -1,8 +1,15 @@
 import { Array as Arr, Bytes, Option, Result, Schema, Stream } from "effect";
 
 import type { SeqNum, Timestamp } from "./ids.ts";
-import { MergeOperatorMissingError } from "./lsm-core-errors.ts";
+import { MergedValueTooLargeError, MergeOperatorMissingError } from "./lsm-core-errors.ts";
 import { type Row, RowValue } from "./row.ts";
+
+/**
+ * Largest value a key's merge operands may resolve to (D99): 1 MiB, the largest value a put may
+ * write (`MAX_VALUE_BYTES`). A read past it fails with {@link MergedValueTooLargeError}; a
+ * compaction leaves such operands unfolded, so no stored row grows past it either.
+ */
+export const MAX_MERGED_VALUE_BYTES = 1024 * 1024;
 
 /**
  * Combines a key's merge operands with its older value.
@@ -117,7 +124,7 @@ export interface ReadResolutionOptions {
 export const resolveVisibleRow = (
   versions: ReadonlyArray<Row>,
   options: ReadResolutionOptions,
-): Result.Result<Option.Option<Row>, MergeOperatorMissingError> => {
+): Result.Result<Option.Option<Row>, MergeOperatorMissingError | MergedValueTooLargeError> => {
   const operands: Array<Row> = [];
   let base = Option.none<Row>();
   for (const version of versions) {
@@ -148,6 +155,15 @@ export const resolveVisibleRow = (
     row.value._tag === "Value" ? row.value.bytes : new Uint8Array(0),
   );
   const merged = options.mergeOperator.value.merge(newest.key, existing, operandBytes);
+  if (merged.length > MAX_MERGED_VALUE_BYTES) {
+    return Result.fail(
+      new MergedValueTooLargeError({
+        bytes: merged.length,
+        limit: MAX_MERGED_VALUE_BYTES,
+        message: `A key's merge operands resolve to ${merged.length} bytes, more than the ${MAX_MERGED_VALUE_BYTES} a read returns, so its value cannot be read. Replace the key with a put (or delete it), then merge onto that.`,
+      }),
+    );
+  }
   const expireTs = [...ordered, ...Option.toArray(base)].reduce<Option.Option<Timestamp>>(
     (earliest, row) => minExpire(earliest, row.expireTs),
     Option.none(),
@@ -248,6 +264,7 @@ export const retainKeyVersions = (
     Option.isSome(base) &&
     (base.value.value._tag === "Tombstone" ||
       sameExpiry(oldestRun[0]?.expireTs, base.value.expireTs));
+  let baseUnfolded = false;
   for (const [index, run] of runs.entries()) {
     const [runNewest] = run;
     if (runNewest === undefined) continue;
@@ -262,6 +279,13 @@ export const retainKeyVersions = (
         )
       : Option.none<Uint8Array>();
     const merged = mergeOperator.merge(runNewest.key, existing, operandBytes);
+    // A fold past the bound would store a row no read may return and every read of its block
+    // would load: keep the run's operands as they are, and the base below them (D99).
+    if (merged.length > MAX_MERGED_VALUE_BYTES) {
+      kept.push(...run);
+      if (withBase) baseUnfolded = true;
+      continue;
+    }
     // With its base (value or delete) the history is complete: the result is a value. Without
     // one, older data may sit in lower levels or below the base, so it stays an operand.
     kept.push({
@@ -272,7 +296,11 @@ export const retainKeyVersions = (
       expireTs: runNewest.expireTs,
     });
   }
-  if (Option.isSome(base) && !absorbsBase && !(baseIsDelete && options.isBottom)) {
+  if (
+    Option.isSome(base) &&
+    (!absorbsBase || baseUnfolded) &&
+    !(baseIsDelete && options.isBottom)
+  ) {
     kept.push(base.value);
   }
   return kept;

@@ -1,4 +1,4 @@
-import { CheckpointLimitError, DatabaseId } from "@shaledb/lsm-core";
+import { CheckpointLimitError, DatabaseId, MergedValueTooLargeError } from "@shaledb/lsm-core";
 import { Schema } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -31,6 +31,22 @@ describe("the public errors of D99's limits", () => {
       details: { databaseId: "orders", checkpoints: 1_000, limit: 1_000 },
     });
     expect(error.message).toContain("Delete one");
+  });
+});
+
+describe("a merged value past its bound", () => {
+  it("is a 409 MergedValueTooLarge, not retryable, telling the caller to replace the key", () => {
+    const error = toPublicError(
+      "get",
+      "req-2",
+    )(new MergedValueTooLargeError({ bytes: 2_000_000, limit: 1_048_576, message: "large" }));
+    expect(error).toMatchObject({
+      _tag: "MergedValueTooLargePublicError",
+      code: "MergedValueTooLarge",
+      retryable: false,
+      details: { bytes: 2_000_000, limit: 1_048_576 },
+    });
+    expect(error.message).toContain("Replace the key with a put");
   });
 });
 
