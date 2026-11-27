@@ -1,6 +1,6 @@
 import { DatabaseId, SeqNum } from "@shaledb/lsm-core";
 import { DbHttpApi } from "@shaledb/lsm-cloudflare";
-import { Data, Effect, Option } from "effect";
+import { Data, Duration, Effect, Option } from "effect";
 import { HttpClient } from "effect/http";
 import { HttpApiClient } from "effect/http-api";
 
@@ -18,11 +18,29 @@ const tagOf = (error: unknown) =>
     ? error._tag
     : "unknown";
 
-/** Runs a step, turning any failure into a `SmokeFailure` naming it. */
+/** Longest one smoke request may take before the run fails naming it (D104). */
+export const SMOKE_STEP_TIMEOUT = Duration.seconds(60);
+
+/**
+ * Runs a step, turning any failure into a `SmokeFailure` naming it; a step that does not answer
+ * within {@link SMOKE_STEP_TIMEOUT} fails too, so a hung request cannot hang the run.
+ */
 const step = <A, E, R>(name: string, effect: Effect.Effect<A, E, R>) =>
   effect.pipe(
-    Effect.mapError(
-      (error) => new SmokeFailure({ step: name, message: `${tagOf(error)}: ${String(error)}` }),
+    Effect.timeoutOrElse({
+      duration: SMOKE_STEP_TIMEOUT,
+      orElse: () =>
+        Effect.fail(
+          new SmokeFailure({
+            step: name,
+            message: `no answer within ${Duration.format(SMOKE_STEP_TIMEOUT)}`,
+          }),
+        ),
+    }),
+    Effect.mapError((error) =>
+      error instanceof SmokeFailure
+        ? error
+        : new SmokeFailure({ step: name, message: `${tagOf(error)}: ${String(error)}` }),
     ),
   );
 
@@ -49,7 +67,8 @@ export const smoke = (apiUrl: string) =>
       baseUrl: apiUrl,
       httpClient: yield* HttpClient.HttpClient,
     });
-    const prefix = `smoke-${Date.now().toString(36)}`;
+    // Unique per run: a removed id cannot be created again for gcMinAge (D90).
+    const prefix = `smoke-${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`;
     const main = DatabaseId.make(`${prefix}-rw`);
     const raced = DatabaseId.make(`${prefix}-race`);
     const created: Array<DatabaseId> = [];
@@ -66,8 +85,9 @@ export const smoke = (apiUrl: string) =>
       });
 
     const checks = Effect.gen(function* () {
-      yield* step("create", create(main));
+      // Recorded before the create: one whose answer is lost may still have created it.
       created.push(main);
+      yield* step("create", create(main));
       passed.push("create");
 
       const receipt = yield* step(
@@ -200,12 +220,12 @@ export const smoke = (apiUrl: string) =>
       );
       passed.push("checkpoint created, listed, deleted");
 
+      created.push(raced);
       const racers = yield* Effect.forEach(
         Array.from({ length: 8 }, (_, index) => index),
         () => Effect.result(create(raced)),
         { concurrency: "unbounded" },
       );
-      created.push(raced);
       const winners = racers.filter((result) => result._tag === "Success").length;
       const refused = racers.filter(
         (result) =>
@@ -219,17 +239,34 @@ export const smoke = (apiUrl: string) =>
       passed.push("create race: one created, seven refused");
     });
 
-    const outcome = yield* Effect.result(checks);
-    // Remove what the smoke test created, whatever happened.
+    const removeAll = Effect.forEach(
+      created,
+      (databaseId) =>
+        Effect.ignore(
+          step(`remove ${databaseId}`, api.databases.removeDatabase({ params: { databaseId } })),
+        ),
+      { discard: true },
+    );
+    // Remove what the smoke test created whatever happened, an interruption included (D104).
+    const outcome = yield* Effect.result(checks).pipe(Effect.onInterrupt(() => removeAll));
+    yield* removeAll;
+    const leftovers: Array<DatabaseId> = [];
     for (const databaseId of created) {
-      yield* Effect.ignore(api.databases.removeDatabase({ params: { databaseId } }));
-      const after = yield* Effect.result(api.databases.status({ params: { databaseId } }));
-      if (after._tag === "Success" || tagOf(after.failure) !== "DatabaseNotFoundPublicError") {
-        return yield* new SmokeFailure({
-          step: `remove ${databaseId}`,
-          message: "it still answers",
-        });
+      const after = yield* Effect.result(
+        step(`remove ${databaseId}`, api.databases.status({ params: { databaseId } })),
+      );
+      if (
+        after._tag === "Success" ||
+        !after.failure.message.includes("DatabaseNotFoundPublicError")
+      ) {
+        leftovers.push(databaseId);
       }
+    }
+    if (leftovers.length > 0) {
+      return yield* new SmokeFailure({
+        step: `remove ${leftovers.join(", ")}`,
+        message: "they still answer; remove them with DELETE /v1/databases/<id>",
+      });
     }
     passed.push("removed every database it created");
     if (outcome._tag === "Failure") return yield* outcome.failure;
