@@ -74,39 +74,39 @@ The load is closed-loop: each client waits for its answer, so rates follow laten
 
 Latencies are span durations in the API Worker, so they leave out the client's round trip.
 
-**Baseline against a plain Durable Object SQLite table.** `preview-3`, production settings, 100% trace sampling, commit `d89beba` (provisional: not the release commit). Runs: `p3-baseline-1` 03:35:48–03:56:20 UTC, exit 0; `p3-baseline-2` 03:56:20–? UTC, exit ?; `p3-baseline-3` (not in the log).
+**Baseline against a plain Durable Object SQLite table.** `preview-3`, production settings, 100% trace sampling, commit `d89beba` (provisional: not the release commit). Runs: `p3-baseline-1` 03:35:48–03:56:20 UTC, exit 0; `p3-baseline-2` 03:56:20–04:17:48 UTC, exit 0; `p3-baseline-3` 04:17:48–04:37:05 UTC, exit 0.
 Each run: 8 writers sending 100-row batches of 100-byte values and 8 readers doing point reads, for 30 seconds per target, one target after the other.
 
-| Target                          | Run                                          | Rows/s    | Write p50 / p90 / p99 (ms) | Reads/s   | Read p50 / p90 / p99 (ms) | Failures |
-| ------------------------------- | -------------------------------------------- | --------- | -------------------------- | --------- | ------------------------- | -------- |
-| shaledb, reads at `Latest`      | `p3-baseline-1`                              | 6,064     | 110 / 163 / 538            | 62.6      | 104 / 163 / 712           | none     |
-| shaledb, reads at `Latest`      | not available: `p3-baseline-2` still running | —         | —                          | —         | —                         | —        |
-| shaledb, reads at `Latest`      | not available: `p3-baseline-3` no output     | —         | —                          | —         | —                         | —        |
-| **shaledb, reads at `Latest`**  | **median of 1**                              | **6,064** | **110 / 163 / 538**        | **62.6**  | **104 / 163 / 712**       |          |
-| shaledb, reads at `Flushed`     | `p3-baseline-1`                              | 6,000     | 120 / 166 / 345            | 133.1     | 37 / 106 / 212            | none     |
-| shaledb, reads at `Flushed`     | not available: `p3-baseline-2` still running | —         | —                          | —         | —                         | —        |
-| shaledb, reads at `Flushed`     | not available: `p3-baseline-3` no output     | —         | —                          | —         | —                         | —        |
-| **shaledb, reads at `Flushed`** | **median of 1**                              | **6,000** | **120 / 166 / 345**        | **133.1** | **37 / 106 / 212**        |          |
-| plain Durable Object SQLite     | `p3-baseline-1`                              | 8,236     | 83 / 116 / 351             | 93.2      | 79 / 109 / 322            | none     |
-| plain Durable Object SQLite     | not available: `p3-baseline-2` still running | —         | —                          | —         | —                         | —        |
-| plain Durable Object SQLite     | not available: `p3-baseline-3` no output     | —         | —                          | —         | —                         | —        |
-| **plain Durable Object SQLite** | **median of 1**                              | **8,236** | **83 / 116 / 351**         | **93.2**  | **79 / 109 / 322**        |          |
+| Target                          | Run             | Rows/s    | Write p50 / p90 / p99 (ms) | Reads/s   | Read p50 / p90 / p99 (ms) | Failures |
+| ------------------------------- | --------------- | --------- | -------------------------- | --------- | ------------------------- | -------- |
+| shaledb, reads at `Latest`      | `p3-baseline-1` | 6,064     | 110 / 163 / 538            | 62.6      | 104 / 163 / 712           | none     |
+| shaledb, reads at `Latest`      | `p3-baseline-2` | 5,860     | 115 / 175 / 520            | 61.6      | 110 / 172 / 577           | none     |
+| shaledb, reads at `Latest`      | `p3-baseline-3` | 4,182     | 171 / 255 / 496            | 42.9      | 161 / 250 / 699           | none     |
+| **shaledb, reads at `Latest`**  | **median of 3** | **5,860** | **115 / 175 / 520**        | **61.6**  | **110 / 172 / 699**       |          |
+| shaledb, reads at `Flushed`     | `p3-baseline-1` | 6,000     | 120 / 166 / 345            | 133.1     | 37 / 106 / 212            | none     |
+| shaledb, reads at `Flushed`     | `p3-baseline-2` | 5,145     | 139 / 212 / 462            | 118.2     | 66 / 108 / 200            | none     |
+| shaledb, reads at `Flushed`     | `p3-baseline-3` | 5,839     | 126 / 175 / 367            | 120.9     | 48 / 110 / 226            | none     |
+| **shaledb, reads at `Flushed`** | **median of 3** | **5,839** | **126 / 175 / 367**        | **120.9** | **48 / 108 / 212**        |          |
+| plain Durable Object SQLite     | `p3-baseline-1` | 8,236     | 83 / 116 / 351             | 93.2      | 79 / 109 / 322            | none     |
+| plain Durable Object SQLite     | `p3-baseline-2` | 6,882     | 100 / 145 / 410            | 75        | 95 / 134 / 362            | none     |
+| plain Durable Object SQLite     | `p3-baseline-3` | 6,991     | 100 / 139 / 397            | 76        | 94 / 131 / 367            | none     |
+| **plain Durable Object SQLite** | **median of 3** | **6,991** | **100 / 139 / 397**        | **76**    | **94 / 131 / 362**        |          |
 
 Stage side, for each target's timed run (tail records and spans):
 
 | Target (median of runs)     | Worker invocations | Worker CPU (ms) | Durable Object invocations | Durable Object CPU (ms) | R2 class A | R2 class B |
 | --------------------------- | ------------------ | --------------- | -------------------------- | ----------------------- | ---------- | ---------- |
-| shaledb, reads at `Latest`  | 3,730              | 63,844          | 3,730                      | 12,777                  | 4          | 620        |
-| shaledb, reads at `Flushed` | 5,928              | 63,426          | 1,826                      | 15,801                  | 9          | 6,303      |
-| plain Durable Object SQLite | 5,273              | 37,614          | 5,273                      | 12,094                  | 0          | 0          |
+| shaledb, reads at `Latest`  | 3,634              | 62,615          | 3,633                      | 12,777                  | 4          | 620        |
+| shaledb, reads at `Flushed` | 5,395              | 62,613          | 1,741                      | 15,801                  | 9          | 6,652      |
+| plain Durable Object SQLite | 4,411              | 31,888          | 4,410                      | 11,563                  | 0          | 0          |
 
 Cost per million rows written with this read mix, at `PRICES_PER_MILLION` (Cloudflare's overage prices, fetched 2026-11-26, allowances ignored: an assumption, not a bill). SQLite rows per row written: memtable 3 (2 on insert, 1 on trim), plain table 1, measured by the row-cost probe on `preview-3` at `ed4e787` on 2026-11-27 (`ROW_COST_ED4E787`).
 
 | Target                      | `p3-baseline-1` | `p3-baseline-2` | `p3-baseline-3` | Median | of which SQLite row writes (median) |
 | --------------------------- | --------------- | --------------- | --------------- | ------ | ----------------------------------- |
-| shaledb, reads at `Latest`  | $3.02           | not available   | not available   | $3.02  | $3.00                               |
-| shaledb, reads at `Flushed` | $3.03           | not available   | not available   | $3.03  | $3.00                               |
-| plain Durable Object SQLite | $1.01           | not available   | not available   | $1.01  | $1.00                               |
+| shaledb, reads at `Latest`  | $3.02           | $3.02           | $3.02           | $3.02  | $3.00                               |
+| shaledb, reads at `Flushed` | $3.03           | $3.04           | $3.03           | $3.03  | $3.00                               |
+| plain Durable Object SQLite | $1.01           | $1.01           | $1.01           | $1.01  | $1.00                               |
 
 **Targets of `docs/handoff-v1.md` against these runs.** Commit `d89beba` (provisional). The targets name `preview-1`; these runs are on `preview-3`.
 
