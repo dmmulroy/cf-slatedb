@@ -254,9 +254,6 @@ export const writeStalls = Metric.counter("lsm_write_stalls", {
   description: "Writes refused with WriteStalledError",
 });
 
-/** How long to wait before retrying a failed flush. */
-const FLUSH_RETRY_MILLIS = 1_000;
-
 /**
  * How many times the end of a flush scans the memtable for fresh counters before it gives up and
  * keeps the counters it has. Each further scan needs a commit to land during the one before.
@@ -1184,9 +1181,30 @@ export const makeDbWriter = Effect.gen(function* () {
     );
   });
 
+  /**
+   * Sets the alarm again after a failed run (D102): one second after the first consecutive
+   * failure, doubling after each further one, at most `maxL0Age` (the longest a row waits for its
+   * flush). The handler never throws, so the runtime's own retries (6, from 2 s) never add to these.
+   */
+  const retryAlarm = (cause: Cause.Cause<unknown>, databaseId: Option.Option<DatabaseId>) =>
+    Effect.gen(function* () {
+      const failures = yield* alarm.retryAfterFailure(settings.maxL0Age);
+      yield* Effect.annotateCurrentSpan({ "alarm.failures": failures });
+      yield* Effect.logWarning("Writer alarm could not flush; it retries later.").pipe(
+        Effect.annotateLogs({
+          "database.id": Option.getOrElse(databaseId, () => "unknown"),
+          "alarm.failures": failures,
+          cause: Cause.pretty(cause),
+        }),
+      );
+    });
+
   const runAlarm = Effect.gen(function* () {
-    const meta = yield* memTable.meta.pipe(Effect.option);
-    const databaseId = Option.flatMap(meta, (value) => value.databaseId);
+    const meta = yield* Effect.exit(memTable.meta);
+    // Unreadable storage: rows may be waiting, so the alarm is set again (D102).
+    if (meta._tag === "Failure") return yield* retryAlarm(meta.cause, Option.none());
+    const databaseId = meta.value.databaseId;
+    // No database: nothing is stored, so nothing can wait for a flush.
     if (Option.isNone(databaseId)) return;
     const id = databaseId.value;
     const outcome = yield* Effect.gen(function* () {
@@ -1202,27 +1220,29 @@ export const makeDbWriter = Effect.gen(function* () {
       if (due) yield* flushNow(id);
       yield* scheduleFlush(id);
     }).pipe(Effect.exit);
-    if (outcome._tag === "Failure") {
-      const current = yield* Ref.get(phase);
-      // A database that no longer exists (removed, its writer's state not yet deleted) has nothing
-      // to flush: retrying every second would wake the object forever (D85).
-      const gone = Cause.findErrorOption(outcome.cause).pipe(
-        Option.exists((error) => error._tag === "DatabaseNotFoundError"),
-      );
-      if (gone) {
-        return yield* Effect.logWarning(
-          "Writer alarm found its database gone; it stops until the removal deletes its state.",
-        ).pipe(Effect.annotateLogs({ "database.id": id }));
-      }
-      if (current._tag !== "Fenced") {
-        const now = yield* Clock.currentTimeMillis;
-        yield* alarm.scheduleAt(now + FLUSH_RETRY_MILLIS);
-      }
-      yield* Effect.logWarning("Writer alarm could not flush; it retries shortly.").pipe(
+    if (outcome._tag === "Success") return yield* alarm.clearFailures;
+    // A database that no longer exists (removed, its writer's state not yet deleted) has nothing
+    // to flush: retrying would wake the object forever (D85).
+    const gone = Cause.findErrorOption(outcome.cause).pipe(
+      Option.exists((error) => error._tag === "DatabaseNotFoundError"),
+    );
+    if (gone) {
+      return yield* Effect.logWarning(
+        "Writer alarm found its database gone; it stops until the removal deletes its state.",
+      ).pipe(Effect.annotateLogs({ "database.id": id }));
+    }
+    // A fenced instance can never flush what it holds: a newer epoch serves the database.
+    if ((yield* Ref.get(phase))._tag === "Fenced") {
+      return yield* Effect.logWarning("Writer alarm found this writer fenced; it stops.").pipe(
         Effect.annotateLogs({ "database.id": id }),
       );
     }
-  }).pipe(Effect.withSpan("DbWriter.alarm"));
+    yield* retryAlarm(outcome.cause, Option.some(id));
+  }).pipe(
+    // A defect anywhere above (a bug) is retried like a failure, never thrown to the runtime.
+    Effect.catchCause((cause) => retryAlarm(cause, Option.none())),
+    Effect.withSpan("DbWriter.alarm"),
+  );
 
   return DbWriter.of({
     write,

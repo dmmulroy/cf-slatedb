@@ -9,7 +9,18 @@ import {
   type WriteBatch,
 } from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
-import { Context, Deferred, Effect, Fiber, Layer, Option, Ref, Result, Tracer } from "effect";
+import {
+  Clock,
+  Context,
+  Deferred,
+  Effect,
+  Fiber,
+  Layer,
+  Option,
+  Ref,
+  Result,
+  Tracer,
+} from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -31,7 +42,7 @@ import {
   memTableLayerWithoutDependencies,
 } from "./mem-table.ts";
 import { ManifestReader } from "./manifest-reader.ts";
-import { ManifestStore, manifestStoreTestLayer } from "./manifest-store.ts";
+import { ManifestStore, manifestStoreTestLayer, ManifestWriteError } from "./manifest-store.ts";
 import { ObjectStore } from "./object-store.ts";
 import { sstStoreLayerWithoutDependencies } from "./sst-store.ts";
 import {
@@ -1105,6 +1116,167 @@ describe("DbWriter seal of a sealed database (D95)", () => {
       sameWithHolds: "sealed",
       successors: ["orders-a", "orders-b"],
       holders: ["orders-a", "orders-b"],
+    });
+  });
+});
+
+describe("DbWriter alarm retries (D102)", () => {
+  /**
+   * A writer whose `writer_meta` reads fail while `metaFails`, and whose flush commits fail while
+   * `r2Down`, with the alarm and storage it keeps across firings.
+   */
+  const failingWriter = Effect.gen(function* () {
+    yield* createDatabase();
+    const store = yield* ManifestStore;
+    const shared = yield* Effect.context<ManifestStore | ManifestReader | ObjectStore>();
+    const flags = { metaFails: false, r2Down: false, defect: false };
+    const failingStore = ManifestStore.of({
+      ...store,
+      updateFrom: (view, edit) =>
+        flags.r2Down
+          ? Effect.fail(
+              new ManifestWriteError({
+                databaseId: DB,
+                reason: "StorageUnavailable",
+                message: "R2 is unavailable",
+              }),
+            )
+          : store.updateFrom(view, edit),
+    });
+    const failingMemTable = Layer.effect(
+      MemTable,
+      Effect.map(MemTable, (memTable) =>
+        MemTable.of({
+          ...memTable,
+          meta: Effect.suspend(() =>
+            flags.defect
+              ? Effect.die(new Error("a bug"))
+              : flags.metaFails
+                ? Effect.fail(
+                    new MemTableError({
+                      operation: "meta",
+                      reason: "StorageUnavailable",
+                      message: "SQLite failed",
+                    }),
+                  )
+                : memTable.meta,
+          ),
+        }),
+      ),
+    ).pipe(
+      Layer.provide(
+        memTableLayerWithoutDependencies.pipe(Layer.provide(writerSqlStorageTestLayer)),
+      ),
+    );
+    const context = yield* Layer.build(
+      Layer.provideMerge(
+        dbWriterLayerWithoutDependencies.pipe(Layer.provide(sstStoreLayerWithoutDependencies)),
+        Layer.mergeAll(
+          failingMemTable,
+          durableObjectAlarmTestLayer,
+          compactionTriggerTestLayer,
+          backgroundWorkTestLayer,
+          lsmConfigurationTestLayer(),
+        ),
+      ).pipe(
+        Layer.provide(Layer.succeedContext(shared.pipe(Context.add(ManifestStore, failingStore)))),
+      ),
+    );
+    const writer = Context.get(context, DbWriter);
+    const alarm = Context.get(context, DurableObjectAlarm);
+    /** Fires the alarm at its scheduled time, as the runtime does; the delay it then set. */
+    const fireAtScheduled = Effect.gen(function* () {
+      const at = Option.getOrThrow(yield* alarm.scheduled);
+      const now = yield* Clock.currentTimeMillis;
+      if (at > now) yield* TestClock.adjust(at - now);
+      yield* alarm.cancel;
+      const exit = yield* Effect.exit(writer.runAlarm);
+      const next = yield* alarm.scheduled;
+      return {
+        threw: exit._tag === "Failure",
+        delay: Option.map(next, (time) => time - at),
+      };
+    });
+    return { writer, alarm, flags, fireAtScheduled };
+  });
+
+  const runFailing = <A, E>(
+    body: (
+      writer: Effect.Success<typeof failingWriter>,
+    ) => Effect.Effect<A, E, ManifestStore | ManifestReader | ObjectStore | RuntimeContext>,
+  ) =>
+    Effect.flatMap(failingWriter, body).pipe(
+      Effect.scoped,
+      Effect.provide(manifestStoreTestLayer),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.provide(TestClock.layer()),
+      Effect.runPromise,
+    );
+
+  it("a flush that keeps failing is retried from 1 s, doubling to maxL0Age, and the first success resets it", async () => {
+    const outcome = await runFailing(({ writer, flags, fireAtScheduled }) =>
+      Effect.gen(function* () {
+        yield* writer.write(DB, put("a", "1"));
+        flags.r2Down = true;
+        const failing: Array<number | undefined> = [];
+        for (let firing = 0; firing < 9; firing++) {
+          const fired = yield* fireAtScheduled;
+          if (fired.threw) return "threw";
+          failing.push(Option.getOrUndefined(fired.delay));
+        }
+        flags.r2Down = false;
+        const recovered = yield* fireAtScheduled;
+        const flushed = (yield* writer.status(DB)).flushedSeq;
+        // The next failure starts again from 1 s.
+        yield* writer.write(DB, put("b", "2"));
+        flags.r2Down = true;
+        yield* fireAtScheduled;
+        const afterReset = yield* fireAtScheduled;
+        return {
+          failing,
+          recovered: Option.getOrUndefined(recovered.delay),
+          flushed,
+          afterReset: Option.getOrUndefined(afterReset.delay),
+        };
+      }),
+    );
+    // The first failure waits 1 s (the alarm had been due at maxL0Age); the waits then double.
+    expect(outcome).toEqual({
+      failing: [1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 60_000, 60_000, 60_000],
+      // Recovered: the flush ran; no row waits, so no alarm.
+      recovered: undefined,
+      flushed: 1,
+      afterReset: 2_000,
+    });
+  });
+
+  it("an unreadable writer_meta at the alarm's start sets the alarm again, and a defect never escapes", async () => {
+    const outcome = await runFailing(({ writer, flags, fireAtScheduled }) =>
+      Effect.gen(function* () {
+        yield* writer.write(DB, put("a", "1"));
+        flags.metaFails = true;
+        const unreadable = [yield* fireAtScheduled, yield* fireAtScheduled];
+        flags.metaFails = false;
+        flags.defect = true;
+        const defect = yield* fireAtScheduled;
+        flags.defect = false;
+        const recovered = yield* fireAtScheduled;
+        return {
+          unreadable: unreadable.map((fired) => [fired.threw, Option.getOrUndefined(fired.delay)]),
+          defect: [defect.threw, Option.getOrUndefined(defect.delay)],
+          flushed: (yield* writer.status(DB)).flushedSeq,
+          recovered: Option.getOrUndefined(recovered.delay),
+        };
+      }),
+    );
+    expect(outcome).toEqual({
+      unreadable: [
+        [false, 1_000],
+        [false, 2_000],
+      ],
+      defect: [false, 4_000],
+      flushed: 1,
+      recovered: undefined,
     });
   });
 });
