@@ -30,7 +30,12 @@ import {
  */
 const FIXTURES = fileURLToPath(new URL("./fixtures/step4", import.meta.url));
 const fixture = (name: string) => readFileSync(`${FIXTURES}/${name}`, "utf8");
-const context = { commit: "d89beba", stage: "preview-3", release: false };
+const context = {
+  commit: "d89beba",
+  stage: "preview-3",
+  settings: "production settings, 100% trace sampling",
+  release: false,
+};
 
 describe("reading run outputs", () => {
   it("reads each run's window and exit status from the log", () => {

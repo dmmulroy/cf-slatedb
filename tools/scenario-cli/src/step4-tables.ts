@@ -15,8 +15,10 @@
  * - **`--release`** marks the figures final. Without it, every block says provisional (Dillon's
  *   second review: a figure is final only if its caption names the release commit).
  * - **`--write`** rewrites each block in place between its markers, `<!-- STEP4 <block>: begin -->`
- *   and `<!-- STEP4 <block>: end -->`, in the files `STEP4_BLOCK_FILES` names.
+ *   and `<!-- STEP4 <block>: end -->`, in the files `STEP4_BLOCK_FILES` names, then runs `vp fmt` on
+ *   them.
  */
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -357,11 +359,13 @@ const table = (header: ReadonlyArray<string>, rows: ReadonlyArray<string>) =>
 export interface Step4Context {
   readonly commit: string;
   readonly stage: string;
+  /** How the stage was deployed, for the captions: "production settings, 100% trace sampling". */
+  readonly settings: string;
   readonly release: boolean;
 }
 
 const caption = (title: string, context: Step4Context, runs: ReadonlyArray<Run<unknown>>) =>
-  `**${title}** \`${context.stage}\`, production settings, commit \`${context.commit}\`` +
+  `**${title}** \`${context.stage}\`, ${context.settings}, commit \`${context.commit}\`` +
   `${context.release ? " (the release commit)" : " (provisional: not the release commit)"}. ` +
   `Runs: ${runs.map(windowText).join("; ")}.`;
 
@@ -737,6 +741,7 @@ export const capacityTable = (context: Step4Context, runs: Step4Runs) => {
     "| Unflushed data per writer | 256 MiB (`maxUnflushedBytes`); then `WriteStalled` until a flush | setting |",
     "| L0 SSTs before writes stall | 16 (`l0MaxSsts`) | setting |",
     `| Manifest commit (one CAS) | ${cas.length === 0 ? "no run" : `p50 ${cas.map((r) => num(r.manifestUpdateMs.p50)).join(" and ")} ms`} | ${label} |`,
+    "| Manifest commit by region | ~285 ms create-if-absent beside the bucket; ~550 ms from Europe; ~1 s from APAC | commit `774ed7b` (D56), R2's own latency |",
     `| Small flush | ${cas.length === 0 ? "no run" : `p50 ${cas.map((r) => num(r.writerFlushMs.p50)).join(" and ")} ms`} | ${label} |`,
     `| 60 MiB flush | ${comp.length === 0 ? "no run" : `${comp.map((r) => num(r.flushCpuMsPerFlush / 1000, 1)).join(" and ")} s CPU; wall p50 ${comp.map((r) => num(r.flushWallMs.p50 / 1000, 1)).join(" and ")} s`} | ${label} |`,
     `| Compaction step | ${steps.length === 0 ? "no run" : `${steps.map((s) => num(s / 1000, 1)).join(" and ")} s CPU`} | ${label} |`,
@@ -746,7 +751,7 @@ export const capacityTable = (context: Step4Context, runs: Step4Runs) => {
     "| GC sweep | 50 databases per run, ~160 ms CPU | commit `e06f3eb` (D60) |",
   ];
   return [
-    `On \`${context.stage}\` with production settings (\`measurements.md\`, "Step 4"). The Basis column says what each figure rests on.`,
+    `On \`${context.stage}\` (${context.settings}; \`measurements.md\`, "Step 4"). The Basis column says what each figure rests on.`,
     "",
     table(["What", "Measured", "Basis"], rows),
   ].join("\n");
@@ -760,7 +765,7 @@ export const readmeWrites = (context: Step4Context, runs: Step4Runs) => {
       : `| not available: \`${run.name}\` ${run.why} | — | — | — | — |`,
   );
   return [
-    `Measured on \`${context.stage}\`, production settings, commit \`${context.commit}\`${context.release ? " (the release commit)" : " (provisional: not the release commit)"}; 16-byte keys and 100-byte values, from a laptop on a US residential connection, so latencies include an internet round trip:`,
+    `Measured on \`${context.stage}\`, ${context.settings}, commit \`${context.commit}\`${context.release ? " (the release commit)" : " (provisional: not the release commit)"}; 16-byte keys and 100-byte values, from a laptop on a US residential connection, so latencies include an internet round trip:`,
     "",
     table(
       [
@@ -799,7 +804,7 @@ export const readmeBaseline = (
       )} | ${num(m(name, (t) => t.readLatencyMs.p50))} / ${num(m(name, (t) => t.readLatencyMs.p99))} | ${usd(median((targets.find((t) => t.name === name)?.perRun ?? []).filter((t): t is BaselineTarget => t !== undefined).map((t) => baselineCost(t, rowCost).perMillionRows)))} |`,
   );
   return [
-    `The same workload against shaledb and against one table in a plain Durable Object, on \`${context.stage}\` with production settings, from the same client, one target after the other, each on a new database or object. Median of ${ok} of ${runs.baseline.length} runs, commit \`${context.commit}\`${context.release ? " (the release commit)" : " (provisional: not the release commit)"}${
+    `The same workload against shaledb and against one table in a plain Durable Object, on \`${context.stage}\` (${context.settings}), from the same client, one target after the other, each on a new database or object. Median of ${ok} of ${runs.baseline.length} runs, commit \`${context.commit}\`${context.release ? " (the release commit)" : " (provisional: not the release commit)"}${
       ok < runs.baseline.length
         ? `; not available: ${runs.baseline
             .filter((r) => !r.ok)
@@ -959,16 +964,18 @@ const main = (argv: ReadonlyArray<string>) => {
     return at === -1 ? undefined : argv[at + 1];
   };
   const positional = argv.filter(
-    (a, i) => !a.startsWith("--") && !["--stage", "--write"].includes(argv[i - 1] ?? ""),
+    (a, i) =>
+      !a.startsWith("--") && !["--stage", "--write", "--settings"].includes(argv[i - 1] ?? ""),
   );
   const [directory, commit] = positional;
   if (directory === undefined || commit === undefined) {
     console.error(
-      "Usage: node tools/scenario-cli/src/step4-tables.ts <directory> <commit> [--stage preview-3] [--release] [--write <repository root>]",
+      "Usage: node tools/scenario-cli/src/step4-tables.ts <directory> <commit> [--stage preview-3] [--settings <how it was deployed>] [--release] [--write <repository root>]",
     );
     process.exit(2);
   }
   const context: Step4Context = {
+    settings: flag("--settings") ?? "production settings, 100% trace sampling",
     commit,
     stage: flag("--stage") ?? "preview-3",
     release: argv.includes("--release"),
@@ -985,6 +992,9 @@ const main = (argv: ReadonlyArray<string>) => {
     writeFileSync(path, replaceBlock(readFileSync(path, "utf8"), name, blocks[name]));
     console.log(`rewrote ${name} in ${STEP4_BLOCK_FILES[name]}`);
   }
+  // The generated tables are unaligned; the repository's formatter aligns them, as `vp check` expects.
+  const files = [...new Set(STEP4_BLOCKS.map((name) => join(root, STEP4_BLOCK_FILES[name])))];
+  execFileSync("vp", ["fmt", ...files], { cwd: root, stdio: "inherit" });
 };
 
 if (import.meta.main) main(process.argv.slice(2));
