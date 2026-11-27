@@ -1751,3 +1751,82 @@ describe("DatabaseLifecycle: an old incarnation's compaction after the id is reu
     expect(outcome).toEqual({ sameRunId: true, commit: "CompactorFencedError" });
   });
 });
+
+describe("DatabaseLifecycle: a thousand checkpoints and pinned snapshots (D99)", () => {
+  it("keep commits, cold reads, and a collection inside the manifest budget", async () => {
+    const MANIFEST_BUDGET_BYTES = 4 * 1024 * 1024;
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const client = yield* DbClient;
+        const objects = yield* ObjectStore;
+        const reader = yield* ManifestReader;
+        const gc = yield* GarbageCollector;
+        yield* lifecycle.create(SOURCE, {
+          keyRange: Option.none(),
+          databaseOptions: DEFAULT_DATABASE_OPTIONS,
+        });
+        yield* client.put(SOURCE, bytes("a"), bytes("A"));
+        for (let index = 0; index < 1_000; index++) {
+          if (index % 2 === 0) {
+            yield* lifecycle.createCheckpoint(SOURCE, {
+              name: Option.some(`checkpoint-${index}`.padEnd(256, "x")),
+              lifetimeMs: Option.none(),
+            });
+          } else {
+            yield* lifecycle.pinSnapshot(SOURCE, 7 * 24 * HOUR);
+          }
+        }
+        const refused = yield* Effect.flip(lifecycle.pinSnapshot(SOURCE, HOUR));
+        // A commit still goes through, and a cold load decodes the whole manifest.
+        yield* client.put(SOURCE, bytes("b"), bytes("B"));
+        yield* client.flush(SOURCE);
+        const newest = yield* reader.loadLatest(SOURCE);
+        const newestBytes = Option.getOrElse(
+          Option.map(yield* objects.get(manifestKey(SOURCE, newest.id)), (body) => body.length),
+          () => 0,
+        );
+        // What one collection reads: every manifest a checkpoint pins.
+        const pinned = new Set(newest.manifest.checkpoints.map((cp) => cp.manifestId));
+        let pinnedBytes = 0;
+        for (const id of pinned) {
+          const body = yield* objects.get(manifestKey(SOURCE, id));
+          pinnedBytes += Option.getOrElse(
+            Option.map(body, (value) => value.length),
+            () => 0,
+          );
+        }
+        yield* TestClock.adjust(HOUR + 1);
+        const report = yield* gc.collect(SOURCE, Option.none());
+        return {
+          refused: refused._tag,
+          checkpoints: newest.manifest.checkpoints.length,
+          newestBytes,
+          pinnedManifests: pinned.size,
+          pinnedBytes,
+          collected: report.manifestId._tag,
+          read: Option.getOrNull(
+            Option.map(
+              yield* client.get(SOURCE, bytes("b"), {
+                consistency: { _tag: "Flushed" },
+                snapshot: Option.none(),
+                refuseSealed: false,
+              }),
+              text,
+            ),
+          ),
+        };
+      }),
+    );
+    require("node:fs").writeFileSync(
+      "/tmp/shale-work/agents/mut-read/checkpoints-1000.json",
+      JSON.stringify(outcome, null, 2),
+    );
+    expect(outcome.refused).toBe("CheckpointLimitError");
+    expect(outcome.checkpoints).toBe(1_000);
+    expect(outcome.newestBytes).toBeLessThan(MANIFEST_BUDGET_BYTES);
+    expect(outcome.pinnedManifests).toBeLessThanOrEqual(1_000);
+    expect(outcome.collected).toBe("Some");
+    expect(outcome.read).toBe("B");
+  }, 300_000);
+});
