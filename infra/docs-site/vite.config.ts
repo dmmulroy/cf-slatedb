@@ -7,7 +7,7 @@ import { defineConfig } from "vite-plus";
  *
  * `build` copies `public/` (the OG image and favicon) and the architecture page
  * (`docs/show-me-system-architecture.html`, as `index.html`) into `dist/`, the directory the
- * assets-only Worker serves. `public/og.png` is rendered from `og-card.html`; rerender it with
+ * assets-only Worker serves. `public/og-v2.png` is rendered from `og-card.html`; rerender it with
  * `npx -y -p puppeteer@24 node render-og.mjs` after changing the card. `deploy` builds, then deploys the
  * `docs` stage, which serves the page at `https://shaledb.<account-subdomain>.workers.dev`. Dillon
  * approved this deploy; it touches no shaledb stage.
