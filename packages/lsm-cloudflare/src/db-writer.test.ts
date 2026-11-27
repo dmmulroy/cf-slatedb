@@ -1424,3 +1424,73 @@ describe("DbWriter's flush alarm set from two writes at once (D102)", () => {
     expect(outcome.scheduledIn).toEqual(Option.some(0));
   });
 });
+
+describe("DbWriter commit lock (D122)", () => {
+  /**
+   * Holds the seal's manifest commit until released, and while it is held sends a write: the
+   * commit lock must keep the write from committing between the seal's final flush and its
+   * commit (an acknowledged write the sealed manifest would not hold), so it waits and is refused.
+   */
+  it("a write sent while a seal commits waits for it and is refused, never acknowledged and lost", async () => {
+    const outcome = await Effect.gen(function* () {
+      yield* createDatabase();
+      const store = yield* ManifestStore;
+      const shared = yield* Effect.context<ManifestStore | ManifestReader | ObjectStore>();
+      const reached = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const armed = yield* Ref.make(false);
+      const gatedStore = ManifestStore.of({
+        ...store,
+        updateFrom: (view, edit) =>
+          Effect.gen(function* () {
+            if (yield* Ref.getAndSet(armed, false)) {
+              yield* Deferred.succeed(reached, undefined);
+              yield* Deferred.await(release);
+            }
+            return yield* store.updateFrom(view, edit);
+          }),
+      });
+      const writer = yield* Layer.build(
+        dbWriterLayerWithoutDependencies.pipe(
+          Layer.provide(sstStoreLayerWithoutDependencies),
+          Layer.provide(memTableLayerWithoutDependencies),
+          Layer.provide([
+            durableObjectAlarmTestLayer,
+            compactionTriggerTestLayer,
+            backgroundWorkTestLayer,
+            lsmConfigurationTestLayer(),
+          ]),
+          Layer.provide(Layer.succeedContext(shared.pipe(Context.add(ManifestStore, gatedStore)))),
+        ),
+      ).pipe(Effect.map((context) => Context.get(context, DbWriter)));
+      yield* writer.write(DB, put("a", "before the seal"));
+      yield* Ref.set(armed, true);
+      const seal = yield* Effect.forkChild(writer.seal(DB, [], false));
+      yield* Deferred.await(reached);
+      const late = yield* Effect.forkChild(
+        Effect.result(writer.write(DB, put("b", "during the seal"))),
+      );
+      // Give the write every chance to run while the seal's commit is held.
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust("1 second");
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(seal);
+      const written = yield* Fiber.join(late);
+      const durable = yield* durableValues;
+      return {
+        late: Result.isSuccess(written) ? "acknowledged" : written.failure._tag,
+        durable: Object.fromEntries(durable.values),
+      };
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(Layer.merge(manifestStoreTestLayer, writerSqlStorageTestLayer)),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.provide(TestClock.layer()),
+      Effect.runPromise,
+    );
+    expect(outcome).toEqual({
+      late: "DatabaseSealedError",
+      durable: { a: "before the seal" },
+    });
+  });
+});
