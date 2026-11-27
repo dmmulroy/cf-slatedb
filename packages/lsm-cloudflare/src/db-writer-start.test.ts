@@ -22,7 +22,7 @@ import { lsmConfigurationTestLayer } from "./lsm-configuration.ts";
 import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
 import { ManifestReader, ManifestReadError } from "./manifest-reader.ts";
 import { ManifestStore, manifestStoreTestLayer, ManifestWriteError } from "./manifest-store.ts";
-import { memTableLayerWithoutDependencies } from "./mem-table.ts";
+import { MemTable, memTableLayerWithoutDependencies } from "./mem-table.ts";
 import { ObjectStore } from "./object-store.ts";
 import { sstStoreLayerWithoutDependencies } from "./sst-store.ts";
 import { writerSqlStorageTestLayer } from "./writer-sql-storage.ts";
@@ -285,5 +285,76 @@ describe("DbWriter locks (D127)", () => {
       }),
     );
     expect(outcome).toEqual({ l0: 1, lastL0Seq: 3 });
+  });
+});
+
+describe("DbWriter flushedManifestId (D58, D127)", () => {
+  it("names the manifest that covers flushedSeq after a flush, and after a restart that followed a crash before recording it", async () => {
+    const outcome = await Effect.gen(function* () {
+      yield* (yield* ManifestStore).initialize(
+        initialManifest(DB, { keyRange: Option.none(), databaseOptions: DEFAULT_DATABASE_OPTIONS }),
+      );
+      const shared = yield* Effect.context<ManifestStore | ManifestReader | ObjectStore>();
+      const crashNext = { value: false };
+      // A memtable whose next record of a flush above 0 "crashes" after the manifest commit.
+      const crashingMemTable = Layer.effect(
+        MemTable,
+        Effect.map(MemTable, (real) =>
+          MemTable.of({
+            ...real,
+            markFlushed: (cut, manifestId, at) =>
+              cut > 0 && crashNext.value
+                ? Effect.die(new Error("simulated crash before recording the flush"))
+                : real.markFlushed(cut, manifestId, at),
+          }),
+        ),
+      ).pipe(Layer.provide(memTableLayerWithoutDependencies));
+      const newWriter = () =>
+        Layer.build(
+          dbWriterLayerWithoutDependencies.pipe(
+            Layer.provide(sstStoreLayerWithoutDependencies),
+            Layer.provide(crashingMemTable),
+            Layer.provide([
+              durableObjectAlarmTestLayer,
+              compactionTriggerTestLayer,
+              backgroundWorkTestLayer,
+              lsmConfigurationTestLayer(),
+            ]),
+            Layer.provide(Layer.succeedContext(shared)),
+          ),
+        ).pipe(Effect.map((context) => Context.get(context, DbWriter)));
+      const latestId = Effect.map(
+        Effect.flatMap(ManifestReader, (reader) => reader.loadLatest(DB)),
+        (latest) => latest.id,
+      );
+      const writer = yield* newWriter();
+      yield* writer.write(DB, put("a", "1"));
+      yield* writer.flush(DB);
+      const afterFlush = { status: yield* writer.status(DB), latest: yield* latestId };
+      yield* writer.write(DB, put("b", "2"));
+      crashNext.value = true;
+      yield* Effect.exit(writer.flush(DB));
+      crashNext.value = false;
+      // The Durable Object restarts on the same SQLite storage; the flush's commit landed.
+      const restarted = yield* newWriter();
+      const afterRestart = { status: yield* restarted.status(DB), latest: yield* latestId };
+      return {
+        afterFlush: [
+          afterFlush.status.flushedSeq,
+          Option.getOrNull(afterFlush.status.flushedManifestId) === afterFlush.latest,
+        ],
+        afterRestart: [
+          afterRestart.status.flushedSeq,
+          Option.getOrNull(afterRestart.status.flushedManifestId) === afterRestart.latest,
+        ],
+      };
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(Layer.merge(manifestStoreTestLayer, writerSqlStorageTestLayer)),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.provide(TestClock.layer()),
+      Effect.runPromise,
+    );
+    expect(outcome).toEqual({ afterFlush: [1, true], afterRestart: [2, true] });
   });
 });
