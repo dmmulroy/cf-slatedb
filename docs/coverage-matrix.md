@@ -726,3 +726,14 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `settledVersions`, and the routed page's shared budget (`shard-router.ts`). Tests:
   `scan-bounds.test.ts`, `shard-scan-bounds.test.ts`. Open: the three-surface oracle property test,
   and the cross-page and phantom transaction tests.
+- **The writer Durable Object at await granularity (D109)** — done. `WriterObject.tla` (PlusCal),
+  skill `.agents/skills/verify-writer-object`: `db-writer.ts` entry points interleaved with
+  eviction, interruption, and R2 failures. Invariants `NoAckedWriteLost`, `LatestSeesAcked`,
+  `Serializable`, `NoAckAfterSeal`, `SealNotHalf`, `NeverSelfFenced`, `CountersCover`,
+  `AlarmCovers`; liveness `AckedFlushed`, `AlarmQuiets`. Broken variants for D74b (both halves),
+  D84, D85, D102, D74's loop, and D115 each fail their property.
+- **A refused flush fences only its own phase (D115)** — done. `markFenced` and the flush's view
+  install in `db-writer.ts`; the seal's `commitAttempted`. Tests: `db-writer.test.ts` ("DbWriter
+  seal interrupted while a flush is in flight (D115)", "DbWriter flush fenced by its own writer's
+  restart (D115)"). Formal: `WriterObject` (`NeverSelfFenced`; `beforeD115`,
+  `markFencedAnyPhase`).

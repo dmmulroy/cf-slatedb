@@ -401,6 +401,14 @@ hand-off is below.
 
 ## Remaining-work log
 
+- **D109 (formal audit, 2026-11-26).** New model `WriterObject.tla`: the writer Durable Object at
+  await granularity, four configs, 14 runs (`writer-object`), skill `verify-writer-object`. Each of
+  D74b (both halves), D84, D85, D102, D74's loop, and D115 is a `Broken` value failing its
+  property. `TLC_WORKERS=2 nice -n 15 node tools/formal-verification/src/verify.ts writer-object`
+  exit 0 (Seal config 3,406,245 states in 95 s under load). `verify.ts` reads `TLC_WORKERS` and
+  names a config's one property when TLC reports a liveness failure without it. Not run:
+  `vp run verify`.
+
 - **D115 (formal audit, 2026-11-26).** The `WriterObject` model found a flush refused at an older
   epoch marking the restarted writer `Fenced` (every request then failed until eviction). Fixed in
   `db-writer.ts`: `markFenced` and the flush's view install change only the phase of their own
