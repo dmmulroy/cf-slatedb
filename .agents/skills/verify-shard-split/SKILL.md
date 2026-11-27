@@ -11,6 +11,9 @@ description: "Model-check a shaledb shard split end to end (TLA+, TLC): the dire
   acknowledged is in the successor that owns its key. (`SealSplit` checks the seal and fork
   steps in detail.)
 - **HoldsMatchSeal.** Every hold on the shard belongs to a successor its seal names (D95).
+- **PublishedIsSealed.** The published map names the successors the shard's seal named, which the
+  forks created. A second request to split the same shard, beginning at the same time, cannot
+  replace the pending split's successor ids (the directory's lock, D116).
 - **ConsumerMissesNothing.** A change-feed consumer that moved to the successors was given every
   write the shard acknowledged (D80's procedure).
 - **NoStaleBeyondBound.** A `Flushed` read through a map older than the bound never returns an
@@ -24,13 +27,27 @@ description: "Model-check a shaledb shard split end to end (TLA+, TLC): the dire
 nice -n 15 node tools/formal-verification/src/verify.ts shard-split
 ```
 
-Expect six `✓` lines, each in a few seconds.
+Expect seven `✓` lines, each in a few seconds.
+
+## Deeper search
+
+Not part of `verify.ts`. Run it after a change to the directory or the split's steps, alone, for up
+to 20 minutes:
+
+```sh
+nice -n 15 java -XX:+UseParallelGC -cp .tlc/downloads/tla2tools.jar tlc2.TLC -workers 2 \
+  -config ShardSplitDeep.cfg ShardSplit.tla   # from tools/formal-verification/specs
+```
+
+`ShardSplitDeep.cfg` has six writes and two crashes of the split's process.
 
 ## Action table
 
 | Action | Code |
 | --- | --- |
-| `Begin` | `ShardDirectory.beginSplit` (the pending split, with its two database ids) |
+| `Begin` | `ShardDirectory.beginSplit` (the pending split, with its two database ids) under the directory's lock: `editMap`'s `cell.get`, `beginShardSplit`, `cell.set` in one step. A pending split of the same shard and key is returned as it is |
+| `BeginRead`, `BeginWrite` | the same without the lock (`noDirectoryLock`): the read and the write are two awaits |
+| `Begin2`, `Begin2Read`, `Begin2Write` | a second request to split the same shard at the same key, with its own fresh ids; its request then ends |
 | `Seal` | `DatabaseLifecycle.seal(shard, [left, right], true)` → `DbWriter.seal`: flush and seal in one commit, taking both holds; a repeat finds it done |
 | `Fork(f)` | `forkRange` from the half's hold (the two run concurrently) |
 | `Publish` | `ShardDirectory.completeSplit` |
@@ -43,8 +60,11 @@ Expect six `✓` lines, each in a few seconds.
 
 ## Bounds and assumptions
 
-- **Bounds:** two keys (one per half), 4 writes, one crash; 24,118 states. An exploration run at 6
-  writes and 2 crashes (228,918 states) also passes.
+- **Bounds:** two keys (one per half), 4 writes, one crash, one second split request; 71,900
+  states, 2 s.
+- **The directory's lock and input gates.** `editMap`'s read and write are two Durable Object
+  storage calls with only pure code between. Input gates already make them atomic unless the
+  fiber's 2048-operation budget runs out between them; the lock is the guarantee.
 - **Simplifications:**
   - a `Flushed` read sees every acknowledged write: the staleness modeled is the router's map,
     not the manifest refresh;
@@ -52,8 +72,10 @@ Expect six `✓` lines, each in a few seconds.
 - **Not modeled:**
   - a second split of a successor before its rewrite (the fork-of-a-fork hold chain is in
     `Lifecycle`);
-  - routers two generations behind (a second split);
-  - a split's step running twice concurrently (tested in `shard-split-faults.test.ts`).
+  - routers two generations behind (a second split). `shard-split-faults.test.ts` tests a
+    two-generation stale router; the model's directory has two versions;
+  - the second request's own seal and forks: under the lock it adopts the pending split, so it
+    repeats the first's steps, which are idempotent.
 
 ## Broken variants
 
@@ -63,8 +85,11 @@ Expect six `✓` lines, each in a few seconds.
 | `resealOthers` | before D95 | `HoldsMatchSeal` |
 | `feedGap` | the consumer leaving the source at the seal, with a fork's feed silent below its fork point (before D80) | `ConsumerMissesNothing` |
 | `noResume` | before D101 | `WaitingWritesLand` |
+| `noDirectoryLock` | the directory's `editMap` without its lock | `PublishedIsSealed` |
+
+`noDirectoryLock`'s unit test: `shard-directory-lock.test.ts` (the lock with two permits fails it).
 
 ## Keeping it in step with the code
 
-Sync commit: the D112 commit. Rerun after any change to a covered function, and show each
+Sync commit: the D116 commit. Rerun after any change to a covered function, and show each
 property still fails on its variant.

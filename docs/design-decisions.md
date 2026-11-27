@@ -4556,3 +4556,80 @@ it. The policy governs only what shaledb exports to its collector.
 - The schema issues of malformed bytes fields.
 - **Four mutations caught:** the event filter removed (the code before), the event name kept whole,
   object values kept under allowed names, and every event attribute kept.
+
+## D116. The models interleave inside the locks; two defects found and fixed
+
+The models from D110, D112 and D114 passed at once. Each lock in the code they cover is now a
+broken variant, steps that stood for several awaits are split where another process can run
+between them, and each spec has a deeper search configuration outside the gate. Two defects came
+out, neither planted.
+
+**A fork's hold deleted while the fork is being created** (`Lifecycle.tla`). `forkRange` commits
+the hold on its source, then, after awaits, writes the fork's first manifest. `deleteCheckpoint`
+(D91) read the holder, found no manifest, took the hold as an orphan, and removed it. The fork
+was then created with no hold, and its source's collection could delete the SSTs it reads.
+
+- **The rule.** A holder with no manifest counts as gone only once the hold is `gcMinAge` old. A
+  removed holder is gone at once, as before. A `forkRange` that committed a hold writes the fork's
+  first manifest well within `gcMinAge`, the bound D90 and D91 already rely on. An orphan hold
+  (its `forkRange` died) is deletable after that.
+- **Tests** (`database-lifecycle.test.ts`):
+  - "deleteCheckpoint between forkRange's hold and its first manifest cannot leave the fork without
+    a hold" failed before the fix;
+  - "a hold whose fork was never created is deletable only once it is gcMinAge old".
+- **Model.** `ForkHold`, `ForkInit`, `ForkDies`, `DeleteHoldRead`, `DeleteHoldCommit`; variant
+  `beforeD116` fails `NoReaderNeedsDeleted`.
+
+**A dropped SST's rows brought back by an unrecorded job** (`CompactorObject.tla`, with every lock
+held). The poll launched a job and then recorded it in the state. An eviction between the two left
+the job running in Workflows and absent from the state. `dropSst` (D62) checked the state, saw no
+job reading the SST's sorted run, and committed the drop. The run keeps its id, and
+`commitCompaction` checks a sorted-run input by its id, so the job then committed its merge of the
+run, the dropped SST's rows included. The same gap left the job's lease unrenewed and its outputs
+outside D96's protection.
+
+- **The rule.**
+  - The poll records a job (an epoch-guarded `updateExisting`) before `launcher.start`.
+  - A start that fails keeps the job recorded, with its lease: Workflows may have created the
+    instance and lost the reply. The next poll's progress read finishes a job Workflows does not
+    hold (D103), or keeps one that runs.
+- **Tests** (`compactor.test.ts`):
+  - "a job launched by a poll that was evicted before recording it still blocks a drop of its
+    sources" failed before the fix;
+  - "a start that failed after Workflows created the instance leaves the job recorded until a read
+    finishes it" fails with the old release-and-forget.
+- **Model.** `PollLoad` records, `PollLaunch` launches; variant `launchBeforeRecord` fails
+  `DroppedStaysDropped`.
+
+**Each lock, and what it protects.**
+
+| Lock                            | Variant                          | Fails                  | Unit test                                                                               |
+| ------------------------------- | -------------------------------- | ---------------------- | --------------------------------------------------------------------------------------- |
+| `compactor.ts` `startLock`      | `twoFenceIns`                    | `EpochNeverRegresses`  | D78's                                                                                   |
+| `compactor.ts` `stateLock`      | `noStateLock`                    | `RunningStaysRecorded` | "a collection's state write never puts back the running jobs a poll replaced meanwhile" |
+| `compactor.ts` `planLock`       | `noPlanLock`                     | `DroppedStaysDropped`  | "an SST drop waits for a poll that is starting a compaction of it"                      |
+| `compactor.ts` `collectionLock` | —                                | none                   | —                                                                                       |
+| `shard-directory.ts` lock       | `noDirectoryLock` (`ShardSplit`) | `PublishedIsSealed`    | `shard-directory-lock.test.ts`                                                          |
+
+- **`collectionLock`** protects no safety property. `GcSafety` with two collections at once
+  (`Collectors`, D83's guard, `GcSafetyTwoCollectors.cfg`) passes, and the collection's due-time
+  write keeps a time it did not see (D78). The lock saves duplicate R2 work.
+- **`stateLock` and the directory's lock.** Each guards a read and a write that are both Durable
+  Object storage calls, with only pure code between. Input gates deliver no event during a
+  storage call, and Effect resumes a fiber in the promise callback, so in production the pair is
+  already atomic unless the fiber's 2048-operation budget runs out between them and Effect yields
+  through `setImmediate`. The locks are the guarantee; the gates make the window rare. Their unit
+  tests hold a test cell's read open, which production's gates mostly would not.
+- **Removal has no lock.** Its steps are ordered and idempotent, and `markRemoved` against a new
+  hold is ordered by the manifest CAS. `LifecycleRemovers.cfg` runs a second removal that may
+  stall past a recreation: variant `deleteByPrefix` (deleting everything under the prefix) fails
+  `NewIncarnationIntact`. `create` is split into its clear and its first manifest, and D91's
+  assumption (no committer's view outlives `gcMinAge`) is explicit: variant `staleViewOutlives`
+  fails `RemovedNeverReopens`.
+
+**Not reached:**
+
+- corrupted SSTs (D53) and the budget's fairness across groups in `CompactorObject`;
+- routers two generations behind and a second split of a successor in `ShardSplit`.
+
+The reasons are in each skill's "Bounds and assumptions".
