@@ -681,3 +681,16 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 - **Abandoned splits finished by a waiting request (D101)** — done. `ShardSplit.resumePending`,
   `withAbandonedSplitFinished`. Tests: `shard-split-faults.test.ts` (each step killed, concurrent
   splits, a two-generation stale router), `health-report.test.ts`.
+- **The compactor Durable Object, modeled (D110)**: done. `CompactorObject.tla`: two wakes, the
+  alarm's poll, Workflow jobs with retried commits, a one-slot lease, GC, and eviction. Properties:
+  `EpochNeverRegresses`, `OutcomeTrue`, `LeaseCapacity`, `L0Drains`, `RunningJobsLeave`. The
+  variants for D78, D94, D96 and D103 each fail.
+- **A shard split end to end, modeled (D112)**: done. `ShardSplit.tla`: crashes after any step and
+  resumption, stale routers, Flushed reads, a rogue seal, and the change feed across the split.
+  Properties: `EveryShardWriteInItsSuccessor`, `HoldsMatchSeal`, `ConsumerMissesNothing`,
+  `NoStaleBeyondBound`, `WaitingWritesLand`. The variants for D80, D89, D95 and D101 each fail.
+- **The lifecycle across databases, modeled (D114)**: done. `Lifecycle.tla`: a source, a fork, and
+  a fork of the fork; holds, GC, deleteCheckpoint, removal interrupted and resumed, stale
+  committers, and recreation. Properties: `NoReaderNeedsDeleted`, `RemovedNeverReopens`,
+  `NoOldIncarnationServed`, `HoldsReleased`, `PrefixEmptied`. The variants for D77 (both forms),
+  D90 and D91 (both forms) each fail.
