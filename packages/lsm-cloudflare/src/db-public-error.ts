@@ -125,6 +125,19 @@ export class CheckpointNotFoundPublicError extends Schema.TaggedError<Checkpoint
   },
 ) {}
 
+/**
+ * `409` — the database already holds the most checkpoints and pinned snapshots a caller may keep
+ * (D99). Delete one, or wait for a pinned snapshot to expire.
+ */
+export class CheckpointLimitReachedPublicError extends Schema.TaggedError<CheckpointLimitReachedPublicError>()(
+  "CheckpointLimitReachedPublicError",
+  {
+    code: Schema.Literal("CheckpointLimitReached"),
+    details: Schema.Struct({ databaseId: DatabaseId, checkpoints: Schema.Int, limit: Schema.Int }),
+    ...common,
+  },
+) {}
+
 /** `404` — the SST is not in the database's manifest (wrong id, or already replaced). */
 export class SstNotFoundPublicError extends Schema.TaggedError<SstNotFoundPublicError>()(
   "SstNotFoundPublicError",
@@ -270,6 +283,7 @@ export const DB_PUBLIC_ERRORS = [
   SnapshotExpiredPublicError.pipe(HttpApiSchema.status(409)),
   ChangelogUnavailablePublicError.pipe(HttpApiSchema.status(409)),
   SstDropRefusedPublicError.pipe(HttpApiSchema.status(409)),
+  CheckpointLimitReachedPublicError.pipe(HttpApiSchema.status(409)),
   WriteStalledPublicError.pipe(HttpApiSchema.status(503)),
   StorageUnavailablePublicError.pipe(HttpApiSchema.status(503)),
   StoredDataInvalidPublicError.pipe(HttpApiSchema.status(500)),
@@ -294,6 +308,7 @@ export type DbPublicError =
   | ChangelogUnavailablePublicError
   | SstNotFoundPublicError
   | SstDropRefusedPublicError
+  | CheckpointLimitReachedPublicError
   | WriteStalledPublicError
   | StorageUnavailablePublicError
   | StoredDataInvalidPublicError

@@ -426,6 +426,23 @@ export class SstNotInManifestError extends Schema.TaggedError<SstNotInManifestEr
   { databaseId: DatabaseId, sstId: SstId, message: Schema.String },
 ) {}
 
+/**
+ * Most checkpoints a caller may hold on one database at once (D99): checkpoints and pinned
+ * snapshots, not the holds forks and split successors take. Each is about 130 bytes of the
+ * manifest, which every commit rewrites and every cold read decodes, so 1,000 is about 127 KiB, 3%
+ * of the manifest's 4 MiB budget.
+ */
+export const MAX_CHECKPOINTS_PER_DATABASE = 1_000;
+
+/**
+ * The database already holds {@link MAX_CHECKPOINTS_PER_DATABASE} checkpoints created by callers.
+ * Not retryable as it is: delete a checkpoint, or let a pinned snapshot expire, then retry.
+ */
+export class CheckpointLimitError extends Schema.TaggedError<CheckpointLimitError>()(
+  "CheckpointLimitError",
+  { databaseId: DatabaseId, checkpoints: Schema.Int, limit: Schema.Int, message: Schema.String },
+) {}
+
 const databaseRemoved = (manifest: Manifest) =>
   new DatabaseRemovedError({
     databaseId: manifest.databaseId,
@@ -544,13 +561,15 @@ export const commitL0Flush = (
   ]);
   if (Option.isSome(stale)) return Result.fail(stale.value);
   return Result.succeed(
-    replaceManifestFields(manifest, {
-      l0: [flush.sst, ...manifest.l0],
-      lastL0Seq: flush.lastSeq > manifest.lastL0Seq ? flush.lastSeq : manifest.lastL0Seq,
-      lastL0ClockTick:
-        flush.clockTick > manifest.lastL0ClockTick ? flush.clockTick : manifest.lastL0ClockTick,
-      changelog: [...manifest.changelog, ...Option.toArray(flush.changelog)],
-    }),
+    capChangelog(
+      replaceManifestFields(manifest, {
+        l0: [flush.sst, ...manifest.l0],
+        lastL0Seq: flush.lastSeq > manifest.lastL0Seq ? flush.lastSeq : manifest.lastL0Seq,
+        lastL0ClockTick:
+          flush.clockTick > manifest.lastL0ClockTick ? flush.clockTick : manifest.lastL0ClockTick,
+        changelog: [...manifest.changelog, ...Option.toArray(flush.changelog)],
+      }),
+    ),
   );
 };
 
@@ -795,6 +814,33 @@ export const removeCheckpoint = (manifest: Manifest, checkpointId: CheckpointId)
       })
     : manifest;
 
+/**
+ * {@link addCheckpoint} for a checkpoint a caller asks for (no `holder`), refused with
+ * {@link CheckpointLimitError} once the database holds {@link MAX_CHECKPOINTS_PER_DATABASE} of them
+ * (D99). Repeating an existing checkpoint is never refused. Forks' and successors' holds are not
+ * counted: a split or fork must not fail because of a caller's checkpoints.
+ */
+export const addCallerCheckpoint = (
+  manifest: Manifest,
+  checkpoint: Checkpoint,
+): Result.Result<Manifest, DatabaseRemovedError | CheckpointLimitError> => {
+  if (manifest.checkpoints.some((existing) => existing.id === checkpoint.id)) {
+    return Result.succeed(manifest);
+  }
+  const held = manifest.checkpoints.filter((existing) => Option.isNone(existing.holder)).length;
+  if (Option.isNone(checkpoint.holder) && held >= MAX_CHECKPOINTS_PER_DATABASE) {
+    return Result.fail(
+      new CheckpointLimitError({
+        databaseId: manifest.databaseId,
+        checkpoints: held,
+        limit: MAX_CHECKPOINTS_PER_DATABASE,
+        message: `Database ${manifest.databaseId} already has ${held} checkpoints and pinned snapshots, the most it may hold (${MAX_CHECKPOINTS_PER_DATABASE}). Delete one, or wait for a pinned snapshot to expire, then retry.`,
+      }),
+    );
+  }
+  return addCheckpoint(manifest, checkpoint);
+};
+
 /** Removes expired checkpoints (fork checkpoints never expire); the same manifest when none expired. */
 export const removeExpiredCheckpoints = (manifest: Manifest, now: Timestamp): Manifest => {
   const live = manifest.checkpoints.filter(
@@ -817,6 +863,33 @@ export const removeExternalRef = (manifest: Manifest, ref: ExternalRef): Manifes
         ),
       })
     : manifest;
+
+/**
+ * Most changelog entries one manifest keeps, however often the database flushes (D99). Each is
+ * about 290 bytes of the manifest, so 2,048 is about 570 KiB, 14% of its 4 MiB budget. At one flush
+ * a minute (`maxL0Age`) that is about 34 hours of changes; a database that flushes more often keeps
+ * fewer hours.
+ */
+export const MAX_CHANGELOG_ENTRIES = 2_048;
+
+/**
+ * Keeps the newest {@link MAX_CHANGELOG_ENTRIES} changelog entries, dropping the oldest, and raises
+ * `changelogAfterSeq` past what it dropped (D80, D99), so a consumer behind them gets a clean
+ * `Expired` and GC collects the dropped SSTs. The same manifest when nothing is over the bound.
+ */
+export const capChangelog = (manifest: Manifest): Manifest => {
+  const over = manifest.changelog.length - MAX_CHANGELOG_ENTRIES;
+  if (over <= 0) return manifest;
+  // Entries are appended by flushes, so the oldest come first.
+  const dropped = manifest.changelog.slice(0, over);
+  const afterSeq = SeqNum.make(
+    Math.max(changelogAfterSeqOf(manifest), ...dropped.map((entry) => entry.lastSeq)),
+  );
+  return replaceManifestFields(manifest, {
+    changelog: manifest.changelog.slice(over),
+    changelogAfterSeq: Option.some(afterSeq),
+  });
+};
 
 /**
  * Drops changelog entries created before `cutoff`, and raises `changelogAfterSeq` past the newest

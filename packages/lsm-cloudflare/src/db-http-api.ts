@@ -30,16 +30,27 @@ const DatabaseParams = Schema.Struct({
 });
 
 /** Schema for creating a database. */
+/** Longest changelog retention a database may ask for: 30 days, like a pinned snapshot (D99). */
+export const MAX_CHANGELOG_RETENTION_MS = 30 * 24 * 3_600_000;
+
+/** Longest checkpoint name: names are kept in the manifest, which every commit rewrites (D99). */
+export const MAX_CHECKPOINT_NAME_LENGTH = 256;
+
 export const CreateDatabaseRequest = Schema.Struct({
   databaseId: DatabaseId.annotate({ examples: [DatabaseId.make("orders-eu")] }),
   /** Keys the database accepts; writes outside fail with `KeyOutOfRange`. Null: every key. */
   keyRange: Schema.OptionFromNullOr(KeyRange),
   /** Built-in merge operator for merge operands; null: merges are stored but cannot be read. */
   mergeOperator: Schema.OptionFromNullOr(MergeOperatorName),
-  /** Changelog retention in milliseconds; null disables change data capture export. */
-  changelogRetentionMs: Schema.OptionFromNullOr(Schema.Int.check(Schema.isGreaterThan(0))),
-  /** Group for fair compaction and cache budgets; null: the database id. */
-  budgetGroup: Schema.OptionFromNullOr(Schema.String),
+  /**
+   * Changelog retention in milliseconds, at most 30 days; null disables change data capture
+   * export. The changelog also keeps at most its newest 2,048 flushes (D99).
+   */
+  changelogRetentionMs: Schema.OptionFromNullOr(
+    Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: MAX_CHANGELOG_RETENTION_MS })),
+  ),
+  /** Group for fair compaction and cache budgets, at most 63 characters; null: the database id. */
+  budgetGroup: Schema.OptionFromNullOr(Schema.String.check(Schema.isMaxLength(63))),
 });
 
 /** Schema for a created database. */
@@ -101,7 +112,9 @@ export const CheckpointsResponse = Schema.Struct({ checkpoints: Schema.Array(Che
 
 /** Schema for a checkpoint request: an optional name and lifetime (none: until deleted). */
 export const CreateCheckpointRequest = Schema.Struct({
-  name: Schema.OptionFromNullOr(Schema.String),
+  name: Schema.OptionFromNullOr(
+    Schema.String.check(Schema.isMaxLength(MAX_CHECKPOINT_NAME_LENGTH)),
+  ),
   lifetimeMs: Schema.OptionFromNullOr(Schema.Int.check(Schema.isGreaterThan(0))),
 });
 

@@ -1,4 +1,5 @@
 import type {
+  CheckpointLimitError,
   TransactionConflictError,
   DatabaseHasDependentsError,
   DatabaseSealedError,
@@ -14,6 +15,7 @@ import { Option } from "effect";
 import {
   BatchInvalidPublicError,
   ChangelogUnavailablePublicError,
+  CheckpointLimitReachedPublicError,
   CheckpointNotFoundPublicError,
   DatabaseAlreadyExistsPublicError,
   DatabaseHasDependentsPublicError,
@@ -60,6 +62,7 @@ export type DbInternalError =
   | CompactorUnavailableError
   | DatabaseHasDependentsError
   | CheckpointNotFoundError
+  | CheckpointLimitError
   | TransactionConflictError
   | ChangelogUnavailableError
   | SstNotInManifestError
@@ -202,6 +205,19 @@ export const toPublicError =
           operation,
           message: `Checkpoint ${error.checkpointId} of database ${error.databaseId} does not exist (deleted or expired). Create a new checkpoint.`,
           details: { databaseId: error.databaseId, checkpointId: error.checkpointId },
+          requestId,
+          retryable: false,
+        });
+      case "CheckpointLimitError":
+        return new CheckpointLimitReachedPublicError({
+          code: "CheckpointLimitReached",
+          operation,
+          message: `Database ${error.databaseId} already has ${error.checkpoints} checkpoints and pinned snapshots, the most it may hold (${error.limit}). Delete one, or wait for a pinned snapshot to expire, then retry.`,
+          details: {
+            databaseId: error.databaseId,
+            checkpoints: error.checkpoints,
+            limit: error.limit,
+          },
           requestId,
           retryable: false,
         });

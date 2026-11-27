@@ -1,6 +1,8 @@
 import {
+  addCallerCheckpoint,
   addCheckpoint,
   type Checkpoint,
+  type CheckpointLimitError,
   CheckpointId,
   DatabaseId,
   type DatabaseOptions,
@@ -101,6 +103,7 @@ export interface DropSstOptions {
 
 /** Every failure a lifecycle operation can report. */
 export type DatabaseLifecycleError =
+  | CheckpointLimitError
   | DatabaseNotFoundError
   | DatabaseAlreadyExistsError
   | DatabaseHasDependentsError
@@ -284,7 +287,7 @@ export const makeDatabaseLifecycle = Effect.gen(function* () {
       const now = Timestamp.make(yield* Clock.currentTimeMillis);
       const committed = yield* manifests
         .update(databaseId, (manifest, manifestId) =>
-          addCheckpoint(manifest, {
+          addCallerCheckpoint(manifest, {
             id,
             manifestId,
             createdAt: now,
