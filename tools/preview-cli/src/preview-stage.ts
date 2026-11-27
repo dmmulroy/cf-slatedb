@@ -384,7 +384,9 @@ export const describeBoundLsmSettings = (json: string): string => {
 export const deployTask = (stage: PreviewStage) => `@shaledb/infra#deploy:${stage}`;
 
 /**
- * The command Dillon runs to tear a preview down. Agents never run it: the deployment guard blocks
- * `alchemy destroy`, and previews are reused by redeploying them.
+ * The command Dillon runs to tear a preview down. Agents never run it, by instruction: the deployment
+ * guard blocks a directly typed `alchemy destroy`, but in this (allowlisted) repository it does not
+ * resolve package tasks, so it would not stop this task (docs/release-v1.md, section 10). Previews
+ * are reused by redeploying them.
  */
 export const destroyCommand = (stage: PreviewStage) => `vp run @shaledb/infra#destroy:${stage}`;

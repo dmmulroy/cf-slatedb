@@ -1,0 +1,33 @@
+{
+  "formatVersion": 1,
+  "databaseId": "orders",
+  "compactorEpoch": 4,
+  "running": [
+    {
+      "jobId": "orders-4-1795000000000",
+      "job": {
+        "sources": [
+          { "_tag": "L0", "sstId": "01JD0000000000000000000001" },
+          { "_tag": "SortedRun", "id": 0 }
+        ],
+        "destination": 1,
+        "isBottom": true
+      },
+      "budgetGroup": "orders",
+      "startedAt": 1795000000000,
+      "lastProgressAt": 1795000060000
+    }
+  ],
+  "fenced": false,
+  "corruptSsts": [
+    {
+      "sstId": "01JD0000000000000000000009",
+      "source": { "_tag": "L0", "sstId": "01JD0000000000000000000009" },
+      "section": "block",
+      "reason": "ChecksumMismatch",
+      "message": "block 3 failed its CRC32C",
+      "detectedAt": 1795000000000
+    }
+  ],
+  "collectionDueAt": 1795003600000
+}
