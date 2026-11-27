@@ -889,3 +889,26 @@ workstreams 2, 3, and 6 of the v1 plan.
 
 Resolved this round: Workers Cache hit and R2 create-if-absent confirmed live; data residency is
 per Stack (Dillon's choice, D49); the §12 write, flush, and split measurements are recorded.
+
+## 2026-11-27: live stages torn down; work stopped with open findings
+
+- **Cost.** The preview stages cost about $160 of metered usage in two days (priced from the
+  account's analytics at published rates; the invoice was not readable). About $137 of it was
+  Durable Object SQLite rows written (186.8M, of which the long soaks on `preview-1` wrote 108M)
+  and about $18 was R2 class A operations, almost all `PutObject` calls into the trace buckets.
+  No budget had been set. Dillon stopped the live work.
+- **Torn down.** Every `shaledb-*` and `cfslatedb-*` Worker (40), Workflow (5), Durable Object
+  namespace (32), bucket (11), and preview token secret (12) was deleted with the `cf` CLI (the
+  last trace bucket, 1.7M objects, was still being emptied by its delete job when this was
+  written). The
+  account's other resources and the shared Alchemy state store were not touched; the state store
+  still holds records for these stacks. Production was never planned or deployed.
+- **State of `main`.** `fc9b7bb` passed `vp run ready`, and the release soaks passed on it
+  (132 minutes on `preview-1`, 22 minutes on `preview-2`, a short sampled soak on `preview-3`).
+  `vp run verify` passed (96 runs) on its parent, which differs by one test change.
+- **Open findings.** A cross-review of the night's fixes found five defects and several risks
+  after `fc9b7bb`. None is fixed. They are listed, with their failing tests, in
+  [`docs/cross-review-2026-11-27/`](cross-review-2026-11-27/README.md). v1 is not ready to
+  release until they are fixed and gated.
+- **Not merged, on purpose.** `proto/parallel-parts` (and `proto/integration`, which holds only
+  that) is the concurrent part upload D73 measured and declined.

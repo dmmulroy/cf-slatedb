@@ -1,0 +1,56 @@
+// Append to packages/lsm-cloudflare/src/database-lifecycle.test.ts (it uses that file's run, compactorOf, HOUR, SOURCE, LEFT, RIGHT, LEFT_RANGE, RIGHT_RANGE, bytes).
+
+describe("xreview-writer: a split resumed after its halves released their holds", () => {
+  it("completes: the seal and both forks succeed again, with no hold left behind", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const client = yield* DbClient;
+        const reader = yield* ManifestReader;
+        yield* lifecycle.create(SOURCE, {
+          keyRange: Option.none(),
+          databaseOptions: DEFAULT_DATABASE_OPTIONS,
+        });
+        for (const key of ["a", "b", "e", "f"]) {
+          yield* client.put(SOURCE, bytes(key), bytes(key.toUpperCase()));
+        }
+        // ShardSplit's steps: one seal that takes each half a hold, then a fork from each hold.
+        const splitSteps = Effect.gen(function* () {
+          const sealed = yield* lifecycle.seal(SOURCE, [LEFT, RIGHT], true);
+          for (const [forkId, range] of [
+            [LEFT, LEFT_RANGE],
+            [RIGHT, RIGHT_RANGE],
+          ] as const) {
+            const hold = sealed.successorHolds.find((held) => held.successor === forkId);
+            if (hold === undefined) return yield* Effect.die(`no hold for ${forkId}`);
+            yield* lifecycle.forkRange({
+              source: SOURCE,
+              checkpointId: hold.checkpointId,
+              range,
+              forkId,
+            });
+          }
+        });
+        yield* splitSteps;
+        // The publish failed, and nothing touched the group for over an hour: both halves rewrote
+        // the shard's SSTs and released their holds (D77).
+        const left = yield* compactorOf(LEFT);
+        const right = yield* compactorOf(RIGHT);
+        yield* TestClock.adjust(HOUR + 1_000);
+        yield* left.runDue;
+        yield* right.runDue;
+        const holdsAfterRelease = (yield* reader.loadLatest(SOURCE)).manifest.checkpoints.length;
+        // A routed request waits out the abandoned split and finishes it from the record (D101):
+        // the same steps again.
+        const resumed = yield* Effect.result(splitSteps);
+        const holdsAfterResume = (yield* reader.loadLatest(SOURCE)).manifest.checkpoints.length;
+        return {
+          holdsAfterRelease,
+          resumed: resumed._tag === "Success" ? "resumed" : resumed.failure._tag,
+          holdsAfterResume,
+        };
+      }),
+    );
+    expect(outcome).toEqual({ holdsAfterRelease: 0, resumed: "resumed", holdsAfterResume: 0 });
+  });
+});

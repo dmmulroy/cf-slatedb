@@ -1,0 +1,91 @@
+/**
+ * Cross-review (compaction): a compaction that its compactor declared finished (D94: unseen for
+ * compactionLeaseMs; D103: its Workflow instance not found) and that commits later must be refused.
+ * D94 relies on `commitCompaction`'s exact-inputs check for that. The check compares sorted-run
+ * ids, and the scheduler reuses them: a merge of runs 1..4 goes into run 1, and the next L0
+ * compactions go into runs 2, 3, 4 again. A late commit of the first merge then finds "its"
+ * inputs present and replaces runs that hold newer data.
+ *
+ * Copy into packages/lsm-core/src/ and run `vp test run src/compaction-late-commit.test.ts`.
+ */
+import { Option, Result } from "effect";
+import { describe, expect, it } from "vite-plus/test";
+
+import { DatabaseId, SstId } from "./ids.ts";
+import {
+  commitCompaction,
+  DEFAULT_DATABASE_OPTIONS,
+  initialManifest,
+  type Manifest,
+  replaceManifestFields,
+  type SstHandle,
+} from "./manifest.ts";
+import {
+  DEFAULT_SIZE_TIERED_COMPACTION_OPTIONS,
+  planCompactions,
+} from "./size-tiered-compaction-scheduler.ts";
+
+const DB = DatabaseId.make("orders");
+const ulid = (n: number) => SstId.make(`01JD${String(n).padStart(22, "0")}`);
+const sst = (n: number): SstHandle => ({
+  id: ulid(n),
+  firstKey: Uint8Array.of(0),
+  lastKey: Uint8Array.of(255),
+  sizeBytes: 1000,
+  rowCount: 10,
+  metaOffset: 900,
+  metaLength: 100,
+  owner: Option.none(),
+  view: Option.none(),
+});
+const options = { ...DEFAULT_SIZE_TIERED_COMPACTION_OPTIONS, maxConcurrentCompactions: 1 };
+const only = (manifest: Manifest) => {
+  const [job] = planCompactions(manifest, [], options);
+  if (job === undefined) throw new Error("no compaction planned");
+  return job;
+};
+const commit = (manifest: Manifest, jobId: string, job: ReturnType<typeof only>, out: number) =>
+  commitCompaction(manifest, {
+    compactorEpoch: manifest.compactorEpoch,
+    jobId,
+    job,
+    outputs: [sst(out)],
+  });
+
+describe("a compaction declared finished that commits late (D94, D103)", () => {
+  it("is refused after its sorted-run ids were reused by later compactions", () => {
+    // Four sorted runs (newest first), one SST each: the scheduler merges them into run 1.
+    let manifest = replaceManifestFields(
+      initialManifest(DB, { keyRange: Option.none(), databaseOptions: DEFAULT_DATABASE_OPTIONS }),
+      {
+        sortedRuns: [4, 3, 2, 1].map((id) => ({
+          id: id as never,
+          ssts: [sst(100 + id)],
+        })),
+      },
+    );
+    const zombie = only(manifest);
+    expect(zombie.sources.map((source) => source._tag === "SortedRun" && source.id)).toEqual([
+      4, 3, 2, 1,
+    ]);
+    // The compactor stops seeing the job, finishes it (D94/D103), and plans the same merge again.
+    manifest = Result.getOrThrow(commit(manifest, "replanned", only(manifest), 200));
+    // Three L0 compactions follow: each goes into the next run id, 2, 3, then 4.
+    for (const round of [0, 1, 2]) {
+      manifest = replaceManifestFields(manifest, {
+        l0: [0, 1, 2, 3].map((index) => sst(300 + round * 10 + index)),
+      });
+      const job = only(manifest);
+      manifest = Result.getOrThrow(commit(manifest, `l0-${round}`, job, 400 + round));
+    }
+    expect(manifest.sortedRuns.map((run) => run.id).sort()).toEqual([1, 2, 3, 4]);
+    // Every SST the zombie read is gone from the manifest.
+    const held = new Set(manifest.sortedRuns.flatMap((run) => run.ssts.map((handle) => handle.id)));
+    expect([101, 102, 103, 104].some((n) => held.has(ulid(n)))).toBe(false);
+    // The zombie's late commit, of output it merged from runs that no longer exist, must be
+    // refused: accepting it replaces runs 1..4, and with them every row the three L0 compactions
+    // and the replanned merge wrote.
+    const late = commit(manifest, "zombie", zombie, 999);
+    expect(Result.isFailure(late) && late.failure._tag).toBe("CompactionInputsChangedError");
+  });
+});

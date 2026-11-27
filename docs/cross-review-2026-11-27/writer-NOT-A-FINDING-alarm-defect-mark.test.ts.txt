@@ -1,0 +1,82 @@
+// xreview-writer: copy to packages/lsm-cloudflare/src/ and run with vitest.
+// A defect in the alarm call D131 placed inside the commit's uninterruptible region leaves the
+// commit mark (`committing`) set for the life of the instance.
+import { DatabaseId, DEFAULT_DATABASE_OPTIONS, initialManifest, type WriteBatch } from "@shaledb/lsm-core";
+import { Effect, Layer, Option } from "effect";
+import { TestClock } from "effect/testing";
+import { describe, expect, it } from "vite-plus/test";
+
+import { backgroundWorkTestLayer } from "./background-work.ts";
+import { compactionTriggerTestLayer } from "./compaction-trigger.ts";
+import { DbWriter, dbWriterLayerWithoutDependencies } from "./db-writer.ts";
+import { DurableObjectAlarm, durableObjectAlarmTestLayer } from "./durable-object-alarm.ts";
+import { lsmConfigurationTestLayer } from "./lsm-configuration.ts";
+import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
+import { memTableTestLayer } from "./mem-table.ts";
+import { ManifestStore, manifestStoreTestLayer } from "./manifest-store.ts";
+import { sstStoreLayerWithoutDependencies } from "./sst-store.ts";
+
+const DB = DatabaseId.make("orders");
+const bytes = (text: string) => new TextEncoder().encode(text);
+const put = (key: string, value: string): WriteBatch => ({
+  operations: [{ _tag: "Put", key: bytes(key), value: bytes(value), ttlMillis: Option.none() }],
+});
+
+describe("xreview-writer: a defect in the commit's alarm check", () => {
+  it("leaves the counters able to settle once the rows are flushed", async () => {
+    let dieOnce = false;
+    // The real alarm, except that `scheduled` can die once (a storage call that rejects).
+    const flakyAlarm = Layer.effect(
+      DurableObjectAlarm,
+      Effect.map(DurableObjectAlarm, (alarm) =>
+        DurableObjectAlarm.of({
+          ...alarm,
+          scheduled: Effect.suspend(() => {
+            if (dieOnce) {
+              dieOnce = false;
+              return Effect.die(new Error("getAlarm rejected"));
+            }
+            return alarm.scheduled;
+          }),
+        }),
+      ),
+    ).pipe(Layer.provide(durableObjectAlarmTestLayer));
+    const layer = dbWriterLayerWithoutDependencies.pipe(
+      Layer.provideMerge(sstStoreLayerWithoutDependencies),
+      Layer.provideMerge(
+        Layer.mergeAll(
+          memTableTestLayer,
+          flakyAlarm,
+          compactionTriggerTestLayer,
+          backgroundWorkTestLayer,
+          lsmConfigurationTestLayer({}),
+        ),
+      ),
+      Layer.provideMerge(manifestStoreTestLayer),
+    );
+    const outcome = await Effect.gen(function* () {
+      yield* (yield* ManifestStore).initialize(
+        initialManifest(DB, { keyRange: Option.none(), databaseOptions: DEFAULT_DATABASE_OPTIONS }),
+      );
+      const writer = yield* DbWriter;
+      yield* writer.write(DB, put("a", "1"));
+      dieOnce = true;
+      const failed = yield* Effect.exit(writer.write(DB, put("b", "2")));
+      yield* writer.write(DB, put("c", "3"));
+      yield* writer.flush(DB);
+      const status = yield* writer.status(DB);
+      return {
+        secondWrite: failed._tag,
+        unflushedRows: status.unflushedRows,
+        unflushedBytes: status.unflushedBytes,
+      };
+    }).pipe(
+      Effect.provide(layer),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.provide(TestClock.layer()),
+      Effect.runPromise,
+    );
+    // Everything committed is flushed: the counters should be back at zero.
+    expect(outcome).toEqual({ secondWrite: "Failure", unflushedRows: 0, unflushedBytes: 0 });
+  });
+});

@@ -1,0 +1,166 @@
+import {
+  type CompactionJob,
+  type CompactorEpoch,
+  DatabaseId,
+  DEFAULT_DATABASE_OPTIONS,
+  FULL_KEY_RANGE,
+  initialManifest,
+  planCompactions,
+  type Row,
+  type SstHandle,
+} from "@shaledb/lsm-core";
+import { Effect, Exit, Layer, Option, Result, type Scope, Stream } from "effect";
+import { TestClock } from "effect/testing";
+import { describe, expect, it } from "vite-plus/test";
+
+import { CompactionExecutor, makeCompactionExecutor } from "./compaction-executor.ts";
+import { DbClient, dbClientTestLayer, makeDbClient } from "./db-client.ts";
+import { type DbReaderServices, ScanPageBudget } from "./db-reader.ts";
+import { ManifestReader } from "./manifest-reader.ts";
+import { sstStoreLayerWithoutDependencies } from "./sst-store.ts";
+import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
+import { ManifestStore } from "./manifest-store.ts";
+import { WriterClient } from "./writer-client.ts";
+
+/**
+ * Every scan surface does a bounded amount of work per page (D125): "limit 1 over a long range of
+ * deleted keys", the review's test, on the regular and the transaction scan; the sharded scan's
+ * is in `packages/lsm-sharding`.
+ */
+const DB = DatabaseId.make("orders");
+const key = (index: number) => Uint8Array.of(0x6b, index >> 8, index & 0xff);
+
+const testLayer = Layer.effect(CompactionExecutor, makeCompactionExecutor).pipe(
+  Layer.provide(sstStoreLayerWithoutDependencies),
+  Layer.provideMerge(dbClientTestLayer({ blockSize: 4096 })),
+);
+type TestServices = Layer.Success<typeof testLayer> | DbReaderServices | Scope.Scope;
+const run = <A, E>(program: Effect.Effect<A, E, TestServices>) =>
+  program.pipe(
+    Effect.scoped,
+    Effect.provide(testLayer),
+    Effect.provide(lsmTestRuntimeContextLayer),
+    Effect.provide(TestClock.layer()),
+    Effect.runPromise,
+  );
+
+const createDatabase = Effect.flatMap(ManifestStore, (store) =>
+  store.initialize(
+    initialManifest(DB, { keyRange: Option.none(), databaseOptions: DEFAULT_DATABASE_OPTIONS }),
+  ),
+);
+
+/** A client whose writer counts the scan pages it answers and the rows they carried. */
+const countingClient = Effect.gen(function* () {
+  const writer = yield* WriterClient;
+  const seen = { pages: 0, rows: 0 };
+  const client = yield* makeDbClient.pipe(
+    Effect.provideService(
+      WriterClient,
+      WriterClient.of({
+        ...writer,
+        scan: (databaseId, request) =>
+          Effect.tap(writer.scan(databaseId, request), (page) =>
+            Effect.sync(() => {
+              seen.pages += 1;
+              seen.rows += page.rows.length;
+            }),
+          ),
+      }),
+    ),
+  );
+  return { client, seen };
+});
+
+/** `count` keys, one live first and the rest after it, all unflushed (5 writer pages for 5,000). */
+const liveThenMany = (count: number) =>
+  Effect.gen(function* () {
+    const db = yield* DbClient;
+    for (let start = 0; start < count; start += 1000) {
+      yield* db.write(DB, {
+        operations: Array.from({ length: Math.min(1000, count - start) }, (_, offset) => ({
+          _tag: "Put" as const,
+          key: key(start + offset),
+          value: Uint8Array.of(1),
+          ttlMillis: Option.none(),
+        })),
+      });
+    }
+  });
+
+
+/**
+ * Cross-review (xreview-api): D108's "a page examines at least one key, then ends on its budget"
+ * is kept per `DbReader.scan` call (`examinedAny`), and D93/D125 make one call per segment. A key
+ * that fills a writer page settles alone (D125), so every such key is a one-key segment, and a
+ * one-key segment never meets the spent budget: the page goes on to the next segment.
+ */
+const PAGE_ROWS = 1000;
+const HEAVY_KEYS = 3;
+
+/** Keys 0..HEAVY_KEYS-1 each written PAGE_ROWS + 1 times, then deleted; key HEAVY_KEYS live. */
+const heavyDeletedKeys = Effect.gen(function* () {
+  const db = yield* DbClient;
+  for (let index = 0; index < HEAVY_KEYS; index++) {
+    for (let version = 0; version <= PAGE_ROWS; version++) {
+      yield* db.write(DB, {
+        operations: [{ _tag: "Put", key: key(index), value: Uint8Array.of(1), ttlMillis: Option.none() }],
+      });
+    }
+    yield* db.write(DB, { operations: [{ _tag: "Delete", key: key(index) }] });
+  }
+  yield* db.write(DB, {
+    operations: [{ _tag: "Put", key: key(HEAVY_KEYS), value: Uint8Array.of(7), ttlMillis: Option.none() }],
+  });
+});
+
+/** A budget spent by the first key examined. */
+const TINY = { maxBytes: 1, shared: Option.none() };
+
+describe("xreview-api: a spent budget ends a page whose segments are one key each", () => {
+  it("regular page, limit 1: ends after the first deleted key with resumeFrom, reading at most two writer pages", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createDatabase;
+        yield* heavyDeletedKeys;
+        const { client, seen } = yield* countingClient;
+        const exit = yield* Effect.exit(
+          Stream.runCollect(
+            client.scan(DB, FULL_KEY_RANGE, {
+              consistency: { _tag: "Latest" as const },
+              snapshot: Option.none(),
+              refuseSealed: false,
+              limit: Option.some(1),
+            }),
+          ).pipe(Effect.provideService(ScanPageBudget, TINY)),
+        );
+        const failure = Exit.isFailure(exit) ? Option.getOrUndefined(Exit.findErrorOption(exit)) : undefined;
+        return {
+          rows: Exit.isSuccess(exit) ? exit.value.length : 0,
+          pageEnd: failure?._tag === "ReaderUnavailableError" ? failure.pageEnd : undefined,
+          writerPages: seen.pages,
+        };
+      }),
+    );
+    expect(outcome).toEqual({ rows: 0, pageEnd: "BudgetSpent", writerPages: expect.any(Number) });
+    expect(outcome.writerPages).toBeLessThanOrEqual(2);
+  }, 300_000);
+
+  it("transaction page, limit 1: the same", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createDatabase;
+        yield* heavyDeletedKeys;
+        const { client, seen } = yield* countingClient;
+        const { readSeq, manifestId } = yield* client.beginTransaction(DB);
+        const page = yield* client
+          .scanAtPage(DB, FULL_KEY_RANGE, readSeq, 1, manifestId)
+          .pipe(Effect.provideService(ScanPageBudget, TINY));
+        return { rows: page.rows.length, resumes: Option.isSome(page.resumeFrom), writerPages: seen.pages };
+      }),
+    );
+    expect(outcome.rows).toBe(0);
+    expect(outcome.resumes).toBe(true);
+    expect(outcome.writerPages).toBeLessThanOrEqual(2);
+  }, 300_000);
+});

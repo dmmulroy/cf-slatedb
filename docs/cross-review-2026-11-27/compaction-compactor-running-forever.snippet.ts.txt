@@ -1,0 +1,53 @@
+// Cross-review (compaction): append this describe block to the end of
+// packages/lsm-cloudflare/src/compactor.test.ts and run `vp test run src/compactor.test.ts -t "reads Running"`.
+//
+// D96 caps a collection at the oldest running job's start and says "D94 bounds how long a job can
+// be recorded as running". D94 bounds only a job no progress read has seen: a Workflow instance
+// that reads `queued`, `paused`, `waiting` or `waitingForPause` is "Running" and renewed by every
+// poll for ever. A paused instance (an operator's dashboard action, or a queue that never drains)
+// then pins the database's collection cutoff at its start: nothing written after it is ever
+// collected, and its sources and budget lease stay taken. The rule this test asks for: a job
+// recorded as running longer than a bound stops capping the collection (the bound is the fix's
+// choice; 7 days here is far past any job D97 allows).
+describe("a compaction job that reads Running for ever (cross-review of D94 and D96)", () => {
+  it("a job that reads Running for 7 days no longer caps the database's collection", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createWithL0(ORDERS, 4);
+        const collector = yield* GarbageCollector;
+        const told: Array<Option.Option<Timestamp>> = [];
+        const pausedLauncher = CompactionLauncher.of({
+          start: () => Effect.void,
+          progress: () => Effect.succeed({ _tag: "Running" as const }),
+        });
+        const recordingCollector = GarbageCollector.of({
+          collect: (databaseId, oldestRunningJobStartedAt) =>
+            Effect.sync(() => told.push(oldestRunningJobStartedAt)).pipe(
+              Effect.andThen(collector.collect(databaseId, oldestRunningJobStartedAt)),
+            ),
+          collectLeftovers: collector.collectLeftovers,
+        });
+        return yield* Effect.gen(function* () {
+          const orders = yield* startCompactor;
+          yield* orders.compactor.wake(ORDERS);
+          yield* orders.fire;
+          const started = (yield* orders.cell.get).pipe(
+            Option.flatMap((state) => Option.fromUndefinedOr(state.running[0]?.startedAt)),
+          );
+          for (let hour = 0; hour < 7 * 24; hour++) {
+            yield* TestClock.adjust("1 hour");
+            yield* orders.fire;
+          }
+          yield* orders.compactor.collect(ORDERS);
+          return { started, lastTold: told[told.length - 1] };
+        }).pipe(
+          Effect.provideService(CompactionLauncher, pausedLauncher),
+          Effect.provideService(GarbageCollector, recordingCollector),
+        );
+      }),
+    );
+    expect(Option.isSome(outcome.started)).toBe(true);
+    // Today the collection is still capped at the paused job's start a week later.
+    expect(outcome.lastTold).not.toEqual(outcome.started);
+  });
+});
