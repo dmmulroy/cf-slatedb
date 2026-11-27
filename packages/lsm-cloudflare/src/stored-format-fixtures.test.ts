@@ -1,4 +1,6 @@
 import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { Exit, Schema } from "effect";
 import { describe, expect, it } from "vite-plus/test";
@@ -10,7 +12,7 @@ import { COMPACTOR_STATE_FORMAT_VERSION, CompactorState } from "./compactor.ts";
  * to it is checked against this shape.
  */
 const RELEASE_SHAPE = readFileSync(
-  new URL("./fixtures/compactor-state-v1-release-shape.json", import.meta.url),
+  join(dirname(fileURLToPath(import.meta.url)), "./fixtures/compactor-state-v1-release-shape.json"),
   "utf8",
 );
 const Json = Schema.fromJsonString(CompactorState);

@@ -1,4 +1,6 @@
 import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { Exit, Schema } from "effect";
 import { describe, expect, it } from "vite-plus/test";
@@ -7,7 +9,7 @@ import { ShardMap } from "./shard-map.ts";
 
 /** A shard group's map as v1 stores it in its directory, with a split pending (D105). */
 const RELEASE_SHAPE = readFileSync(
-  new URL("./fixtures/shard-map-v1-release-shape.json", import.meta.url),
+  join(dirname(fileURLToPath(import.meta.url)), "./fixtures/shard-map-v1-release-shape.json"),
   "utf8",
 );
 const Json = Schema.fromJsonString(ShardMap);
