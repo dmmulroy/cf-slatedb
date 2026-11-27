@@ -2275,3 +2275,79 @@ manifest, checked against two concurrent first calls:
 and a compactor that fences in again is one more of those. The overwritten epoch was in the
 compactor's own Durable Object state, not in the manifest, so it is a property of that state, and
 the tests check it. No step changed; reran, and every broken variant fails (the skill records it).
+
+## D83. Review of D76: a transaction read may use any cached manifest; concurrent collections; TTL and clocks
+
+Found in the review of D76 and in the interaction pairs `docs/invariants.md` had not reached. Six
+items, each with a test or a model run that fails without it.
+
+**Transactions model.** `Transactions.tla`'s `Read` chose between the begin manifest and the
+newest one. The reader's "newest" is its cached manifest, which may be any committed manifest:
+older than the begin manifest, between it and the newest, or a flush's manifest committed before
+`flushed_seq` recorded it. `Read` now reads with any `m \in 0 .. seq` that `Fits`, and is refused
+only when the begin manifest does not fit either. The model allows refusing whenever the begin
+manifest does not fit; the code refuses less often, and refusing is always safe. The state count is
+36.9M, checked in 167 s; the run's 420 s limit stands. A first draft, which refused whenever any
+chosen manifest did not fit, timed out.
+
+**Two tests the review named.**
+
+- **A read the reader cannot yet serve is retryable, not too old.** A transaction read whose writer
+  keeps rows only above every manifest the reader can load (the newest is below
+  `retained_from_seq` after a refresh, and the begin manifest is too) fails with the retryable
+  `StorageUnavailable`. It does not fail with `SnapshotExpired`, which the client turns into
+  `SnapshotTooOld`. `db-transaction.test.ts`; the mutation that returns `SnapshotExpired` there
+  fails it.
+- **A transaction begun before a seal cannot commit after it.** It fails with
+  `DatabaseSealedError`, and none of its writes reaches the source or either successor.
+  `database-lifecycle.test.ts`; a `commitTransaction` that skips `writableReady` fails it, and no
+  other test.
+
+**Two collections of one database at once** are possible and safe. The argument is in D60. A
+collection that cannot load a manifest it retained now re-reads `gc/manifest.boundary`:
+
+- **At or below the boundary**, a later collection deleted the manifest, and the run goes on
+  without it.
+- **Above the boundary**, something other than a collection deleted it. The run fails with
+  `GarbageCollectorUnavailableError` and deletes nothing.
+
+This guard, not a second process in `GcSafety.tla`, was chosen for two reasons:
+
+- **The collector can tell the two cases apart.** A collection deletes a manifest only after it has
+  moved the boundary past it.
+- **A model would cost more than the guard.** A second collection doubles the model's GC variables
+  and its interleavings, for a property that rests on two monotonic writes and one ordering, which
+  a test can check directly.
+
+`garbage-collector.test.ts` stops one collection with gates at the load of a retained manifest and
+at its first delete, runs the other whole, and asserts that neither deleted an SST that a manifest
+the other loaded names. A third test deletes a retained manifest above the boundary and asserts
+that the collection deletes nothing. Three mutations fail them: no guard, every missing manifest
+treated as unexplained, and retained manifests ignored.
+
+**What a read that lost an SST partway should do.** The message was "Retry the read" for every
+read. It now depends on the read:
+
+- **A read** retries; the retry reads the newest manifest.
+- **A scan** resumes from the key after the last row it returned.
+- **A snapshot** must be taken again: its SSTs go only when GC collects it, so a retry would end in
+  `SnapshotExpired`.
+
+Codes and statuses are unchanged. `db-client.test.ts` checks a get, a scan, a snapshot get, a
+snapshot scan, and a transaction read. Three mutations fail it.
+
+**TTL and clocks.** What readers can rely on (D10, D23, D81):
+
+- **A value expires within clock skew of its `expireTs`.** Expiry is judged by the clock of the
+  isolate that reads it, and by the compaction Workflow's clock, fixed when the compaction
+  prepares.
+- **Readers in different isolates may disagree for up to the skew between their clocks.** One may
+  see a value that another, whose clock is ahead, already reads as deleted.
+- **Once compaction has turned an expired value into a delete, it does not come back.** A reader
+  whose clock is behind the compactor's then sees the value gone up to that skew early.
+- **The writer's clock can only make expiry late.** A row's commit time is the later of the
+  writer's clock and its monotonic tick (`createTs = max(now, clockTick)`), so `expireTs` is never
+  earlier than the writer's clock plus the TTL.
+
+These hold by reading the code (`resolveVisibleRow`, `retainKeyVersions`, `DbWriter.commitBatch`,
+the executor's `prepare`). No code changed for them.
