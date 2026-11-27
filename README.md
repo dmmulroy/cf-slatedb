@@ -76,7 +76,70 @@ It is not a fit for:
 - anything [`docs/measurements.md`](docs/measurements.md) does not cover (its "Not measured" list
   names what is open).
 
-<!-- BASELINE: the orchestrator fills this -->
+<!-- BASELINE: begin -->
+
+### Compared with a plain Durable Object SQLite table
+
+The same workload against shaledb and against one table in a plain Durable Object, on the same
+stage (`preview-3`, production settings), from the same client, one target after the other, each
+on a new database or object: 8 writers each sending 100-row batches (16-byte keys, 100-byte
+values) and 8 readers each doing point reads of preloaded keys, for 30 seconds.
+
+> **Provisional.** One run, 2026-11-27, at commit `ed4e787`, while a local test run loaded the
+> client during the plain-table part. The release checklist repeats it three times on the release
+> commit ([`docs/release-v1.md`](docs/release-v1.md)); this table is replaced by those runs.
+
+| Target                      | Rows/s acknowledged | Write p50 / p90 / p99 (ms) | Reads/s | Read p50 / p90 / p99 (ms) |
+| --------------------------- | ------------------: | -------------------------- | ------: | ------------------------- |
+| shaledb, reads at `Latest`  |               6,134 | 114 / 162 / 425            |    60.3 | 114 / 175 / 592           |
+| shaledb, reads at `Flushed` |               8,329 | 87 / 124 / 269             |   115.9 | 57 / 114 / 203            |
+| plain Durable Object SQLite |               8,193 | 82 / 132 / 359             |    89.1 | 77 / 120 / 429            |
+
+Each writer and reader waits for its answer before sending the next request, so the rates follow
+the latencies: they are what 8 clients over the internet got, not a capacity. What the stage did
+for each run, from its tail records and spans:
+
+| Target                      | Worker CPU per request | Durable Object requests per read | Durable Object CPU per request | SQLite rows written per row | R2 class A / class B requests |
+| --------------------------- | ---------------------: | -------------------------------: | -----------------------------: | --------------------------: | ----------------------------- |
+| shaledb, reads at `Latest`  |                16.6 ms |                                1 |                         3.3 ms |                           3 | 5 / 609                       |
+| shaledb, reads at `Flushed` |                11.2 ms |                                0 |                         4.7 ms |                           3 | 10 / 6,774                    |
+| plain Durable Object SQLite |                 8.0 ms |                                1 |                         2.3 ms |                           1 | 0 / 0                         |
+
+**What was measured.**
+
+- **Writes cost the caller the same.** Write latency is within run-to-run noise of the plain
+  table's; nearly all of it is the client's round trip.
+- **A `Latest` read is slower than a plain read** (p50 114 ms against 77 ms): it asks the writer
+  and then reads SSTs.
+- **A `Flushed` read is faster and never touches a Durable Object** (p50 57 ms against 77 ms; the
+  only Durable Object requests in that run were the writes).
+- **shaledb's writes cost three times a plain table's in SQLite charges.** Its memtable bills two
+  rows written per row (the table and its index) and one more when the flushed row is deleted;
+  a plain table bills one (measured on `preview-3` by the row-cost probe). At Cloudflare's
+  published overage prices, fetched 2026-11-26 and ignoring included allowances, that is $3.02
+  against $1.01 per million rows written with this read mix; SQLite row writes are $3.00 and
+  $1.00 of it.
+
+**What that buys, and how far each claim is measured.**
+
+- **Data leaves the Durable Object.** A plain table lives inside one object's SQLite storage,
+  with that product's size limit and storage price; shaledb's flushed data is in R2. The price
+  and the limit are Cloudflare's published figures, not measurements
+  ([`docs/operations.md`](docs/operations.md), "Platform limits").
+- **Reads that do not load the writer.** Measured above for `Flushed`; `AtLeast`, snapshots and
+  scans of flushed data take the same path.
+- **Forks, checkpoints, pinned snapshots, and splits** have no counterpart in a plain table.
+  Their costs are measured separately ([`docs/measurements.md`](docs/measurements.md), "Split
+  write pause"); this comparison does not include them.
+- **Not measured here:** storage cost over time, a dataset near a Durable Object's storage
+  limit, readers in other regions, and either system above 8 clients.
+
+If one Durable Object's table holds the data and its writer can serve every read, the plain
+table is simpler and cheaper to write to. The numbers, the commands, and the price arithmetic
+are in [`docs/measurements.md`](docs/measurements.md), "Baseline: a plain Durable Object SQLite
+table".
+
+<!-- BASELINE: end -->
 
 ## Quick start (local)
 

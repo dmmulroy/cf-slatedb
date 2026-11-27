@@ -2015,6 +2015,46 @@ flush). Both are once per flush.
 **Model.** `NoAckedWriteLost` and `SealSplit` are indifferent to when a flush is scheduled; no
 step changed (the skills record it).
 
+## D75. The baseline is a plain Durable Object SQLite table, measured on the same stage
+
+Dillon's architecture review asked for one representative workload compared against plain
+Durable Object SQLite, with the same placement, payload, batch size and concurrency, reporting
+p99, operation counts and cost assumptions, and what forks or off-writer reads buy, with
+evidence kept apart from unmeasured claims.
+
+**The baseline lives in the preview-only probe Worker** (`PlainSqliteServer`,
+`infra/shaledb/src/telemetry-probe-worker.ts`): one `WITHOUT ROWID` table keyed by the key, a
+batch written in one transaction, a point read by key, reached through a Worker over the same
+kind of binding shaledb's writer is. The probe Worker is not part of a production Stack (D104
+pins that), so the baseline can never reach production.
+
+**One tool runs both sides.** `scenario-cli measure baseline` runs the same closed-loop load
+(writers sending batches, readers doing point reads of preloaded keys) against shaledb with
+reads at `Latest`, shaledb with reads at `Flushed`, and the plain table, and reports for each
+what the client saw and what the stage did: invocations and CPU per Worker and Durable Object
+from tail records, and R2 requests by billing class from spans. A `/rowcost` route measures what
+SQLite bills per row for the memtable's statements and the plain table's.
+
+**What it found** (`docs/measurements.md`, "Baseline: a plain Durable Object SQLite table";
+provisional until the release-commit runs):
+
+- Write latency is the same as the plain table's.
+- A `Latest` read is slower than a plain read; a `Flushed` read is faster and reaches no
+  Durable Object.
+- **shaledb's SQLite write charge is three times the plain table's**: two rows written per row
+  on insert (the memtable's table and its index) and one when the flushed row is trimmed. At
+  100-row batches that charge is 99% of the marginal cost of either system.
+
+**Decided.**
+
+- The README states the comparison and says when the plain table is the better choice: when one
+  object's table holds the data and its writer can serve every read.
+- The memtable's index stays for v1. It serves the flush's and the feed's reads in sequence
+  order and the probe by key; removing it would trade a billed row per write for a sort or a
+  scan per flush. That trade has not been measured, so it is recorded here as the first cost
+  experiment after v1, not done now.
+- Storage costs, large datasets, and forks are not in the comparison, and the README says so.
+
 ## D76. A transaction reads the newest manifest when it fits; a snapshot is taken at the newest manifest
 
 Corrects D58's "reads pin the begin manifest". Found by checking `docs/invariants.md` against the

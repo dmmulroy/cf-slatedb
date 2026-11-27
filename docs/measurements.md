@@ -473,6 +473,88 @@ when it answered again. With D74 every run accepted its 128 batches, refused 4 a
 **D61's memory question, answered again.** Two writers each holding 256 MiB unflushed at the
 same time, six runs: no `exceededMemory` and no reset. The one reset seen was the alarm loop.
 
+## Baseline: a plain Durable Object SQLite table (D75)
+
+`measure baseline` runs one workload against three targets on one stage, one after the other,
+each on a new database or object: shaledb with its point reads at `Latest`, shaledb with them at
+`Flushed`, and a table in a plain Durable Object (`PlainSqliteServer` in the preview-only probe
+Worker: `CREATE TABLE kv (key BLOB PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID`, one
+transaction per batch, reached through a Worker as shaledb's writer is). The same placement
+(no location hint for either), payload, batch size, concurrency, client, and preload (2,000 rows;
+flushed on shaledb, so its reads find them in an SST).
+
+```sh
+node tools/scenario-cli/src/scenario-cli.ts measure baseline --stage preview-3 \
+  --batch-rows 100 --value-bytes 100 --writers 8 --readers 8 --seconds 30
+curl -X POST -H "Authorization: Bearer $TOKEN" "$PROBE/v1/probe/sqlite/<name>/rowcost?rows=1000&valueBytes=100"
+```
+
+**Provisional: one run**, `preview-3`, production settings, 100% sampling, commit `ed4e787`,
+2026-11-27 00:08 UTC. `vp run ready` started on the client machine during the plain-table part,
+so that row's client latencies are, if anything, pessimistic. The release runs (three, on the
+release commit) replace this table.
+
+Client side, p50 / p90 / p99 in ms:
+
+| Target                      | Rows/s | Batches/s | Write latency   | Reads/s | Read latency    | Failures |
+| --------------------------- | -----: | --------: | --------------- | ------: | --------------- | -------- |
+| shaledb, reads at `Latest`  |  6,134 |      61.3 | 114 / 162 / 425 |    60.3 | 114 / 175 / 592 | none     |
+| shaledb, reads at `Flushed` |  8,329 |      83.3 | 87 / 124 / 269  |   115.9 | 57 / 114 / 203  | none     |
+| plain Durable Object SQLite |  8,193 |      81.9 | 82 / 132 / 359  |    89.1 | 77 / 120 / 429  | none     |
+
+The load is closed-loop: 8 writers and 8 readers, each waiting for its answer. Rates therefore
+follow latency and are not capacities.
+
+Stage side, for the timed 30 seconds of each target (tail records at 100% sampling; R2 requests
+counted from `ObjectStore.*` and `ObjectReader.*` spans by billing class):
+
+| Target                      | Worker invocations | Worker CPU (ms) | Durable Object invocations | Durable Object CPU (ms) | R2 class A | R2 class B |
+| --------------------------- | -----------------: | --------------: | -------------------------: | ----------------------: | ---------: | ---------: |
+| shaledb, reads at `Latest`  |              3,654 |          60,526 |                      3,654 |                  12,089 |          5 |        609 |
+| shaledb, reads at `Flushed` |              6,017 |          67,588 |                      2,516 |                  11,708 |         10 |      6,774 |
+| plain Durable Object SQLite |              5,157 |          41,016 |                      5,157 |                  11,986 |          0 |          0 |
+
+- At `Flushed`, the 2,516 Durable Object invocations are the write batches alone: no read
+  reached the writer.
+- At `Latest`, every read is one writer probe (3,654 = 1,843 batches + 1,811 reads).
+- R2 class B at `Flushed` is 1.9 per read: block reads the `BlockServer`'s cache did not answer,
+  hedged reads (D72), and manifest refreshes.
+
+SQLite rows billed, from the row-cost probe on `preview-3` (1,000 rows of 100 bytes; each figure
+is the statement cursor's own `rowsWritten` and `rowsRead`):
+
+| Statement                                 | Rows written | Rows read |
+| ----------------------------------------- | -----------: | --------: |
+| memtable insert (the table and its index) |        2,000 |         0 |
+| memtable flush read                       |            0 |     1,000 |
+| memtable trim after the flush             |        1,000 |     1,000 |
+| memtable probe of one key                 |            0 |         2 |
+| plain table insert                        |        1,000 |         0 |
+| plain table get of one key                |            0 |         1 |
+
+So shaledb bills **3 rows written per row** (2 on insert, 1 when the flushed row is trimmed) and
+a plain table bills 1.
+
+**Cost arithmetic.** Each count above times its price: Cloudflare's published overage prices
+as fetched 2026-11-26, with included allowances ignored, so these are marginal costs at scale and
+an **assumption**, not a bill: Workers $0.30 per million requests and $0.02 per million CPU ms;
+Durable Objects $0.15 per million requests, SQLite rows written $1.00 per million and rows read
+$0.001 per million; R2 class A $4.50 and class B $0.36 per million.
+
+| Target                      | Per million rows written, with this read mix | of which SQLite row writes |
+| --------------------------- | -------------------------------------------: | -------------------------: |
+| shaledb, reads at `Latest`  |                                        $3.02 |                      $3.00 |
+| shaledb, reads at `Flushed` |                                        $3.03 |                      $3.00 |
+| plain Durable Object SQLite |                                        $1.01 |                      $1.00 |
+
+Requests, CPU and R2 operations together are under 1% of either figure at 100-row batches; with
+one row per request they would dominate both.
+
+**Not measured:** storage (Durable Object SQLite and R2 are priced per GB-month; shaledb also
+keeps flushed rows in SQLite for `transactionRetentionMs`), duration charges, a dataset near a
+Durable Object's storage limit, more than 8 clients, other regions, scans, and what a fork, a
+checkpoint or a split costs (a plain table has none).
+
 ## Live checks
 
 | Check                                       | Result                         | How                                                                                                                                                                                                                                                                                                                                                                                             |
