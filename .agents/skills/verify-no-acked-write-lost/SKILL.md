@@ -93,6 +93,19 @@ past its snapshot filtered out the newer version and no longer found the older o
 
 ## Maintenance notes
 
+- D93: a `Latest` scan no longer reads every unflushed page before it merges. It reads pages a
+  segment at a time (`DbClient` `scanUnflushed`). Every segment uses the scan's one snapshot and
+  the largest `flushed_seq` of every page so far as its bounds, which are this model's
+  `LatestSeesAcked` bounds. A flush that overtakes the scan between segments leaves no manifest
+  between them:
+  - before any row was returned, the scan starts again at a new snapshot, as before;
+  - after rows were returned, it fails retryably with `resumeFrom`, the first key not returned.
+
+  The model has one read of one key, so segments add no step. `db-client-scan.test.ts` checks
+  the scan against an oracle over writes, flushes, and compactions landing between pages. Memtable
+  pages are now bounded by bytes, which changes no step. Reran: pass, and every broken variant
+  fails.
+
 - D74, review fix: the three counters are one value with a generation number; a commit advances
   it when it starts and when it ends (adding its row in that step), and the refresh at the end of
   a flush installs its scan only when no commit ran during it, otherwise scans again, three times
@@ -172,7 +185,7 @@ past its snapshot filtered out the newer version and no longer found the older o
 
 ## Keeping it in step with the code
 
-Sync commit: the D70–D74 commit (`fix(read)`, `fix(writer)`, and `perf`: the snapshot bound, the newest-version flush, the read and flush path changes, the writer's counters). When a covered function changes after it, update the model so
+Sync commit: the D93 commit (`fix(read, writer)`: a `Latest` scan pages lazily; memtable pages bounded by bytes); before it the D70–D74 commit. When a covered function changes after it, update the model so
 each action is still one awaited effect in the code, rerun, and show each invariant still fails on a
 broken variant before moving the sync commit. For drift that skipped this skill, use
 `.agents/skills/maintain-formal-verification-skill/SKILL.md`.

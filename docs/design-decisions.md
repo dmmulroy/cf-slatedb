@@ -2839,3 +2839,115 @@ interrupted:
 
 **Models.** `seal-split` and `transactions` were rerun: pass, and every broken variant fails. No
 step changed; the skills record why.
+
+## D93. A Latest scan pulls the writer's pages as it needs them; every memtable page is bounded by bytes
+
+**Found by the limits audit.** A `Latest` scan read every unflushed row of its range from the
+writer, 1,000 rows per call, before it returned one, whatever its limit:
+
+- **Memory:** up to `maxUnflushedBytes` (256 MiB) in one 128 MB API isolate.
+- **Subrequests:** one per 1,000 rows. With 5,000 unflushed rows, a scan for one row made 6
+  writer calls.
+- **Pages:** none was bounded by bytes. The writer's scan page, the flush's 1,024-row page and the
+  change feed's page could each hold 1,000 values of 1 MiB.
+
+**The rules.**
+
+- **Every memtable page is bounded by bytes as well as rows.** `MemTable` reads each row's size
+  first (`LENGTH(key) + LENGTH(payload)`, same conditions and order), then the rows that fit in
+  `MAX_MEMTABLE_PAGE_BYTES` (8 MiB). A page always holds at least one row, and returns whether
+  more may follow (`complete`). This covers the writer's scan page, the flush's page, and the
+  change feed's page.
+- **A change feed page holds whole batches.** It backs off to the start of a batch cut by its byte
+  bound or row limit. A page that is all one batch returns that whole batch, which holds at most
+  8 MiB (`MAX_BATCH_BYTES`).
+- **A `Latest` scan reads in segments** (`DbClient` `scanUnflushed`):
+  - A segment reads writer pages, at the snapshot the first page fixed, until its rows hold a
+    second key or the range ends.
+  - It covers the keys before the last key read, so it has every version of each.
+  - It merges with one manifest between D70's bounds: at least the largest `flushed_seq` of every
+    page so far, at most the snapshot.
+  - The next segment starts at the last key.
+  - A scan that has its rows reads no more pages. Memory is one segment: a page, plus the versions
+    of one key that span pages.
+- **A flush that overtakes the scan between segments** leaves no manifest between the bounds.
+  - Before any row was returned, the scan starts again at a new snapshot, as D70 did.
+  - After rows were returned, a restart would mix two snapshots. Instead the scan fails retryably
+    (`ReaderUnavailableError`, `StorageUnavailable`) with `resumeFrom`, the first key it did not
+    return. Every row before it was returned, and none at or after it.
+  - The public scan fails that page, and the client repeats the request.
+
+**Also fixed: the change feed split large batches** (found while bounding its page).
+`DbWriter.changes` capped its page at 1,000 rows, so for an unflushed batch of 1,500 rows
+`DbClient.changes` received 1,000 and moved its cursor past the batch: 500 changes skipped
+silently. The changelog export resumed each 1,024-row page after its last row's sequence number,
+which dropped the rest of a batch the page had cut. Both now page by whole batches.
+
+**Tests.**
+
+- **`db-client-scan.test.ts`:**
+  - the limits audit's case: one writer page, not six;
+  - a scan overtaken after returning rows: its error's `resumeFrom` is the next key, and the
+    resumed scan returns every key exactly once;
+  - pages of large values: 40 rows of 512 KiB give at most 16 rows per page;
+  - a property against the oracle with writes, flushes and compactions between pages. A scan
+    returns the database at one snapshot, or a prefix at one snapshot cut exactly at
+    `resumeFrom`.
+- **`mem-table.test.ts`:** scan, feed and flush pages at the byte bound; feed pages cut only
+  between batches.
+- **`change-feed.test.ts`:** a 1,500-row batch returned whole (1,000 of 1,500 before).
+- **Mutations:** 6 of 7 caught. The missed one keeps the last key's partial versions in a segment.
+  It is equivalent, because the segment's range ends before that key.
+
+**Not done here, proposed to their owners:**
+
+- the public scan page, bounded by bytes with an early `resumeFrom`, which the contract's "up to
+  `limit` rows" allows;
+- the feed's flushed part (`DbReader.changelogRows`), bounded at a batch boundary.
+
+## D94. A compaction job unseen for compactionLeaseMs is finished
+
+**Found by the Workflow audit.** The compactor mapped every failure of `launcher.progress` to
+`Running`, including a Workflow instance that no longer exists (purged, or never created). Such a
+job stayed recorded for good: its lease was renewed on every poll, and its sources were reserved,
+so its L0 or runs were never compacted again. With D96's rule that GC holds back while a job runs,
+it would also stop SST collection.
+
+**The rule.**
+
+- A running job records when a progress read last said it may still commit (`lastProgressAt`;
+  absent means `startedAt`).
+- A job no read has seen running for `compactionLeaseMs` (15 minutes) is finished, with no
+  outcome: its lease is released and its sources are planned again.
+- A long job that is read as running is kept, however long it takes.
+- If the abandoned job does commit later, `commitCompaction`'s exact-inputs check refuses it once
+  another job has taken its sources.
+
+**Format.** `lastProgressAt` is optional in the compactor state, so the format stays 1. The
+compaction status response gains it as an optional field, which is additive.
+
+**Tests** (`compactor.test.ts`):
+
+- a job whose reads all fail is kept before the bound and replanned after it;
+- the bound counts from the last read that saw the job running.
+
+Three mutations are caught.
+
+**Left to the Workflow launcher's owner.** `progress` cannot yet tell a missing instance from an
+unreachable service, and it counts the status `unknown` as running.
+
+## D95. A seal naming other successors than the recorded ones fails
+
+**Found by the API audit.** Sealing a sealed database with different successors succeeded and kept
+the old ones. With holds it also took holds for the new successors on the manifest sealed for the
+old ones.
+
+**The rule.**
+
+- A seal of a sealed database with the same successors, in the same order, is a retry and
+  succeeds.
+- A seal with other successors fails with `DatabaseSealedError` naming the recorded ones (409).
+- `ShardSplit`'s retry passes the pending split's own successors, so it is unaffected.
+
+**Test** (`db-writer.test.ts`): other successors are refused, with and without holds; the same
+successors succeed; only the first successors hold checkpoints. One mutation is caught.

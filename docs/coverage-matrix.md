@@ -29,7 +29,8 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `compactor-worker.ts`; writers wake compactors (`compaction-trigger.ts`, `compactor-client.ts`).
   Tests: `compactor.test.ts` (fence-once, idle, fencing, shared budget; D78: concurrent first
   wakes share one fence-in, no state write over a newer epoch or a requested collection, a fenced
-  compactor fences in again on wake and alarm), `compaction-executor.test.ts`
+  compactor fences in again on wake and alarm; D94: a job unseen for `compactionLeaseMs` is
+  finished), `compaction-executor.test.ts`
   (oracle property across flushes and compactions, key-ordered outputs, bottom deletes, inputs
   changed, fenced), `writer.workerd.ts` (four flushes → compactor wake → Workflow → commit, reads at
   every consistency, span assertions). D33–D36.
@@ -74,7 +75,8 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 ## §4 Read path
 
 - **`Flushed`, `AtLeast(seq)`, `Latest` (probe + `flushedSeq`)** — done. `read-consistency.ts`
-  (lsm-core), `DbClient.pointView`/`scanView`, `DbReader.manifestFor` (refresh when older than
+  (lsm-core), `DbClient.pointView`/`scanUnflushed` (D93: a `Latest` scan pages lazily by segment;
+  `db-client-scan.test.ts`), `DbReader.manifestFor` (refresh when older than
   `flushedSeq`/`seq`). Tests: `db-client.test.ts` (Map-oracle property at every consistency;
   staleness bound, shown failing without the refresh), `writer.workerd.ts`. Formal:
   `NoAckedWriteLost` (`LatestSeesAcked`) (D29).
@@ -95,7 +97,7 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
     fails).
   - **Live.** `docs/measurements.md` ("Read latency").
 - **A read never uses a manifest flushed past its snapshot** — done (D70). `ReadView.maxLastL0Seq`
-  set to the writer's snapshot by `DbClient.pointView` and `scanView`; `DbClient.getRow` and `scan`
+  set to the writer's snapshot by `DbClient.pointView` and `scanUnflushed`; `DbClient.getRow` and `scan`
   ask the writer again on `SnapshotExpired` (`LATEST_READ_ATTEMPTS`); `DbClient.scanAt` without a
   begin manifest requires the largest `flushedSeq` of its pages. Tests: `db-client.test.ts` (a
   writer overtaken after it answers: get, scan, a scan between its pages, giving up as
