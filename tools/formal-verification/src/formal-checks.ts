@@ -80,6 +80,18 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
         expect: "LoadFromKnownFindsHead",
         timeLimitSeconds: 60,
       },
+      {
+        config: "ManifestCasFencingRemove.cfg",
+        broken: "none",
+        expect: "pass",
+        timeLimitSeconds: 150,
+      },
+      {
+        config: "ManifestCasFencingRemove.cfg",
+        broken: "removalDeletesHead",
+        expect: "NoResurrection",
+        timeLimitSeconds: 60,
+      },
     ],
   },
   {

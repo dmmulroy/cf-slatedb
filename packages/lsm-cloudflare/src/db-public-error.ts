@@ -85,6 +85,19 @@ export class DatabaseAlreadyExistsPublicError extends Schema.TaggedError<Databas
   },
 ) {}
 
+/**
+ * `409` — a database with this id was removed less than `gcMinAge` ago; the id can be used again
+ * after `retryAfterMs` (D90).
+ */
+export class DatabaseRecentlyRemovedPublicError extends Schema.TaggedError<DatabaseRecentlyRemovedPublicError>()(
+  "DatabaseRecentlyRemovedPublicError",
+  {
+    code: Schema.Literal("DatabaseRecentlyRemoved"),
+    details: Schema.Struct({ databaseId: DatabaseId, retryAfterMs: Schema.Int }),
+    ...common,
+  },
+) {}
+
 /** `409` — a key is outside the database's key range; route it to the database that holds it. */
 export class KeyOutOfRangePublicError extends Schema.TaggedError<KeyOutOfRangePublicError>()(
   "KeyOutOfRangePublicError",
@@ -288,6 +301,7 @@ export const DB_PUBLIC_ERRORS = [
   CheckpointNotFoundPublicError.pipe(HttpApiSchema.status(404)),
   SstNotFoundPublicError.pipe(HttpApiSchema.status(404)),
   DatabaseAlreadyExistsPublicError.pipe(HttpApiSchema.status(409)),
+  DatabaseRecentlyRemovedPublicError.pipe(HttpApiSchema.status(409)),
   KeyOutOfRangePublicError.pipe(HttpApiSchema.status(409)),
   DatabaseSealedPublicError.pipe(HttpApiSchema.status(409)),
   DatabaseHasDependentsPublicError.pipe(HttpApiSchema.status(409)),
@@ -313,6 +327,7 @@ export type DbPublicError =
   | CheckpointNotFoundPublicError
   | RouteNotFoundPublicError
   | DatabaseAlreadyExistsPublicError
+  | DatabaseRecentlyRemovedPublicError
   | KeyOutOfRangePublicError
   | DatabaseSealedPublicError
   | DatabaseHasDependentsPublicError

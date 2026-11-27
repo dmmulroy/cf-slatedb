@@ -19,6 +19,7 @@ import {
   CheckpointLimitReachedPublicError,
   CheckpointNotFoundPublicError,
   DatabaseAlreadyExistsPublicError,
+  DatabaseRecentlyRemovedPublicError,
   DatabaseHasDependentsPublicError,
   type DbApiOperation,
   DatabaseNotFoundPublicError,
@@ -43,7 +44,10 @@ import type {
   WriteStalledError,
 } from "./lsm-errors.ts";
 import type { CompactorUnavailableError, SstDropRefusedError } from "./compactor.ts";
-import type { CheckpointNotFoundError } from "./database-lifecycle.ts";
+import type {
+  CheckpointNotFoundError,
+  DatabaseRecentlyRemovedError,
+} from "./database-lifecycle.ts";
 import type { ChangelogUnavailableError, ReaderUnavailableError } from "./db-reader.ts";
 import type { DatabaseAlreadyExistsError } from "./manifest-store.ts";
 
@@ -52,6 +56,7 @@ export type DbInternalError =
   | DatabaseNotFoundError
   | DatabaseIdMismatchError
   | DatabaseAlreadyExistsError
+  | DatabaseRecentlyRemovedError
   | DatabaseSealedError
   | WriterFencedError
   | WriteStalledError
@@ -127,6 +132,18 @@ export const toPublicError =
           details: { reason: error.reason, operationIndex: Option.getOrNull(error.operationIndex) },
           requestId,
           retryable: false,
+        });
+      case "DatabaseRecentlyRemovedError":
+        return new DatabaseRecentlyRemovedPublicError({
+          code: "DatabaseRecentlyRemoved",
+          operation,
+          message: error.message,
+          details: {
+            databaseId: error.databaseId,
+            retryAfterMs: Math.max(0, Math.ceil(error.retryAfterMs)),
+          },
+          requestId,
+          retryable: true,
         });
       case "WriteStalledError":
         return new WriteStalledPublicError({

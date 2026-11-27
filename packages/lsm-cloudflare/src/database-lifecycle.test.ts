@@ -1,12 +1,24 @@
 import {
+  addCheckpoint,
+  CheckpointId,
+  commitCompaction,
+  commitL0Flush,
   DatabaseId,
   DEFAULT_DATABASE_OPTIONS,
+  holdForSuccessors,
   type KeyRange,
+  type Manifest,
   ManifestId,
+  markRemoved,
   manifestSstHandles,
+  prepareGarbageCollection,
+  sealManifest,
   SeqNum,
+  SortedRunId,
+  SstId,
+  Timestamp,
 } from "@shaledb/lsm-core";
-import { Clock, Context, Effect, Layer, Option, Ref } from "effect";
+import { Clock, Context, Effect, Layer, Option, Ref, Result } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -26,13 +38,22 @@ import {
   databaseLifecycleLayerWithoutDependencies,
 } from "./database-lifecycle.ts";
 import { DbClient, type DbSnapshot, dbClientTestLayer } from "./db-client.ts";
+import { toPublicError } from "./db-public-error-translation.ts";
 import type { DbReaderServices } from "./db-reader.ts";
 import { DurableObjectAlarm, durableObjectAlarmTestLayer } from "./durable-object-alarm.ts";
 import { GarbageCollector, makeGarbageCollector } from "./garbage-collector.ts";
 import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
+import { MaintenanceSweep, maintenanceSweepLayerWithoutDependencies } from "./maintenance-sweep.ts";
 import { ManifestReader } from "./manifest-reader.ts";
 import { ManifestStore } from "./manifest-store.ts";
-import { databasePrefix, manifestKey, manifestPrefix } from "./object-keys.ts";
+import {
+  compactedPrefix,
+  databasePrefix,
+  latestManifestKey,
+  manifestGcBoundaryKey,
+  manifestKey,
+  manifestPrefix,
+} from "./object-keys.ts";
 import { ObjectStore, ObjectStoreUnavailableError, objectStoreTestLayer } from "./object-store.ts";
 import { sstStoreLayerWithoutDependencies } from "./sst-store.ts";
 import { WriterClient } from "./writer-client.ts";
@@ -55,12 +76,15 @@ interface StoreFaultRules {
   readonly hideGet: (key: string) => boolean;
   readonly failGet: (key: string) => boolean;
   readonly failCreate: (key: string, body: string) => boolean;
+  /** Runs before a listing of `prefix` (once: the rule is cleared before it runs). */
+  readonly beforeList: Option.Option<(prefix: string) => Effect.Effect<void>>;
 }
 
 const NO_STORE_FAULTS: StoreFaultRules = {
   hideGet: () => false,
   failGet: () => false,
   failCreate: () => false,
+  beforeList: Option.none(),
 };
 
 /** The current fault rules. */
@@ -87,6 +111,15 @@ const faultyObjectStoreLayer = Layer.effect(
           if (rule.failGet(key)) return yield* injected("get", key);
           if (rule.hideGet(key)) return Option.none();
           return yield* inner.get(key);
+        }),
+      list: (prefix, cursor) =>
+        Effect.gen(function* () {
+          const rule = yield* rules;
+          if (Option.isSome(rule.beforeList)) {
+            yield* Ref.set(faults, { ...rule, beforeList: Option.none() });
+            yield* rule.beforeList.value(prefix);
+          }
+          return yield* inner.list(prefix, cursor);
         }),
       putIfAbsent: (key, body) =>
         Effect.gen(function* () {
@@ -209,6 +242,17 @@ const readAtSnapshot = (databaseId: DatabaseId, key: string, snapshot: DbSnapsho
   });
 
 const HOUR = 3_600_000;
+
+/** Whether `keys` are exactly a removal's tombstone: one manifest, the LATEST hint, GC's boundary. */
+const tombstoneShape = (keys: ReadonlyArray<string>) => {
+  const relative = keys.map((key) => key.slice(databasePrefix(SOURCE).length)).sort();
+  return (
+    relative.length === 3 &&
+    relative[0] === "gc/manifest.boundary" &&
+    /^manifest\/\d{20}$/.test(relative[1] ?? "") &&
+    relative[2] === "manifest/LATEST"
+  );
+};
 
 /** The source's checkpoints and the fork's external references, as one value to compare. */
 const holdsAndRefs = Effect.gen(function* () {
@@ -392,7 +436,7 @@ describe("DatabaseLifecycle", () => {
         const holdsAfter = (yield* reader.loadLatest(SOURCE)).manifest.checkpoints.length;
         yield* lifecycle.remove(SOURCE);
         const remaining = yield* (yield* ObjectStore).list(databasePrefix(SOURCE), Option.none());
-        const gone = yield* Effect.flip(reader.loadLatest(SOURCE));
+        const gone = (yield* reader.loadLatest(SOURCE)).manifest.state._tag;
         const { destroyed } = yield* Ref.get(yield* CompactorClientRecord);
         return {
           lateWrite,
@@ -409,7 +453,7 @@ describe("DatabaseLifecycle", () => {
           blockedAfterRewrite,
           leftRefs: leftManifest.externalRefs,
           holdsAfter,
-          remaining: remaining.objects.length,
+          remaining: remaining.objects.map((object) => object.key),
           gone,
           destroyed,
           leftAfter: yield* valuesIn(LEFT),
@@ -431,8 +475,10 @@ describe("DatabaseLifecycle", () => {
     expect(outcome.blockedAfterRewrite._tag).toBe("DatabaseHasDependentsError");
     expect(outcome.leftRefs).toEqual([]);
     expect(outcome.holdsAfter).toBe(0);
-    expect(outcome.remaining).toBe(0);
-    expect(outcome.gone._tag).toBe("DatabaseNotFoundError");
+    // Only the tombstone is left (the Removed head, its hint, GC's boundary below it); the
+    // maintenance sweep deletes it gcMinAge later (D91).
+    expect(tombstoneShape(outcome.remaining)).toBe(true);
+    expect(outcome.gone).toBe("Removed");
     expect(outcome.destroyed).toEqual([SOURCE]);
     expect(outcome.leftAfter).toEqual(["a=A", "b=B", "c=C"]);
     expect(outcome.rightAfter).toEqual(["d=D", "e=E", "f=F", "x=X"]);
@@ -1007,5 +1053,610 @@ describe("DatabaseLifecycle", () => {
     expect(result.afterAnHour).toEqual({ unpinned: "SnapshotExpired", pinned: "1" });
     expect(result.afterExpiry).toBe("SnapshotExpired");
     expect(result.pinned.expireAt).toBeGreaterThan(0);
+  });
+});
+
+describe("DatabaseLifecycle: recreate with the same id", () => {
+  it("a reader that cached the removed database's manifest reads the new database, not the old", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const client = yield* DbClient;
+        const options = { keyRange: Option.none(), databaseOptions: DEFAULT_DATABASE_OPTIONS };
+        // Removal times are measured from the removal, not from the clock's start.
+        yield* TestClock.adjust(5 * HOUR);
+        yield* lifecycle.create(SOURCE, options);
+        // Several flushes, so the old chain's newest manifest id is well above the new chain's.
+        for (const round of [1, 2, 3, 4, 5]) {
+          yield* client.put(SOURCE, bytes("a"), bytes(`old-${round}`));
+          yield* client.put(SOURCE, bytes(`k${round}`), bytes("old"));
+          yield* client.flush(SOURCE);
+        }
+        const latestRead = (key: string) =>
+          client
+            .get(SOURCE, bytes(key), {
+              consistency: { _tag: "Latest" },
+              snapshot: Option.none(),
+              refuseSealed: false,
+            })
+            .pipe(
+              Effect.map((value) => Option.getOrElse(Option.map(value, text), () => "none")),
+              Effect.catchTag("ReaderUnavailableError", (error) => Effect.succeed(error.reason)),
+            );
+        const before = yield* latestRead("a");
+        const flushedRead = (key: string) =>
+          client
+            .get(SOURCE, bytes(key), {
+              consistency: { _tag: "Flushed" },
+              snapshot: Option.none(),
+              refuseSealed: false,
+            })
+            .pipe(
+              Effect.map((value) => Option.getOrElse(Option.map(value, text), () => "none")),
+              Effect.catchTag("ReaderUnavailableError", (error) => Effect.succeed(error.reason)),
+            );
+        const flushedBefore = yield* flushedRead("a");
+        yield* lifecycle.remove(SOURCE);
+        // The id is not reusable while readers may still hold the removed database's manifests.
+        const tooSoon = yield* Effect.flip(lifecycle.create(SOURCE, options));
+        yield* TestClock.adjust(HOUR - 1);
+        const stillTooSoon = yield* Effect.flip(lifecycle.create(SOURCE, options));
+        yield* TestClock.adjust(1);
+        yield* lifecycle.create(SOURCE, options);
+        yield* client.put(SOURCE, bytes("a"), bytes("new"));
+        yield* client.flush(SOURCE);
+        const latestAfter = yield* latestRead("a");
+        const flushedAfter = yield* flushedRead("a");
+        const flushedOldKey = yield* flushedRead("k1");
+        // Long after any cache window.
+        yield* TestClock.adjust(2 * HOUR);
+        return {
+          tooSoon: tooSoon._tag === "DatabaseRecentlyRemovedError" && tooSoon.retryAfterMs === HOUR,
+          tooSoonPublic: toPublicError("createDatabase", "r1")(tooSoon),
+          stillTooSoon: stillTooSoon._tag,
+          before,
+          flushedBefore,
+          latestAfter,
+          flushedAfter,
+          flushedOldKey,
+          flushedLater: yield* flushedRead("a"),
+          latestOldKey: yield* latestRead("k1"),
+        };
+      }),
+    );
+    expect(outcome.tooSoon).toBe(true);
+    expect(outcome.tooSoonPublic).toMatchObject({
+      _tag: "DatabaseRecentlyRemovedPublicError",
+      code: "DatabaseRecentlyRemoved",
+      retryable: true,
+      details: { databaseId: SOURCE, retryAfterMs: HOUR },
+    });
+    expect(outcome.stillTooSoon).toBe("DatabaseRecentlyRemovedError");
+    expect(outcome.before).toBe("old-5");
+    expect(outcome.flushedBefore).toBe("old-5");
+    expect(outcome.latestAfter).toBe("new");
+    expect(outcome.flushedAfter).toBe("new");
+    expect(outcome.flushedOldKey).toBe("none");
+    expect(outcome.flushedLater).toBe("new");
+    expect(outcome.latestOldKey).toBe("none");
+  });
+});
+
+describe("DatabaseLifecycle: reads after removal", () => {
+  it("a reader that cached a removed database's manifest reports it not found", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const client = yield* DbClient;
+        const options = { keyRange: Option.none(), databaseOptions: DEFAULT_DATABASE_OPTIONS };
+        yield* lifecycle.create(SOURCE, options);
+        yield* client.put(SOURCE, bytes("a"), bytes("old"));
+        yield* client.flush(SOURCE);
+        const read = (consistency: "Latest" | "Flushed") =>
+          client
+            .get(SOURCE, bytes("a"), {
+              consistency: { _tag: consistency },
+              snapshot: Option.none(),
+              refuseSealed: false,
+            })
+            .pipe(
+              Effect.map((value) => Option.getOrElse(Option.map(value, text), () => "none")),
+              Effect.catchTags({
+                ReaderUnavailableError: (error) => Effect.succeed(error.reason),
+                DatabaseNotFoundError: () => Effect.succeed("DatabaseNotFound"),
+              }),
+            );
+        const before = { latest: yield* read("Latest"), flushed: yield* read("Flushed") };
+        yield* lifecycle.remove(SOURCE);
+        // A Flushed read may lag by manifestRefreshInterval (D29); past it, removal is seen.
+        yield* TestClock.adjust(1_001);
+        const live = yield* Effect.flip((yield* ManifestReader).loadLive(SOURCE));
+        return {
+          before,
+          latest: yield* read("Latest"),
+          flushed: yield* read("Flushed"),
+          live: live._tag,
+        };
+      }),
+    );
+    expect(outcome).toEqual({
+      before: { latest: "old", flushed: "old" },
+      latest: "DatabaseNotFound",
+      flushed: "DatabaseNotFound",
+      live: "DatabaseNotFoundError",
+    });
+  });
+});
+
+describe("DatabaseLifecycle: the removal tombstone", () => {
+  it("is all removal leaves, and the sweep deletes it gcMinAge later (D91)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const client = yield* DbClient;
+        const objects = yield* ObjectStore;
+        const keys = Effect.map(objects.list(databasePrefix(SOURCE), Option.none()), (page) =>
+          page.objects.map((object) => object.key),
+        );
+        const sweep = Effect.gen(function* () {
+          yield* (yield* MaintenanceSweep).sweepPage(50);
+        }).pipe(Effect.provide(maintenanceSweepLayerWithoutDependencies));
+        yield* lifecycle.create(SOURCE, {
+          keyRange: Option.none(),
+          databaseOptions: DEFAULT_DATABASE_OPTIONS,
+        });
+        yield* client.put(SOURCE, bytes("a"), bytes("A"));
+        yield* client.flush(SOURCE);
+        yield* lifecycle.remove(SOURCE);
+        const afterRemove = tombstoneShape(yield* keys);
+        yield* sweep;
+        const sweptEarly = tombstoneShape(yield* keys);
+        yield* TestClock.adjust(HOUR + 1);
+        yield* sweep;
+        return { afterRemove, sweptEarly, sweptLate: yield* keys };
+      }),
+    );
+    expect(outcome).toEqual({ afterRemove: true, sweptEarly: true, sweptLate: [] });
+  });
+});
+
+describe("DatabaseLifecycle: what an old incarnation may leave behind", () => {
+  it("a stale GC manifest boundary and LATEST hint do not hide or refuse the new chain (D90)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const client = yield* DbClient;
+        const objects = yield* ObjectStore;
+        const gc = yield* GarbageCollector;
+        const reader = yield* ManifestReader;
+        const options = { keyRange: Option.none(), databaseOptions: DEFAULT_DATABASE_OPTIONS };
+        yield* lifecycle.create(SOURCE, options);
+        for (const round of [1, 2, 3, 4, 5, 6]) {
+          yield* client.put(SOURCE, bytes("a"), bytes(`old-${round}`));
+          yield* client.flush(SOURCE);
+        }
+        // Old manifests collected: GC's manifest boundary is above 1.
+        yield* TestClock.adjust(HOUR + 1);
+        yield* gc.collect(SOURCE, Option.none());
+        const boundary = (yield* reader.loadManifestBoundary(SOURCE)).id;
+        const leftovers = [manifestGcBoundaryKey(SOURCE), latestManifestKey(SOURCE)];
+        const saved: Array<readonly [string, Uint8Array]> = [];
+        for (const key of leftovers) {
+          const body = yield* objects.get(key);
+          if (Option.isSome(body)) saved.push([key, body.value]);
+        }
+        yield* lifecycle.remove(SOURCE);
+        // A collection or a LATEST hint of the old incarnation, in flight during the removal,
+        // lands after its deletes.
+        for (const [key, body] of saved) yield* objects.put(key, body);
+        yield* TestClock.adjust(HOUR + 1);
+        const created = yield* Effect.result(lifecycle.create(SOURCE, options));
+        if (created._tag === "Failure") {
+          return {
+            boundaryAboveOne: boundary > 1,
+            savedKeys: saved.length,
+            created: created.failure._tag,
+            read: "not run",
+          };
+        }
+        const read = yield* Effect.result(
+          Effect.gen(function* () {
+            yield* client.put(SOURCE, bytes("a"), bytes("new"));
+            yield* client.flush(SOURCE);
+            return Option.map(
+              yield* client.get(SOURCE, bytes("a"), {
+                consistency: { _tag: "Flushed" },
+                snapshot: Option.none(),
+                refuseSealed: false,
+              }),
+              text,
+            );
+          }),
+        );
+        return {
+          boundaryAboveOne: boundary > 1,
+          savedKeys: saved.length,
+          created: "created",
+          read: read._tag === "Success" ? Option.getOrNull(read.success) : read.failure._tag,
+        };
+      }),
+    );
+    expect(outcome).toEqual({
+      boundaryAboveOne: true,
+      savedKeys: 2,
+      created: "created",
+      read: "new",
+    });
+  });
+});
+
+describe("DatabaseLifecycle: clearing a removed incarnation", () => {
+  it("keeps a live database's objects and a concurrent create's young objects (D90)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const client = yield* DbClient;
+        const objects = yield* ObjectStore;
+        const options = { keyRange: Option.none(), databaseOptions: DEFAULT_DATABASE_OPTIONS };
+        const marker = `${databasePrefix(SOURCE)}removed`;
+        const young = `${databasePrefix(SOURCE)}compacted/young.sst`;
+        yield* lifecycle.create(SOURCE, options);
+        yield* lifecycle.remove(SOURCE);
+        yield* TestClock.adjust(HOUR);
+        // A concurrent create of the same id has just written an object: it is young, so it stays.
+        yield* objects.put(young, Uint8Array.of(1));
+        yield* lifecycle.create(SOURCE, options);
+        const youngKept = Option.isSome(yield* objects.head(young));
+        yield* client.put(SOURCE, bytes("a"), bytes("A"));
+        yield* client.flush(SOURCE);
+        // A create that saw a marker while another create of the id won (the marker written again
+        // here stands for that view): the live database's objects, old by now, stay.
+        yield* objects.put(marker, Uint8Array.of(1));
+        yield* TestClock.adjust(HOUR);
+        const again = yield* Effect.flip(lifecycle.create(SOURCE, options));
+        const read = yield* client.get(SOURCE, bytes("a"), {
+          consistency: { _tag: "Flushed" },
+          snapshot: Option.none(),
+          refuseSealed: false,
+        });
+        return { youngKept, again: again._tag, read: Option.getOrNull(Option.map(read, text)) };
+      }),
+    );
+    expect(outcome).toEqual({ youngKept: true, again: "DatabaseAlreadyExistsError", read: "A" });
+  });
+});
+
+describe("DatabaseLifecycle: what lands after removal", () => {
+  it("an SST upload and a LATEST hint written after the deletes go with the tombstone (D91)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const client = yield* DbClient;
+        const objects = yield* ObjectStore;
+        yield* lifecycle.create(SOURCE, {
+          keyRange: Option.none(),
+          databaseOptions: DEFAULT_DATABASE_OPTIONS,
+        });
+        yield* client.put(SOURCE, bytes("a"), bytes("A"));
+        yield* client.flush(SOURCE);
+        yield* lifecycle.remove(SOURCE);
+        // A compaction step in flight uploads its output; a commit's hint write lands late.
+        yield* objects.put(`${compactedPrefix(SOURCE)}late.sst`, Uint8Array.of(1));
+        yield* objects.put(latestManifestKey(SOURCE), new TextEncoder().encode("99"));
+        const removedRead = yield* Effect.flip(
+          client.get(SOURCE, bytes("a"), {
+            consistency: { _tag: "Flushed" },
+            snapshot: Option.none(),
+            refuseSealed: false,
+          }),
+        );
+        yield* TestClock.adjust(2 * HOUR);
+        yield* Effect.gen(function* () {
+          yield* (yield* MaintenanceSweep).sweepPage(50);
+        }).pipe(Effect.provide(maintenanceSweepLayerWithoutDependencies));
+        const page = yield* objects.list(databasePrefix(SOURCE), Option.none());
+        return { removedRead: removedRead._tag, left: page.objects.map((object) => object.key) };
+      }),
+    );
+    expect(outcome).toEqual({ removedRead: "DatabaseNotFoundError", left: [] });
+  });
+});
+
+describe("DatabaseLifecycle: a manifest CAS in flight during removal", () => {
+  const firstL0 = (manifest: Manifest) => {
+    const sst = manifest.l0[0];
+    if (sst === undefined) throw new Error("the database was flushed");
+    return sst;
+  };
+  const checkpointAt = (id: string, manifestId: ManifestId) => ({
+    id: CheckpointId.make(id),
+    manifestId,
+    createdAt: Timestamp.make(0),
+    expireAt: Option.none(),
+    holder: Option.none(),
+    name: Option.none(),
+  });
+  // Each committer's edit, applied to the manifest it loaded before the removal (`view`).
+  // A committer carries the epoch it fenced in with (the view's), not the one it reloads.
+  const committers = (
+    view: Manifest,
+  ): ReadonlyArray<
+    readonly [
+      string,
+      (
+        manifest: Manifest,
+        manifestId: ManifestId,
+      ) => Result.Result<Manifest, { readonly _tag: string }>,
+    ]
+  > => [
+    [
+      "flush",
+      (manifest) =>
+        commitL0Flush(manifest, {
+          writerEpoch: view.writerEpoch,
+          sst: { ...firstL0(view), id: SstId.make("01JD00000000000000000000F1") },
+          lastSeq: SeqNum.make(manifest.lastL0Seq + 1),
+          clockTick: manifest.lastL0ClockTick,
+          changelog: Option.none(),
+        }),
+    ],
+    [
+      "compaction",
+      (manifest) =>
+        commitCompaction(manifest, {
+          compactorEpoch: view.compactorEpoch,
+          job: {
+            sources: view.l0.map((sst) => ({ _tag: "L0" as const, sstId: sst.id })),
+            destination: SortedRunId.make(0),
+            isBottom: true,
+          },
+          outputs: [{ ...firstL0(view), id: SstId.make("01JD00000000000000000000C1") }],
+          jobId: "job-after-removal",
+        }),
+    ],
+    [
+      "collection",
+      (manifest) =>
+        Result.succeed(
+          prepareGarbageCollection(manifest, {
+            now: Timestamp.make(10),
+            cutoff: Timestamp.make(5),
+            advanceBoundary: true,
+          }),
+        ),
+    ],
+    [
+      "checkpoint",
+      (manifest, id) => addCheckpoint(manifest, checkpointAt("01JD0000000000000000000CK1", id)),
+    ],
+    ["seal", (manifest) => Result.succeed(sealManifest(manifest, [LEFT, RIGHT]))],
+    [
+      "fork hold",
+      (manifest, id) =>
+        holdForSuccessors(manifest, {
+          pinnedManifestId: id,
+          proposed: [
+            { successor: LEFT, checkpointId: CheckpointId.make("01JD0000000000000000000HD1") },
+          ],
+          createdAt: Timestamp.make(0),
+        }),
+    ],
+  ];
+  const COMMITTERS = ["flush", "compaction", "collection", "checkpoint", "seal", "fork hold"];
+  for (const committer of COMMITTERS) {
+    it(`a ${committer} that lands after the removal's deletes does not bring the database back`, async () => {
+      const outcome = await run(
+        Effect.gen(function* () {
+          const lifecycle = yield* DatabaseLifecycle;
+          const client = yield* DbClient;
+          const store = yield* ManifestStore;
+          const reader = yield* ManifestReader;
+          const objects = yield* ObjectStore;
+          yield* lifecycle.create(SOURCE, {
+            keyRange: Option.none(),
+            databaseOptions: DEFAULT_DATABASE_OPTIONS,
+          });
+          yield* client.put(SOURCE, bytes("a"), bytes("A"));
+          yield* client.flush(SOURCE);
+          // The committer loaded the newest manifest, then the whole removal ran.
+          const view = yield* reader.loadLatest(SOURCE);
+          const edit = committers(view.manifest).find(([name]) => name === committer)?.[1];
+          if (edit === undefined) return yield* Effect.die(`no committer ${committer}`);
+          yield* lifecycle.remove(SOURCE);
+          const headId = (yield* reader.loadLatest(SOURCE)).id;
+          const landed = yield* Effect.result(store.updateFrom(view, edit));
+          // Manifest objects, not the LATEST hint.
+          const manifestsLeft = (yield* objects.list(
+            manifestPrefix(SOURCE),
+            Option.none(),
+          )).objects.filter((object) => object.key !== latestManifestKey(SOURCE)).length;
+          const seen = yield* Effect.result(reader.loadLatest(SOURCE));
+          const write = yield* Effect.result(client.put(SOURCE, bytes("b"), bytes("B")));
+          return {
+            // Refused (the edit's error), or a no-op on the tombstone: nothing above the head.
+            committedAboveHead: landed._tag === "Success" && landed.success.id > headId,
+            manifestsLeft,
+            seen: seen._tag === "Success" ? seen.success.manifest.state._tag : seen.failure._tag,
+            write: write._tag === "Success" ? "acknowledged" : write.failure._tag,
+          };
+        }),
+      );
+      // Exactly one manifest object is left, the head: the Removed tombstone (D91).
+      expect(outcome).toEqual({
+        committedAboveHead: false,
+        manifestsLeft: 1,
+        seen: "Removed",
+        write: "DatabaseNotFoundError",
+      });
+    });
+  }
+});
+
+describe("DatabaseLifecycle: a removal that stopped after marking", () => {
+  it("leaves nothing of the old incarnation to a create gcMinAge later, and sequence numbers start again (D91)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const client = yield* DbClient;
+        const store = yield* ManifestStore;
+        const options = { keyRange: Option.none(), databaseOptions: DEFAULT_DATABASE_OPTIONS };
+        const latestRead = (key: string) =>
+          Effect.map(
+            client.get(SOURCE, bytes(key), {
+              consistency: { _tag: "Latest" },
+              snapshot: Option.none(),
+              refuseSealed: false,
+            }),
+            (value) => Option.getOrNull(Option.map(value, text)),
+          );
+        yield* lifecycle.create(SOURCE, options);
+        yield* client.put(SOURCE, bytes("a"), bytes("flushed"));
+        yield* client.flush(SOURCE);
+        // Unflushed rows in the writer's SQLite, at sequence numbers past the flushed ones.
+        for (const round of [1, 2, 3]) yield* client.put(SOURCE, bytes(`u${round}`), bytes("old"));
+        // The removal marks the manifest, then stops: the writer's state is never destroyed.
+        const removedAt = Timestamp.make(yield* Clock.currentTimeMillis);
+        yield* store.update(SOURCE, (manifest) => markRemoved(manifest, removedAt));
+        const tooSoon = (yield* Effect.flip(lifecycle.create(SOURCE, options)))._tag;
+        yield* TestClock.adjust(HOUR + 1_000);
+        // The sweep cannot reach the writer, so it leaves an uncleared tombstone to create.
+        yield* Effect.gen(function* () {
+          yield* (yield* MaintenanceSweep).sweepPage(50);
+        }).pipe(Effect.provide(maintenanceSweepLayerWithoutDependencies));
+        yield* lifecycle.create(SOURCE, options);
+        const receipt = yield* client.put(SOURCE, bytes("b"), bytes("new"));
+        yield* client.flush(SOURCE);
+        return {
+          tooSoon,
+          firstSeq: receipt.seq,
+          a: yield* latestRead("a"),
+          u1: yield* latestRead("u1"),
+          b: yield* latestRead("b"),
+        };
+      }),
+    );
+    expect(outcome).toEqual({
+      tooSoon: "DatabaseRecentlyRemovedError",
+      firstSeq: 1,
+      a: null,
+      u1: null,
+      b: "new",
+    });
+  });
+});
+
+describe("DatabaseLifecycle: a removal still deleting when the id is created again", () => {
+  it("deletes none of the new database's objects (D91)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const client = yield* DbClient;
+        const faults = yield* StoreFaults;
+        const context = yield* Effect.context<TestServices>();
+        const options = { keyRange: Option.none(), databaseOptions: DEFAULT_DATABASE_OPTIONS };
+        yield* lifecycle.create(SOURCE, options);
+        yield* client.put(SOURCE, bytes("a"), bytes("old"));
+        yield* client.flush(SOURCE);
+        // The removal's first listing is slow: gcMinAge passes, and a create of the id and its
+        // first flush land before the listing returns.
+        yield* Ref.update(faults, (rule) => ({
+          ...rule,
+          beforeList: Option.some((prefix: string) =>
+            prefix === databasePrefix(SOURCE)
+              ? Effect.gen(function* () {
+                  yield* TestClock.adjust(HOUR + 1);
+                  yield* lifecycle.create(SOURCE, options);
+                  yield* client.put(SOURCE, bytes("b"), bytes("new"));
+                  yield* client.flush(SOURCE);
+                }).pipe(Effect.provideContext(context), Effect.scoped, Effect.orDie)
+              : Effect.void,
+          ),
+        }));
+        yield* lifecycle.remove(SOURCE);
+        return Option.getOrNull(
+          Option.map(
+            yield* client.get(SOURCE, bytes("b"), {
+              consistency: { _tag: "Flushed" },
+              snapshot: Option.none(),
+              refuseSealed: false,
+            }),
+            text,
+          ),
+        );
+      }),
+    );
+    expect(outcome).toBe("new");
+  });
+});
+
+describe("DatabaseLifecycle: a fork's hold", () => {
+  it("cannot be deleted as a checkpoint while the fork holds it (D91)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const client = yield* DbClient;
+        const reader = yield* ManifestReader;
+        yield* lifecycle.create(SOURCE, {
+          keyRange: Option.none(),
+          databaseOptions: DEFAULT_DATABASE_OPTIONS,
+        });
+        yield* client.put(SOURCE, bytes("a"), bytes("A"));
+        const checkpoint = yield* lifecycle.createCheckpoint(SOURCE, {
+          name: Option.none(),
+          lifetimeMs: Option.none(),
+        });
+        yield* lifecycle.forkRange({
+          source: SOURCE,
+          checkpointId: checkpoint.id,
+          range: LEFT_RANGE,
+          forkId: LEFT,
+        });
+        const hold = (yield* reader.loadLatest(SOURCE)).manifest.checkpoints.find((cp) =>
+          Option.contains(cp.holder, LEFT),
+        );
+        if (hold === undefined) return yield* Effect.die("the fork holds no checkpoint");
+        const deleted = yield* Effect.result(lifecycle.deleteCheckpoint(SOURCE, hold.id));
+        const holdLeft = (yield* reader.loadLatest(SOURCE)).manifest.checkpoints.some(
+          (cp) => cp.id === hold.id,
+        );
+        // The caller's own checkpoint is still deletable.
+        yield* lifecycle.deleteCheckpoint(SOURCE, checkpoint.id);
+        return {
+          deleted: deleted._tag === "Success" ? "deleted" : deleted.failure._tag,
+          holdLeft,
+        };
+      }),
+    );
+    expect(outcome).toEqual({ deleted: "DatabaseHasDependentsError", holdLeft: true });
+  });
+
+  it("is released when the fork's id belongs to another database (D37)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const reader = yield* ManifestReader;
+        const options = { keyRange: Option.none(), databaseOptions: DEFAULT_DATABASE_OPTIONS };
+        yield* lifecycle.create(SOURCE, options);
+        yield* lifecycle.create(LEFT, options);
+        const checkpoint = yield* lifecycle.createCheckpoint(SOURCE, {
+          name: Option.none(),
+          lifetimeMs: Option.none(),
+        });
+        const fork = yield* Effect.flip(
+          lifecycle.forkRange({
+            source: SOURCE,
+            checkpointId: checkpoint.id,
+            range: LEFT_RANGE,
+            forkId: LEFT,
+          }),
+        );
+        const checkpoints = (yield* reader.loadLatest(SOURCE)).manifest.checkpoints.map(
+          (cp) => cp.id,
+        );
+        return { fork: fork._tag, checkpoints };
+      }),
+    );
+    expect(outcome.fork).toBe("DatabaseAlreadyExistsError");
+    expect(outcome.checkpoints).toHaveLength(1);
   });
 });

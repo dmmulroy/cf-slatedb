@@ -6,6 +6,7 @@ import {
   markRemoved,
   type Row,
   SeqNum,
+  Timestamp,
   type WriteBatch,
 } from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
@@ -1054,7 +1055,8 @@ describe("DbWriter alarm for a database that is gone (D85)", () => {
       const set = yield* alarm.scheduled;
       // Removal marks the manifest removed; the step that deletes the writer's state never runs
       // (the removal was interrupted), and the object restarts.
-      yield* (yield* ManifestStore).update(DB, (manifest) => markRemoved(manifest));
+      const removedAt = Timestamp.make(yield* Clock.currentTimeMillis);
+      yield* (yield* ManifestStore).update(DB, (manifest) => markRemoved(manifest, removedAt));
       const after = yield* newWriter();
       const fired = [];
       for (let firing = 0; firing < 3; firing++) {

@@ -331,6 +331,17 @@ hand-off is below.
     tests). `verify.ts transactions` and `verify.ts gc-safety` exit 0. Each new test fails under
     a named mutation (`/tmp/shale-work/agents/review/REPORT-4.md`).
 
+- **Audit round 2, lifecycle (D90, D91).**
+  - **Recreating a removed id** served the removed database's data to warm readers. An id is now
+    reusable only `gcMinAge` after its removal, with a new `DatabaseRecentlyRemoved` (409,
+    retryable).
+  - **A commit in flight during a removal** brought the database back as `Open` (or `Sealed`) and
+    let its writer acknowledge writes. The `Removed` manifest now stays at the head as a tombstone
+    for `gcMinAge`; the sweep deletes it.
+  - **A property test** applies every manifest edit as a state machine.
+  - **Model:** `ManifestCasFencingRemove.cfg`.
+  - **Not run:** workerd, scenarios, previews.
+
 ## Remaining-work log
 
 - **Set up (new session).** Node 24.22, `vp` 1.8, pnpm 12.14; `repos/slatedb` and `.tlc/` present;

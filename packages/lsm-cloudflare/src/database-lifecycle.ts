@@ -7,14 +7,16 @@ import {
   DatabaseId,
   type DatabaseOptions,
   type DatabaseRemovedError,
-  type DatabaseHasDependentsError,
+  DatabaseHasDependentsError,
   forkManifest,
   generateCheckpointId,
   initialManifest,
   type KeyRange,
   type Manifest,
   ManifestId,
+  markRemovalCleared,
   markRemoved,
+  removalExpiresAt,
   removeCheckpoint,
   type SstId,
   Timestamp,
@@ -39,12 +41,14 @@ import {
   type ManifestReadError,
   type VersionedManifest,
 } from "./manifest-reader.ts";
+import { DatabaseAlreadyExistsError, ManifestStore, ManifestWriteError } from "./manifest-store.ts";
+import { LsmConfiguration } from "./lsm-configuration.ts";
 import {
-  type DatabaseAlreadyExistsError,
-  ManifestStore,
-  type ManifestWriteError,
-} from "./manifest-store.ts";
-import { databasePrefix } from "./object-keys.ts";
+  databasePrefix,
+  latestManifestKey,
+  manifestGcBoundaryKey,
+  manifestKey,
+} from "./object-keys.ts";
 import { ObjectStore, type ObjectStoreUnavailableError } from "./object-store.ts";
 import { WriterClient, type WriterClientError } from "./writer-client.ts";
 
@@ -92,6 +96,23 @@ export class CheckpointNotFoundError extends Schema.TaggedError<CheckpointNotFou
   { databaseId: DatabaseId, checkpointId: CheckpointId, message: Schema.String },
 ) {}
 
+/**
+ * A database with this id was removed less than `gcMinAge` ago, so the id cannot be used yet:
+ * reader isolates may still hold the removed database's manifests (D90). Retryable after
+ * `retryAfterMs`.
+ */
+export class DatabaseRecentlyRemovedError extends Schema.TaggedError<DatabaseRecentlyRemovedError>()(
+  "DatabaseRecentlyRemovedError",
+  {
+    databaseId: DatabaseId,
+    /** When the id may be used again, in epoch milliseconds. */
+    reusableAt: Schema.Number,
+    /** How long from the refusal until then. */
+    retryAfterMs: Schema.Number,
+    message: Schema.String,
+  },
+) {}
+
 /** An operator's request to drop one SST (see {@link IDatabaseLifecycle.dropSst}). */
 export interface DropSstOptions {
   readonly sstId: SstId;
@@ -106,6 +127,7 @@ export type DatabaseLifecycleError =
   | CheckpointLimitError
   | DatabaseNotFoundError
   | DatabaseAlreadyExistsError
+  | DatabaseRecentlyRemovedError
   | DatabaseHasDependentsError
   | CheckpointNotFoundError
   | WriterUnavailableError
@@ -123,17 +145,15 @@ export interface IDatabaseLifecycle {
   /**
    * Creates a database: writes its first manifest. The writer and compactor start lazily.
    *
-   * @returns The first manifest, `DatabaseAlreadyExistsError`, or `WriterUnavailableError` when
-   *   storage is unavailable.
+   * @returns The first manifest; `DatabaseAlreadyExistsError`; `DatabaseRecentlyRemovedError`
+   *   when a database with this id was removed less than `gcMinAge` ago (D90); or
+   *   `WriterUnavailableError` (or a writer or compactor error while it clears a removed
+   *   incarnation) when storage is unavailable.
    */
   readonly create: (
     databaseId: DatabaseId,
     options: CreateDatabaseOptions,
-  ) => Effect.Effect<
-    VersionedManifest,
-    DatabaseAlreadyExistsError | WriterUnavailableError,
-    RuntimeContext
-  >;
+  ) => Effect.Effect<VersionedManifest, DatabaseLifecycleError, DatabaseLifecycleServices>;
   /**
    * Flushes every acknowledged write, then pins the resulting manifest with a checkpoint: GC keeps
    * every SST it references until the checkpoint is deleted or expires.
@@ -231,6 +251,7 @@ export const makeDatabaseLifecycle = Effect.gen(function* () {
   const compactors = yield* CompactorClient;
   const background = yield* BackgroundWork;
   const blocks = yield* BlockSource;
+  const settings = yield* LsmConfiguration;
 
   const unavailable =
     (databaseId: DatabaseId, operation: string) =>
@@ -258,9 +279,111 @@ export const makeDatabaseLifecycle = Effect.gen(function* () {
       message: `Checkpoint ${checkpointId} of database ${databaseId} does not exist (deleted or expired), or its manifest was collected. Create a new checkpoint.`,
     });
 
+  /**
+   * The part of a removal outside the bucket: the writer's SQLite state and the compactor's cell
+   * destroyed, and the database's holds on its sources released. Each step is idempotent.
+   */
+  const destroyRemovedState = (databaseId: DatabaseId, removed: Manifest) =>
+    Effect.gen(function* () {
+      yield* writers.destroy(databaseId);
+      yield* compactors.destroy(databaseId);
+      // A fork releases the checkpoints it holds on its sources, so they can collect those SSTs.
+      for (const ref of removed.externalRefs) {
+        yield* manifests
+          .update(ref.owner, (manifest) =>
+            Result.succeed(removeCheckpoint(manifest, ref.checkpointId)),
+          )
+          .pipe(
+            Effect.catchTags(updateFailures(ref.owner, "remove")),
+            Effect.catchTags({ DatabaseNotFoundError: () => Effect.void }),
+          );
+      }
+    });
+
+  /** When the object of `databaseId`'s manifest `manifestId` was written, if it exists. */
+  const writtenAt = (databaseId: DatabaseId, manifestId: ManifestId) =>
+    Effect.map(objects.head(manifestKey(databaseId, manifestId)), (info) =>
+      Option.map(info, (object) => object.uploadedAt),
+    );
+
+  /**
+   * Clears a removed incarnation whose tombstone is `gcMinAge` old, so the id can start a new chain
+   * (D90, D91): finishes the removal's state part if it stopped before it, then deletes every object
+   * under the prefix written no later than the tombstone (or `gcMinAge` ago), the tombstone among
+   * them, and the `LATEST` hint and GC manifest boundary, which would refuse or slow the new chain.
+   * A concurrent create of the same id writes only later objects, which stay.
+   */
+  const clearRemovedIncarnation = (databaseId: DatabaseId, head: VersionedManifest, now: number) =>
+    Effect.gen(function* () {
+      if (head.manifest.state._tag === "Removed" && !head.manifest.state.cleared) {
+        yield* destroyRemovedState(databaseId, head.manifest);
+      }
+      const headWritten = yield* writtenAt(databaseId, head.id);
+      const cutoff = Math.max(
+        now - settings.gcMinAge,
+        Option.getOrElse(headWritten, () => now - settings.gcMinAge),
+      );
+      let cursor = Option.none<string>();
+      do {
+        const page = yield* objects.list(databasePrefix(databaseId), cursor);
+        const old = page.objects.filter(
+          (object) =>
+            object.uploadedAt <= cutoff ||
+            object.key === latestManifestKey(databaseId) ||
+            object.key === manifestGcBoundaryKey(databaseId),
+        );
+        if (old.length > 0) yield* objects.delete(old.map((object) => object.key));
+        cursor = page.cursor;
+      } while (Option.isSome(cursor));
+    }).pipe(
+      Effect.catchTags({
+        ObjectStoreUnavailableError: (error: { readonly message: string }) =>
+          Effect.fail(
+            new ManifestWriteError({
+              databaseId,
+              reason: "StorageUnavailable",
+              message: error.message,
+            }),
+          ),
+      }),
+    );
+
   const create = Effect.fn("DatabaseLifecycle.create")(
     function* (databaseId: DatabaseId, options: CreateDatabaseOptions) {
       yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
+      // An id removed less than gcMinAge ago is not reusable yet: a reader isolate may still hold
+      // a manifest of the removed database, and would serve it as the new one's, and a commit from
+      // a view loaded before the removal must still find the tombstone (D90, D91).
+      const head = yield* reader.loadLatest(databaseId).pipe(
+        Effect.map(Option.some),
+        Effect.catchTags({
+          DatabaseNotFoundError: () => Effect.succeed(Option.none<VersionedManifest>()),
+          ManifestReadError: (error) =>
+            Effect.fail(
+              new ManifestWriteError({
+                databaseId,
+                reason: "StorageUnavailable",
+                message: error.message,
+              }),
+            ),
+        }),
+      );
+      const now = yield* Clock.currentTimeMillis;
+      if (Option.isSome(head) && head.value.manifest.state._tag === "Removed") {
+        const reusableAt = Option.getOrElse(
+          removalExpiresAt(head.value.manifest, Timestamp.make(now), settings.gcMinAge),
+          () => now,
+        );
+        if (now < reusableAt) {
+          return yield* new DatabaseRecentlyRemovedError({
+            databaseId,
+            reusableAt,
+            retryAfterMs: reusableAt - now,
+            message: `Database ${databaseId} was removed less than gcMinAge ago, so its id cannot be used yet: readers may still hold the removed database's manifests. Retry after ${new Date(reusableAt).toISOString()}, or use another id.`,
+          });
+        }
+        yield* clearRemovedIncarnation(databaseId, head.value, now);
+      }
       return yield* manifests.initialize(initialManifest(databaseId, options));
     },
     Effect.catchTags({
@@ -340,14 +463,43 @@ export const makeDatabaseLifecycle = Effect.gen(function* () {
     return pinned;
   });
 
+  /** Removes a checkpoint whoever holds it (a fork's failed creation releasing its own hold). */
+  const removeCheckpointNow = (databaseId: DatabaseId, checkpointId: CheckpointId) =>
+    manifests
+      .update(databaseId, (manifest) => Result.succeed(removeCheckpoint(manifest, checkpointId)))
+      .pipe(Effect.asVoid, Effect.catchTags(updateFailures(databaseId, "checkpoint")));
+
   const deleteCheckpoint = Effect.fn("DatabaseLifecycle.deleteCheckpoint")(function* (
     databaseId: DatabaseId,
     checkpointId: CheckpointId,
   ) {
     yield* Effect.annotateCurrentSpan({ "database.id": databaseId, "checkpoint.id": checkpointId });
-    yield* manifests
-      .update(databaseId, (manifest) => Result.succeed(removeCheckpoint(manifest, checkpointId)))
-      .pipe(Effect.catchTags(updateFailures(databaseId, "checkpoint")));
+    // A fork's hold is not the caller's to delete while the fork exists: the fork reads the SSTs
+    // it pins. The fork's own collection releases it (D77), or the fork's removal does.
+    const latest = yield* reader
+      .loadLive(databaseId)
+      .pipe(Effect.catchTags({ ManifestReadError: unavailable(databaseId, "checkpoint") }));
+    const holder = Option.flatMap(
+      Option.fromUndefinedOr(latest.manifest.checkpoints.find((cp) => cp.id === checkpointId)),
+      (checkpoint) => checkpoint.holder,
+    );
+    if (Option.isSome(holder)) {
+      const holderLive = yield* reader.loadLive(holder.value).pipe(
+        Effect.as(true),
+        Effect.catchTags({
+          DatabaseNotFoundError: () => Effect.succeed(false),
+          ManifestReadError: unavailable(databaseId, "checkpoint"),
+        }),
+      );
+      if (holderLive) {
+        return yield* new DatabaseHasDependentsError({
+          databaseId,
+          dependents: [holder.value],
+          message: `Checkpoint ${checkpointId} of database ${databaseId} is the hold of fork ${holder.value}, which still reads its SSTs, so it was not deleted. The fork releases it once it no longer needs it; remove the fork to release it now.`,
+        });
+      }
+    }
+    yield* removeCheckpointNow(databaseId, checkpointId);
   });
 
   const seal = Effect.fn("DatabaseLifecycle.seal")(function* (
@@ -448,7 +600,7 @@ export const makeDatabaseLifecycle = Effect.gen(function* () {
             if (ours && Option.isSome(first)) {
               return { id: ManifestId.make(1), manifest: first.value };
             }
-            yield* deleteCheckpoint(source, hold.id);
+            yield* removeCheckpointNow(source, hold.id);
             return yield* Effect.fail(error);
           }),
       }),
@@ -493,36 +645,71 @@ export const makeDatabaseLifecycle = Effect.gen(function* () {
 
   const remove = Effect.fn("DatabaseLifecycle.remove")(function* (databaseId: DatabaseId) {
     yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
-    // Fence first: after this CAS no write, checkpoint, or fork can commit.
+    // Fence first: after this CAS no write, checkpoint, or fork can commit, and every later commit
+    // carries the Removed state forward.
+    const removedAt = Timestamp.make(yield* Clock.currentTimeMillis);
     const marked = yield* manifests
-      .update(databaseId, (manifest) => markRemoved(manifest))
+      .update(databaseId, (manifest) => markRemoved(manifest, removedAt))
       .pipe(Effect.catchTags(updateFailures(databaseId, "remove")));
-    yield* writers.destroy(databaseId);
-    yield* compactors.destroy(databaseId);
-    // A fork releases the checkpoints it holds on its sources, so they can collect those SSTs.
-    for (const ref of marked.manifest.externalRefs) {
+    yield* destroyRemovedState(databaseId, marked.manifest);
+    const head = yield* manifests
+      .update(databaseId, (manifest) => Result.succeed(markRemovalCleared(manifest)))
+      .pipe(Effect.catchTags(updateFailures(databaseId, "remove")));
+    // The head stays as the tombstone for gcMinAge (D91). GC's manifest boundary moves to just
+    // below it first, so readers start at the head and a commit from any older view lands at or
+    // below the boundary, loses, reloads, and finds the database removed.
+    if (head.id > 1) {
       yield* manifests
-        .update(ref.owner, (manifest) =>
-          Result.succeed(removeCheckpoint(manifest, ref.checkpointId)),
-        )
-        .pipe(
-          Effect.catchTags(updateFailures(ref.owner, "remove")),
-          Effect.catchTags({ DatabaseNotFoundError: () => Effect.void }),
-        );
+        .advanceManifestBoundary(databaseId, ManifestId.make(head.id - 1))
+        .pipe(Effect.catchTags({ ManifestWriteError: unavailable(databaseId, "remove") }));
     }
-    // Delete everything under db/<id>/, page by page; manifests sort last, so a partial removal
-    // still has its manifest and is retried (GC also sweeps a prefix left without one).
+    const keep = new Set([
+      manifestKey(databaseId, head.id),
+      latestManifestKey(databaseId),
+      manifestGcBoundaryKey(databaseId),
+    ]);
+    // Everything else under db/<id>/ written no later than the tombstone, page by page, while the
+    // head is still this tombstone. A removal still running after a later create of the id (it
+    // waits gcMinAge) deletes none of the new database's objects: they are all newer than the
+    // tombstone. What lands after it is the sweep's (D91).
+    const tombstoneWritten = Option.getOrElse(
+      yield* writtenAt(databaseId, head.id).pipe(
+        Effect.catchTags({ ObjectStoreUnavailableError: unavailable(databaseId, "remove") }),
+      ),
+      () => Number.POSITIVE_INFINITY,
+    );
     let deleted = 0;
-    for (;;) {
+    let cursor = Option.none<string>();
+    do {
+      const current = yield* reader.loadLatest(databaseId).pipe(
+        Effect.map(Option.some),
+        Effect.catchTags({
+          ManifestReadError: unavailable(databaseId, "remove"),
+          DatabaseNotFoundError: () => Effect.succeed(Option.none<VersionedManifest>()),
+        }),
+      );
+      if (
+        Option.isNone(current) ||
+        current.value.id !== head.id ||
+        current.value.manifest.state._tag !== "Removed"
+      )
+        break;
       const page = yield* objects
-        .list(databasePrefix(databaseId), Option.none())
+        .list(databasePrefix(databaseId), cursor)
         .pipe(Effect.catchTags({ ObjectStoreUnavailableError: unavailable(databaseId, "remove") }));
-      if (page.objects.length === 0) break;
-      yield* objects
-        .delete(page.objects.map((object) => object.key))
-        .pipe(Effect.catchTags({ ObjectStoreUnavailableError: unavailable(databaseId, "remove") }));
-      deleted += page.objects.length;
-    }
+      const keys = page.objects
+        .filter((object) => !keep.has(object.key) && object.uploadedAt <= tombstoneWritten)
+        .map((object) => object.key);
+      if (keys.length > 0) {
+        yield* objects
+          .delete(keys)
+          .pipe(
+            Effect.catchTags({ ObjectStoreUnavailableError: unavailable(databaseId, "remove") }),
+          );
+      }
+      deleted += keys.length;
+      cursor = page.cursor;
+    } while (Option.isSome(cursor));
     const purged = yield* blocks
       .purge(databaseId)
       .pipe(Effect.catchTags({ BlockSourceUnavailableError: () => Effect.succeed(false) }));

@@ -101,12 +101,24 @@ export type ExternalRef = typeof ExternalRef.Type;
 
 /**
  * Schema for a database's lifecycle state: open, sealed with the databases that replace it, or
- * being removed (its objects are deleted next; nothing may write to it or fork from it).
+ * removed (nothing may write to it or fork from it).
+ *
+ * **Details**
+ *
+ * A `Removed` manifest is the removal's tombstone (D91): it stays at the head of the chain for
+ * `gcMinAge` after `removedAt`, so every commit from a view loaded before the removal loses its
+ * create-if-absent, reloads, and finds the database removed. `cleared` records that the writer's
+ * and compactor's state is destroyed and the database's holds on its sources are released.
+ * Manifests written before D91 carry neither field: no `removedAt` reads as removed just now,
+ * `cleared` as false.
  */
 export const DatabaseState = Schema.Union([
   Schema.TaggedStruct("Open", {}),
   Schema.TaggedStruct("Sealed", { successors: Schema.Array(DatabaseId) }),
-  Schema.TaggedStruct("Removed", {}),
+  Schema.TaggedStruct("Removed", {
+    removedAt: Schema.OptionFromOptionalKey(Timestamp),
+    cleared: Schema.Boolean.pipe(Schema.withDecodingDefaultKey(Effect.succeed(false))),
+  }),
 ]);
 
 /** A database's lifecycle state. */
@@ -630,6 +642,8 @@ export const commitCompaction = (
   Manifest,
   CompactorFencedError | CompactionInputsChangedError | SstBelowGcBoundaryError
 > => {
+  // A removed database is not compacted: a commit that finds the tombstone changes nothing (D91).
+  if (manifest.state._tag === "Removed") return Result.succeed(manifest);
   const l0Inputs = new Set(
     commit.job.sources.flatMap((source) => (source._tag === "L0" ? [source.sstId] : [])),
   );
@@ -700,9 +714,11 @@ export const sealManifest = (
   manifest: Manifest,
   successors: ReadonlyArray<DatabaseId>,
 ): Manifest =>
-  manifest.state._tag === "Sealed" &&
-  manifest.state.successors.length === successors.length &&
-  manifest.state.successors.every((id, index) => id === successors[index])
+  // A removed database stays removed: a seal that finds the tombstone changes nothing (D91).
+  manifest.state._tag === "Removed" ||
+  (manifest.state._tag === "Sealed" &&
+    manifest.state.successors.length === successors.length &&
+    manifest.state.successors.every((id, index) => id === successors[index]))
     ? manifest
     : replaceManifestFields(manifest, {
         state: { _tag: "Sealed", successors },
@@ -801,16 +817,25 @@ export const dependentForks = (manifest: Manifest): ReadonlyArray<DatabaseId> =>
 ];
 
 /**
- * Marks the database as being removed and fences its writer (`writerEpoch + 1`), so no write,
+ * Marks the database as removed at `now` and fences its writer (`writerEpoch + 1`), so no write,
  * checkpoint, or fork can commit after it.
  *
- * @returns The manifest; the same manifest when it is already marked; or
- *   `DatabaseHasDependentsError` while forks hold checkpoints on it.
+ * @returns The manifest; the same manifest when it is already marked (one marked before D91 gains
+ *   its `removedAt`); or `DatabaseHasDependentsError` while forks hold checkpoints on it.
  */
 export const markRemoved = (
   manifest: Manifest,
+  now: Timestamp,
 ): Result.Result<Manifest, DatabaseHasDependentsError> => {
-  if (manifest.state._tag === "Removed") return Result.succeed(manifest);
+  if (manifest.state._tag === "Removed") {
+    return Result.succeed(
+      Option.isSome(manifest.state.removedAt)
+        ? manifest
+        : replaceManifestFields(manifest, {
+            state: { ...manifest.state, removedAt: Option.some(now) },
+          }),
+    );
+  }
   const dependents = dependentForks(manifest);
   if (dependents.length > 0) {
     return Result.fail(
@@ -823,11 +848,29 @@ export const markRemoved = (
   }
   return Result.succeed(
     replaceManifestFields(manifest, {
-      state: { _tag: "Removed" },
+      state: { _tag: "Removed", removedAt: Option.some(now), cleared: false },
       writerEpoch: WriterEpoch.make(manifest.writerEpoch + 1),
     }),
   );
 };
+
+/**
+ * Records that a removed database's writer and compactor state is destroyed and its holds are
+ * released (D91); the same manifest when it is not removed or already cleared.
+ */
+export const markRemovalCleared = (manifest: Manifest): Manifest =>
+  manifest.state._tag === "Removed" && !manifest.state.cleared
+    ? replaceManifestFields(manifest, { state: { ...manifest.state, cleared: true } })
+    : manifest;
+
+/**
+ * When a removed database's id may be used again and its tombstone deleted: `gcMinAge` after its
+ * removal (D90, D91). A manifest removed before D91 counts as removed at `now`.
+ */
+export const removalExpiresAt = (manifest: Manifest, now: Timestamp, gcMinAge: number) =>
+  manifest.state._tag === "Removed"
+    ? Option.some(Option.getOrElse(manifest.state.removedAt, () => now) + gcMinAge)
+    : Option.none<number>();
 
 /** Removes a checkpoint; the same manifest when it is absent. */
 export const removeCheckpoint = (manifest: Manifest, checkpointId: CheckpointId): Manifest =>

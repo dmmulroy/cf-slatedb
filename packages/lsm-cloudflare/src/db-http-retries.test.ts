@@ -6,7 +6,7 @@ import { DatabaseLifecycle } from "./database-lifecycle.ts";
 import { DbClient } from "./db-client.ts";
 import type { DbApiOperation } from "./db-public-error.ts";
 import { type DbInternalError, toPublicError } from "./db-public-error-translation.ts";
-import { WriterUnavailableError } from "./lsm-errors.ts";
+import { DatabaseNotFoundError, WriterUnavailableError } from "./lsm-errors.ts";
 import { dbServicesTestLayer } from "./db-services.ts";
 import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
 import { WriterClient } from "./writer-client.ts";
@@ -86,8 +86,19 @@ describe("what a retried call returns (D88)", () => {
     expect(out["commit again"]).toContain("it may have committed: read its keys");
     expect(out["seal again"]).toBe("ok");
     expect(out["remove"]).toBe("ok");
-    expect(out["remove again"]).toContain("already removed");
-    expect(out["remove again"]).not.toContain("Create it first");
+    // While the removal's tombstone stands (gcMinAge, D91), a retried remove succeeds again.
+    expect(out["remove again"]).toBe("ok");
+  });
+
+  it("tells a caller removing a database that is gone that it is already removed", () => {
+    // After the tombstone is collected, the database no longer exists for a retried remove.
+    const gone = toPublicError(
+      "remove",
+      "r",
+    )(new DatabaseNotFoundError({ databaseId: ID, message: `Database ${ID} does not exist.` }));
+    expect(gone.code).toBe("DatabaseNotFound");
+    expect(gone.message).toContain("already removed");
+    expect(gone.message).not.toContain("Create it first");
   });
 });
 

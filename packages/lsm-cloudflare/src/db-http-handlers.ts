@@ -69,7 +69,7 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
           const status = yield* writer.status(params.databaseId);
           // The writer's manifest is the one it last committed or loaded; after a compaction the
           // newest manifest has fewer L0 SSTs, so report that (D61).
-          const latest = yield* manifests.loadLatest(params.databaseId).pipe(
+          const latest = yield* manifests.loadLive(params.databaseId).pipe(
             Effect.catchTags({
               ManifestReadError: (error) =>
                 Effect.fail(
@@ -97,7 +97,7 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
       )
       .handle("listCheckpoints", ({ params }) =>
         Effect.gen(function* () {
-          const latest = yield* manifests.loadLatest(params.databaseId).pipe(
+          const latest = yield* manifests.loadLive(params.databaseId).pipe(
             Effect.catchTags({
               ManifestReadError: (error) =>
                 Effect.fail(
@@ -177,7 +177,7 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
       )
       .handle("compaction", ({ params }) =>
         Effect.gen(function* () {
-          const latest = yield* manifests.loadLatest(params.databaseId).pipe(
+          const latest = yield* manifests.loadLive(params.databaseId).pipe(
             Effect.catchTags({
               ManifestReadError: (error) =>
                 Effect.fail(

@@ -388,7 +388,15 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   then writer and compactor state destroyed (`DbWriter.destroy`, `Compactor.destroy`), the fork's
   holds released, `db/<id>/` deleted (manifests last), and `db:<id>` purged through `BlockServer`.
   `DELETE /v1/databases/:id`. Tests: `manifest.test.ts`, `database-lifecycle.test.ts`,
-  `writer.workerd.ts` (blocked by dependents, then removed). D39.
+  `writer.workerd.ts` (blocked by dependents, then removed). D39. An id is reusable only
+  `gcMinAge` after its removal (`create` refuses a young `Removed` head; `ManifestCache.loadWith`
+  drops an expired entry with a higher id): `database-lifecycle.test.ts` (recreate, leftovers,
+  reads after removal). D90. The `Removed` head stays as the tombstone for `gcMinAge`
+  (`markRemoved` records `removedAt`, `markRemovalCleared`; compaction, seal, and collection are
+  no-ops on it; the sweep finishes a cleared one): `database-lifecycle.test.ts` (six committers
+  in flight, an interrupted removal, a removal still deleting after a create, the tombstone's
+  shape), `ManifestCasFencingRemove.cfg` (`NoResurrection`; broken `removalDeletesHead`). D91.
+  Manifest edits as a state machine: `manifest-state-machine.test.ts`. D91.
 - **`CompactionBudget` by `budgetGroup`** — done. lsm-core `compaction-budget-ledger.ts` (fair share
   among holders and waiting groups, expiring leases; property test against capacity and share,
   shown failing on four mutations), `compaction-budget.ts` (unlimited, ledger, test),

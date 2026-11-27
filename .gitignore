@@ -39,6 +39,6 @@ dist-ssr
 # Read-only reference clones (SlateDB) and local trace stores
 repos/
 .traces/
-.tlc/
+.tlc
 *.tla.out
 states/

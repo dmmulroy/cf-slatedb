@@ -74,6 +74,16 @@ export interface IManifestReader {
     databaseId: DatabaseId,
   ) => Effect.Effect<VersionedManifest, DatabaseNotFoundError | ManifestReadError, RuntimeContext>;
   /**
+   * {@link IManifestReader.loadLatest} for a caller that serves the database: a removed database's
+   * head (its tombstone, D91) answers as no database.
+   *
+   * @returns The newest manifest of a database that is not removed, `DatabaseNotFoundError`, or
+   *   `ManifestReadError`.
+   */
+  readonly loadLive: (
+    databaseId: DatabaseId,
+  ) => Effect.Effect<VersionedManifest, DatabaseNotFoundError | ManifestReadError, RuntimeContext>;
+  /**
    * Finds and reads the newest manifest starting from `knownId`, a manifest the caller knows is
    * stored (the writer's last flush, from its probe, or the manifest the caller loaded before):
    * GC's manifest boundary, the `LATEST` hint, that manifest, and the id after it are read
@@ -381,7 +391,19 @@ export const makeManifestReader = Effect.gen(function* () {
     );
   });
 
-  return ManifestReader.of({ load, loadLatest, loadLatestFrom, loadManifestBoundary });
+  const loadLive = (databaseId: DatabaseId) =>
+    Effect.flatMap(loadLatest(databaseId), (latest) =>
+      latest.manifest.state._tag === "Removed"
+        ? Effect.fail(
+            new DatabaseNotFoundError({
+              databaseId,
+              message: `Database ${databaseId} was removed. Create it again to use the id, or check the id.`,
+            }),
+          )
+        : Effect.succeed(latest),
+    );
+
+  return ManifestReader.of({ load, loadLatest, loadLive, loadLatestFrom, loadManifestBoundary });
 });
 
 /** Provides the manifest reader, leaving the object store requirement visible. */

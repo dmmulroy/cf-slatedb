@@ -49,21 +49,33 @@
 (*   "hintOnlyProbe"      loadLatest probes from the hint alone (WithGc)   *)
 (*   "knownIgnoresBoundary" loadLatestFrom probes from any stored known    *)
 (*                        manifest, even at or below the boundary (WithGc) *)
+(*   "removalDeletesHead" removal deletes every manifest, its head too     *)
+(*                        (WithRemove; the rule before D91)                *)
+(*                                                                         *)
+(* With WithRemove, DatabaseLifecycle.remove (D91): markRemoved is an edit *)
+(* committed like any other (writer epoch + 1); then every manifest but    *)
+(* the head is deleted and GC's boundary set just below the head, which    *)
+(* stays as the tombstone. A writer that reloads a removed head stops      *)
+(* (fenceWriter refuses; commitL0Flush is fenced by the epoch); a          *)
+(* compaction on it is a no-op. Removal's other steps (writer and          *)
+(* compactor state, the bucket's SSTs) are outside this model.             *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets, TLC
 
-CONSTANTS Writers, Compactors, JobsPerCompactor, MaxId, MaxFlushes, WithGc, Broken
+CONSTANTS Writers, Compactors, JobsPerCompactor, MaxId, MaxFlushes, WithGc, WithRemove, Broken
 
 ASSUME Broken \in {"none", "noWriterEpochCheck", "noInputsCheck", "blindCreate",
-                   "noBoundaryReread", "hintOnlyProbe", "knownIgnoresBoundary"}
+                   "noBoundaryReread", "hintOnlyProbe", "knownIgnoresBoundary",
+                   "removalDeletesHead"}
 ASSUME WithGc \in BOOLEAN
+ASSUME WithRemove \in BOOLEAN
 
 Ids == 1 .. MaxId
 Jobs == Compactors \X (1 .. JobsPerCompactor)
 NoManifest == [absent |-> TRUE]
 
 \* A manifest: writer epoch, compactor epoch, L0 SSTs, and one sorted run (a set of SSTs).
-Empty == [we |-> 0, ce |-> 0, l0 |-> {}, runs |-> {}]
+Empty == [we |-> 0, ce |-> 0, l0 |-> {}, runs |-> {}, removed |-> FALSE]
 
 VARIABLES
   store,        \* manifest id -> manifest or NoManifest (the object store's manifest keys)
@@ -79,17 +91,25 @@ VARIABLES
   sstData,      \* uploaded SST -> its data (set of sequence numbers)
   nextSeq,
   acked,        \* sequence numbers whose flush commit succeeded (acknowledged to the writer)
-  commits       \* every successful commit: kind, actor epoch, base manifest epoch
+  commits,      \* every successful commit: kind, actor epoch, base manifest epoch
+  rpc,          \* the removal: "idle", "markCreate", "delete", "done"
+  rSnap,        \* the manifest id the removal loaded
+  rBase,        \* the manifest the removal loaded
+  markId        \* the id markRemoved committed at, 0 before
 
 vars == <<store, overwritten, reported, recommitted, boundary, hint, hintWrites,
           wpc, wEpoch, wSnap, wBase, wOpt, wSst, flushes, cpc, cEpoch, cSnap, cBase,
-          jpc, jSnap, jBase, jInputs, jRuns, jOut, sstData, nextSeq, acked, commits>>
+          jpc, jSnap, jBase, jInputs, jRuns, jOut, sstData, nextSeq, acked, commits,
+          rpc, rSnap, rBase, markId>>
+removeVars == <<rpc, rSnap, rBase, markId>>
 writerVars == <<wpc, wEpoch, wSnap, wBase, wOpt, wSst, flushes>>
 compactorVars == <<cpc, cEpoch, cSnap, cBase>>
 jobVars == <<jpc, jSnap, jBase, jInputs, jRuns, jOut>>
 storeVars == <<store, overwritten, reported, recommitted, hintWrites>>
 
 Exists(i) == i \in Ids /\ store[i] # NoManifest
+\* Some manifest is stored: the database exists, or its tombstone does.
+Live == \E i \in Ids : Exists(i)
 \* The newest manifest: the largest id that exists.
 Head == CHOOSE i \in Ids : Exists(i) /\ \A k \in Ids : Exists(k) => k <= i
 Data(m) == UNION {sstData[s] : s \in m.l0 \cup m.runs}
@@ -143,6 +163,10 @@ Init ==
   /\ nextSeq = 1
   /\ acked = {}
   /\ commits = {}
+  /\ rpc = "idle"
+  /\ rSnap = 1
+  /\ rBase = Empty
+  /\ markId = 0
 
 \* ManifestStore.create of manifest id i: "Exists" when putIfAbsent finds it (blindCreate writes
 \* anyway); otherwise the manifest is written, and the boundary re-read makes it "Collected" (a
@@ -173,6 +197,7 @@ Attempt(i, m, onCommit, onConflict) ==
 \* Writer: WriterServer init runs ManifestStore.update(fenceWriter).
 WriterFenceLoad(w) ==
   /\ wpc[w] = "fenceLoad"
+  /\ Live
   /\ wSnap' = [wSnap EXCEPT ![w] = LoadLatest]
   /\ wBase' = [wBase EXCEPT ![w] = store[LoadLatest]]
   /\ wpc' = [wpc EXCEPT ![w] = "fenceCreate"]
@@ -184,7 +209,11 @@ WriterFenceCreate(w) ==
   /\ wpc[w] = "fenceCreate"
   /\ LET i == wSnap[w] + 1
          next == [wBase[w] EXCEPT !.we = @ + 1]
-     IN /\ i \in Ids
+     IN IF wBase[w].removed
+        THEN /\ wpc' = [wpc EXCEPT ![w] = "fenced"]   \* fenceWriter: DatabaseRemovedError
+             /\ UNCHANGED <<wEpoch, wSnap, wBase>> /\ UNCHANGED storeVars
+        ELSE
+        /\ i \in Ids
         /\ Attempt(i, next,
              /\ wEpoch' = [wEpoch EXCEPT ![w] = next.we]
              /\ wSnap' = [wSnap EXCEPT ![w] = i]
@@ -212,6 +241,7 @@ WriterUpload(w) ==
 
 WriterFlushLoad(w) ==
   /\ wpc[w] = "flushLoad"
+  /\ Live
   /\ wSnap' = [wSnap EXCEPT ![w] = LoadLatest]
   /\ wBase' = [wBase EXCEPT ![w] = store[LoadLatest]]
   /\ wOpt' = [wOpt EXCEPT ![w] = FALSE]
@@ -255,6 +285,7 @@ WriterFlushCreate(w) ==
 \* Compactor: CompactorServer init runs ManifestStore.update(fenceCompactor).
 CompactorFenceLoad(c) ==
   /\ cpc[c] = "fenceLoad"
+  /\ Live
   /\ cSnap' = [cSnap EXCEPT ![c] = LoadLatest]
   /\ cBase' = [cBase EXCEPT ![c] = store[LoadLatest]]
   /\ cpc' = [cpc EXCEPT ![c] = "fenceCreate"]
@@ -277,6 +308,7 @@ CompactorFenceCreate(c) ==
 \* The scheduler plans a job from the newest manifest it loads: some L0 SSTs plus the whole run.
 JobPlan(j) ==
   /\ jpc[j] = "idle"
+  /\ Live
   /\ cpc[j[1]] = "ready"
   /\ LET m == store[LoadLatest]
      IN \E inputs \in SUBSET m.l0 :
@@ -301,6 +333,7 @@ JobUpload(j) ==
 
 JobCommitLoad(j) ==
   /\ jpc[j] = "commitLoad"
+  /\ Live
   /\ jSnap' = [jSnap EXCEPT ![j] = LoadLatest]
   /\ jBase' = [jBase EXCEPT ![j] = store[LoadLatest]]
   /\ jpc' = [jpc EXCEPT ![j] = "commitCreate"]
@@ -316,7 +349,10 @@ JobCommitCreate(j) ==
          i == jSnap[j] + 1
          inputsPresent == jInputs[j] \subseteq base.l0 /\ base.runs = jRuns[j]
          next == [base EXCEPT !.l0 = base.l0 \ jInputs[j], !.runs = {jOut[j]}]
-     IN IF base.ce # cEpoch[c]
+     IN IF base.removed
+        THEN /\ jpc' = [jpc EXCEPT ![j] = "done"]           \* commitCompaction: no-op (D91)
+             /\ UNCHANGED storeVars /\ UNCHANGED commits
+        ELSE IF base.ce # cEpoch[c]
         THEN /\ jpc' = [jpc EXCEPT ![j] = "done"]           \* CompactorFencedError
              /\ UNCHANGED storeVars /\ UNCHANGED commits
         ELSE IF ~inputsPresent /\ Broken # "noInputsCheck"
@@ -366,6 +402,47 @@ HintLost ==
   /\ UNCHANGED writerVars /\ UNCHANGED compactorVars /\ UNCHANGED jobVars
   /\ UNCHANGED <<sstData, nextSeq, acked, commits>>
 
+\* DatabaseLifecycle.remove (WithRemove): markRemoved by ManifestStore.update (load, then create
+\* head + 1, reloading on conflict), then the deletes.
+RemoveLoad ==
+  /\ WithRemove /\ rpc \in {"idle", "markLoad"} /\ Live
+  /\ rSnap' = LoadLatest
+  /\ rBase' = store[LoadLatest]
+  /\ rpc' = "markCreate"
+  /\ UNCHANGED markId /\ UNCHANGED storeVars /\ UNCHANGED <<boundary, hint>>
+  /\ UNCHANGED writerVars /\ UNCHANGED compactorVars /\ UNCHANGED jobVars
+  /\ UNCHANGED <<sstData, nextSeq, acked, commits>>
+
+RemoveMarkCreate ==
+  /\ rpc = "markCreate"
+  /\ LET i == rSnap + 1
+         base == rBase
+         next == [base EXCEPT !.we = @ + 1, !.removed = TRUE]
+     IN IF base.removed
+        THEN /\ rpc' = "delete" /\ markId' = IF markId = 0 THEN rSnap ELSE markId
+             /\ UNCHANGED storeVars /\ UNCHANGED rSnap
+        ELSE /\ i \in Ids
+             /\ Attempt(i, next,
+                  /\ rpc' = "delete" /\ markId' = i /\ rSnap' = i,
+                  /\ rpc' = "markLoad" /\ UNCHANGED <<markId, rSnap>>)
+  /\ UNCHANGED <<boundary, hint, rBase>>
+  /\ UNCHANGED writerVars /\ UNCHANGED compactorVars /\ UNCHANGED jobVars
+  /\ UNCHANGED <<sstData, nextSeq, acked, commits>>
+
+\* Deletes every manifest but the head and sets GC's boundary just below it (the head stays as the
+\* tombstone, D91); "removalDeletesHead" deletes the head too and leaves no boundary.
+RemoveDelete ==
+  /\ rpc = "delete"
+  /\ IF Broken = "removalDeletesHead"
+     THEN /\ store' = [i \in Ids |-> NoManifest]
+          /\ boundary' = 0
+     ELSE /\ store' = [i \in Ids |-> IF i = Head THEN store[i] ELSE NoManifest]
+          /\ boundary' = Max(boundary, Head - 1)
+  /\ rpc' = "done"
+  /\ UNCHANGED <<overwritten, reported, recommitted, hintWrites, hint, rSnap, rBase, markId>>
+  /\ UNCHANGED writerVars /\ UNCHANGED compactorVars /\ UNCHANGED jobVars
+  /\ UNCHANGED <<sstData, nextSeq, acked, commits>>
+
 \* Every actor is finished or the id space is used up.
 Done ==
   /\ \A w \in Writers : wpc[w] \in {"ready", "fenced"}
@@ -373,12 +450,14 @@ Done ==
   /\ UNCHANGED vars
 
 Next ==
-  \/ \E w \in Writers : WriterFenceLoad(w) \/ WriterFenceCreate(w) \/ WriterUpload(w)
-                         \/ WriterFlushLoad(w) \/ WriterFlushCreate(w)
-  \/ \E c \in Compactors : CompactorFenceLoad(c) \/ CompactorFenceCreate(c)
-  \/ \E j \in Jobs : JobPlan(j) \/ JobUpload(j) \/ JobCommitLoad(j) \/ JobCommitCreate(j)
-  \/ GcAdvanceBoundary \/ GcDeleteManifest \/ HintLands \/ HintLost
-  \/ Done
+  \/ /\ \/ \E w \in Writers : WriterFenceLoad(w) \/ WriterFenceCreate(w) \/ WriterUpload(w)
+                              \/ WriterFlushLoad(w) \/ WriterFlushCreate(w)
+       \/ \E c \in Compactors : CompactorFenceLoad(c) \/ CompactorFenceCreate(c)
+       \/ \E j \in Jobs : JobPlan(j) \/ JobUpload(j) \/ JobCommitLoad(j) \/ JobCommitCreate(j)
+       \/ GcAdvanceBoundary \/ GcDeleteManifest \/ HintLands \/ HintLost
+       \/ Done
+     /\ UNCHANGED removeVars
+  \/ RemoveLoad \/ RemoveMarkCreate \/ RemoveDelete
 
 Spec == Init /\ [][Next]_vars
 
@@ -399,26 +478,34 @@ NoStaleCommit == \A c \in commits : c.epoch = c.baseEpoch
 \* Fencing: an SST reaches the newest manifest only through a commit, so a fenced writer's
 \* uploaded SST (an orphan) is never referenced.
 FencedWriterOrphansUnreferenced ==
-  \A w \in Writers : (wpc[w] = "fenced" /\ wSst[w] # <<>>) => wSst[w] \notin store[Head].l0
+  Live => \A w \in Writers : (wpc[w] = "fenced" /\ wSst[w] # <<>>) => wSst[w] \notin store[Head].l0
 
 \* Linearizability of concurrent edits: every acknowledged flush's data is readable from the
 \* newest manifest, whatever writer, compactor, GC, hint, and retry interleavings happened.
-AckedDataVisible == acked \subseteq Data(store[Head])
+AckedDataVisible == markId = 0 => acked \subseteq Data(store[Head])
 
 \* loadLatest finds the newest manifest, however far the hint lags or which manifests GC deleted.
-LoadFindsHead == LoadLatest = Head
+LoadFindsHead == Live => LoadLatest = Head
 
 \* loadLatestFrom finds the newest manifest from any manifest that is stored (one a committer was
 \* told it committed, or one a reader loaded), however long ago, whatever was committed after it
 \* and whichever manifests GC deleted.
-LoadFromKnownFindsHead == \A k \in Ids : Exists(k) => LoadLatestFrom(k) = Head
+LoadFromKnownFindsHead == Live => \A k \in Ids : Exists(k) => LoadLatestFrom(k) = Head
 
 \* Compactions never duplicate data into both L0 and the sorted run (inputs are replaced exactly).
-NoDoubleReference == \A s \in store[Head].l0 : sstData[s] \cap UNION {sstData[r] : r \in store[Head].runs} = {}
+NoDoubleReference == Live => \A s \in store[Head].l0 : sstData[s] \cap UNION {sstData[r] : r \in store[Head].runs} = {}
 
 TypeOK ==
-  /\ Head \in Ids
-  /\ boundary < Head
+  /\ Live => Head \in Ids /\ boundary < Head
   /\ nextSeq \in Nat
+
+\* After a removal, no manifest a reader can find (above GC's boundary) from the one that marked it
+\* on is open, and the newest manifest is removed: a commit in flight during the removal never
+\* brings the database back (D91). A create that lands at or below the boundary writes an object
+\* no reader looks at (and deletes it after its conflict).
+NoResurrection ==
+  markId > 0 =>
+    /\ \A i \in Ids : (Exists(i) /\ i >= markId /\ i > boundary) => store[i].removed
+    /\ Live => store[Head].removed
 
 =============================================================================

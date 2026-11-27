@@ -277,6 +277,10 @@ export const makeManifestStore = Effect.gen(function* () {
     const boundary = yield* readManifestBoundary(databaseId);
     if (manifestId <= boundary.id) {
       yield* Effect.annotateCurrentSpan({ "manifest.gc_boundary": boundary.id });
+      // No reader looks at or below the boundary, so the object is only clutter: remove it.
+      yield* objects
+        .delete([manifestKey(databaseId, manifestId)])
+        .pipe(writeUnavailable(databaseId));
       return yield* conflict(
         `Manifest ${manifestId} of database ${databaseId} is at or below GC's manifest boundary ${boundary.id}: the id was used before and its manifest collected. Reload and reapply.`,
       );

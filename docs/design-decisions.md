@@ -2988,6 +2988,221 @@ for as long as its isolate cached the map: unbounded, against a lag of about a s
   sealed state, which would make the router exact rather than bounded. That is
   `db-client.ts`'s owner's call.
 
+## D90. A removed database's id is reusable only `gcMinAge` after its removal
+
+**The defect.** `remove` deleted every object under `db/<id>/`, and `create` with the same id
+then started a new manifest chain at id 1. A reader isolate that had cached a manifest of the
+removed database went on serving it as the new database's:
+
+- `ManifestCache.covering` hit on it, because its `lastL0Seq` was at least the new writer's
+  `flushedSeq`;
+- `current` served it for `manifestRefreshInterval`;
+- `loadWith` kept it over a freshly loaded manifest because its id was higher, even after its
+  hold window had ended.
+
+Nothing in a manifest or in the writer's probe names an incarnation, so a hit (no I/O) could not
+tell the two chains apart.
+
+Test, before the fix (`database-lifecycle.test.ts`, "a reader that cached the removed database's
+manifest reads the new database, not the old"): five flushes, then remove, create, and one write
+of `a=new`.
+
+- A `Flushed` get of `a` returned the removed database's `old-5`, served from the L1 block cache.
+- A `Latest` get failed with `StorageUnavailable`, as did a `Flushed` get of a key only the
+  removed database had.
+
+**The rule.** A cached manifest is held at most `max(gcMinAge / 2, manifestRefreshInterval)`
+after its load began (D67), and every manifest of the removed database was loaded before its
+removal. So once `gcMinAge` has passed since the removal, no isolate can serve one, and the id
+is reusable.
+
+- **`create`** loads the newest manifest of the id first. If it is a `Removed` tombstone (D91)
+  younger than `gcMinAge` (from its `removedAt`), `create` fails with
+  `DatabaseRecentlyRemovedError`. The public code is `DatabaseRecentlyRemoved`: status 409,
+  `retryable: true`, `details.retryAfterMs`, and a message naming the time. This is a new public
+  error, allowed because v1 is not released, and the OpenAPI document is regenerated.
+- **An older tombstone is cleared first.** If the removal stopped before it destroyed the writer's
+  and compactor's state, `create` destroys them. Then it deletes every object under the prefix
+  written no later than the tombstone (or `gcMinAge` ago), plus the `LATEST` hint and GC's
+  manifest boundary, and only then writes manifest 1. The test "a stale GC manifest boundary and
+  LATEST hint do not hide or refuse the new chain" failed before the clearing:
+  - **A stale boundary** (7 in the test): `ManifestStore` refuses manifest 1 at or below it.
+  - **A stale `LATEST` hint:** it never moves back, so every cache miss listed manifests.
+
+  A concurrent create of the same id writes only later objects, so they are kept.
+
+- **`ManifestCache.loadWith`** prefers a cached manifest with a higher id only while that entry
+  is still inside its hold window.
+
+**Rejected.**
+
+- **An incarnation id in every manifest and in the writer's probe.** It would make any reuse
+  safe at once, but it changes the stored format and the writer protocol, for a case a one-hour
+  wait covers.
+- **Never reusing an id.** That needs a permanent tombstone, and it refuses a legitimate pattern:
+  remove, then later create a fresh database under the same id.
+
+**What remains.**
+
+- **An old handle.** A client holding a `DbSnapshot` or a transaction's begin manifest id from the
+  removed database, used after the id was reused, names a manifest id in the new chain. If that id
+  exists, the read resolves against the new database instead of failing with `SnapshotExpired`.
+  Its promise had ended with the removal (checkpoints are deleted with the database). This is a
+  risk that an incarnation id would close.
+- **Two creates at once.** Two concurrent creates of a reused id whose removal never destroyed
+  its writer's state can race. One may destroy the other's just-started writer state. Both
+  creates must find the uncleared tombstone `gcMinAge` after the removal.
+
+**Tests** (`database-lifecycle.test.ts`):
+
+- **Recreate.** `create` is refused within `gcMinAge` (also 1 ms before it) and succeeds at it.
+  `Latest` and `Flushed` reads then see only the new database, at once and 2 h later.
+- **Leftovers.** A stale boundary and hint neither refuse nor hide the new chain. A concurrent
+  create's young object and a live database's objects survive the clearing.
+- **Reads after removal.** A warm isolate's `Latest` read reports `DatabaseNotFound` at once, and
+  its `Flushed` read after `manifestRefreshInterval` (D29 allows that lag).
+- **The public error.** `toPublicError` maps the refusal to `DatabaseRecentlyRemoved`,
+  retryable, with `retryAfterMs`.
+- **Mutations.** Each is caught:
+  - `create` ignores the tombstone, or refuses for half of `gcMinAge` only;
+  - `loadWith` keeps an expired entry with a higher id;
+  - `create` clears no leftovers;
+  - the clearing ignores its time filter, or runs for a live database;
+  - the public error is not retryable.
+
+## D91. A removal's `Removed` manifest stays at the head for `gcMinAge`, as its tombstone
+
+**The defect.** `markRemoved` is a manifest edit, so a commit that reloads after it carries
+`Removed` forward. But `remove` then deleted every manifest, its head too. A committer that had
+loaded the newest manifest before the removal could create the next id once its key was free:
+its edit had been applied to the old view, so the new manifest was `Open`. GC's boundary was
+deleted too, so the boundary re-read passed.
+
+Six tests (`database-lifecycle.test.ts`, "a <committer> that lands after the removal's deletes
+does not bring the database back") each commit from a view loaded before `remove`, through
+`ManifestStore.updateFrom`. Before the fix, each committer brought the database back:
+
+- **Flush, compaction, collection, checkpoint, fork hold:** the database was `Open` again, and
+  a later write was acknowledged.
+- **Seal:** the database was `Sealed`, with no `Removed` manifest left.
+
+The writer's own flush is serialized with removal by `DbWriter.destroy`'s locks. The others are
+not.
+
+**The rule.** The `Removed` manifest is the removal's tombstone and stays at the head of the
+chain for `gcMinAge`.
+
+- **`markRemoved(manifest, now)`** records `removedAt`. After the writer's and compactor's state
+  is destroyed and the holds are released, a second edit, `markRemovalCleared`, records
+  `cleared`.
+  - Both fields are new and optional in the stored format.
+  - A manifest without `removedAt` counts as removed at the moment it is read.
+  - A manifest without `cleared` counts as not cleared.
+- **`remove` keeps the head.** It moves GC's manifest boundary to just below the head. It then
+  deletes everything else written no later than the head, except the `LATEST` hint and the
+  boundary. Before each page it checks that the head is still this tombstone. A commit from any
+  older view then creates an id at or below the boundary, loses, reloads, finds `Removed`, and is
+  refused (a stale writer epoch, `addCheckpoint`, `holdForSuccessors`) or is a no-op
+  (`commitCompaction`, `sealManifest`, and `prepareGarbageCollection` now change nothing on a
+  `Removed` manifest). Exactly one manifest object is left, the head.
+- **A create at or below the boundary** now deletes the object it wrote (`ManifestStore`'s create).
+  No reader looks there.
+- **Readers.** `ManifestCache` answers `DatabaseNotFound` for a `Removed` head. So do the status,
+  checkpoint list, and compaction endpoints (`ManifestReader.loadLive`).
+- **The maintenance sweep** finishes a cleared tombstone older than `gcMinAge`. It deletes every
+  object under the prefix older than `gcMinAge`: the tombstone, its hint, the boundary, and
+  anything that landed later, such as an SST a compaction step uploaded. It leaves an uncleared
+  tombstone to a retried `remove` or a `create`, because it cannot reach the writer.
+
+**The assumption, and who holds a view.** No view of a manifest chain outlives `gcMinAge`, which
+is the same assumption GC rests on (D29, D33). Once the tombstone is gone, nothing can create
+above it.
+
+| Holder                                                       | Its view, and how long it lives                                                                                                                                   |
+| ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The writer                                                   | Its own view (`updateFrom`). `remove` destroys its state under its commit and flush locks first, and a restarted writer's `fenceWriter` refuses a `Removed` head. |
+| A compactor                                                  | Loads the newest manifest on every poll and fences in with `update`.                                                                                              |
+| A compaction Workflow step                                   | Its commit is `ManifestStore.update(commitCompaction)`, which loads the newest manifest at the commit. It never creates from a view carried across steps.         |
+| A collection                                                 | `update(prepareGarbageCollection)`, loaded at the commit.                                                                                                         |
+| The lifecycle's own edits (checkpoint, seal, fork hold, pin) | `update`, loaded at the commit.                                                                                                                                   |
+
+A view taken with `update` lives for one CAS round: a load, then one create request.
+
+**Rejected.** A check after each create that its predecessor still exists, undoing the commit
+when it does not. It costs every commit of every database one more read. It also races: a second
+stale committer can build on the first one's doomed manifest and pass its own check before the
+first deletes it, leaving an open manifest alone at the head.
+
+**Tests and model.**
+
+- **The six committer tests.** Each commit is refused or a no-op, and one manifest object is
+  left.
+- **An interrupted removal.** The removal stops after `markRemoved` with unflushed rows in the
+  writer. The sweep leaves the uncleared tombstone. `create` `gcMinAge` later starts a writer
+  whose first write is sequence number 1, and nothing of the old incarnation is readable.
+- **A removal still deleting** when, `gcMinAge` later, the id is created and flushed: it deletes
+  none of the new database's objects.
+- **Tombstone shape.** Removal leaves exactly the head, its hint, and the boundary, and the sweep
+  deletes them `gcMinAge` later. A late SST upload and `LATEST` hint go with them.
+- **Mutations.** Twelve run, eleven caught:
+  - the clearing skips the state;
+  - the deletes ignore the tombstone's time;
+  - the head is deleted;
+  - the boundary is not moved;
+  - a seal, a compaction, or a collection commits on the tombstone;
+  - readers serve the tombstone;
+  - the sweep deletes an uncleared tombstone;
+  - `removedAt` is not recorded;
+  - a create below the boundary leaves its object.
+
+  One is equivalent: the sweep's own `removedAt` check repeats its age filter.
+
+- **Model.** `ManifestCasFencing.tla` gains `WithRemove`, `ManifestCasFencingRemove.cfg`
+  (3,033 states, about 2 s; with GC as well it does not finish in 150 s), and
+  `NoResurrection`. The broken variant `removalDeletesHead` fails it.
+
+**The manifest edits as a state machine.** `manifest-state-machine.test.ts` applies random
+sequences of every edit and checks these invariants after each step. Several were assumed and
+written nowhere:
+
+- `lastL0Seq`, `lastL0ClockTick`, both epochs, and `gcSstBoundary` never decrease;
+- no SST is named twice, and none is named again after it left;
+- sorted run ids are unique and newest first, and each run's SSTs are key-ordered and disjoint;
+- the state only moves Open, Sealed, Removed, and a seal or removal fences the writer;
+- no flush commits after a seal or removal;
+- checkpoint ids are unique, and each pins a manifest of the chain;
+- a dropped SST is not in the manifest;
+- `changelogAfterSeq` is at most `lastL0Seq` and never decreases, and the changelog is
+  contiguous from it to `lastL0Seq`;
+- a fork's views lie inside its range, it continues its source's sequence numbers, starts open
+  with epochs 0, and names one hold, on its source.
+
+The generator models a writer and a compactor that each carry the epoch they fenced in with:
+3,000 runs of 30 to 80 steps, about 1 s. Mutations (`mut/d91.json`):
+
+- **Caught, 8:** compaction leaves runs unsorted; a seal or a removal does not fence the writer;
+  the GC boundary may move back; pruning does not advance `changelogAfterSeq`; a fork's views are
+  not restricted; a duplicate checkpoint id is added; a flush lowers `lastL0Seq`.
+- **Equivalent, 1:** `commitL0Flush` without its `Sealed` check. The epoch alone refuses the
+  flush, because `fenceWriter` never hands out an epoch after a seal.
+
+**A fork's hold is not a caller's checkpoint.** `deleteCheckpoint`
+(`DELETE /v1/databases/<id>/checkpoints/<cp>`) deleted any checkpoint, a fork's hold among them,
+after which the source's collection could delete the SSTs the fork reads. It now refuses a hold
+whose holder still exists, with `DatabaseHasDependentsError` (409, already public). The fork's
+collection releases the hold (D77), or the fork's removal does. A hold whose holder is gone stays
+deletable, for repair. `forkRange`'s cleanup of its own hold, when the fork id belongs to another
+database, removes it directly.
+
+Tests (`database-lifecycle.test.ts`):
+
+- "cannot be deleted as a checkpoint while the fork holds it" failed before: the hold was
+  deleted.
+- "is released when the fork's id belongs to another database" covers the cleanup path.
+
+Two mutations, both caught: `deleteCheckpoint` ignores the holder; the cleanup uses the refusing
+delete.
+
 ## D92. Cloudflare's platform limits against what shaledb can ask of them
 
 An audit of every platform limit the design touches. Each documented value below was read from

@@ -7,6 +7,10 @@ description: "Model-check shaledb's manifest CAS and writer/compactor epoch fenc
 
 ## What is verified, in plain words
 
+- **NoResurrection** (`ManifestCasFencingRemove.cfg`, D91): after `DatabaseLifecycle.remove`
+  marks the database, no manifest a reader can find (above GC's boundary) from the mark on is
+  open, and the newest is removed, whatever commit was in flight. Harm if broken: a removed
+  database comes back, reads serve deleted SSTs, and its writer acknowledges writes.
 - **CreateOnce**: nothing ever overwrites an existing manifest.
   Harm if broken: two writers both believe they committed, and one's flush silently disappears.
 - **CommitOnce**: no commit is ever reported at an id that was committed before, even after GC
@@ -44,7 +48,7 @@ The first run downloads a pinned JDK 21 and `tla2tools.jar` 1.7.4 into `.tlc/` (
 Each TLC run has a hard time limit; a run that times out fails the verification. The whole check
 takes about 10 seconds.
 
-Expected output: nine `✓` lines. The code as written passes all three configs, and each broken
+Expected output: eleven `✓` lines. The code as written passes all four configs, and each broken
 variant fails with its invariant. Any `✗` is a finding: read the next section.
 
 ## Read a result
@@ -121,6 +125,15 @@ a flush commits from its own view with one create and no `ManifestReader.loadLat
   create's conflict corrects); memtable truncation (the write-loss check covers it). The hint is
   modeled as able to move back, a weaker guarantee than the code's conditional write, so safety
   does not depend on that.
+- `ManifestCasFencingRemove.cfg`: 1 writer, 1 compactor, 1 job, 2 flushes, 8 ids, a removal, no
+  GC (3,033 states, about 2 s). With GC as well, TLC passed 6.97M states unfinished at the 150 s
+  limit, so removal is checked without GC deleting manifests; the removal sets the boundary
+  itself. The removal is markRemoved (an edit committed like the others), then one step that
+  deletes every manifest but the head and sets the boundary just below it. Its other steps
+  (writer and compactor state, SSTs, the sweep, a create of the id `gcMinAge` later) are covered
+  by `database-lifecycle.test.ts`. `removalDeletesHead` (the rule before D91) fails
+  `NoResurrection`: a commit from a view loaded before the removal creates an open manifest
+  after the deletes.
 - Broken variants (`Broken` constant): `noWriterEpochCheck` → `NoStaleCommit`; `blindCreate` →
   `CreateOnce`; `noInputsCheck` → `AckedDataVisible` (race config); `noBoundaryReread` →
   `CommitOnce`, `hintOnlyProbe` → `LoadFindsHead`, and `knownIgnoresBoundary` →
@@ -150,6 +163,14 @@ a flush commits from its own view with one create and no `ManifestReader.loadLat
   commit after success: `JobCommitCreate` runs once per job. The already-applied path writes
   nothing, so widening it cannot break `AckedDataVisible`, `NoDoubleReference`, or the fencing
   invariants. No model step changed; not rerun.
+- D91: a removal keeps its `Removed` head as the tombstone for `gcMinAge`, with GC's manifest
+  boundary moved just below it. New in the model are `WithRemove`, `RemoveLoad`,
+  `RemoveMarkCreate`, `RemoveDelete`, the `removed` field, the invariant `NoResurrection` and the
+  broken variant `removalDeletesHead`. A writer that reloads a removed head stops; a compaction
+  on it is a no-op (`commitCompaction`, like `sealManifest` and `prepareGarbageCollection`).
+  `attemptCreate` now deletes the object it wrote at or below the boundary. The model still
+  writes it, which is weaker: readers never look there. The three earlier configs are
+  unchanged: `ManifestCasFencing.cfg` 749,232 states.
 
 - D78: `Compactor.ensureState` is single-flight (`startLock`), and a fenced compactor fences in
   again on its next start (wake, requested collection, SST drop, or alarm). Every compactor state
@@ -203,7 +224,7 @@ a flush commits from its own view with one create and no `ManifestReader.loadLat
 
 ## Keeping it in step with the code
 
-Sync commit: the D78 commit (`fix(compactor)`: one fence-in per start, state written by read-modify-write, a fenced compactor fences in again) (the model was last
+Sync commit: the D91 commit (`fix(lifecycle)`: the Removed manifest stays as the chain's tombstone); before it the D78 commit (the model was last
 confirmed to describe the code at this commit). When a covered file changed after it, diff it, update the model so each step still maps
 to one awaited effect in the code, rerun, and show the affected invariant still fails on a broken
 variant. Move the sync commit forward only after confirming the model describes the code at the

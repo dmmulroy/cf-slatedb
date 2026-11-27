@@ -110,6 +110,17 @@ creating a new installation and forking or copying databases into it.
   read and `gcMinAge` (1 hour) has passed since. The fork's own collection releases its hold then,
   once no snapshot or cached manifest of the fork can still read the source (D77). After a split,
   the sealed database can be removed about an hour after both halves' rewrites.
+- **Reusing a removed database's id.** `create` with the id of a database removed less than
+  `gcMinAge` (1 hour) ago fails with `DatabaseRecentlyRemoved` (409, `retryable: true`,
+  `details.retryAfterMs`). Reader isolates may still hold the removed database's manifests until
+  then (D90).
+- **What a removal leaves.** For `gcMinAge` after a removal, `db/<id>/` still holds three
+  objects: the `Removed` manifest at the head of the chain, its `LATEST` hint, and the GC
+  manifest boundary. That head is the tombstone: a commit in flight during the removal finds it
+  and is refused (D91). The sweep deletes all three after that hour.
+  - A removal that stopped before destroying the writer's state leaves a tombstone the sweep
+    cannot finish. Retry `DELETE /v1/databases/<id>`, or create the id again after the hour:
+    `create` finishes it.
 - **A fork of a fork** (or a split half split again before its rewrite) holds the middle database,
   and the middle database holds the original one. After the inner fork releases its hold, the
   middle database releases the original at its next collection. Only the sweep asks for that

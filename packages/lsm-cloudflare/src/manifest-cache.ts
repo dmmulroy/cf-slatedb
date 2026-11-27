@@ -7,7 +7,7 @@ import {
   lsmConfigurationLayer,
   lsmConfigurationTestLayer,
 } from "./lsm-configuration.ts";
-import type { DatabaseNotFoundError } from "./lsm-errors.ts";
+import { DatabaseNotFoundError } from "./lsm-errors.ts";
 import {
   ManifestReader,
   type ManifestReadError,
@@ -103,6 +103,14 @@ export const makeManifestCache = Effect.gen(function* () {
       ? Option.some(entry.versioned)
       : Option.none<VersionedManifest>();
 
+  const forget = (databaseId: DatabaseId) =>
+    Ref.update(entries, (current) => {
+      if (!current.has(databaseId)) return current;
+      const next = new Map(current);
+      next.delete(databaseId);
+      return next;
+    });
+
   /** Loads the newest manifest with `load` and caches it, unless the cache holds a newer one. */
   const loadWith = (
     databaseId: DatabaseId,
@@ -116,13 +124,23 @@ export const makeManifestCache = Effect.gen(function* () {
       // The load's start, not its end: the manifest was the newest at some moment in between.
       const loadedAt = yield* Clock.currentTimeMillis;
       const loaded = yield* load;
+      // A removed database's head is its tombstone (D91): readers answer as for no database.
+      if (loaded.manifest.state._tag === "Removed") {
+        yield* forget(databaseId);
+        return yield* new DatabaseNotFoundError({
+          databaseId,
+          message: `Database ${databaseId} was removed. Create it again to use the id, or check the id.`,
+        });
+      }
+      const now = yield* Clock.currentTimeMillis;
       return yield* Ref.modify(
         entries,
         (current): readonly [VersionedManifest, Map<DatabaseId, CachedManifest>] => {
           const previous = current.get(databaseId);
           // A concurrent load that started later already cached a newer manifest: keep it, with
-          // its own times.
-          if (previous !== undefined && previous.versioned.id > loaded.id) {
+          // its own times. Only while it may still be held: an entry past its hold window may
+          // belong to a removed database whose id was reused, whose chain starts again at 1 (D90).
+          if (previous !== undefined && held(previous, now) && previous.versioned.id > loaded.id) {
             return [previous.versioned, current];
           }
           return [
@@ -202,14 +220,6 @@ export const makeManifestCache = Effect.gen(function* () {
       }),
     );
   });
-
-  const forget = (databaseId: DatabaseId) =>
-    Ref.update(entries, (current) => {
-      if (!current.has(databaseId)) return current;
-      const next = new Map(current);
-      next.delete(databaseId);
-      return next;
-    });
 
   return ManifestCache.of({ current, recent, covering, refresh, forget });
 });

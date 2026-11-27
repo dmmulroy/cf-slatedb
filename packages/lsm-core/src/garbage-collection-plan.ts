@@ -190,6 +190,8 @@ export const prepareGarbageCollection = (
     readonly advanceBoundary: boolean;
   },
 ): Manifest => {
+  // A removed database's head is its tombstone (D91): collection changes nothing in it.
+  if (manifest.state._tag === "Removed") return manifest;
   const withoutExpired = removeExpiredCheckpoints(manifest, options.now);
   const pruned = Option.match(withoutExpired.options.changelog, {
     onNone: () => withoutExpired,

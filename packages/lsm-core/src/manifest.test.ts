@@ -199,11 +199,14 @@ describe("dropSstFromManifest (D62)", () => {
       droppedAt: at,
     });
     expect(Result.isFailure(missing) && missing.failure._tag).toBe("SstNotInManifestError");
-    const removed = dropSstFromManifest(Result.getOrThrow(markRemoved(withRuns)), {
-      sstId: ulid(1),
-      reason: "Corrupted",
-      droppedAt: at,
-    });
+    const removed = dropSstFromManifest(
+      Result.getOrThrow(markRemoved(withRuns, Timestamp.make(1))),
+      {
+        sstId: ulid(1),
+        reason: "Corrupted",
+        droppedAt: at,
+      },
+    );
     expect(Result.isFailure(removed) && removed.failure._tag).toBe("DatabaseRemovedError");
   });
 
@@ -415,12 +418,14 @@ describe("manifest edits", () => {
       name: Option.none(),
     };
     const held = Result.getOrThrow(addCheckpoint(empty, checkpoint));
-    const refused = markRemoved(held);
+    const refused = markRemoved(held, Timestamp.make(1));
     expect(Result.isFailure(refused) && refused.failure.dependents).toEqual(["orders-b"]);
-    const removed = Result.getOrThrow(markRemoved(removeCheckpoint(held, checkpoint.id)));
+    const removed = Result.getOrThrow(
+      markRemoved(removeCheckpoint(held, checkpoint.id), Timestamp.make(1)),
+    );
     expect(removed.state._tag).toBe("Removed");
     expect(removed.writerEpoch).toBe(empty.writerEpoch + 1);
-    expect(Result.getOrThrow(markRemoved(removed))).toBe(removed);
+    expect(Result.getOrThrow(markRemoved(removed, Timestamp.make(2)))).toBe(removed);
     const start = fenceWriter(removed);
     expect(Result.isFailure(start) && start.failure._tag).toBe("DatabaseRemovedError");
     const pin = addCheckpoint(removed, {
@@ -534,7 +539,7 @@ describe("holdForSuccessors", () => {
       })),
     });
     expect(Result.getOrThrow(again)).toBe(held);
-    const removed = Result.getOrThrow(markRemoved(empty));
+    const removed = Result.getOrThrow(markRemoved(empty, Timestamp.make(1)));
     expect(Result.isFailure(holdForSuccessors(removed, options))).toBe(true);
   });
 });

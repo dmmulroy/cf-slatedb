@@ -1,6 +1,6 @@
-import { DatabaseId, externalOwners } from "@shaledb/lsm-core";
+import { DatabaseId, externalOwners, removalExpiresAt, Timestamp } from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
-import { Context, Effect, Layer, Option, Schema } from "effect";
+import { Clock, Context, Effect, Layer, Option, Schema } from "effect";
 
 import { CompactorClient } from "./compactor-client.ts";
 import {
@@ -9,6 +9,7 @@ import {
   GarbageCollectorUnavailableError,
 } from "./garbage-collector.ts";
 import { ManifestReader } from "./manifest-reader.ts";
+import { LsmConfiguration } from "./lsm-configuration.ts";
 import { databasePrefix } from "./object-keys.ts";
 import { ObjectStore, type ObjectStoreUnavailableError } from "./object-store.ts";
 
@@ -90,6 +91,29 @@ export const makeMaintenanceSweep = Effect.gen(function* () {
   const reader = yield* ManifestReader;
   const collector = yield* GarbageCollector;
   const compactors = yield* CompactorClient;
+  const settings = yield* LsmConfiguration;
+
+  /**
+   * Finishes a cleared removal whose tombstone is `gcMinAge` old: deletes every object under the
+   * prefix older than `gcMinAge`, the tombstone, its hint, and GC's boundary among them, and
+   * anything that landed after the removal's deletes (an SST upload in flight) (D91).
+   */
+  const finishRemoval = (databaseId: DatabaseId) =>
+    Effect.gen(function* () {
+      const now = yield* Clock.currentTimeMillis;
+      const cutoff = now - settings.gcMinAge;
+      let deleted = 0;
+      let cursor = Option.none<string>();
+      do {
+        const page = yield* objects.list(databasePrefix(databaseId), cursor);
+        const old = page.objects.filter((object) => object.uploadedAt < cutoff);
+        if (old.length > 0) yield* objects.delete(old.map((object) => object.key));
+        deleted += old.length;
+        cursor = page.cursor;
+      } while (Option.isSome(cursor));
+      yield* Effect.annotateCurrentSpan({ "gc.removed_leftovers": deleted });
+      return deleted;
+    });
 
   const bucketUnavailable = (error: ObjectStoreUnavailableError) =>
     Effect.fail(
@@ -110,7 +134,28 @@ export const makeMaintenanceSweep = Effect.gen(function* () {
         return { visit: "Leftovers", report: Option.some(report) };
       }
       const manifest = latest.value.manifest;
-      if (manifest.state._tag === "Removed") return { visit: "Nothing", report: Option.none() };
+      if (manifest.state._tag === "Removed") {
+        // The head is the removal's tombstone (D91). A removal that stopped before destroying the
+        // writer's and compactor's state is not cleared: only a retried remove or a create of the
+        // id finishes it (the sweep cannot reach the writer). A cleared one is deleted, with
+        // everything else under the prefix, once it is gcMinAge old.
+        const now = yield* Clock.currentTimeMillis;
+        const expiresAt = removalExpiresAt(manifest, Timestamp.make(now), settings.gcMinAge);
+        if (!manifest.state.cleared || Option.exists(expiresAt, (at) => now < at))
+          return { visit: "Nothing", report: Option.none() };
+        const deleted = yield* finishRemoval(databaseId);
+        return {
+          visit: "Leftovers",
+          report: Option.some<GarbageCollectionReport>({
+            databaseId,
+            manifestId: Option.some(latest.value.id),
+            sstBoundary: Timestamp.make(0),
+            deletedSsts: deleted,
+            deletedManifests: 0,
+            nextCollectionAt: Option.none(),
+          }),
+        };
+      }
       if (manifest.externalRefs.length > 0 && externalOwners(manifest).size > 0) {
         yield* compactors.wake(databaseId).pipe(Effect.scoped);
         return { visit: "Woken", report: Option.none() };
