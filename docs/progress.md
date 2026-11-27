@@ -930,5 +930,7 @@ per Stack (Dillon's choice, D49); the §12 write, flush, and split measurements 
 - **Link previews.** The page has a description, Open Graph and Twitter tags, and a favicon.
   `infra/docs-site/public/og.png` (1200x630) is rendered from `og-card.html` with
   `npx -y -p puppeteer@24 node render-og.mjs`; `build` copies `public/` into `dist/`.
+  Phones show the card about 350px wide, so its smallest text is 30px (about 9px there) and
+  its diagram has four boxes.
 - `vp run ready` exit 0 (14 tasks). The first run failed when parallel test tasks raced to clear
   `node_modules/.vitest-cache`; the run after clearing it passed.
