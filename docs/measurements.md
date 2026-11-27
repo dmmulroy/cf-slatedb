@@ -120,7 +120,7 @@ Cost per million rows written with this read mix, at `PRICES_PER_MILLION` (Cloud
 <!-- STEP4 measurements: end -->
 
 Live measurements for design §12 ("Measure before trusting these numbers"), plus the live checks of
-hand-off item 4. The sections from here to "Rows per second per writer" came from the **`preview-1`** stage on Dillon's account
+hand-off item 4. A section below that names no other stage or commit came from the **`preview-1`** stage on Dillon's account
 (`99459fce09d9a9eec83befd957af4ec5`) on 2026-11-25 with the **production write-path settings**
 (`DEFAULT_LSM_SETTINGS`: `l0SstSize` 64 MiB, `maxL0Age` 60 s, `maxUnflushedBytes` 256 MiB, 4 KiB
 blocks). One correction (D54): an earlier `--dev-timings` deploy's `gcMinAge` (10 s) and
