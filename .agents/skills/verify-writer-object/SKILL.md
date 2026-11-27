@@ -25,9 +25,9 @@ another fiber inside the object (D109): an R2 call, a lock, or two SQLite statem
   evicted (D115).
 - **CountersCover**: while the writer is `Ready`, the unflushed counters hold every unflushed row,
   except inside one commit between its SQLite commit and its counters' update (D74b).
-- **AlarmCovers**: with nothing running, an unflushed row has an alarm (D74b, D102). A row whose
-  write was evicted between its SQLite commit and its `scheduleFlush` is excepted (`orphans`):
-  it waits for the next request, whose start sets the alarm. See "Bounds and assumptions".
+- **AlarmCovers**: with nothing running, an unflushed row has an alarm, whatever was interrupted
+  or evicted (D74b, D102, D131). A commit makes sure an alarm exists after its mark and before
+  its rows reach SQLite, and a scheduler that sees a commit under way keeps an alarm.
 - **AckedFlushed** (liveness, `WriterObjectLive.cfg`): every acknowledged write reaches the
   manifest.
 - **AlarmQuiets** (liveness, `WriterObjectAlarmLoop.cfg`): the alarm eventually stops firing: no
@@ -40,20 +40,23 @@ node tools/formal-verification/src/verify.ts writer-object   # about 4 minutes w
 TLC_WORKERS=2 nice -n 15 node tools/formal-verification/src/verify.ts writer-object
 ```
 
-Expected: thirteen `✓` lines.
+Expected: sixteen `✓` lines.
 
 | Config | `Broken` | Expected |
 | --- | --- | --- |
-| `WriterObjectSeal.cfg` | `none` | pass (3,855,683 states, 98 s with 2 workers under load) |
+| `WriterObjectSeal.cfg` | `none` | pass (4,949,012 states, 72 s with 2 workers) |
+| `WriterObjectSeal.cfg` | `alarmAfterCommit` (before D131) | `AlarmCovers` |
+| `WriterObjectSeal.cfg` | `alarmBeforeMark` | `AlarmCovers` |
+| `WriterObjectSeal.cfg` | `schedulerIgnoresCommit` | `AlarmCovers` |
 | `WriterObjectSeal.cfg` | `sealKeepsPhase` (before D85) | `SealNotHalf` |
 | `WriterObjectSeal.cfg` | `beforeD115` | `NeverSelfFenced` |
 | `WriterObjectSeal.cfg` | `markFencedAnyPhase` | `NeverSelfFenced` |
 | `WriterObjectSeal.cfg` | `noAlarmRetry` (before D102) | `AlarmCovers` |
-| `WriterObjectTxn.cfg` | `none` | pass (2,046,184 states, 49 s) |
+| `WriterObjectTxn.cfg` | `none` | pass (2,312,359 states, about 35 s) |
 | `WriterObjectTxn.cfg` | `noHorizonReread` (before D84) | `Serializable` |
 | `WriterObjectTxn.cfg` | `noGeneration` (before D74b) | `CountersCover` |
 | `WriterObjectTxn.cfg` | `interruptedWrite` (before D74b's second half) | `CountersCover` |
-| `WriterObjectLive.cfg` | `none` | pass (72,597 states, about 15 s) |
+| `WriterObjectLive.cfg` | `none` | pass (97,769 states, about 20 s) |
 | `WriterObjectLive.cfg` | `noAlarmRetry` | `AckedFlushed` |
 | `WriterObjectAlarmLoop.cfg` | `none` | pass |
 | `WriterObjectAlarmLoop.cfg` | `noSettle` (D74's loop) | `AlarmQuiets` |
@@ -92,7 +95,8 @@ process's label (`pc`); replay it against the code:
 | `RfScan`, `RfInstall` | `refreshUnflushedCounters`: `Ref.get` + `memTable.stats`; `Ref.modify` installing only if `generation` is unchanged and no commit runs; otherwise again or give up |
 | `WLock`, `WReady`, `WCheck` | `commitBatch`: `commitLock`, `writableReady` |
 | `THorizon`, `TQuery`, `THorizonAgain` | `commitTransaction`'s check: `retainedFromSeq`, `writtenAfter`, `retainedFromSeq` again (D84) |
-| `WMark`, `WSql`, `WEnd` | the uninterruptible region: mark, `memTable.commit`, counters' update |
+| `WAlarmEarly` | only for `alarmBeforeMark`: the alarm made sure of before the mark |
+| `WMark`, `WAlarm`, `WSql`, `WEnd` | the uninterruptible region: mark, `ensureAlarmBeforeCommit` (D131), `memTable.commit`, counters' update |
 | `WDone` | `commitLock` released, `ensuring(scheduleFlush)`, the acknowledgement |
 | `FlLock`, `FlReady`, `FlMeta` | `flushThen`: `flushLock`, `ensureReady` (the `ready` it keeps), `memTable.meta` for the cut; nothing to flush: `settleCountersWithNothingToFlush` |
 | `FlUpload` | `ssts.write` (R2) |
@@ -129,16 +133,41 @@ the code's words.
   keeping only reachable versions in an SST (`NoAckedWriteLost` checks it), the manifest view's
   content, and other writer instances (removal's epoch bump). SQLite statements fail only where
   D102 retries them (`runAlarm`'s `meta`).
-- **The eviction gap.** A write evicted after its SQLite commit and before its `scheduleFlush`
-  leaves an unacknowledged row with no alarm. Its next request to the object starts the writer,
-  whose `scheduleFlush` covers it; a database with no further request keeps it in SQLite only
-  (durable, visible to `Latest` reads, which start the writer). Whether Cloudflare can evict the
-  isolate between the two depends on the output gate: `scheduleFlush` awaits `getAlarm` before
-  `setAlarm`. `AlarmCovers` excepts these rows (`orphans`).
+- **Abstract time and D131.** The alarm a commit sets is at `maxL0Age` from now; the model lets
+  it fire at once, so `alarmBeforeMark`'s counterexample (an alarm run between the alarm check
+  and the mark) stands for an alarm that was already scheduled and fires then. A SQLite commit
+  that fails is not modeled; `db-writer.test.ts` shows its alarm fires once and is not set
+  again.
 - R2 is CAS-atomic at the head (`verify-manifest-cas-fencing` checks it); a commit may fail
   before landing or land and lose its response.
 
+## Deeper search
+
+Not registered in `formal-checks.ts` (too long for the gate). Run one at a time, niced:
+
+```sh
+cd "$(mktemp -d)" && cp <repo>/tools/formal-verification/specs/WriterObject.tla . && \
+  cp <repo>/tools/formal-verification/specs/WriterObjectSearch.cfg run.cfg && \
+  nice -n 15 <repo>/.tlc/jdk/*/Contents/Home/bin/java -XX:+UseParallelGC -cp \
+  <repo>/.tlc/downloads/tla2tools.jar tlc2.TLC -workers 1 -config run.cfg WriterObject.tla
+# random traces where the state space is too large: WriterObjectSimulate.cfg (6 requests,
+# 4 sequence numbers, every fault twice), with `-simulate -depth 200` added
+```
+
+- `WriterObjectSearch.cfg`: all five operations, 3 requests, 3 sequence numbers, 2 keys, every
+  fault once, symmetry.
+- `WriterObjectSimulate.cfg`: 6 requests, 4 sequence numbers, 2 evictions, 2 interruptions,
+  2 R2 failures, no symmetry; simulation only.
+
+Results are recorded in `/tmp/shale-work/agents/formal/STATUS.md` and the maintenance notes.
+
 ## Maintenance notes
+
+- D131: a commit makes sure an alarm exists before its rows reach SQLite
+  (`ensureAlarmBeforeCommit`, after the mark), and `scheduleFlush` keeps an alarm when a commit
+  is under way and no row is counted. `AlarmCovers` lost its `orphans` exception. `alarmAfterCommit`
+  (the order before), `alarmBeforeMark` (the check before the mark), and
+  `schedulerIgnoresCommit` (no alarm kept by a scheduler during a commit) fail it.
 
 - D113: `FlCommit` gains the stale refusal: a flush whose `flushed_seq` is below the manifest's
   `lastL0Seq` (an earlier commit landed and lost its response) records it and flushes again.
@@ -154,8 +183,8 @@ the code's words.
 
 ## Keeping it in step with the code
 
-Sync commit: the D113 fix (`fix(lsm-cloudflare): a flush is exact about where it starts; the
-change feed reads each change once (D113)`); before it the D115 fix (`fix(lsm-cloudflare): a refused flush marks only its own phase fenced;
+Sync commit: the D131 fix (`fix(lsm-cloudflare): a commit makes sure an alarm exists before its
+rows reach SQLite (D131)`); before it the D113 fix, and the D115 fix (`fix(lsm-cloudflare): a refused flush marks only its own phase fenced;
 a seal forgets its phase only after applying its edit (D115)`). When a covered function changes,
 move or add the labels so that each is still one step between two fiber switches, translate,
 rerun, and show each property still fails on its broken variant before moving the sync commit.

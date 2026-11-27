@@ -793,3 +793,12 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `manifest.test.ts` ("caps checkpoints so the manifests they pin fit one collection's read budget
   (D129)"), `database-lifecycle.test.ts` ("the most checkpoints and pinned snapshots a database may
   hold (D99, D129)"); 2 mutations caught.
+- **Paged scans model-checked (D116)** — done. `PagedScan.tla`, skill
+  `.agents/skills/verify-paged-scan`: `LatestPageAtSnapshot` (`restartAfterRows` fails),
+  `TxnPagesAtReadSeq`, `TxnPagesComplete`, `PhantomRefused` (`pageRangesOnly` fails). Code-level:
+  `scan-oracle.property.test.ts`, `scan-bounds.test.ts`.
+- **A commit makes sure an alarm exists before its rows reach SQLite (D131)** — done.
+  `ensureAlarmBeforeCommit` and `scheduleFlush`'s commit-under-way rule (`db-writer.ts`). Tests:
+  `db-writer.test.ts` ("DbWriter alarm set before a commit's rows reach SQLite (D131)"). Formal:
+  `WriterObject` (`AlarmCovers` without exception; `alarmAfterCommit`, `alarmBeforeMark`,
+  `schedulerIgnoresCommit` fail).

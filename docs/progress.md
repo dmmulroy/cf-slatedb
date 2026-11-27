@@ -401,6 +401,15 @@ hand-off is below.
 
 ## Remaining-work log
 
+- **D131, D116 (formal round 2, 2026-11-26).** D131: a commit makes sure an alarm exists before its
+  rows reach SQLite, so `WriterObject`'s `AlarmCovers` has no exception; two tests in
+  `db-writer.test.ts`; 16 `writer-object` runs. D116: `PagedScan.tla` (4 runs) models Latest
+  segments, budget-limited pages, and transaction pages with the phantom rule.
+  `TLC_WORKERS=2 node tools/formal-verification/src/verify.ts writer-object paged-scan` exit 0;
+  `vp check` exit 0; `lsm-cloudflare` `vp test run --maxWorkers 2` 319 passed. Deeper search
+  configs (not registered): `WriterObjectSearch.cfg`, `WriterObjectSimulate.cfg`,
+  `ChangeFeedSearch.cfg`, `ChangeFeedSearchLarge.cfg`; results in the skills.
+
 - **D113 fix (formal audit, 2026-11-26).** A flush commit that landed with its response lost made
   the next flush export the same changes again, and the feed delivered them twice. `commitL0Flush`
   now takes `afterSeq` and refuses a stale start (`FlushedSeqStaleError`); the writer records the

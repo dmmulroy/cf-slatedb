@@ -53,6 +53,14 @@
 (*                       (before D85)                                      *)
 (*   "noAlarmRetry"      an alarm run that cannot read writer_meta sets no *)
 (*                       alarm again (before D102)                         *)
+(*   "alarmAfterCommit"  no alarm made sure of before the commit (before   *)
+(*                       D131): an eviction after the SQLite commit leaves *)
+(*                       rows with no alarm                                *)
+(*   "alarmBeforeMark"   the alarm made sure of before the mark, and a     *)
+(*                       scheduler ignores a commit under way: an alarm    *)
+(*                       run between the two leaves none                   *)
+(*   "schedulerIgnoresCommit" the check after the mark, but a scheduler    *)
+(*                       that counts no row sets no alarm during a commit  *)
 (*   "beforeD115"        both rules below as they were before D115         *)
 (*   "markFencedAnyPhase" a flush's WriterFencedError marks the phase      *)
 (*                       Fenced even when the writer started again since   *)
@@ -67,7 +75,8 @@ CONSTANTS Req, Keys, Ops, MaxOps, MaxSeq, MaxEvictions, MaxInterrupts, MaxFailur
 
 ASSUME Broken \in {"none", "noGeneration", "interruptedWrite", "noHorizonReread",
                    "sealKeepsPhase", "noAlarmRetry", "noSettle", "markFencedAnyPhase",
-                   "sealForgetsUntried", "beforeD115"}
+                   "sealForgetsUntried", "beforeD115", "alarmAfterCommit", "alarmBeforeMark",
+                   "schedulerIgnoresCommit"}
 ASSUME Ops \subseteq {"write", "txn", "flush", "seal", "probe"}
 
 A == "alarm"
@@ -98,9 +107,7 @@ variables
   sealTried = [p \in Req \cup {A} |-> FALSE],
   \* history and bounds
   acked = {}, opsLeft = MaxOps, writesStarted = 0, evictions = 0, interrupts = 0, failures = 0, seals = 0,
-  txnBad = FALSE, readBad = FALSE,
-  \* rows of writes evicted between their SQLite commit and their scheduleFlush, until a start
-  orphans = {};
+  txnBad = FALSE, readBad = FALSE;
 
 define
   Unflushed == {s \in mem : s > flushedSeq}
@@ -113,8 +120,11 @@ define
 end define;
 
 macro Schedule() begin
-  \* scheduleFlush: under scheduleLock, from the counters only.
-  if cnt # {} then alarmSet := TRUE; end if;
+  \* scheduleFlush: under scheduleLock, from the counters only; with no row counted, a commit
+  \* under way still keeps an alarm (D131).
+  if cnt # {} \/ (committing /\ Broken \notin {"alarmBeforeMark", "schedulerIgnoresCommit"}) then
+    alarmSet := TRUE;
+  end if;
 end macro;
 
 procedure Refresh()
@@ -179,7 +189,6 @@ StReady:
   rEpoch[self] := stEpoch || rSealed[self] := stSealed;
   if ~stSealed then Schedule(); end if;
   initLock := None;
-  orphans := {};
   return;
 end procedure;
 
@@ -315,7 +324,7 @@ WReady:
   call EnsureReady();
 WCheck:
   if failed[self] \/ rSealed[self] then goto Cleanup;
-  elsif op = "write" then goto WMark;
+  elsif op = "write" then goto WAlarmEarly;
   end if;
 THorizon:
   if RetainedFrom > tr \/ tr > lastSeq then goto Cleanup; end if;
@@ -324,8 +333,14 @@ TQuery:
   if \E s \in mem : s > tr /\ keyOf[s] = TK then goto Cleanup; end if;
 THorizonAgain:
   if Broken # "noHorizonReread" /\ RetainedFrom > tr then goto Cleanup; end if;
+WAlarmEarly:
+  \* "alarmBeforeMark": the alarm made sure of before the mark
+  if Broken = "alarmBeforeMark" /\ ~alarmSet then alarmSet := TRUE; end if;
 WMark:
   gen := gen + 1 || committing := TRUE;
+WAlarm:
+  \* ensureAlarmBeforeCommit (D131): an alarm exists before the rows reach SQLite
+  if Broken \notin {"alarmAfterCommit", "alarmBeforeMark"} /\ ~alarmSet then alarmSet := TRUE; end if;
 WSql:
   \* MemTable.commit: the next seq and its row, in one SQLite transaction.
   if op = "txn" then
@@ -477,8 +492,7 @@ VARIABLES lastSeq, flushedSeq, retained, mem, keyOf, marks, alarmSet, mEpoch,
           mSealed, mL0Seq, mData, sealedAt, phase, pEpoch, pSealed, cnt, gen, 
           committing, commitLock, flushLock, initLock, failed, rEpoch, 
           rSealed, committed, sealTried, acked, opsLeft, writesStarted, 
-          evictions, interrupts, failures, seals, txnBad, readBad, orphans, 
-          pc, stack
+          evictions, interrupts, failures, seals, txnBad, readBad, pc, stack
 
 (* define statement *)
 Unflushed == {s \in mem : s > flushedSeq}
@@ -496,9 +510,9 @@ vars == << lastSeq, flushedSeq, retained, mem, keyOf, marks, alarmSet, mEpoch,
            mSealed, mL0Seq, mData, sealedAt, phase, pEpoch, pSealed, cnt, gen, 
            committing, commitLock, flushLock, initLock, failed, rEpoch, 
            rSealed, committed, sealTried, acked, opsLeft, writesStarted, 
-           evictions, interrupts, failures, seals, txnBad, readBad, orphans, 
-           pc, stack, before, scan, stEpoch, stSealed, sealing, fEpoch, cut, 
-           ffs, sst, op, seq, tr, snap, rfs, rows, racked >>
+           evictions, interrupts, failures, seals, txnBad, readBad, pc, stack, 
+           before, scan, stEpoch, stSealed, sealing, fEpoch, cut, ffs, sst, 
+           op, seq, tr, snap, rfs, rows, racked >>
 
 ProcSet == (Req) \cup {A}
 
@@ -538,7 +552,6 @@ Init == (* Global variables *)
         /\ seals = 0
         /\ txnBad = FALSE
         /\ readBad = FALSE
-        /\ orphans = {}
         (* Procedure Refresh *)
         /\ before = [ self \in ProcSet |-> 0]
         /\ scan = [ self \in ProcSet |-> {}]
@@ -574,9 +587,9 @@ RfScan(self) == /\ pc[self] = "RfScan"
                                 initLock, failed, rEpoch, rSealed, committed, 
                                 sealTried, acked, opsLeft, writesStarted, 
                                 evictions, interrupts, failures, seals, txnBad, 
-                                readBad, orphans, stack, stEpoch, stSealed, 
-                                sealing, fEpoch, cut, ffs, sst, op, seq, tr, 
-                                snap, rfs, rows, racked >>
+                                readBad, stack, stEpoch, stSealed, sealing, 
+                                fEpoch, cut, ffs, sst, op, seq, tr, snap, rfs, 
+                                rows, racked >>
 
 RfInstall(self) == /\ pc[self] = "RfInstall"
                    /\ IF (gen = before[self] /\ ~committing) \/ Broken = "noGeneration"
@@ -599,10 +612,9 @@ RfInstall(self) == /\ pc[self] = "RfInstall"
                                    initLock, failed, rEpoch, rSealed, 
                                    committed, sealTried, acked, opsLeft, 
                                    writesStarted, evictions, interrupts, 
-                                   failures, seals, txnBad, readBad, orphans, 
-                                   stEpoch, stSealed, sealing, fEpoch, cut, 
-                                   ffs, sst, op, seq, tr, snap, rfs, rows, 
-                                   racked >>
+                                   failures, seals, txnBad, readBad, stEpoch, 
+                                   stSealed, sealing, fEpoch, cut, ffs, sst, 
+                                   op, seq, tr, snap, rfs, rows, racked >>
 
 Refresh(self) == RfScan(self) \/ RfInstall(self)
 
@@ -634,9 +646,9 @@ ErCheck(self) == /\ pc[self] = "ErCheck"
                                  gen, committing, commitLock, flushLock, 
                                  committed, sealTried, acked, opsLeft, 
                                  writesStarted, evictions, interrupts, 
-                                 failures, seals, txnBad, readBad, orphans, 
-                                 before, scan, sealing, fEpoch, cut, ffs, sst, 
-                                 op, seq, tr, snap, rfs, rows, racked >>
+                                 failures, seals, txnBad, readBad, before, 
+                                 scan, sealing, fEpoch, cut, ffs, sst, op, seq, 
+                                 tr, snap, rfs, rows, racked >>
 
 StFence(self) == /\ pc[self] = "StFence"
                  /\ \/ /\ CanFail
@@ -673,9 +685,9 @@ StFence(self) == /\ pc[self] = "StFence"
                                  commitLock, flushLock, rEpoch, rSealed, 
                                  committed, sealTried, acked, opsLeft, 
                                  writesStarted, evictions, interrupts, seals, 
-                                 txnBad, readBad, orphans, before, scan, 
-                                 sealing, fEpoch, cut, ffs, sst, op, seq, tr, 
-                                 snap, rfs, rows, racked >>
+                                 txnBad, readBad, before, scan, sealing, 
+                                 fEpoch, cut, ffs, sst, op, seq, tr, snap, rfs, 
+                                 rows, racked >>
 
 StRefresh(self) == /\ pc[self] = "StRefresh"
                    /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "Refresh",
@@ -693,10 +705,9 @@ StRefresh(self) == /\ pc[self] = "StRefresh"
                                    initLock, failed, rEpoch, rSealed, 
                                    committed, sealTried, acked, opsLeft, 
                                    writesStarted, evictions, interrupts, 
-                                   failures, seals, txnBad, readBad, orphans, 
-                                   stEpoch, stSealed, sealing, fEpoch, cut, 
-                                   ffs, sst, op, seq, tr, snap, rfs, rows, 
-                                   racked >>
+                                   failures, seals, txnBad, readBad, stEpoch, 
+                                   stSealed, sealing, fEpoch, cut, ffs, sst, 
+                                   op, seq, tr, snap, rfs, rows, racked >>
 
 StReady(self) == /\ pc[self] = "StReady"
                  /\ /\ pEpoch' = stEpoch[self]
@@ -705,14 +716,13 @@ StReady(self) == /\ pc[self] = "StReady"
                  /\ /\ rEpoch' = [rEpoch EXCEPT ![self] = stEpoch[self]]
                     /\ rSealed' = [rSealed EXCEPT ![self] = stSealed[self]]
                  /\ IF ~stSealed[self]
-                       THEN /\ IF cnt # {}
+                       THEN /\ IF cnt # {} \/ (committing /\ Broken \notin {"alarmBeforeMark", "schedulerIgnoresCommit"})
                                   THEN /\ alarmSet' = TRUE
                                   ELSE /\ TRUE
                                        /\ UNCHANGED alarmSet
                        ELSE /\ TRUE
                             /\ UNCHANGED alarmSet
                  /\ initLock' = None
-                 /\ orphans' = {}
                  /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
                  /\ stEpoch' = [stEpoch EXCEPT ![self] = Head(stack[self]).stEpoch]
                  /\ stSealed' = [stSealed EXCEPT ![self] = Head(stack[self]).stSealed]
@@ -740,9 +750,9 @@ FlLock(self) == /\ pc[self] = "FlLock"
                                 gen, committing, commitLock, initLock, failed, 
                                 rEpoch, rSealed, sealTried, acked, opsLeft, 
                                 writesStarted, evictions, interrupts, failures, 
-                                seals, txnBad, readBad, orphans, stack, before, 
-                                scan, stEpoch, stSealed, sealing, fEpoch, cut, 
-                                ffs, sst, op, seq, tr, snap, rfs, rows, racked >>
+                                seals, txnBad, readBad, stack, before, scan, 
+                                stEpoch, stSealed, sealing, fEpoch, cut, ffs, 
+                                sst, op, seq, tr, snap, rfs, rows, racked >>
 
 FlReady(self) == /\ pc[self] = "FlReady"
                  /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "EnsureReady",
@@ -760,9 +770,9 @@ FlReady(self) == /\ pc[self] = "FlReady"
                                  initLock, failed, rEpoch, rSealed, committed, 
                                  sealTried, acked, opsLeft, writesStarted, 
                                  evictions, interrupts, failures, seals, 
-                                 txnBad, readBad, orphans, before, scan, 
-                                 sealing, fEpoch, cut, ffs, sst, op, seq, tr, 
-                                 snap, rfs, rows, racked >>
+                                 txnBad, readBad, before, scan, sealing, 
+                                 fEpoch, cut, ffs, sst, op, seq, tr, snap, rfs, 
+                                 rows, racked >>
 
 FlMeta(self) == /\ pc[self] = "FlMeta"
                 /\ IF failed[self]
@@ -802,9 +812,9 @@ FlMeta(self) == /\ pc[self] = "FlMeta"
                                 gen, committing, commitLock, initLock, failed, 
                                 rEpoch, rSealed, committed, sealTried, acked, 
                                 opsLeft, writesStarted, evictions, interrupts, 
-                                failures, seals, txnBad, readBad, orphans, 
-                                before, scan, stEpoch, stSealed, op, seq, tr, 
-                                snap, rfs, rows, racked >>
+                                failures, seals, txnBad, readBad, before, scan, 
+                                stEpoch, stSealed, op, seq, tr, snap, rfs, 
+                                rows, racked >>
 
 FlUpload(self) == /\ pc[self] = "FlUpload"
                   /\ \/ /\ CanFail
@@ -827,9 +837,8 @@ FlUpload(self) == /\ pc[self] = "FlUpload"
                                   initLock, rEpoch, rSealed, committed, 
                                   sealTried, acked, opsLeft, writesStarted, 
                                   evictions, interrupts, seals, txnBad, 
-                                  readBad, orphans, before, scan, stEpoch, 
-                                  stSealed, op, seq, tr, snap, rfs, rows, 
-                                  racked >>
+                                  readBad, before, scan, stEpoch, stSealed, op, 
+                                  seq, tr, snap, rfs, rows, racked >>
 
 FlCommit(self) == /\ pc[self] = "FlCommit"
                   /\ \/ /\ CanFail
@@ -931,9 +940,9 @@ FlCommit(self) == /\ pc[self] = "FlCommit"
                                   committing, commitLock, flushLock, initLock, 
                                   rEpoch, rSealed, acked, opsLeft, 
                                   writesStarted, evictions, interrupts, seals, 
-                                  txnBad, readBad, orphans, before, scan, 
-                                  stEpoch, stSealed, op, seq, tr, snap, rfs, 
-                                  rows, racked >>
+                                  txnBad, readBad, before, scan, stEpoch, 
+                                  stSealed, op, seq, tr, snap, rfs, rows, 
+                                  racked >>
 
 FlMark(self) == /\ pc[self] = "FlMark"
                 /\ IF cut[self] > flushedSeq
@@ -948,10 +957,10 @@ FlMark(self) == /\ pc[self] = "FlMark"
                                 commitLock, flushLock, initLock, failed, 
                                 rEpoch, rSealed, committed, sealTried, acked, 
                                 opsLeft, writesStarted, evictions, interrupts, 
-                                failures, seals, txnBad, readBad, orphans, 
-                                stack, before, scan, stEpoch, stSealed, 
-                                sealing, fEpoch, cut, ffs, sst, op, seq, tr, 
-                                snap, rfs, rows, racked >>
+                                failures, seals, txnBad, readBad, stack, 
+                                before, scan, stEpoch, stSealed, sealing, 
+                                fEpoch, cut, ffs, sst, op, seq, tr, snap, rfs, 
+                                rows, racked >>
 
 FlTrim(self) == /\ pc[self] = "FlTrim"
                 /\ \E h \in TrimHorizons:
@@ -965,10 +974,10 @@ FlTrim(self) == /\ pc[self] = "FlTrim"
                                 commitLock, flushLock, initLock, failed, 
                                 rEpoch, rSealed, committed, sealTried, acked, 
                                 opsLeft, writesStarted, evictions, interrupts, 
-                                failures, seals, txnBad, readBad, orphans, 
-                                stack, before, scan, stEpoch, stSealed, 
-                                sealing, fEpoch, cut, ffs, sst, op, seq, tr, 
-                                snap, rfs, rows, racked >>
+                                failures, seals, txnBad, readBad, stack, 
+                                before, scan, stEpoch, stSealed, sealing, 
+                                fEpoch, cut, ffs, sst, op, seq, tr, snap, rfs, 
+                                rows, racked >>
 
 FlRefresh(self) == /\ pc[self] = "FlRefresh"
                    /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "Refresh",
@@ -986,10 +995,9 @@ FlRefresh(self) == /\ pc[self] = "FlRefresh"
                                    initLock, failed, rEpoch, rSealed, 
                                    committed, sealTried, acked, opsLeft, 
                                    writesStarted, evictions, interrupts, 
-                                   failures, seals, txnBad, readBad, orphans, 
-                                   stEpoch, stSealed, sealing, fEpoch, cut, 
-                                   ffs, sst, op, seq, tr, snap, rfs, rows, 
-                                   racked >>
+                                   failures, seals, txnBad, readBad, stEpoch, 
+                                   stSealed, sealing, fEpoch, cut, ffs, sst, 
+                                   op, seq, tr, snap, rfs, rows, racked >>
 
 FlDone(self) == /\ pc[self] = "FlDone"
                 /\ flushLock' = None
@@ -1006,9 +1014,9 @@ FlDone(self) == /\ pc[self] = "FlDone"
                                 gen, committing, commitLock, initLock, failed, 
                                 rEpoch, rSealed, committed, sealTried, acked, 
                                 opsLeft, writesStarted, evictions, interrupts, 
-                                failures, seals, txnBad, readBad, orphans, 
-                                before, scan, stEpoch, stSealed, op, seq, tr, 
-                                snap, rfs, rows, racked >>
+                                failures, seals, txnBad, readBad, before, scan, 
+                                stEpoch, stSealed, op, seq, tr, snap, rfs, 
+                                rows, racked >>
 
 FlSettle(self) == /\ pc[self] = "FlSettle"
                   /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "Refresh",
@@ -1026,9 +1034,9 @@ FlSettle(self) == /\ pc[self] = "FlSettle"
                                   initLock, failed, rEpoch, rSealed, committed, 
                                   sealTried, acked, opsLeft, writesStarted, 
                                   evictions, interrupts, failures, seals, 
-                                  txnBad, readBad, orphans, stEpoch, stSealed, 
-                                  sealing, fEpoch, cut, ffs, sst, op, seq, tr, 
-                                  snap, rfs, rows, racked >>
+                                  txnBad, readBad, stEpoch, stSealed, sealing, 
+                                  fEpoch, cut, ffs, sst, op, seq, tr, snap, 
+                                  rfs, rows, racked >>
 
 FlSettleDone(self) == /\ pc[self] = "FlSettleDone"
                       /\ flushLock' = None
@@ -1047,9 +1055,8 @@ FlSettleDone(self) == /\ pc[self] = "FlSettleDone"
                                       rSealed, committed, sealTried, acked, 
                                       opsLeft, writesStarted, evictions, 
                                       interrupts, failures, seals, txnBad, 
-                                      readBad, orphans, before, scan, stEpoch, 
-                                      stSealed, op, seq, tr, snap, rfs, rows, 
-                                      racked >>
+                                      readBad, before, scan, stEpoch, stSealed, 
+                                      op, seq, tr, snap, rfs, rows, racked >>
 
 FlushThen(self) == FlLock(self) \/ FlReady(self) \/ FlMeta(self)
                       \/ FlUpload(self) \/ FlCommit(self) \/ FlMark(self)
@@ -1090,9 +1097,9 @@ Idle(self) == /\ pc[self] = "Idle"
                               committing, commitLock, flushLock, initLock, 
                               failed, rEpoch, rSealed, committed, sealTried, 
                               acked, evictions, interrupts, failures, txnBad, 
-                              readBad, orphans, stack, before, scan, stEpoch, 
-                              stSealed, sealing, fEpoch, cut, ffs, sst, seq, 
-                              snap, rfs, rows, racked >>
+                              readBad, stack, before, scan, stEpoch, stSealed, 
+                              sealing, fEpoch, cut, ffs, sst, seq, snap, rfs, 
+                              rows, racked >>
 
 WLock(self) == /\ pc[self] = "WLock"
                /\ commitLock = None
@@ -1104,9 +1111,9 @@ WLock(self) == /\ pc[self] = "WLock"
                                committing, flushLock, initLock, failed, rEpoch, 
                                rSealed, committed, sealTried, acked, opsLeft, 
                                writesStarted, evictions, interrupts, failures, 
-                               seals, txnBad, readBad, orphans, stack, before, 
-                               scan, stEpoch, stSealed, sealing, fEpoch, cut, 
-                               ffs, sst, op, seq, tr, snap, rfs, rows, racked >>
+                               seals, txnBad, readBad, stack, before, scan, 
+                               stEpoch, stSealed, sealing, fEpoch, cut, ffs, 
+                               sst, op, seq, tr, snap, rfs, rows, racked >>
 
 WReady(self) == /\ pc[self] = "WReady"
                 /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "EnsureReady",
@@ -1124,15 +1131,14 @@ WReady(self) == /\ pc[self] = "WReady"
                                 initLock, failed, rEpoch, rSealed, committed, 
                                 sealTried, acked, opsLeft, writesStarted, 
                                 evictions, interrupts, failures, seals, txnBad, 
-                                readBad, orphans, before, scan, sealing, 
-                                fEpoch, cut, ffs, sst, op, seq, tr, snap, rfs, 
-                                rows, racked >>
+                                readBad, before, scan, sealing, fEpoch, cut, 
+                                ffs, sst, op, seq, tr, snap, rfs, rows, racked >>
 
 WCheck(self) == /\ pc[self] = "WCheck"
                 /\ IF failed[self] \/ rSealed[self]
                       THEN /\ pc' = [pc EXCEPT ![self] = "Cleanup"]
                       ELSE /\ IF op[self] = "write"
-                                 THEN /\ pc' = [pc EXCEPT ![self] = "WMark"]
+                                 THEN /\ pc' = [pc EXCEPT ![self] = "WAlarmEarly"]
                                  ELSE /\ pc' = [pc EXCEPT ![self] = "THorizon"]
                 /\ UNCHANGED << lastSeq, flushedSeq, retained, mem, keyOf, 
                                 marks, alarmSet, mEpoch, mSealed, mL0Seq, 
@@ -1141,7 +1147,7 @@ WCheck(self) == /\ pc[self] = "WCheck"
                                 initLock, failed, rEpoch, rSealed, committed, 
                                 sealTried, acked, opsLeft, writesStarted, 
                                 evictions, interrupts, failures, seals, txnBad, 
-                                readBad, orphans, stack, before, scan, stEpoch, 
+                                readBad, stack, before, scan, stEpoch, 
                                 stSealed, sealing, fEpoch, cut, ffs, sst, op, 
                                 seq, tr, snap, rfs, rows, racked >>
 
@@ -1156,10 +1162,9 @@ THorizon(self) == /\ pc[self] = "THorizon"
                                   initLock, failed, rEpoch, rSealed, committed, 
                                   sealTried, acked, opsLeft, writesStarted, 
                                   evictions, interrupts, failures, seals, 
-                                  txnBad, readBad, orphans, stack, before, 
-                                  scan, stEpoch, stSealed, sealing, fEpoch, 
-                                  cut, ffs, sst, op, seq, tr, snap, rfs, rows, 
-                                  racked >>
+                                  txnBad, readBad, stack, before, scan, 
+                                  stEpoch, stSealed, sealing, fEpoch, cut, ffs, 
+                                  sst, op, seq, tr, snap, rfs, rows, racked >>
 
 TQuery(self) == /\ pc[self] = "TQuery"
                 /\ IF \E s \in mem : s > tr[self] /\ keyOf[s] = TK
@@ -1172,14 +1177,14 @@ TQuery(self) == /\ pc[self] = "TQuery"
                                 initLock, failed, rEpoch, rSealed, committed, 
                                 sealTried, acked, opsLeft, writesStarted, 
                                 evictions, interrupts, failures, seals, txnBad, 
-                                readBad, orphans, stack, before, scan, stEpoch, 
+                                readBad, stack, before, scan, stEpoch, 
                                 stSealed, sealing, fEpoch, cut, ffs, sst, op, 
                                 seq, tr, snap, rfs, rows, racked >>
 
 THorizonAgain(self) == /\ pc[self] = "THorizonAgain"
                        /\ IF Broken # "noHorizonReread" /\ RetainedFrom > tr[self]
                              THEN /\ pc' = [pc EXCEPT ![self] = "Cleanup"]
-                             ELSE /\ pc' = [pc EXCEPT ![self] = "WMark"]
+                             ELSE /\ pc' = [pc EXCEPT ![self] = "WAlarmEarly"]
                        /\ UNCHANGED << lastSeq, flushedSeq, retained, mem, 
                                        keyOf, marks, alarmSet, mEpoch, mSealed, 
                                        mL0Seq, mData, sealedAt, phase, pEpoch, 
@@ -1188,24 +1193,59 @@ THorizonAgain(self) == /\ pc[self] = "THorizonAgain"
                                        rEpoch, rSealed, committed, sealTried, 
                                        acked, opsLeft, writesStarted, 
                                        evictions, interrupts, failures, seals, 
-                                       txnBad, readBad, orphans, stack, before, 
-                                       scan, stEpoch, stSealed, sealing, 
-                                       fEpoch, cut, ffs, sst, op, seq, tr, 
-                                       snap, rfs, rows, racked >>
+                                       txnBad, readBad, stack, before, scan, 
+                                       stEpoch, stSealed, sealing, fEpoch, cut, 
+                                       ffs, sst, op, seq, tr, snap, rfs, rows, 
+                                       racked >>
+
+WAlarmEarly(self) == /\ pc[self] = "WAlarmEarly"
+                     /\ IF Broken = "alarmBeforeMark" /\ ~alarmSet
+                           THEN /\ alarmSet' = TRUE
+                           ELSE /\ TRUE
+                                /\ UNCHANGED alarmSet
+                     /\ pc' = [pc EXCEPT ![self] = "WMark"]
+                     /\ UNCHANGED << lastSeq, flushedSeq, retained, mem, keyOf, 
+                                     marks, mEpoch, mSealed, mL0Seq, mData, 
+                                     sealedAt, phase, pEpoch, pSealed, cnt, 
+                                     gen, committing, commitLock, flushLock, 
+                                     initLock, failed, rEpoch, rSealed, 
+                                     committed, sealTried, acked, opsLeft, 
+                                     writesStarted, evictions, interrupts, 
+                                     failures, seals, txnBad, readBad, stack, 
+                                     before, scan, stEpoch, stSealed, sealing, 
+                                     fEpoch, cut, ffs, sst, op, seq, tr, snap, 
+                                     rfs, rows, racked >>
 
 WMark(self) == /\ pc[self] = "WMark"
                /\ /\ committing' = TRUE
                   /\ gen' = gen + 1
-               /\ pc' = [pc EXCEPT ![self] = "WSql"]
+               /\ pc' = [pc EXCEPT ![self] = "WAlarm"]
                /\ UNCHANGED << lastSeq, flushedSeq, retained, mem, keyOf, 
                                marks, alarmSet, mEpoch, mSealed, mL0Seq, mData, 
                                sealedAt, phase, pEpoch, pSealed, cnt, 
                                commitLock, flushLock, initLock, failed, rEpoch, 
                                rSealed, committed, sealTried, acked, opsLeft, 
                                writesStarted, evictions, interrupts, failures, 
-                               seals, txnBad, readBad, orphans, stack, before, 
-                               scan, stEpoch, stSealed, sealing, fEpoch, cut, 
-                               ffs, sst, op, seq, tr, snap, rfs, rows, racked >>
+                               seals, txnBad, readBad, stack, before, scan, 
+                               stEpoch, stSealed, sealing, fEpoch, cut, ffs, 
+                               sst, op, seq, tr, snap, rfs, rows, racked >>
+
+WAlarm(self) == /\ pc[self] = "WAlarm"
+                /\ IF Broken \notin {"alarmAfterCommit", "alarmBeforeMark"} /\ ~alarmSet
+                      THEN /\ alarmSet' = TRUE
+                      ELSE /\ TRUE
+                           /\ UNCHANGED alarmSet
+                /\ pc' = [pc EXCEPT ![self] = "WSql"]
+                /\ UNCHANGED << lastSeq, flushedSeq, retained, mem, keyOf, 
+                                marks, mEpoch, mSealed, mL0Seq, mData, 
+                                sealedAt, phase, pEpoch, pSealed, cnt, gen, 
+                                committing, commitLock, flushLock, initLock, 
+                                failed, rEpoch, rSealed, committed, sealTried, 
+                                acked, opsLeft, writesStarted, evictions, 
+                                interrupts, failures, seals, txnBad, readBad, 
+                                stack, before, scan, stEpoch, stSealed, 
+                                sealing, fEpoch, cut, ffs, sst, op, seq, tr, 
+                                snap, rfs, rows, racked >>
 
 WSql(self) == /\ pc[self] = "WSql"
               /\ IF op[self] = "txn"
@@ -1227,9 +1267,9 @@ WSql(self) == /\ pc[self] = "WSql"
                               flushLock, initLock, failed, rEpoch, rSealed, 
                               committed, sealTried, acked, opsLeft, 
                               writesStarted, evictions, interrupts, failures, 
-                              seals, readBad, orphans, stack, before, scan, 
-                              stEpoch, stSealed, sealing, fEpoch, cut, ffs, 
-                              sst, op, tr, snap, rfs, rows, racked >>
+                              seals, readBad, stack, before, scan, stEpoch, 
+                              stSealed, sealing, fEpoch, cut, ffs, sst, op, tr, 
+                              snap, rfs, rows, racked >>
 
 WEnd(self) == /\ pc[self] = "WEnd"
               /\ /\ cnt' = (cnt \cup {seq[self]})
@@ -1242,13 +1282,13 @@ WEnd(self) == /\ pc[self] = "WEnd"
                               flushLock, initLock, failed, rEpoch, rSealed, 
                               committed, sealTried, acked, opsLeft, 
                               writesStarted, evictions, interrupts, failures, 
-                              seals, txnBad, readBad, orphans, stack, before, 
-                              scan, stEpoch, stSealed, sealing, fEpoch, cut, 
-                              ffs, sst, op, seq, tr, snap, rfs, rows, racked >>
+                              seals, txnBad, readBad, stack, before, scan, 
+                              stEpoch, stSealed, sealing, fEpoch, cut, ffs, 
+                              sst, op, seq, tr, snap, rfs, rows, racked >>
 
 WDone(self) == /\ pc[self] = "WDone"
                /\ commitLock' = None
-               /\ IF cnt # {}
+               /\ IF cnt # {} \/ (committing /\ Broken \notin {"alarmBeforeMark", "schedulerIgnoresCommit"})
                      THEN /\ alarmSet' = TRUE
                      ELSE /\ TRUE
                           /\ UNCHANGED alarmSet
@@ -1260,9 +1300,9 @@ WDone(self) == /\ pc[self] = "WDone"
                                flushLock, initLock, failed, rEpoch, rSealed, 
                                committed, sealTried, opsLeft, writesStarted, 
                                evictions, interrupts, failures, seals, txnBad, 
-                               readBad, orphans, stack, before, scan, stEpoch, 
-                               stSealed, sealing, fEpoch, cut, ffs, sst, op, 
-                               seq, tr, snap, rfs, rows, racked >>
+                               readBad, stack, before, scan, stEpoch, stSealed, 
+                               sealing, fEpoch, cut, ffs, sst, op, seq, tr, 
+                               snap, rfs, rows, racked >>
 
 FReady(self) == /\ pc[self] = "FReady"
                 /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "EnsureReady",
@@ -1280,9 +1320,8 @@ FReady(self) == /\ pc[self] = "FReady"
                                 initLock, failed, rEpoch, rSealed, committed, 
                                 sealTried, acked, opsLeft, writesStarted, 
                                 evictions, interrupts, failures, seals, txnBad, 
-                                readBad, orphans, before, scan, sealing, 
-                                fEpoch, cut, ffs, sst, op, seq, tr, snap, rfs, 
-                                rows, racked >>
+                                readBad, before, scan, sealing, fEpoch, cut, 
+                                ffs, sst, op, seq, tr, snap, rfs, rows, racked >>
 
 FGo(self) == /\ pc[self] = "FGo"
              /\ IF failed[self]
@@ -1309,8 +1348,8 @@ FGo(self) == /\ pc[self] = "FGo"
                              failed, rEpoch, rSealed, committed, sealTried, 
                              acked, opsLeft, writesStarted, evictions, 
                              interrupts, failures, seals, txnBad, readBad, 
-                             orphans, before, scan, stEpoch, stSealed, op, seq, 
-                             tr, snap, rfs, rows, racked >>
+                             before, scan, stEpoch, stSealed, op, seq, tr, 
+                             snap, rfs, rows, racked >>
 
 FDone(self) == /\ pc[self] = "FDone"
                /\ pc' = [pc EXCEPT ![self] = "Cleanup"]
@@ -1321,9 +1360,9 @@ FDone(self) == /\ pc[self] = "FDone"
                                failed, rEpoch, rSealed, committed, sealTried, 
                                acked, opsLeft, writesStarted, evictions, 
                                interrupts, failures, seals, txnBad, readBad, 
-                               orphans, stack, before, scan, stEpoch, stSealed, 
-                               sealing, fEpoch, cut, ffs, sst, op, seq, tr, 
-                               snap, rfs, rows, racked >>
+                               stack, before, scan, stEpoch, stSealed, sealing, 
+                               fEpoch, cut, ffs, sst, op, seq, tr, snap, rfs, 
+                               rows, racked >>
 
 SLock(self) == /\ pc[self] = "SLock"
                /\ commitLock = None
@@ -1335,9 +1374,9 @@ SLock(self) == /\ pc[self] = "SLock"
                                committing, flushLock, initLock, failed, rEpoch, 
                                rSealed, committed, sealTried, acked, opsLeft, 
                                writesStarted, evictions, interrupts, failures, 
-                               seals, txnBad, readBad, orphans, stack, before, 
-                               scan, stEpoch, stSealed, sealing, fEpoch, cut, 
-                               ffs, sst, op, seq, tr, snap, rfs, rows, racked >>
+                               seals, txnBad, readBad, stack, before, scan, 
+                               stEpoch, stSealed, sealing, fEpoch, cut, ffs, 
+                               sst, op, seq, tr, snap, rfs, rows, racked >>
 
 SReady(self) == /\ pc[self] = "SReady"
                 /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "EnsureReady",
@@ -1355,9 +1394,8 @@ SReady(self) == /\ pc[self] = "SReady"
                                 initLock, failed, rEpoch, rSealed, committed, 
                                 sealTried, acked, opsLeft, writesStarted, 
                                 evictions, interrupts, failures, seals, txnBad, 
-                                readBad, orphans, before, scan, sealing, 
-                                fEpoch, cut, ffs, sst, op, seq, tr, snap, rfs, 
-                                rows, racked >>
+                                readBad, before, scan, sealing, fEpoch, cut, 
+                                ffs, sst, op, seq, tr, snap, rfs, rows, racked >>
 
 SCheck(self) == /\ pc[self] = "SCheck"
                 /\ IF failed[self]
@@ -1375,7 +1413,7 @@ SCheck(self) == /\ pc[self] = "SCheck"
                                 initLock, failed, rEpoch, rSealed, committed, 
                                 sealTried, acked, opsLeft, writesStarted, 
                                 evictions, interrupts, failures, seals, txnBad, 
-                                readBad, orphans, stack, before, scan, stEpoch, 
+                                readBad, stack, before, scan, stEpoch, 
                                 stSealed, sealing, fEpoch, cut, ffs, sst, seq, 
                                 tr, snap, rfs, rows, racked >>
 
@@ -1401,8 +1439,8 @@ SFlush(self) == /\ pc[self] = "SFlush"
                                 initLock, failed, rEpoch, rSealed, committed, 
                                 sealTried, acked, opsLeft, writesStarted, 
                                 evictions, interrupts, failures, seals, txnBad, 
-                                readBad, orphans, before, scan, stEpoch, 
-                                stSealed, op, seq, tr, snap, rfs, rows, racked >>
+                                readBad, before, scan, stEpoch, stSealed, op, 
+                                seq, tr, snap, rfs, rows, racked >>
 
 SAfter(self) == /\ pc[self] = "SAfter"
                 /\ IF failed[self]
@@ -1417,7 +1455,7 @@ SAfter(self) == /\ pc[self] = "SAfter"
                                 initLock, failed, rEpoch, rSealed, committed, 
                                 sealTried, acked, opsLeft, writesStarted, 
                                 evictions, interrupts, failures, seals, txnBad, 
-                                readBad, orphans, stack, before, scan, stEpoch, 
+                                readBad, stack, before, scan, stEpoch, 
                                 stSealed, sealing, fEpoch, cut, ffs, sst, op, 
                                 seq, tr, snap, rfs, rows, racked >>
 
@@ -1452,9 +1490,9 @@ SCommit(self) == /\ pc[self] = "SCommit"
                                  flushLock, initLock, failed, rEpoch, rSealed, 
                                  committed, acked, opsLeft, writesStarted, 
                                  evictions, interrupts, seals, txnBad, readBad, 
-                                 orphans, stack, before, scan, stEpoch, 
-                                 stSealed, sealing, fEpoch, cut, ffs, sst, op, 
-                                 seq, tr, snap, rfs, rows, racked >>
+                                 stack, before, scan, stEpoch, stSealed, 
+                                 sealing, fEpoch, cut, ffs, sst, op, seq, tr, 
+                                 snap, rfs, rows, racked >>
 
 SSet(self) == /\ pc[self] = "SSet"
               /\ /\ pEpoch' = mEpoch
@@ -1468,9 +1506,9 @@ SSet(self) == /\ pc[self] = "SSet"
                               flushLock, initLock, failed, rEpoch, rSealed, 
                               committed, sealTried, acked, opsLeft, 
                               writesStarted, evictions, interrupts, failures, 
-                              seals, txnBad, readBad, orphans, stack, before, 
-                              scan, stEpoch, stSealed, sealing, fEpoch, cut, 
-                              ffs, sst, seq, tr, snap, rfs, rows, racked >>
+                              seals, txnBad, readBad, stack, before, scan, 
+                              stEpoch, stSealed, sealing, fEpoch, cut, ffs, 
+                              sst, seq, tr, snap, rfs, rows, racked >>
 
 PReady(self) == /\ pc[self] = "PReady"
                 /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "EnsureReady",
@@ -1488,9 +1526,8 @@ PReady(self) == /\ pc[self] = "PReady"
                                 initLock, failed, rEpoch, rSealed, committed, 
                                 sealTried, acked, opsLeft, writesStarted, 
                                 evictions, interrupts, failures, seals, txnBad, 
-                                readBad, orphans, before, scan, sealing, 
-                                fEpoch, cut, ffs, sst, op, seq, tr, snap, rfs, 
-                                rows, racked >>
+                                readBad, before, scan, sealing, fEpoch, cut, 
+                                ffs, sst, op, seq, tr, snap, rfs, rows, racked >>
 
 PRead(self) == /\ pc[self] = "PRead"
                /\ IF failed[self]
@@ -1508,8 +1545,8 @@ PRead(self) == /\ pc[self] = "PRead"
                                failed, rEpoch, rSealed, committed, sealTried, 
                                acked, opsLeft, writesStarted, evictions, 
                                interrupts, failures, seals, txnBad, readBad, 
-                               orphans, stack, before, scan, stEpoch, stSealed, 
-                               sealing, fEpoch, cut, ffs, sst, op, seq, tr >>
+                               stack, before, scan, stEpoch, stSealed, sealing, 
+                               fEpoch, cut, ffs, sst, op, seq, tr >>
 
 PManifest(self) == /\ pc[self] = "PManifest"
                    /\ IF rfs[self] <= mL0Seq /\ mL0Seq <= snap[self]
@@ -1527,10 +1564,10 @@ PManifest(self) == /\ pc[self] = "PManifest"
                                    initLock, failed, rEpoch, rSealed, 
                                    committed, sealTried, acked, opsLeft, 
                                    writesStarted, evictions, interrupts, 
-                                   failures, seals, txnBad, orphans, stack, 
-                                   before, scan, stEpoch, stSealed, sealing, 
-                                   fEpoch, cut, ffs, sst, op, seq, tr, snap, 
-                                   rfs, rows, racked >>
+                                   failures, seals, txnBad, stack, before, 
+                                   scan, stEpoch, stSealed, sealing, fEpoch, 
+                                   cut, ffs, sst, op, seq, tr, snap, rfs, rows, 
+                                   racked >>
 
 Cleanup(self) == /\ pc[self] = "Cleanup"
                  /\ IF /\ op[self] = "seal" /\ commitLock = self /\ Broken # "sealKeepsPhase" /\ phase = "ready"
@@ -1551,7 +1588,7 @@ Cleanup(self) == /\ pc[self] = "Cleanup"
                        ELSE /\ TRUE
                             /\ UNCHANGED initLock
                  /\ IF op[self] \in {"write", "txn"} /\ Broken # "interruptedWrite"
-                       THEN /\ IF cnt # {}
+                       THEN /\ IF cnt # {} \/ (committing /\ Broken \notin {"alarmBeforeMark", "schedulerIgnoresCommit"})
                                   THEN /\ alarmSet' = TRUE
                                   ELSE /\ TRUE
                                        /\ UNCHANGED alarmSet
@@ -1572,18 +1609,18 @@ Cleanup(self) == /\ pc[self] = "Cleanup"
                                  sealedAt, pEpoch, pSealed, cnt, gen, 
                                  committing, rEpoch, rSealed, committed, acked, 
                                  opsLeft, writesStarted, evictions, interrupts, 
-                                 failures, seals, txnBad, readBad, orphans, 
-                                 stack, before, scan, stEpoch, stSealed, 
-                                 sealing, fEpoch, cut, ffs, sst >>
+                                 failures, seals, txnBad, readBad, stack, 
+                                 before, scan, stEpoch, stSealed, sealing, 
+                                 fEpoch, cut, ffs, sst >>
 
 r(self) == Idle(self) \/ WLock(self) \/ WReady(self) \/ WCheck(self)
               \/ THorizon(self) \/ TQuery(self) \/ THorizonAgain(self)
-              \/ WMark(self) \/ WSql(self) \/ WEnd(self) \/ WDone(self)
-              \/ FReady(self) \/ FGo(self) \/ FDone(self) \/ SLock(self)
-              \/ SReady(self) \/ SCheck(self) \/ SFlush(self)
-              \/ SAfter(self) \/ SCommit(self) \/ SSet(self)
-              \/ PReady(self) \/ PRead(self) \/ PManifest(self)
-              \/ Cleanup(self)
+              \/ WAlarmEarly(self) \/ WMark(self) \/ WAlarm(self)
+              \/ WSql(self) \/ WEnd(self) \/ WDone(self) \/ FReady(self)
+              \/ FGo(self) \/ FDone(self) \/ SLock(self) \/ SReady(self)
+              \/ SCheck(self) \/ SFlush(self) \/ SAfter(self)
+              \/ SCommit(self) \/ SSet(self) \/ PReady(self) \/ PRead(self)
+              \/ PManifest(self) \/ Cleanup(self)
 
 AIdle == /\ pc[A] = "AIdle"
          /\ alarmSet
@@ -1595,9 +1632,9 @@ AIdle == /\ pc[A] = "AIdle"
                          flushLock, initLock, failed, rEpoch, rSealed, 
                          committed, sealTried, acked, opsLeft, writesStarted, 
                          evictions, interrupts, failures, seals, txnBad, 
-                         readBad, orphans, stack, before, scan, stEpoch, 
-                         stSealed, sealing, fEpoch, cut, ffs, sst, op, seq, tr, 
-                         snap, rfs, rows, racked >>
+                         readBad, stack, before, scan, stEpoch, stSealed, 
+                         sealing, fEpoch, cut, ffs, sst, op, seq, tr, snap, 
+                         rfs, rows, racked >>
 
 AMeta == /\ pc[A] = "AMeta"
          /\ \/ /\ CanFail
@@ -1615,10 +1652,9 @@ AMeta == /\ pc[A] = "AMeta"
                          pEpoch, pSealed, cnt, gen, committing, commitLock, 
                          flushLock, initLock, failed, rEpoch, rSealed, 
                          committed, sealTried, acked, opsLeft, writesStarted, 
-                         evictions, interrupts, seals, txnBad, readBad, 
-                         orphans, stack, before, scan, stEpoch, stSealed, 
-                         sealing, fEpoch, cut, ffs, sst, op, seq, tr, snap, 
-                         rfs, rows, racked >>
+                         evictions, interrupts, seals, txnBad, readBad, stack, 
+                         before, scan, stEpoch, stSealed, sealing, fEpoch, cut, 
+                         ffs, sst, op, seq, tr, snap, rfs, rows, racked >>
 
 AReady == /\ pc[A] = "AReady"
           /\ stack' = [stack EXCEPT ![A] = << [ procedure |->  "EnsureReady",
@@ -1635,9 +1671,9 @@ AReady == /\ pc[A] = "AReady"
                           commitLock, flushLock, initLock, failed, rEpoch, 
                           rSealed, committed, sealTried, acked, opsLeft, 
                           writesStarted, evictions, interrupts, failures, 
-                          seals, txnBad, readBad, orphans, before, scan, 
-                          sealing, fEpoch, cut, ffs, sst, op, seq, tr, snap, 
-                          rfs, rows, racked >>
+                          seals, txnBad, readBad, before, scan, sealing, 
+                          fEpoch, cut, ffs, sst, op, seq, tr, snap, rfs, rows, 
+                          racked >>
 
 ADue == /\ pc[A] = "ADue"
         /\ IF failed[A]
@@ -1667,14 +1703,14 @@ ADue == /\ pc[A] = "ADue"
                         commitLock, flushLock, initLock, failed, rEpoch, 
                         rSealed, committed, sealTried, acked, opsLeft, 
                         writesStarted, evictions, interrupts, failures, seals, 
-                        txnBad, readBad, orphans, before, scan, stEpoch, 
-                        stSealed, op, seq, tr, snap, rfs, rows, racked >>
+                        txnBad, readBad, before, scan, stEpoch, stSealed, op, 
+                        seq, tr, snap, rfs, rows, racked >>
 
 ASched == /\ pc[A] = "ASched"
           /\ IF failed[A]
                 THEN /\ pc' = [pc EXCEPT ![A] = "AFail"]
                      /\ UNCHANGED alarmSet
-                ELSE /\ IF cnt # {}
+                ELSE /\ IF cnt # {} \/ (committing /\ Broken \notin {"alarmBeforeMark", "schedulerIgnoresCommit"})
                            THEN /\ alarmSet' = TRUE
                            ELSE /\ TRUE
                                 /\ UNCHANGED alarmSet
@@ -1685,9 +1721,9 @@ ASched == /\ pc[A] = "ASched"
                           flushLock, initLock, failed, rEpoch, rSealed, 
                           committed, sealTried, acked, opsLeft, writesStarted, 
                           evictions, interrupts, failures, seals, txnBad, 
-                          readBad, orphans, stack, before, scan, stEpoch, 
-                          stSealed, sealing, fEpoch, cut, ffs, sst, op, seq, 
-                          tr, snap, rfs, rows, racked >>
+                          readBad, stack, before, scan, stEpoch, stSealed, 
+                          sealing, fEpoch, cut, ffs, sst, op, seq, tr, snap, 
+                          rfs, rows, racked >>
 
 AFail == /\ pc[A] = "AFail"
          /\ IF phase # "fenced"
@@ -1701,9 +1737,9 @@ AFail == /\ pc[A] = "AFail"
                          flushLock, initLock, failed, rEpoch, rSealed, 
                          committed, sealTried, acked, opsLeft, writesStarted, 
                          evictions, interrupts, failures, seals, txnBad, 
-                         readBad, orphans, stack, before, scan, stEpoch, 
-                         stSealed, sealing, fEpoch, cut, ffs, sst, op, seq, tr, 
-                         snap, rfs, rows, racked >>
+                         readBad, stack, before, scan, stEpoch, stSealed, 
+                         sealing, fEpoch, cut, ffs, sst, op, seq, tr, snap, 
+                         rfs, rows, racked >>
 
 AEnd == /\ pc[A] = "AEnd"
         /\ IF flushLock = A
@@ -1721,9 +1757,9 @@ AEnd == /\ pc[A] = "AEnd"
                         phase, pEpoch, pSealed, cnt, gen, committing, 
                         commitLock, rEpoch, rSealed, committed, sealTried, 
                         acked, opsLeft, writesStarted, evictions, interrupts, 
-                        failures, seals, txnBad, readBad, orphans, stack, 
-                        before, scan, stEpoch, stSealed, sealing, fEpoch, cut, 
-                        ffs, sst, op, seq, tr, snap, rfs, rows, racked >>
+                        failures, seals, txnBad, readBad, stack, before, scan, 
+                        stEpoch, stSealed, sealing, fEpoch, cut, ffs, sst, op, 
+                        seq, tr, snap, rfs, rows, racked >>
 
 alarm == AIdle \/ AMeta \/ AReady \/ ADue \/ ASched \/ AFail \/ AEnd
 
@@ -1772,7 +1808,6 @@ Evict ==
   /\ committed' = [p \in ProcSet |-> FALSE]
   /\ sealTried' = [p \in ProcSet |-> FALSE]
   /\ alarmSet' = (alarmSet \/ pc[A] # "AIdle")
-  /\ orphans' = orphans \cup {seq[q] : q \in {q2 \in Req : pc[q2] \in {"WEnd", "WDone", "Cleanup"} /\ seq[q2] # 0}}
   /\ pc' = [p \in ProcSet |-> IF p = A THEN "AIdle" ELSE "Idle"]
   /\ op' = [p \in Req |-> "none"] /\ seq' = [p \in Req |-> 0] /\ tr' = [p \in Req |-> 0]
   /\ snap' = [p \in Req |-> 0] /\ rfs' = [p \in Req |-> 0]
@@ -1783,7 +1818,7 @@ Evict ==
                   readBad >>
 
 \* The commit's mark, SQLite commit, and the counters' update are one uninterruptible region.
-Uninterruptible == IF Broken = "interruptedWrite" THEN {} ELSE {"WSql", "WEnd"}
+Uninterruptible == IF Broken = "interruptedWrite" THEN {} ELSE {"WAlarm", "WSql", "WEnd"}
 
 \* A request's caller hangs up at an await: its fiber is interrupted and runs its finalizers
 \* (Cleanup: the locks, the seal's onExit, the write's ensuring(scheduleFlush)).
@@ -1796,7 +1831,7 @@ Interrupt(p) ==
   /\ UNCHANGED << lastSeq, flushedSeq, retained, mem, keyOf, marks, alarmSet, mEpoch, mSealed,
                   mL0Seq, mData, sealedAt, phase, pEpoch, pSealed, cnt, gen, committing,
                   commitLock, flushLock, initLock, failed, rEpoch, rSealed, committed, sealTried, acked,
-                  writesStarted, opsLeft, evictions, failures, seals, txnBad, readBad, orphans,
+                  writesStarted, opsLeft, evictions, failures, seals, txnBad, readBad,
                   op, seq, tr, snap, rfs, rows, racked >>
 
 Symmetry == Permutations(Req)
@@ -1836,10 +1871,9 @@ SealNotHalf == (mSealed /\ phase = "ready" /\ \A p \in Req : op[p] # "seal") => 
 CountersCover ==
   (phase = "ready" /\ \A p \in Req : pc[p] # "WEnd") => Unflushed \subseteq cnt
 
-\* With nothing running, an unflushed row has its alarm, except a row whose write was evicted
-\* between its SQLite commit and its scheduleFlush (see the skill: until the next request).
+\* With nothing running, an unflushed row has its alarm, after any eviction too (D131).
 Quiescent == (\A p \in Req : pc[p] = "Idle") /\ pc[A] = "AIdle"
-AlarmCovers == (Quiescent /\ Unflushed \ orphans # {}) => alarmSet
+AlarmCovers == (Quiescent /\ Unflushed # {}) => alarmSet
 
 \* One object runs one writer: nothing but a newer instance of itself can fence it, so this
 \* instance must never mark itself fenced (a fenced instance refuses every request until evicted).

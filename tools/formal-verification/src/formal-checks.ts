@@ -421,7 +421,25 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
     name: "writer-object",
     spec: "WriterObject.tla",
     runs: [
-      { config: "WriterObjectSeal.cfg", broken: "none", expect: "pass", timeLimitSeconds: 240 },
+      { config: "WriterObjectSeal.cfg", broken: "none", expect: "pass", timeLimitSeconds: 360 },
+      {
+        config: "WriterObjectSeal.cfg",
+        broken: "alarmAfterCommit",
+        expect: "AlarmCovers",
+        timeLimitSeconds: 60,
+      },
+      {
+        config: "WriterObjectSeal.cfg",
+        broken: "alarmBeforeMark",
+        expect: "AlarmCovers",
+        timeLimitSeconds: 60,
+      },
+      {
+        config: "WriterObjectSeal.cfg",
+        broken: "schedulerIgnoresCommit",
+        expect: "AlarmCovers",
+        timeLimitSeconds: 60,
+      },
       {
         config: "WriterObjectSeal.cfg",
         broken: "sealKeepsPhase",
