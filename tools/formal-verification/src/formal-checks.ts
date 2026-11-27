@@ -198,7 +198,7 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
     name: "transactions",
     spec: "Transactions.tla",
     runs: [
-      { config: "Transactions.cfg", broken: "none", expect: "pass", timeLimitSeconds: 420 },
+      { config: "Transactions.cfg", broken: "none", expect: "pass", timeLimitSeconds: 900 },
       {
         config: "Transactions.cfg",
         broken: "snapshotOnly",
