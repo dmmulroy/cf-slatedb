@@ -722,3 +722,8 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `merge-limits`, `garbage-collection-plan`, `size-tiered-compaction-scheduler`, `key-range`,
   `bloom-filter`, `lsm-settings`, `manifest`, `sst-codec`, `byte-codec`, `merge-iterator`, and
   `ulid` tests. Of the 82 that survive, 80 are equivalent and 2 change only how many rows a block seek decodes (`/tmp/shale-work/agents/mut-core/REPORT.md`).
+- **Mutation sweep of the writer, memtable, and compactor (D127)** — partial. `mem-table` swept
+  with every survivor triaged; compactor stage 1 complete and stage 2 two-thirds done; the
+  writer's named candidates (start-path scheduling, start-failure reasons, D95 successors,
+  `initLock`, `flushLock`) tested. Tests: `db-transaction-ranges.test.ts` (scanned ranges),
+  `db-writer-start.test.ts`, `mem-table.test.ts`, `compactor.test.ts`.
