@@ -1,0 +1,24 @@
+{
+  "databaseId": "ms-txn-mwydti8w",
+  "load": {
+    "transactors": 4,
+    "writers": 4,
+    "seconds": 150,
+    "holdSeconds": 0,
+    "flushEverySeconds": 0
+  },
+  "transactions": 1117,
+  "outcomes": {
+    "Committed": 1117
+  },
+  "snapshotTooOldRate": 0,
+  "transactionMs": {
+    "count": 1117,
+    "p50": 485,
+    "p90": 737,
+    "p99": 2160,
+    "max": 3490
+  },
+  "forcedFlushes": 0,
+  "l0SstsAtEnd": 2
+}

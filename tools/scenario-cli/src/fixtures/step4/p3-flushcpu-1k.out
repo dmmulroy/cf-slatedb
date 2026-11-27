@@ -1,0 +1,38 @@
+{
+  "databaseId": "ms-flush-mwydm7n6",
+  "megabytesWritten": 48,
+  "valueBytes": 1000,
+  "rowsWritten": 52000,
+  "unflushedBytesBeforeFlush": 54652000,
+  "flushes": 1,
+  "sstMiB": 51.02101993560791,
+  "flushInvocations": [
+    {
+      "kind": "fetch",
+      "cpuTimeMs": 2082,
+      "wallTimeMs": 8214,
+      "outcome": "ok"
+    }
+  ],
+  "cpuMs": 2082,
+  "wallMs": 8214,
+  "cpuMsPerMiB": 40.80671069742685,
+  "cpuMicrosPerRow": 40.03846153846154,
+  "writeBatches": {
+    "rowsPerBatch": 2000,
+    "writerCpuMs": {
+      "count": 26,
+      "p50": 115,
+      "p90": 380,
+      "p99": 619,
+      "max": 619
+    },
+    "writerWallMs": {
+      "count": 26,
+      "p50": 587,
+      "p90": 1807,
+      "p99": 2214,
+      "max": 2214
+    }
+  }
+}

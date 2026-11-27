@@ -1,0 +1,95 @@
+{
+  "minutes": 40,
+  "operations": [
+    {
+      "operation": "get Latest",
+      "sampled": 2365,
+      "latencyMs": {
+        "count": 2365,
+        "p50": 23,
+        "p90": 141,
+        "p99": 1146,
+        "max": 1682
+      },
+      "blockReads": {
+        "p50": 0,
+        "p90": 2
+      }
+    },
+    {
+      "operation": "get AtLeast",
+      "sampled": 414,
+      "latencyMs": {
+        "count": 414,
+        "p50": 11,
+        "p90": 117,
+        "p99": 235,
+        "max": 1400
+      },
+      "blockReads": {
+        "p50": 0,
+        "p90": 0
+      }
+    },
+    {
+      "operation": "get Flushed",
+      "sampled": 245,
+      "latencyMs": {
+        "count": 245,
+        "p50": 7,
+        "p90": 174,
+        "p99": 532,
+        "max": 628
+      },
+      "blockReads": {
+        "p50": 0,
+        "p90": 2
+      }
+    },
+    {
+      "operation": "scan",
+      "sampled": 980,
+      "latencyMs": {
+        "count": 980,
+        "p50": 27,
+        "p90": 75,
+        "p99": 512,
+        "max": 1627
+      },
+      "blockReads": {
+        "p50": 0,
+        "p90": 3
+      }
+    },
+    {
+      "operation": "write batch",
+      "sampled": 2384,
+      "latencyMs": {
+        "count": 2384,
+        "p50": 36,
+        "p90": 46,
+        "p99": 107,
+        "max": 2027
+      },
+      "blockReads": {
+        "p50": 0,
+        "p90": 0
+      }
+    },
+    {
+      "operation": "transaction commit",
+      "sampled": 234,
+      "latencyMs": {
+        "count": 234,
+        "p50": 29,
+        "p90": 36,
+        "p99": 52,
+        "max": 57
+      },
+      "blockReads": {
+        "p50": 0,
+        "p90": 0
+      }
+    }
+  ]
+}

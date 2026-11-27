@@ -1,0 +1,16 @@
+{
+  "rows": 1000,
+  "valueBytes": 100,
+  "memtable": {
+    "insert": { "rowsWritten": 2000, "rowsRead": 0 },
+    "probe": { "rowsWritten": 0, "rowsRead": 2, "returned": 1 },
+    "flushRead": { "rowsWritten": 0, "rowsRead": 1000, "returned": 1000 },
+    "trim": { "rowsWritten": 1000, "rowsRead": 1000, "returned": 0 }
+  },
+  "plain": {
+    "insert": { "rowsWritten": 1000, "rowsRead": 0 },
+    "get": { "rowsWritten": 0, "rowsRead": 1, "returned": 1 },
+    "deleteAll": { "rowsWritten": 1000, "rowsRead": 0, "returned": 0 }
+  },
+  "databaseBytesAfter": 24576
+}
