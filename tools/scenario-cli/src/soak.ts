@@ -276,7 +276,10 @@ const redeploy = (stage: string, traceSampleRate: Option.Option<number>) =>
  * Exceptions the soak's workload provokes on purpose, so their error spans are expected:
  * - `DatabaseSealedError`: a router's stale map sends a key to a shard a split just sealed; it waits
  *   for the new map and retries (D59).
- * - `DatabaseNotFoundError`: the remover's check that a removed database no longer answers.
+ * - `DatabaseNotFoundError`, `DatabaseRemovedError`: the remover's check that a removed database
+ *   no longer answers. For `gcMinAge` after a removal its writer, starting for that check, finds
+ *   the removal's tombstone and refuses (D91); the caller is answered `DatabaseNotFound`. Seen on
+ *   the first live run of the D106 workload, as the one unexpected error.
  * - `TransactionConflictError`: concurrent increments of one counter; the loser retries.
  * - `WriterFencedError`: the redeploy replaces writers; a request on the old one is retried.
  * - `HttpClientError`: the calling side of one of the above.
@@ -290,6 +293,7 @@ const EXPECTED_EXCEPTIONS = new Set([
   "DatabaseRecentlyRemovedError",
   "DatabaseSealedError",
   "DatabaseNotFoundError",
+  "DatabaseRemovedError",
   "TransactionConflictError",
   "WriterFencedError",
   "HttpClientError",
