@@ -97,6 +97,11 @@ export class ReaderUnavailableError extends Data.TaggedError("ReaderUnavailableE
   readonly databaseId: DatabaseId;
   readonly reason: "StorageUnavailable" | "StoredManifestInvalid" | "SnapshotExpired";
   readonly message: string;
+  /**
+   * For a scan that had already returned rows: the key to resume from (the next range start).
+   * Every row before it was returned, and none at or after it (D93).
+   */
+  readonly resumeFrom?: Uint8Array;
 }> {}
 
 /**

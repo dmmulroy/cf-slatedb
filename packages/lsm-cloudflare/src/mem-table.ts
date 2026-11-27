@@ -24,6 +24,21 @@ const ROW_OVERHEAD_BYTES = 32;
 /** Rows per page when streaming the memtable out for a flush. */
 const FLUSH_PAGE_ROWS = 1024;
 
+/**
+ * Most key and payload bytes one page of memtable rows holds (D93): a scan page, a flush page, and
+ * a change feed page. A value may be 1 MiB, so a page of 1,000 rows could otherwise be 1 GiB in a
+ * 128 MB isolate. At least one row (one batch, for pages cut between sequence numbers) is always
+ * returned; a batch holds at most 8 MiB (`MAX_BATCH_BYTES`), so a batch always fits.
+ */
+export const MAX_MEMTABLE_PAGE_BYTES = 8 * 1024 * 1024;
+
+/** One page of rows, and whether it holds every row its query asked for. */
+export interface MemTablePage {
+  readonly rows: ReadonlyArray<Row>;
+  /** False when the page stopped at its row limit or byte bound: more rows may follow it. */
+  readonly complete: boolean;
+}
+
 const ROW_KIND = { Value: 0, Merge: 1, Tombstone: 2 } as const;
 
 /** The writer's durable bookkeeping, stored in the same SQLite database as the rows. */
@@ -155,18 +170,21 @@ export interface IMemTable {
     afterSeq: SeqNum,
     cursor: Option.Option<MemTableCursor>,
     limit: number,
-  ) => Effect.Effect<ReadonlyArray<Row>, MemTableError>;
+  ) => Effect.Effect<MemTablePage, MemTableError>;
   /**
    * Every row with `afterSeq < seq <= cut`, in key-ascending, sequence-descending order, paged from
    * SQLite (a flush streams the unflushed rows: `afterSeq` is `flushedSeq`).
    */
   readonly rowsUpTo: (afterSeq: SeqNum, cut: SeqNum) => Stream.Stream<Row, MemTableError>;
-  /** Up to `limit` rows with `afterSeq < seq <= upToSeq`, in sequence order (changelog and CDC). */
+  /**
+   * Up to `limit` rows with `afterSeq < seq <= upToSeq`, in sequence order (changelog and CDC),
+   * within {@link MAX_MEMTABLE_PAGE_BYTES} and cut only between sequence numbers.
+   */
   readonly rowsBySeq: (
     afterSeq: SeqNum,
     upToSeq: SeqNum,
     limit: number,
-  ) => Effect.Effect<ReadonlyArray<Row>, MemTableError>;
+  ) => Effect.Effect<MemTablePage, MemTableError>;
   /**
    * Records `cut` as `flushedSeq` (it never moves back) and, when given, `manifestId` as the manifest
    * that made it durable, with the flush's time for retention. Deletes nothing: flushed rows stay
@@ -290,6 +308,60 @@ export const makeMemTable = Effect.gen(function* () {
       Effect.flatMap((rows) => decodeStoredRows(rows).pipe(Effect.mapError(invalid(operation)))),
       Effect.map((rows) => rows.map(toRow)),
     );
+
+  /**
+   * Runs `query` (a `SELECT ${ROW_COLUMNS} …` whose last binding is its `LIMIT`) for at most
+   * `limit` rows and {@link MAX_MEMTABLE_PAGE_BYTES} of keys and payloads (D93). It first reads
+   * only each row's sequence number and size, with the same conditions and order, then the rows
+   * that fit. With `bySeq` (which reads one batch's rows) it cuts only between sequence numbers,
+   * so a page never splits a batch. Run it
+   * inside one transaction (or over rows nothing else changes) so both reads see the same rows.
+   */
+  const selectPage = (
+    operation: string,
+    query: string,
+    bindings: ReadonlyArray<SqlValue>,
+    limit: number,
+    bySeq: Option.Option<(seq: number) => Effect.Effect<ReadonlyArray<Row>, MemTableError>>,
+  ) =>
+    Effect.gen(function* () {
+      const sizes = yield* exec(
+        operation,
+        query.replace(`SELECT ${ROW_COLUMNS}`, "SELECT seq, LENGTH(key) + LENGTH(payload) AS size"),
+        ...bindings,
+        limit,
+      );
+      const seqAt = (index: number) => sizes[index]?.["seq"];
+      let count = 0;
+      let bytes = 0;
+      for (const entry of sizes) {
+        const size = typeof entry["size"] === "number" ? entry["size"] : 0;
+        if (count > 0 && bytes + size > MAX_MEMTABLE_PAGE_BYTES) break;
+        bytes += size;
+        count++;
+      }
+      // A page that may stop inside a batch (at its byte bound, or at its row limit) backs off to
+      // the start of that batch; a page that is all one batch returns the whole batch instead.
+      const cutSeq =
+        count < sizes.length
+          ? seqAt(count)
+          : sizes.length === limit && count > 0
+            ? seqAt(count - 1)
+            : undefined;
+      if (Option.isSome(bySeq) && cutSeq !== undefined) {
+        let start = count < sizes.length ? count : count - 1;
+        while (start > 0 && seqAt(start - 1) === cutSeq) start--;
+        if (start > 0) {
+          const rows = yield* selectRows(operation, query, ...bindings, start);
+          return { rows, complete: false };
+        }
+        if (typeof cutSeq === "number") {
+          return { rows: yield* bySeq.value(cutSeq), complete: false };
+        }
+      }
+      const rows = count === 0 ? [] : yield* selectRows(operation, query, ...bindings, count);
+      return { rows, complete: sizes.length < limit && count === sizes.length };
+    });
 
   for (const statement of MIGRATIONS) yield* exec("migrate", statement);
 
@@ -463,50 +535,54 @@ export const makeMemTable = Effect.gen(function* () {
         conditions.push(resumeAfterCursor);
         bindings.push(cursor.value.key, cursor.value.key, cursor.value.seq);
       }
-      return selectRows(
+      return selectPage(
         "scan",
         `SELECT ${ROW_COLUMNS} FROM memtable_rows WHERE ${conditions.join(" AND ")} ORDER BY key ASC, seq DESC LIMIT ?`,
-        ...bindings,
+        bindings,
         limit,
+        Option.none(),
       );
     },
     rowsUpTo: (afterSeq, cut) =>
       Stream.paginate(Option.none<MemTableCursor>(), (cursor) =>
         Effect.gen(function* () {
-          const page = Option.isNone(cursor)
-            ? yield* selectRows(
+          const { rows: page, complete } = Option.isNone(cursor)
+            ? yield* selectPage(
                 "rowsUpTo",
                 MEMTABLE_FLUSH_PAGE_QUERIES.first,
-                afterSeq,
-                cut,
+                [afterSeq, cut],
                 FLUSH_PAGE_ROWS,
+                Option.none(),
               )
-            : yield* selectRows(
+            : yield* selectPage(
                 "rowsUpTo",
                 MEMTABLE_FLUSH_PAGE_QUERIES.next,
-                cursor.value.key,
-                cursor.value.key,
-                cursor.value.seq,
-                afterSeq,
-                cut,
+                [cursor.value.key, cursor.value.key, cursor.value.seq, afterSeq, cut],
                 FLUSH_PAGE_ROWS,
+                Option.none(),
               );
           const last = page[page.length - 1];
           return [
             page,
-            page.length === FLUSH_PAGE_ROWS && last !== undefined
+            !complete && last !== undefined
               ? Option.some(Option.some({ key: last.key, seq: last.seq }))
               : Option.none(),
           ] as const;
         }),
       ),
     rowsBySeq: (afterSeq, upToSeq, limit) =>
-      selectRows(
+      selectPage(
         "rowsBySeq",
         `SELECT ${ROW_COLUMNS} FROM memtable_rows WHERE seq > ? AND seq <= ? ORDER BY seq ASC, key ASC LIMIT ?`,
-        afterSeq,
-        upToSeq,
+        [afterSeq, upToSeq],
         limit,
+        Option.some((seq: number) =>
+          selectRows(
+            "rowsBySeq",
+            `SELECT ${ROW_COLUMNS} FROM memtable_rows WHERE seq = ? ORDER BY key ASC`,
+            seq,
+          ),
+        ),
       ),
     markFlushed: Effect.fn("MemTable.markFlushed")(function* (
       cut: SeqNum,

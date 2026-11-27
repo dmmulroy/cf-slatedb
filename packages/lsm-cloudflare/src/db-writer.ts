@@ -698,18 +698,16 @@ export const makeDbWriter = Effect.gen(function* () {
     Effect.gen(function* () {
       const rows = Stream.paginate(afterSeq, (from) =>
         memTable.rowsBySeq(from, cut, 1024).pipe(
-          Effect.map((page) => {
-            const last = page[page.length - 1];
+          Effect.map(({ rows, complete }) => {
+            const last = rows[rows.length - 1];
+            // A page holds whole batches (D93), so the next one starts after its last sequence.
             return [
-              page,
-              page.length === 1024 && last !== undefined ? Option.some(last.seq) : Option.none(),
+              rows,
+              !complete && last !== undefined ? Option.some(last.seq) : Option.none(),
             ] as const;
           }),
         ),
-      ).pipe(
-        // Rows sharing the last sequence of a page continue on the next page by key order.
-        Stream.filter((row) => row.seq > afterSeq),
-      );
+      ).pipe(Stream.filter((row) => row.seq > afterSeq));
       const written = yield* ssts
         .write({
           owner: databaseId,
@@ -972,7 +970,7 @@ export const makeDbWriter = Effect.gen(function* () {
     const ready = yield* ensureReady(databaseId);
     const limit = Math.max(1, Math.min(request.limit, 1000));
     // One page is read atomically with flushedSeq; across pages the reader takes the largest one.
-    const { meta, snapshotSeq, rows } = yield* memTable
+    const { meta, snapshotSeq, rows, complete } = yield* memTable
       .consistently((meta) => {
         const snapshotSeq = Option.getOrElse(request.snapshotSeq, () => meta.lastSeq);
         return Effect.map(
@@ -983,10 +981,11 @@ export const makeDbWriter = Effect.gen(function* () {
             request.cursor,
             limit,
           ),
-          (rows) => ({
+          (page) => ({
             meta,
             snapshotSeq,
-            rows,
+            rows: page.rows,
+            complete: page.complete,
           }),
         );
       })
@@ -999,8 +998,9 @@ export const makeDbWriter = Effect.gen(function* () {
       retainedFromSeq: meta.retainedFromSeq,
       flushedManifestId: meta.flushedManifestId,
       sealedSuccessors: ready.sealed,
+      // A page ends at its row limit or its byte bound (D93): either way the next resumes after it.
       nextCursor:
-        rows.length === limit && last !== undefined
+        !complete && last !== undefined
           ? Option.some({ key: last.key, seq: last.seq })
           : Option.none(),
     };
@@ -1028,9 +1028,9 @@ export const makeDbWriter = Effect.gen(function* () {
             meta.lastSeq,
             Math.max(1, Math.min(limit, 1000)),
           ),
-          (rows) => ({
+          (page) => ({
             meta,
-            rows,
+            rows: page.rows,
           }),
         ),
       )

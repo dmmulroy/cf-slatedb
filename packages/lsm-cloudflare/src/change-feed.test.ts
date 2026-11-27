@@ -354,3 +354,29 @@ describe("change feed gaps (D80)", () => {
     });
   });
 });
+
+describe("change feed pages (D93)", () => {
+  it("returns an unflushed batch larger than the writer's page whole, never part of it", async () => {
+    const outcome = await Effect.runPromise(
+      provide(
+        Effect.gen(function* () {
+          yield* create(true);
+          const client = yield* DbClient;
+          const receipt = yield* client.write(DB, {
+            operations: Array.from({ length: 1500 }, (_, index) => ({
+              _tag: "Put" as const,
+              key: Uint8Array.of(index >> 8, index & 0xff),
+              value: Uint8Array.of(1),
+              ttlMillis: Option.none(),
+            })),
+          });
+          yield* client.put(DB, Uint8Array.of(0xff, 0xff), Uint8Array.of(2));
+          const page = yield* client.changes(DB, SeqNum.make(0), 10);
+          return { seq: receipt.seq, rows: page.rows.length, next: page.nextAfterSeq };
+        }),
+      ),
+    );
+    // The page holds the whole first batch; resuming after it skips none of its rows.
+    expect(outcome).toEqual({ seq: 1, rows: 1500, next: 1 });
+  });
+});
