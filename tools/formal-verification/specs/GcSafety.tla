@@ -32,7 +32,13 @@
 (* reader may hold names this database's SSTs (releasableExternalRefs over *)
 (* planManifestCollection's retained set). An SST's creation time is its   *)
 (* ULID time.                                                              *)
-(* One GC runs at a time; its six steps interleave with everything else.   *)
+(* Collectors: the collections that may run at once (D83: the alarm's and  *)
+(* an operator's collect, without collectionLock, or the compactor's and   *)
+(* the maintenance sweep's). Each one's six steps interleave with          *)
+(* everything else and with the other's. A collection loads only the      *)
+(* retained manifests still stored; one that is gone is skipped when it is *)
+(* at or below GC's manifest boundary (a collection deleted it) and fails  *)
+(* the run otherwise (D83).                                                *)
 (*                                                                         *)
 (* Broken selects a deliberately broken variant (must fail):               *)
 (*   "none"             the code as written                                *)
@@ -48,7 +54,7 @@
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
-CONSTANTS Ssts, MaxTime, MinAge, MaxManifests, Broken, WithFork
+CONSTANTS Ssts, MaxTime, MinAge, MaxManifests, Broken, WithFork, Collectors
 
 ASSUME Broken \in {"none", "noBoundaryCheck", "ownUploadAge", "ignorePins", "noMinBoundary",
                    "dropDeletesObject", "earlyForkRelease"}
@@ -64,15 +70,16 @@ VARIABLES
   pending,    \* SSTs uploaded by a flush or compaction and not yet committed or discarded
   chain,      \* every manifest ever committed, by id: [ssts, boundary, pins, hold, written]
   stored,     \* manifest ids whose objects still exist
-  gpc, gNow, gSsts, gAdvance, gCommitted, gListed,  \* the GC run in progress
+  gpc, gNow, gSsts, gAdvance, gCommitted, gListed,  \* each collection's run in progress
+  mBound,     \* GC's manifest boundary: every manifest at or below it may be deleted
   fState,       \* the fork: "none", "reading" (its manifests read the held manifest's SSTs),
                 \* "rewritten" (its newest manifest no longer does), "released" (hold removed)
   fHeld,        \* the manifest id the fork's hold pins (its first manifest reads its SSTs)
   fRewrittenAt  \* when the fork's rewrite committed (its first manifest's successor was written)
 
 vars == <<now, created, objects, pending, chain, stored, gpc, gNow, gSsts, gAdvance, gCommitted, gListed,
-          fState, fHeld, fRewrittenAt>>
-gcVars == <<gpc, gNow, gSsts, gAdvance, gCommitted, gListed>>
+          mBound, fState, fHeld, fRewrittenAt>>
+gcVars == <<gpc, gNow, gSsts, gAdvance, gCommitted, gListed, mBound>>
 forkVars == <<fState, fHeld, fRewrittenAt>>
 
 LatestId == Len(chain)
@@ -87,7 +94,10 @@ Init ==
   /\ pending = {}
   /\ chain = << [ssts |-> {}, boundary |-> 0, pins |-> {}, hold |-> 0, written |-> 0] >>
   /\ stored = {1}
-  /\ gpc = "idle" /\ gNow = 0 /\ gSsts = {} /\ gAdvance = FALSE /\ gCommitted = 1 /\ gListed = {}
+  /\ gpc = [c \in Collectors |-> "idle"] /\ gNow = [c \in Collectors |-> 0]
+  /\ gSsts = [c \in Collectors |-> {}] /\ gAdvance = [c \in Collectors |-> FALSE]
+  /\ gCommitted = [c \in Collectors |-> 1] /\ gListed = [c \in Collectors |-> {}]
+  /\ mBound = 0
   /\ fState = "none" /\ fHeld = 1 /\ fRewrittenAt = 0
 
 \* Commits a manifest (create-if-absent of id LatestId + 1, atomic here).
@@ -183,70 +193,83 @@ ForkRelease ==
 (***************************************************************************)
 (* GC, step by step (GarbageCollector.collect).                            *)
 (***************************************************************************)
-Cutoff == IF gNow >= MinAge THEN gNow - MinAge ELSE 0
+Cutoff(c) == IF gNow[c] >= MinAge THEN gNow[c] - MinAge ELSE 0
 
 \* List the SST objects; `now` (and so the cutoff) is fixed for the run.
-GcListSsts ==
-  /\ gpc = "idle"
-  /\ gpc' = "listed" /\ gNow' = now /\ gSsts' = objects
-  /\ UNCHANGED <<gAdvance, gCommitted, gListed>>
+GcListSsts(c) ==
+  /\ gpc[c] = "idle"
+  /\ gpc' = [gpc EXCEPT ![c] = "listed"] /\ gNow' = [gNow EXCEPT ![c] = now]
+  /\ gSsts' = [gSsts EXCEPT ![c] = objects]
+  /\ UNCHANGED <<gAdvance, gCommitted, gListed, mBound>>
   /\ UNCHANGED <<now, created, objects, pending, chain, stored>>
 
 \* hasSstCollectionCandidates against the newest manifest.
-GcPrecheck ==
-  /\ gpc = "listed"
-  /\ gAdvance' = \E s \in gSsts : s \notin Latest.ssts /\ created[s] < Cutoff
-  /\ gpc' = "prechecked"
-  /\ UNCHANGED <<gNow, gSsts, gCommitted, gListed>>
+GcPrecheck(c) ==
+  /\ gpc[c] = "listed"
+  /\ gAdvance' = [gAdvance EXCEPT ![c] =
+                    \E s \in gSsts[c] : s \notin Latest.ssts /\ created[s] < Cutoff(c)]
+  /\ gpc' = [gpc EXCEPT ![c] = "prechecked"]
+  /\ UNCHANGED <<gNow, gSsts, gCommitted, gListed, mBound>>
   /\ UNCHANGED <<now, created, objects, pending, chain, stored>>
 
 \* prepareGarbageCollection by CAS: a new manifest only when the boundary moves.
-GcCommit ==
-  /\ gpc = "prechecked"
-  /\ IF gAdvance /\ Cutoff > Latest.boundary
+GcCommit(c) ==
+  /\ gpc[c] = "prechecked"
+  /\ IF gAdvance[c] /\ Cutoff(c) > Latest.boundary
        THEN /\ CanAppend
-            /\ Commit([Latest EXCEPT !.boundary = Cutoff])
-            /\ gCommitted' = LatestId + 1
-       ELSE /\ gCommitted' = LatestId /\ UNCHANGED <<chain, stored>>
-  /\ gpc' = "committed"
-  /\ UNCHANGED <<gNow, gSsts, gAdvance, gListed>>
+            /\ Commit([Latest EXCEPT !.boundary = Cutoff(c)])
+            /\ gCommitted' = [gCommitted EXCEPT ![c] = LatestId + 1]
+       ELSE /\ gCommitted' = [gCommitted EXCEPT ![c] = LatestId] /\ UNCHANGED <<chain, stored>>
+  /\ gpc' = [gpc EXCEPT ![c] = "committed"]
+  /\ UNCHANGED <<gNow, gSsts, gAdvance, gListed, mBound>>
   /\ UNCHANGED <<now, created, objects, pending>>
 
-GcListManifests ==
-  /\ gpc = "committed"
-  /\ gListed' = stored /\ gpc' = "listedManifests"
-  /\ UNCHANGED <<gNow, gSsts, gAdvance, gCommitted>>
+GcListManifests(c) ==
+  /\ gpc[c] = "committed"
+  /\ gListed' = [gListed EXCEPT ![c] = stored] /\ gpc' = [gpc EXCEPT ![c] = "listedManifests"]
+  /\ UNCHANGED <<gNow, gSsts, gAdvance, gCommitted, mBound>>
   /\ UNCHANGED <<now, created, objects, pending, chain, stored>>
 
 \* planManifestCollection: superseded when the next listed manifest was written.
-NextListed(id) == CHOOSE j \in gListed : j > id /\ \A k \in gListed : k > id => j <= k
-SupersededLongAgo(id) ==
+NextListed(c, id) == CHOOSE j \in gListed[c] : j > id /\ \A k \in gListed[c] : k > id => j <= k
+SupersededLongAgo(c, id) ==
   IF Broken = "ownUploadAge"
-    THEN chain[id].written + MinAge <= gNow
-    ELSE /\ \E j \in gListed : j > id
-         /\ chain[NextListed(id)].written + MinAge <= gNow
-Pinned(id) ==
-  Broken # "ignorePins" /\ (id \in chain[gCommitted].pins \/ id = chain[gCommitted].hold)
-Deletable == {id \in gListed : id < gCommitted /\ SupersededLongAgo(id) /\ ~Pinned(id)}
-Retained == (gListed \ Deletable) \cup {gCommitted}
+    THEN chain[id].written + MinAge <= gNow[c]
+    ELSE /\ \E j \in gListed[c] : j > id
+         /\ chain[NextListed(c, id)].written + MinAge <= gNow[c]
+Pinned(c, id) ==
+  Broken # "ignorePins" /\ (id \in chain[gCommitted[c]].pins \/ id = chain[gCommitted[c]].hold)
+Deletable(c) == {id \in gListed[c] : id < gCommitted[c] /\ SupersededLongAgo(c, id) /\ ~Pinned(c, id)}
+Retained(c) == (gListed[c] \ Deletable(c)) \cup {gCommitted[c]}
 
-\* planSstCollection, then delete the SSTs.
-GcDeleteSsts ==
-  /\ gpc = "listedManifests"
-  /\ LET live == UNION {chain[id].ssts : id \in Retained}
-         bound == IF Broken = "noMinBoundary" THEN Cutoff
-                  ELSE Min(chain[gCommitted].boundary, Cutoff)
-     IN objects' = objects \ {s \in gSsts : s \notin live /\ created[s] < bound}
-  /\ gpc' = "deletedSsts"
-  /\ UNCHANGED <<gNow, gSsts, gAdvance, gCommitted, gListed>>
+\* planSstCollection, then delete the SSTs. The retained manifests are loaded now: one that is
+\* gone is skipped at or below the manifest boundary, and fails the run above it (D83).
+GcDeleteSsts(c) ==
+  /\ gpc[c] = "listedManifests"
+  /\ LET missing == Retained(c) \ stored
+         live == UNION {chain[id].ssts : id \in Retained(c) \cap stored}
+         bound == IF Broken = "noMinBoundary" THEN Cutoff(c)
+                  ELSE Min(chain[gCommitted[c]].boundary, Cutoff(c))
+     IN IF \A id \in missing : id <= mBound
+          THEN /\ objects' = objects \ {s \in gSsts[c] : s \notin live /\ created[s] < bound}
+               /\ gpc' = [gpc EXCEPT ![c] = "deletedSsts"]
+          ELSE /\ gpc' = [gpc EXCEPT ![c] = "idle"] /\ UNCHANGED objects
+  /\ UNCHANGED <<gNow, gSsts, gAdvance, gCommitted, gListed, mBound>>
   /\ UNCHANGED <<now, created, pending, chain, stored>>
 
-GcDeleteManifests ==
-  /\ gpc = "deletedSsts"
-  /\ stored' = stored \ Deletable
-  /\ gpc' = "idle"
+\* The manifest boundary moves past the old manifests, then they are deleted.
+GcDeleteManifests(c) ==
+  /\ gpc[c] = "deletedSsts"
+  /\ mBound' = IF Deletable(c) = {} THEN mBound
+                ELSE Max(mBound, CHOOSE m \in Deletable(c) : \A k \in Deletable(c) : k <= m)
+  /\ stored' = stored \ Deletable(c)
+  /\ gpc' = [gpc EXCEPT ![c] = "idle"]
   /\ UNCHANGED <<gNow, gSsts, gAdvance, gCommitted, gListed>>
   /\ UNCHANGED <<now, created, objects, pending, chain>>
+
+GcStep(c) ==
+  GcListSsts(c) \/ GcPrecheck(c) \/ GcCommit(c) \/ GcListManifests(c) \/ GcDeleteSsts(c)
+  \/ GcDeleteManifests(c)
 
 \* Everything this database's own actors and its GC do; the fork's variables stay.
 DatabaseNext ==
@@ -256,7 +279,7 @@ DatabaseNext ==
   \* With the fork, its hold is the only checkpoint (other pins are covered without it).
   \/ ~WithFork /\ Pin
   \/ ~WithFork /\ \E p \in 1..MaxManifests : Unpin(p)
-  \/ GcListSsts \/ GcPrecheck \/ GcCommit \/ GcListManifests \/ GcDeleteSsts \/ GcDeleteManifests
+  \/ \E c \in Collectors : GcStep(c)
 
 Next ==
   \/ DatabaseNext /\ UNCHANGED forkVars
@@ -266,6 +289,8 @@ Spec == Init /\ [][Next]_vars
 
 \* SST names are interchangeable: TLC checks one ordering of them.
 SstSymmetry == Permutations(Ssts)
+\* Collections are interchangeable too.
+CollectorSymmetry == Permutations(Collectors)
 
 (***************************************************************************)
 (* Properties                                                              *)
