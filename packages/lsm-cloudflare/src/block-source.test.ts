@@ -163,6 +163,7 @@ const readThroughUnansweredBlockServer = (options: {
     const unanswered = BlockSource.of({
       block: () => Effect.never,
       meta: () => Effect.never,
+      uncached: () => Effect.never,
       purge: () => Effect.succeed(true),
     });
     const source = yield* hedgeBlockSource(unanswered).pipe(
@@ -195,6 +196,37 @@ const readThroughUnansweredBlockServer = (options: {
   );
 
 describe("hedgeBlockSource", () => {
+  it("reads a range past every cache from the bucket at once, where the Stack has Workers Cache (read audit)", async () => {
+    const answer = await Effect.gen(function* () {
+      const store = yield* ObjectStore;
+      yield* store.put(sstKey(SOURCE, SST), SST_BYTES);
+      const unanswered = BlockSource.of({
+        block: () => Effect.never,
+        meta: () => Effect.never,
+        uncached: () => Effect.never,
+        purge: () => Effect.succeed(true),
+      });
+      const source = yield* hedgeBlockSource(unanswered).pipe(
+        Effect.provideService(
+          ObjectReader,
+          ObjectReader.of({ get: store.get, getRange: store.getRange }),
+        ),
+        Effect.provide(lsmConfigurationTestLayer({ blockReadHedgeAfterMs: 50 })),
+        Effect.provideService(
+          ConfigProvider.ConfigProvider,
+          ConfigProvider.fromUnknown({ [LSM_JURISDICTION_SETTING]: "none" }),
+        ),
+      );
+      return [...(yield* Effect.scoped(source.uncached(SOURCE, SST, 2, 4)))];
+    }).pipe(
+      Effect.provide(Layer.merge(objectStoreTestLayer, lsmTestRuntimeContextLayer)),
+      Effect.provide(TestClock.layer()),
+      Effect.runPromise,
+    );
+    // No hedge delay and no BlockServer: the bucket's bytes, straight away.
+    expect(answer).toEqual([3, 4, 5, 6]);
+  });
+
   it("answers block and metadata reads from the source's SST in the bucket once the hedge delay has passed", async () => {
     const early = await readThroughUnansweredBlockServer({
       jurisdiction: "none",

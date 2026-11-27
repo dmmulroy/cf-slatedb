@@ -82,7 +82,8 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 
 - **`Flushed`, `AtLeast(seq)`, `Latest` (probe + `flushedSeq`)** — done. `read-consistency.ts`
   (lsm-core), `DbClient.pointView`/`scanUnflushed` (D93: a `Latest` scan pages lazily by segment;
-  `db-client-scan.test.ts`), `DbReader.manifestFor` (refresh when older than
+  `db-client-scan.test.ts`; D108: a page examines at most 16 MiB of versions and ends early with
+  `resumeFrom`, `db-http-scan.test.ts`), `DbReader.manifestFor` (refresh when older than
   `flushedSeq`/`seq`). Tests: `db-client.test.ts` (Map-oracle property at every consistency;
   staleness bound, shown failing without the refresh), `writer.workerd.ts`. Formal:
   `NoAckedWriteLost` (`LatestSeesAcked`) (D29).
@@ -127,8 +128,9 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   read fetches every candidate SST's metadata at once, a scan fetches every overlapping SST's
   metadata at once and reads ahead `SCAN_READ_AHEAD_BLOCKS` (8) blocks per SST, and
   `mergeRowStreams` pulls every input's first chunk concurrently. Blocks default to 16 KiB
-  (`DEFAULT_LSM_SETTINGS.blockSize`); readers follow each SST's own index. Tests:
-  `sst-codec.test.ts`, `merge-iterator.test.ts` (the merge properties), `db-client.test.ts`.
+  (`DEFAULT_LSM_SETTINGS.blockSize`), and hold at least 32 times their index keys (D107);
+  readers follow each SST's own index. Tests: `sst-codec.test.ts` (D107: metadata at most 1/16
+  of the data for keys up to 16 KiB), `merge-iterator.test.ts` (the merge properties), `db-client.test.ts`.
 - **L1 `BlockCache` (separate data and metadata caches)** — done. `block-cache.ts` (completed
   values shared across requests, reads in flight never shared (D66), failures not cached,
   `cache.hit` span attribute, `lsm_block_cache_requests` metric; bounded by bytes per

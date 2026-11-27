@@ -4078,3 +4078,133 @@ caps are limits in code, and the others do not exist. They are not in the fixtur
   older code does with it.
 - A further test shows today's code dropping an unknown field, which is why the format rule
   exists.
+
+## D107. An SST's metadata stays a small fraction of its data, whatever its key size
+
+**Found by the read audit.**
+
+- **The cause.** An index entry records each data block's first and last key. A block closed once
+  it reached `blockSize` (16 KiB), so with long keys each block held one or two rows and the
+  index grew with the keys.
+- **Measured** on 4 MiB SSTs with 16 KiB blocks and 16-byte values, metadata as a share of data:
+
+  | Key size | 16 B | 1 KiB | 4 KiB | 16 KiB (`MAX_KEY_BYTES`) |
+  | -------- | ---: | ----: | ----: | -----------------------: |
+  | Before   | 3.2% | 12.5% |   50% |                     200% |
+  | After    | 3.2% |  3.3% |  3.4% |        3.4% (about 3.3%) |
+
+- **At a 64 MiB SST** that was 32 MiB of metadata at 4 KiB keys and 128 MiB at 16 KiB.
+  - Every reader reads the metadata whole, and the L1 metadata cache never holds an entry larger
+    than its group share (8 MiB of 16 MiB). So every get re-read it, and gets fetch the metadata
+    of all their candidate SSTs at once (D67).
+  - At 16 KiB keys, the writer's flush builds that index in memory, past the 128 MB isolate: the
+    flush fails on every attempt and writes then stall.
+
+**The rule.** A data block closes once it reaches `blockSize`, and also not before it holds
+`BLOCK_BYTES_PER_INDEX_KEY_BYTE` (32) times the bytes of its index entry's two keys. The index is
+then at most about 1/32 of the data.
+
+- **Keys up to 256 bytes** change nothing at the default 16 KiB block.
+- **16 KiB keys** make 1 MiB blocks of about 64 rows. A point read of such a key fetches one 1 MiB
+  block, which the L1 data cache charges as 1 MiB.
+- **Older SSTs stay readable.** Readers follow each SST's own index, so no format changes and
+  nothing is rewritten.
+
+**Tests.**
+
+- `sst-codec.test.ts`: metadata is at most 1/16 of the data for keys of 16 bytes to 16 KiB, and the
+  last key is still found. It fails without the rule, at 200%.
+- `db-client.test.ts`'s short-scan test (D72) asserted exactly two block reads over 64-byte test
+  blocks. Those blocks now hold about ten rows, so it asserts one or two. The D72 mutation (a
+  merge that fills its batch before emitting) still fails it.
+
+**Revises D103's memory row.** The index of a 64 MiB output is now at most about 2 MiB, at any key
+size.
+
+**Also found: a damaged SST trailer threw instead of failing typed.**
+
+- **The defect.** The trailer (footer length, metadata offset, format version) has no checksum of
+  its own. `decodeSstMeta` read it with unguarded `ByteReader` calls. A damaged metadata offset (above
+  2^53 - 1), or metadata cut short by a short response or cache entry, threw a plain error: the read
+  died as a defect (`InternalFailure`), naming no SST, where every other section fails with
+  `SstCorruptedError`.
+- **The fix.** The trailer is read inside `Result.try` and fails as `SstCorruptedError` (`Trailer`,
+  `Malformed`). Any other damage to it is then caught by the footer's checksum.
+- **Tests.** New property tests in `sst-codec.test.ts`, 400 runs each, cover any one byte changed
+  and a cut at any length, for both the metadata section and a data block. Each decoder must fail
+  typed, never throw and never answer. Neither decoder had such a property before, only one fixed
+  damage each. The metadata property fails without the fix: shrunk, a one-row SST whose metadata is
+  cut to 8% of its length.
+
+## D108. A scan page examines a bounded amount and ends early, resumably
+
+**Found by the read audit.**
+
+- **The defect.** A scan ended only when it had `limit` visible rows or the range ended. Over a
+  range of deletes or expired values, the same shape as D97 on the write side, one page read and
+  resolved every version in the range to return a few rows or none.
+- **The cost.** Reading, decoding, and resolving versions costs up to about 0.28 s of CPU per MiB
+  (D61's compaction rate, an upper bound for reads). A range holding more than about 100 MiB of
+  deleted versions then exceeded the API Worker's 30 s on every request: a timeout, not a
+  resumable page.
+- **The block reads.** At 16 KiB blocks each MiB is 64 block reads, 128 hedged, against an
+  invocation's 10,000 subrequests.
+
+**The rule.**
+
+- **The budget.** A scan with a limit (every public scan page, and any in-Worker scan given a
+  limit) examines at most `SCAN_PAGE_EXAMINED_BYTES` (16 MiB) of versions, counted with
+  `rowEncodedSizeEstimate` whether returned or not. That is at most about 4.5 s and 2,048 hedged
+  block reads.
+- **Sharing.** The budget (`ScanBudget`) is shared by the segments a `Latest` page is made of
+  (D93).
+- **Where it ends.** Once spent, the scan ends before the next key with `ReaderUnavailableError`
+  carrying `resumeFrom`, that key. Every row before it was returned, and none at or after it, as
+  for D93's early end.
+- **Progress.** Each underlying scan examines at least one key, so a resumed page always moves on.
+- **The public page.** It turns that into a page with the rows it has, possibly none, and
+  `resumeFrom`. Before, it required at least one row, which D93 guaranteed; that guard is gone.
+- **The contract.** The OpenAPI description says a page may end early, with fewer rows or none, and
+  that a client follows `resumeFrom` until it is null. That was already the rule for continuing.
+  The contract is regenerated.
+- **Unlimited scans stay unbounded.** An in-Worker stream with no limit reads its whole range, as
+  before.
+
+**Also: a damaged cached copy no longer fails a block for a year.**
+
+- **The defect.** Responses of the `BlockServer` are cached immutable for a year. A copy damaged in
+  Workers Cache, or in transit, failed its checksum, and the read failed with `SstCorruptedError`
+  even though the bucket held intact bytes. The L1 never kept it, but Workers Cache did, so every
+  read of that block failed until the copy was evicted.
+- **The fix.** `BlockCache` reads a range whose bytes fail their checksum once more past every
+  cache (`BlockSource.uncached`). Where the Stack has Workers Cache, that reads the bucket. In a
+  restricted Stack it goes through the `BlockServer` again, which reads the bucket on every
+  request there.
+  - An intact copy answers, with `cache.damaged_copy` on the span and a warning that names the SST
+    and the offset.
+  - A damaged bucket copy still fails, typed.
+- **Tests.**
+  - `block-cache.test.ts`: a damaged cached copy with an intact bucket copy answers; damage in both
+    fails as `SstCorruptedError` naming the SST.
+  - `block-source.test.ts`: the hedged source's `uncached` reads the bucket at once.
+  - Two mutations caught.
+
+**Also: a read fetches at most eight SSTs' metadata at once.**
+
+- **Before.** D67 fetched every candidate SST's metadata at once: a get reads one SST per level (up
+  to 16 L0 SSTs and as many runs), and a scan reads every overlapping SST. Metadata is up to 1/32
+  of an SST (D107), 2 MiB for a 64 MiB SST, so a cold read could hold 64 MiB of bodies and their
+  decoded form at once.
+- **Now.** `METADATA_READS_AT_ONCE` (8). An invocation has only six connections waiting for headers
+  at a time, so this costs no latency.
+- **Test** (`db-reader-limits.test.ts`): over 20 L0 SSTs holding one key, a get and a scan keep at
+  most 8 metadata reads in flight; with the fetches unbounded, the get keeps 20.
+
+**Not covered.** The transaction scan (`DbClient.scanAt`, `transactions/scan`) passes no budget.
+Its pages are bounded by `limit` rows, not by what they examine, and its `resumeFrom`-less contract
+needs a decision of its own (`CROSS:` to the API owner).
+
+**Test** (`db-http-scan.test.ts`): 24,000 keys of 1 KiB values, all but the last deleted. The
+first page answers 200 with no rows and a `resumeFrom`, and following `resumeFrom` returns exactly
+the live key, with every page answered. Three mutations caught: no budget, the handler requiring a
+row to end early, and versions not counted.

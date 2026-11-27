@@ -387,7 +387,7 @@ describe("DbClient against a Map oracle", () => {
       Effect.gen(function* () {
         yield* createDatabase;
         const client = yield* DbClient;
-        // One SST of 120 small rows in 64-byte blocks: dozens of blocks, a few rows each.
+        // One SST of 120 small rows in 64-byte blocks: a dozen blocks or more, a few rows each.
         for (let key = 1; key <= 120; key++) {
           yield* client.put(DB, keyBytes(key), Uint8Array.of(key));
         }
@@ -425,9 +425,11 @@ describe("DbClient against a Map oracle", () => {
       }),
     );
     expect(outcome.short.keys).toEqual([1, 2, 3]);
-    // The block holding the three rows and the one after it. The merge used to fill a batch of
-    // 256 rows before emitting any, which read all 40 blocks of this SST.
-    expect(outcome.short.blockReads).toBe(2);
+    // At most the block holding the three rows and the one after it, of the SST's twelve or more
+    // (D107 holds blocks open to 32 times their keys, so these tiny blocks hold about ten rows).
+    // The merge used to fill a batch of 256 rows before emitting any, which read every block.
+    expect(outcome.short.blockReads).toBeGreaterThanOrEqual(1);
+    expect(outcome.short.blockReads).toBeLessThanOrEqual(2);
     expect(outcome.pastDeletes).toEqual([61, 62, 63]);
   });
 

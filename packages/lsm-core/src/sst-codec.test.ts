@@ -18,7 +18,7 @@ import {
   sortRows,
 } from "./lsm-core-arbitraries.ts";
 import { MERGE_OPERATORS, resolveVisibleRow } from "./row-resolution.ts";
-import type { Row } from "./row.ts";
+import { type Row, RowValue } from "./row.ts";
 import {
   blocksOverlappingRange,
   decodeSstMeta,
@@ -205,6 +205,44 @@ describe("SST codec and read path", () => {
     });
   });
 
+  it("keeps an SST's metadata a small fraction of its data, whatever its key size (D107)", () => {
+    // Rows of long keys (up to MAX_KEY_BYTES, 16 KiB) and short values, as a database keyed by
+    // long paths or composite keys holds. 4 MiB of rows each, with production's 16 KiB blocks.
+    const fractions: Array<readonly [number, number]> = [];
+    for (const keyBytes of [16, 1024, 4096, 16 * 1024]) {
+      const rows: Array<Row> = [];
+      const count = Math.ceil((4 * 1024 * 1024) / (keyBytes + 16));
+      for (let index = 0; index < count; index++) {
+        const key = new Uint8Array(keyBytes).fill(0x61);
+        key[0] = index >> 16;
+        key[1] = (index >> 8) & 0xff;
+        key[2] = index & 0xff;
+        rows.push({
+          key,
+          seq: SeqNum.make(index + 1),
+          value: RowValue.Value({ bytes: new Uint8Array(16).fill(1) }),
+          createTs: Option.none(),
+          expireTs: Option.none(),
+        });
+      }
+      const { bytes, info } = buildSst(rows, 16 * 1024);
+      fractions.push([keyBytes, Math.round((info.metaLength / info.metaOffset) * 1000) / 1000]);
+      // Still readable: every key is found through the index.
+      const meta = openSst(bytes, info.metaOffset);
+      const last = rows.at(-1);
+      if (last === undefined) throw new Error("no rows");
+      const found = firstBlockForKey(meta, last.key);
+      expect(Option.isSome(found)).toBe(true);
+    }
+    // The metadata is read whole by every reader of the SST and held in its L1 cache: at most a
+    // sixteenth of the data (Bloom filter and index), 4 MiB for a 64 MiB SST. Before D107 it was
+    // 50% at 4 KiB keys and 200% at 16 KiB.
+    expect(
+      fractions.every(([, fraction]) => fraction <= 1 / 16),
+      JSON.stringify(fractions),
+    ).toBe(true);
+  });
+
   it("lists the blocks a key range overlaps", () => {
     assertProperty(
       Arbitrary.all({ writes: historyArbitrary(80), start: keyArbitrary }),
@@ -243,6 +281,73 @@ describe("SST codec and read path", () => {
 });
 
 const smallSize = Arbitrary.schema(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 64 })));
+
+describe("decoders over damaged bytes (read audit)", () => {
+  const damageArbitrary = Arbitrary.all({
+    writes: historyArbitrary(60),
+    position: Arbitrary.schema(
+      Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 100_000 })),
+    ),
+    flip: Arbitrary.schema(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 255 }))),
+    cut: Arbitrary.schema(Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 100 }))),
+  });
+
+  /** Whether `decode` fails typed (an `SstCorruptedError`) rather than throwing or answering. */
+  const failsTyped = <A>(decode: () => Result.Result<A, { readonly _tag: string }>) => {
+    try {
+      const decoded = decode();
+      return Result.isFailure(decoded) && decoded.failure._tag === "SstCorruptedError";
+    } catch {
+      return false;
+    }
+  };
+
+  it("refuses a metadata section with any one byte changed, or cut anywhere, with a typed error", () => {
+    assertProperty(
+      damageArbitrary,
+      ({ writes, position, flip, cut }) => {
+        const rows = rowsFromWrites(writes);
+        if (rows.length === 0) return true;
+        const { bytes, info } = buildSst(sortRows(rows));
+        const meta = bytes.slice(info.metaOffset);
+        const changed = meta.slice();
+        const at = position % changed.length;
+        changed[at] = (changed[at] ?? 0) ^ flip;
+        const truncated = meta.slice(0, Math.floor((meta.length * cut) / 101));
+        return (
+          failsTyped(() => decodeSstMeta(SST_ID, changed)) &&
+          failsTyped(() => decodeSstMeta(SST_ID, truncated))
+        );
+      },
+      { runs: 400 },
+    );
+  });
+
+  it("refuses a data block with any one byte changed, or cut anywhere, with a typed error", () => {
+    assertProperty(
+      damageArbitrary,
+      ({ writes, position, flip, cut }) => {
+        const rows = rowsFromWrites(writes);
+        if (rows.length === 0) return true;
+        const { bytes, info } = buildSst(sortRows(rows));
+        const meta = openSst(bytes, info.metaOffset);
+        const entry = meta.index[position % meta.index.length];
+        if (entry === undefined) return false;
+        const block = bytes.slice(entry.offset, entry.offset + entry.length);
+        const changed = block.slice();
+        const at = position % changed.length;
+        changed[at] = (changed[at] ?? 0) ^ flip;
+        const truncated = block.slice(0, Math.floor((block.length * cut) / 101));
+        const at0 = { sstId: SST_ID, offset: entry.offset };
+        return (
+          failsTyped(() => decodeDataBlock(changed, at0)) &&
+          failsTyped(() => decodeDataBlock(truncated, at0))
+        );
+      },
+      { runs: 400 },
+    );
+  });
+});
 
 describe("groupBlockReads", () => {
   it("covers exactly the given blocks in order with contiguous reads within the size bound", () => {

@@ -460,7 +460,7 @@ export class DbHttpApiGroup extends HttpApiGroup.make("databases")
       OpenApi.annotations({
         summary: "Scan a key range",
         description:
-          "Returns up to `limit` visible rows in the half-open range, in key order. To continue, send the same request with `range.start` set to `resumeFrom`.",
+          "Returns up to `limit` visible rows in the half-open range, in key order. To continue, send the same request with `range.start` set to `resumeFrom`. A page also ends early, with fewer rows or none, once it has examined 16 MiB of versions (deleted or expired rows count, returned or not): keep following `resumeFrom` until it is null.",
       }),
     ),
   )

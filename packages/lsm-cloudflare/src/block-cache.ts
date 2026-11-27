@@ -10,7 +10,7 @@ import {
   type SstIndexEntry,
   type SstMeta,
 } from "@shaledb/lsm-core";
-import { Context, Effect, Layer, Metric, Option } from "effect";
+import { Context, Effect, Layer, Metric, Option, type Result } from "effect";
 
 import {
   BlockSource,
@@ -142,6 +142,43 @@ export const makeBlockCache = Effect.gen(function* () {
       return key;
     });
 
+  /**
+   * Decodes a range read by `read`; when its bytes fail their checksum, reads the range once more
+   * past every cache (`BlockSource.uncached`). A damaged copy in Workers Cache, or one damaged in
+   * transit, then costs one bucket read instead of failing every read of the block for as long as
+   * the copy is cached (an immutable year). Damage in the bucket itself still fails, typed.
+   */
+  const decodedOrUncached = <A>(
+    owner: DatabaseId,
+    sstId: SstId,
+    read: Effect.Effect<
+      Uint8Array,
+      SstMissingError | BlockSourceUnavailableError,
+      BlockSourceServices
+    >,
+    offset: number,
+    length: number,
+    decode: (bytes: Uint8Array) => Result.Result<A, SstCorruptedError>,
+  ): Effect.Effect<A, BlockReadError, BlockSourceServices> =>
+    read.pipe(
+      Effect.flatMap((bytes) => Effect.fromResult(decode(bytes))),
+      Effect.catchTags({
+        SstCorruptedError: (damaged) =>
+          source.uncached(owner, sstId, offset, length).pipe(
+            Effect.flatMap((bytes) => Effect.fromResult(decode(bytes))),
+            Effect.tap(() =>
+              Effect.annotateCurrentSpan({ "cache.damaged_copy": true }).pipe(
+                Effect.andThen(
+                  Effect.logWarning(
+                    `A cached or in-transit copy of SST ${sstId} of database ${owner} at offset ${offset} failed its checksum (${damaged.reason} in ${damaged.section}); the bucket's copy is intact and was used.`,
+                  ),
+                ),
+              ),
+            ),
+          ),
+      }),
+    );
+
   return BlockCache.of({
     meta: (owner, handle, budgetGroup) =>
       Effect.gen(function* () {
@@ -151,9 +188,14 @@ export const makeBlockCache = Effect.gen(function* () {
           key,
           budgetGroup,
           handle.metaLength,
-          source
-            .meta(owner, handle.id, handle.metaOffset, handle.metaLength)
-            .pipe(Effect.flatMap((bytes) => Effect.fromResult(decodeSstMeta(handle.id, bytes)))),
+          decodedOrUncached(
+            owner,
+            handle.id,
+            source.meta(owner, handle.id, handle.metaOffset, handle.metaLength),
+            handle.metaOffset,
+            handle.metaLength,
+            (bytes) => decodeSstMeta(handle.id, bytes),
+          ),
         );
       }).pipe(Effect.withSpan("BlockCache.meta")),
     block: (owner, handle, entry, budgetGroup) =>
@@ -164,15 +206,14 @@ export const makeBlockCache = Effect.gen(function* () {
           key,
           budgetGroup,
           entry.length,
-          source
-            .block(owner, handle.id, entry.offset, entry.length)
-            .pipe(
-              Effect.flatMap((bytes) =>
-                Effect.fromResult(
-                  decodeDataBlock(bytes, { sstId: handle.id, offset: entry.offset }),
-                ),
-              ),
-            ),
+          decodedOrUncached(
+            owner,
+            handle.id,
+            source.block(owner, handle.id, entry.offset, entry.length),
+            entry.offset,
+            entry.length,
+            (bytes) => decodeDataBlock(bytes, { sstId: handle.id, offset: entry.offset }),
+          ),
         );
       }).pipe(Effect.withSpan("BlockCache.block")),
   });
