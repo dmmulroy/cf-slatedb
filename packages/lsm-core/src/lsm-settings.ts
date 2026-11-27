@@ -49,6 +49,7 @@ interface LsmSettingsCombinationRule {
  * **Details**
  *
  * - A compaction needs at least as many sources allowed as it requires.
+ * - Writes refused for L0 backlog must leave L0 enough SSTs to compact, or they stall for good.
  * - A memtable must be able to reach `l0SstSize` before backpressure refuses writes, or writes stall
  *   until `maxL0Age` flushes.
  * - A compaction's budget lease must outlive the compactor's poll interval, which renews it.
@@ -59,6 +60,12 @@ const LSM_SETTINGS_COMBINATION_RULES: ReadonlyArray<LsmSettingsCombinationRule> 
     field: "maxCompactionSources",
     holds: (settings) => settings.minCompactionSources <= settings.maxCompactionSources,
     message: "maxCompactionSources must be at least minCompactionSources",
+  },
+  {
+    field: "l0MaxSsts",
+    holds: (settings) => settings.minCompactionSources <= settings.l0MaxSsts,
+    message:
+      "l0MaxSsts must be at least minCompactionSources: writes stop at l0MaxSsts L0 SSTs, and L0 is compacted only once it holds minCompactionSources, so writes would stall for good",
   },
   {
     field: "maxUnflushedBytes",

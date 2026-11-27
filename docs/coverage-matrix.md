@@ -213,7 +213,8 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `db-writer.ts` (sequence oracle and clock in the commit transaction, D20; `ChangelogExport` is
   `exportChangelog`), `writer-client.ts`, `writer-server.ts`, `writer-http-api.ts`.
 - **`CompactionScheduler` (pure)** — done. `lsm-core/src/size-tiered-compaction-scheduler.ts`;
-  `size-tiered-compaction-scheduler.test.ts` over `Arbitrary` manifests and options: jobs are
+  `size-tiered-compaction-scheduler.test.ts` over `Arbitrary` manifests and options (D87: with L0
+  at `l0MaxSsts` and nothing running, every valid setting plans an L0 job): jobs are
   consecutive, all-L0 or all-runs, within min/max sources and `includeSizeThreshold`, never overlap
   each other or a job in flight, have the right destination and `isBottom`; repeatedly committing
   planned jobs converges (fallback consolidation terminates). Shown failing with the size

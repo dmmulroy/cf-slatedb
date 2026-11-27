@@ -2807,3 +2807,25 @@ manifest). Before, each step loaded nothing.
   2,973,046 bytes.
 - **An output step of a job whose inputs another compaction replaced is discarded.** The mutation
   that ignores a missing id fails it.
+
+## D87. Settings must leave L0 enough SSTs to compact before writes stop
+
+**Found by the Workflow audit** with a property test: from a manifest whose L0 holds `l0MaxSsts`
+SSTs, with nothing running, the scheduler must plan a job that shrinks L0.
+
+**The defect.** `LsmSettings` accepted `l0MaxSsts` below `minCompactionSources` (for example 1
+and 2). Two rules then never meet:
+
+- **The writer** refuses writes once L0 holds `l0MaxSsts` SSTs (`WriteStalledError`, `L0Backlog`).
+- **The scheduler** compacts L0 only once it holds `minCompactionSources` SSTs.
+
+L0 never reaches the scheduler's threshold, so writes stall for good. The settings come from the
+Stack's `SHALEDB_LSM_SETTINGS` override, so an operator could deploy them.
+
+**The rule.** A combination rule refuses such settings at plan time: `minCompactionSources <=
+l0MaxSsts`. The defaults (4 and 16) satisfy it.
+
+**Test.** `size-tiered-compaction-scheduler.test.ts`, "plans a job that shrinks L0 whenever writes
+are refused for L0 backlog and nothing runs". Over every settings value the schema accepts, with
+any sorted runs, the plan includes an L0 job. It fails without the rule (shrunk to `l0MaxSsts` 1
+and `minCompactionSources` 2), and the mutation that drops the rule fails it.
