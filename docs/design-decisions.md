@@ -3644,6 +3644,9 @@ caches and serves many requests, so it fits within 128 MB. At 10 MiB, 100 ms per
 cold read, plus up to 100 MiB of heap, is the point where a commit or a cold read becomes a
 problem. These times were measured in Node; workerd was not measured.
 
+> **Corrected by D129:** the cap is now 128. 1,000 fit the manifest, but a collection reads every
+> pinned manifest whole.
+
 **Checkpoints: at most 1,000 per database** (`MAX_CHECKPOINTS_PER_DATABASE`, lsm-core
 `addCallerCheckpoint`).
 
@@ -4413,6 +4416,28 @@ was a modeling error, not a defect:
 No new defect was found. `verify.ts` now reads a violated temporal property's name from a config
 that has exactly one, because TLC does not print it.
 
+## D111. Liveness checked for the writer and transaction models
+
+**Why.** Every model checked safety only: nothing bad happens. D76 (transactions refused forever)
+and D74's alarm loop were "nothing good ever happens", which no invariant sees.
+
+**What "keeps working" means, and where it is checked.**
+
+| Model                                           | Property                                                               | Fairness                                               | Broken value that fails it                  |
+| ----------------------------------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------ | ------------------------------------------- |
+| `WriterObject` (`WriterObjectLive.cfg`)         | `AckedFlushed`: every acknowledged write reaches the manifest          | each started request step and the alarm, strongly fair | `noAlarmRetry` (D102)                       |
+| `WriterObject` (`WriterObjectAlarmLoop.cfg`)    | `AlarmQuiets`: the alarm stops firing                                  | the same                                               | `noSettle` (D74's loop)                     |
+| `NoAckedWriteLost` (`NoAckedWriteLostLive.cfg`) | `EventuallyFlushed`: every acknowledged write is readable at `Flushed` | the flush's steps and the restart, weakly fair         | `noWake` (nothing starts an evicted writer) |
+| `Transactions` (`TransactionsLive.cfg`)         | `EveryTxnCommits`: a transaction retried after each abort commits      | each transaction's steps, weakly fair                  | `beforeD76`                                 |
+
+`Transactions` gains a `Live` constant. With it, a read decides as `DbReader.manifestFor` does,
+GC deletes a flush's own manifest (`Collect`), and an aborted transaction is retried. Writes are
+finite, so conflicts with real writes end. The safety config is unchanged.
+
+**Not checked here.** Liveness for `GcSafety`, `SealSplit`, and `ManifestCasFencing` (a fork
+eventually releases its source, a removal eventually leaves nothing) belongs to the second formal
+agent's `Lifecycle` and `CompactorObject` work (D110, D114).
+
 ## D112. A shard split is modeled end to end
 
 `ShardSplit.tla` models a split from start to finish:
@@ -4436,6 +4461,30 @@ that has exactly one, because TLC does not print it.
 | `WaitingWritesLand` (liveness)  | before D101 |
 
 The safety run has 24,118 states. An exploration at larger bounds (228,918 states) found nothing.
+
+## D113. The change feed can repeat changes after a flush commit whose response was lost
+
+**Found** while placing the labels of a change-feed model, and shown by a failing test before
+any model was written:
+
+- **The test.** `db-writer.test.ts`, "DbWriter changelog after a flush commit whose response was
+  lost (D113)". The manifest holds the entries `(1, 1)` and `(1, 2)`.
+- **Where the commit lands without an answer.** A flush's manifest create lands, and then
+  `attemptCreate` fails reading GC's boundary, or the `putIfAbsent` response is lost. The flush
+  fails, so `markFlushed` never runs.
+- **The second export.** The next flush exports its changelog from the old `flushed_seq` again
+  (`exportChangelog(meta.flushedSeq, cut)`). `commitL0Flush` appends a second entry.
+- **The repeat.** `DbReader.changelogRows` reads every entry above `afterSeq` in `firstSeq`
+  order and keeps every row in range. A consumer gets sequence number 1 twice: the "same batch"
+  check keeps the repeat inside one batch.
+
+L0 is not affected: the merge removes the duplicate rows.
+
+**Not fixed here.** Two places could fix it; the owners of `db-reader.ts` and `db-writer.ts`
+decide which:
+
+- the feed never returns a sequence number at or below one it already returned;
+- the export starts at the newest `lastL0Seq` the commit finds.
 
 ## D114. The lifecycle is modeled across three databases
 
@@ -4975,3 +5024,79 @@ regular, transaction, and routed page. A routed page holds one shard's segment a
     workerd tests run it.
   - `db-http-request.ts:61` and `:79`, the 300-character issue cap moved by one: no contract
     names the exact cap.
+- the oracle property test over the three surfaces with random budgets and writes, flushes, and
+  compactions between pages;
+- the tests of two transaction pages separated by a flush and a compaction, and of a phantom
+  beyond an early page's end but inside the scanned range;
+- the workerd assertions of the HTTP shapes.
+
+## D129. The checkpoint cap is set by what a collection reads: 128 per database
+
+**The contradiction.** D99 allowed 1,000 caller checkpoints per database, sized by their cost
+inside the manifest (about 130 bytes each). D98 bounds a collection by the number of manifests it
+loads (5,000), not by their bytes. A collection reads every manifest a checkpoint pins, whole, so
+with 1,000 pins it reads 1,000 manifests.
+
+- **Measured.** At small manifests (242 KB, 1,000 checkpoints with 256-character names), one
+  collection read 121,124,785 bytes, and each pin's expiry schedules another collection.
+- **Derived worst case.** At D99's 4 MiB manifest budget, one collection reads
+  1,000 × 4 MiB = 4 GiB. Decoding that is about 41 s at D99's measured 10 ms per MiB in Node,
+  against the compactor's 60 s CPU limit. That leaves no room for workerd being slower, the
+  listings, or 4 GB of R2 reads. The collection exceeds its CPU on every run and deletes no SST
+  again.
+- **What a collection holds.** Little: it folds each manifest into a set of SST ids and drops it
+  (D98). One decoded manifest at a time, about 16 to 40 MiB at 4 MiB. The cost is CPU and bytes
+  read, not memory.
+
+So the two limits contradicted each other at their maxima.
+
+**The rule.** The cap is derived from a read budget:
+
+- A collection may read `GC_PINNED_MANIFEST_READ_BUDGET_BYTES` = 512 MiB of pinned manifests.
+  That is about 5 s of decoding, a tenth of the compactor's CPU limit.
+- A manifest is kept within `MANIFEST_SIZE_BUDGET_BYTES` = 4 MiB (D99).
+- So `MAX_CHECKPOINTS_PER_DATABASE` = 512 MiB / 4 MiB = **128**.
+- The public error is unchanged (`CheckpointLimitReached`, 409); only the number changes, which
+  is allowed because v1 is not released.
+- Forks' and successors' holds are still not counted. A database has as many of those as it has
+  forks.
+
+**Rejected.**
+
+- **Reading pinned manifests' references in bounded pieces across runs.** A collection could
+  delete only once a full pass is done, and pins can be added and expire between pieces. The
+  progress would have to live in the compactor's state, and the pass restarts whenever the set
+  of pins changes.
+- **A pinned manifest's reference set cached in the compactor's state.** Up to 16,400 SST ids per
+  pinned manifest at the 1 TiB limit (D99), times the pins. Too large for one Durable Object
+  value, and it is a second copy of data the manifest already holds.
+
+Both would keep 1,000. Neither is needed for a limit that covers the use: a pinned snapshot
+serves a long read, and 128 at once per database is many.
+
+**What D98's budget still allows.** Young manifests count against the 5,000 loads by number,
+not bytes. At 4 MiB manifests that is up to 20 GiB, which takes a busy database at the 1 TiB
+limit. That is D98's limit, not this one's; it is left to D98's owner.
+
+**Tests.**
+
+- `manifest.test.ts`: the cap times the manifest budget fits the read budget, and the read
+  budget's decode time is at most a tenth of the CPU limit. D99's 1,000 fails it, and so does
+  a budget twice as large.
+- `database-lifecycle.test.ts`, with the most checkpoints allowed:
+  - the 129th is refused;
+  - the newest manifest is 31,556 bytes;
+  - a collection reads 2,037,306 bytes of pinned manifests and deletes the four SSTs a
+    compaction replaced.
+- `CROSS`: `garbage-collector.ts` is unchanged. The fix is in the cap.
+
+**Also in this round (D119's follow-ups).**
+
+- `ManifestCache` keeps the newer manifest when an older load finishes last
+  (`manifest-store.test.ts`).
+- A change-feed page that ends at a batch boundary (`change-feed.test.ts`).
+- Two mutants of `db-reader.ts`'s change feed are equivalent:
+  - **The byte bound with `batchStart >= 0`.** A batch's keys and values are at most
+    `MAX_BATCH_BYTES`, which equals `MAX_MEMTABLE_PAGE_BYTES`, counted the same way, so a
+    first batch alone never passes the bound. No consumer stalls.
+  - **The row limit with `>`.** `DbClient.changes` cuts again at the limit.

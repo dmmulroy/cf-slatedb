@@ -12,7 +12,7 @@ import {
   WriterEpoch,
 } from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
-import { Effect, Layer, Option, Result, Stream, Tracer } from "effect";
+import { Effect, Fiber, Layer, Option, Result, Stream, Tracer } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -758,5 +758,68 @@ describe("loadLatest's listing fallback (mutation sweep)", () => {
       }),
     );
     expect(outcome).toBe("DatabaseNotFoundError");
+  });
+});
+
+describe("ManifestCache under two overlapping loads (mutation sweep)", () => {
+  it("keeps the newer manifest when an older load finishes last, and returns it to both", async () => {
+    // The first loadLatest reads the newest manifest, then waits until released to return it.
+    let releaseSlow = () => {};
+    const slowReleased = new Promise<void>((resolve) => (releaseSlow = resolve));
+    let slowLoaded = () => {};
+    const slowHasLoaded = new Promise<void>((resolve) => (slowLoaded = resolve));
+    let calls = 0;
+    const gatedReader = Layer.effect(
+      ManifestReader,
+      Effect.gen(function* () {
+        const reader = yield* ManifestReader;
+        return ManifestReader.of({
+          ...reader,
+          loadLatest: (databaseId) =>
+            Effect.gen(function* () {
+              calls += 1;
+              const loaded = yield* reader.loadLatest(databaseId);
+              if (calls === 2) {
+                slowLoaded();
+                yield* Effect.promise(() => slowReleased);
+              }
+              return loaded;
+            }),
+        });
+      }),
+    );
+    const outcome = await Effect.gen(function* () {
+      yield* initialize;
+      const store = yield* ManifestStore;
+      const cache = yield* ManifestCache;
+      yield* cache.refresh(DB);
+      // A second refresh (a load from the newest known, or a full load) starts and is slow.
+      yield* store.update(DB, flushEdit(1, WriterEpoch.make(0)));
+      const slow = yield* Effect.forkChild(
+        Effect.flatMap(cache.forget(DB), () => cache.refresh(DB)),
+      );
+      yield* Effect.promise(() => slowHasLoaded);
+      // Meanwhile a newer manifest is committed and a faster load caches it.
+      yield* store.update(DB, flushEdit(2, WriterEpoch.make(0)));
+      const fast = yield* cache.refresh(DB);
+      releaseSlow();
+      const late = yield* Fiber.join(slow);
+      const after = yield* cache.current(DB);
+      return { fast: fast.id, late: late.id, after: after.id };
+    }).pipe(
+      Effect.provide(
+        manifestCacheLayerWithoutDependencies.pipe(
+          Layer.provide(gatedReader),
+          Layer.provideMerge(manifestStoreTestLayer),
+          Layer.provide(lsmConfigurationTestLayer({ manifestRefreshInterval: 1000 })),
+        ),
+      ),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.provide(TestClock.layer()),
+      Effect.runPromise,
+    );
+    // The slow load read manifest 2; manifest 3 was cached before it returned. The cache never
+    // returns an older manifest than one it already returned.
+    expect(outcome).toEqual({ fast: 3, late: 3, after: 3 });
   });
 });

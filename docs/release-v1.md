@@ -784,7 +784,7 @@ the account's Workflows) are now refused when a deploy is planned.
 
 **Bounds a caller meets (D99).**
 
-- **Checkpoints and pinned snapshots:** at most 1,000 per database. The next one is refused with
+- **Checkpoints and pinned snapshots:** at most 128 per database (D129). The next one is refused with
   `CheckpointLimitReached` (409).
 - **The changelog:** its newest 2,048 flushes and at most 30 days of retention. A consumer behind
   them gets `Expired`.

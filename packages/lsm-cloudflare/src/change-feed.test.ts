@@ -426,4 +426,42 @@ describe("change feed pages of flushed changes (D93)", () => {
       { seqs: [3, 4], next: 4 },
     ]);
   });
+
+  it("ends a flushed page at the batch that reaches the row limit, and the next page goes on from it (mutation sweep)", async () => {
+    const outcome = await Effect.runPromise(
+      provide(
+        Effect.gen(function* () {
+          yield* create(true);
+          const client = yield* DbClient;
+          // Three batches of two rows each, all flushed.
+          for (const first of [0, 2, 4]) {
+            yield* client.write(DB, {
+              operations: [first, first + 1].map((key) => ({
+                _tag: "Put" as const,
+                key: Uint8Array.of(key),
+                value: Uint8Array.of(key),
+                ttlMillis: Option.none(),
+              })),
+            });
+          }
+          yield* client.flush(DB);
+          const pages: Array<ReadonlyArray<number>> = [];
+          let cursor = SeqNum.make(0);
+          for (let page = 0; page < 5; page++) {
+            const read = yield* client.changes(DB, cursor, 2);
+            if (read.rows.length === 0) break;
+            pages.push(read.rows.map((row) => row.seq));
+            cursor = read.nextAfterSeq;
+          }
+          return pages;
+        }),
+      ),
+    );
+    // A limit of two rows is exactly one batch: each page holds one batch, none skipped.
+    expect(outcome).toEqual([
+      [1, 1],
+      [2, 2],
+      [3, 3],
+    ]);
+  });
 });

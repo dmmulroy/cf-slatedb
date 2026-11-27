@@ -452,13 +452,25 @@ export class SstNotInManifestError extends Schema.TaggedError<SstNotInManifestEr
   { databaseId: DatabaseId, sstId: SstId, message: Schema.String },
 ) {}
 
+/** The size a manifest is kept within (D99): every commit rewrites it and every cold read decodes it. */
+export const MANIFEST_SIZE_BUDGET_BYTES = 4 * 1024 * 1024;
+
 /**
- * Most checkpoints a caller may hold on one database at once (D99): checkpoints and pinned
- * snapshots, not the holds forks and split successors take. Each is about 130 bytes of the
- * manifest, which every commit rewrites and every cold read decodes, so 1,000 is about 127 KiB, 3%
- * of the manifest's 4 MiB budget.
+ * Bytes of pinned manifests one collection may read (D129). A collection reads every manifest a
+ * checkpoint pins, whole; at about 10 ms per MiB to decode (D99, measured in Node), 512 MiB is
+ * about 5 s, inside the compactor's 60 s CPU limit with room for workerd, listings, and deletes.
  */
-export const MAX_CHECKPOINTS_PER_DATABASE = 1_000;
+export const GC_PINNED_MANIFEST_READ_BUDGET_BYTES = 512 * 1024 * 1024;
+
+/**
+ * Most checkpoints a caller may hold on one database at once (D99, D129): checkpoints and pinned
+ * snapshots, not the holds forks and split successors take. Each pins a manifest that every
+ * collection reads whole, so the cap is the collection's pinned-manifest read budget over the
+ * manifest's size budget: 512 MiB / 4 MiB = 128. (D99's 1,000 fit the manifest itself, about 127
+ * KiB, but made a collection read up to 4 GiB.)
+ */
+export const MAX_CHECKPOINTS_PER_DATABASE =
+  GC_PINNED_MANIFEST_READ_BUDGET_BYTES / MANIFEST_SIZE_BUDGET_BYTES;
 
 /**
  * The database already holds {@link MAX_CHECKPOINTS_PER_DATABASE} checkpoints created by callers.
