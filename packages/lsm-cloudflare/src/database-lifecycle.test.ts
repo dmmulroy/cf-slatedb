@@ -1395,6 +1395,7 @@ describe("DatabaseLifecycle: a manifest CAS in flight during removal", () => {
         commitL0Flush(manifest, {
           writerEpoch: view.writerEpoch,
           sst: { ...firstL0(view), id: SstId.make("01JD00000000000000000000F1") },
+          afterSeq: manifest.lastL0Seq,
           lastSeq: SeqNum.make(manifest.lastL0Seq + 1),
           clockTick: manifest.lastL0ClockTick,
           changelog: Option.none(),

@@ -333,6 +333,7 @@ describe("planCompactions", () => {
         commitL0Flush(manifest, {
           writerEpoch: manifest.writerEpoch,
           sst: handle(1000),
+          afterSeq: manifest.lastL0Seq,
           lastSeq: SeqNum.make(n),
           clockTick: Timestamp.make(n),
           changelog: Option.none(),

@@ -599,118 +599,176 @@ export const makeDbWriter = Effect.gen(function* () {
       manifest: Manifest,
       manifestId: ManifestId,
     ) => Result.Result<Manifest, WriterFencedError | DatabaseRemovedError>,
-  ) =>
-    flushLock
+  ) => {
+    /** One flush, or the manifest's flushed state when this writer's `flushed_seq` is stale. */
+    type FlushAttempt =
+      | {
+          readonly _tag: "Done";
+          readonly flushedSeq: SeqNum;
+          readonly committed: Option.Option<VersionedManifest>;
+        }
+      | { readonly _tag: "Stale"; readonly lastL0Seq: SeqNum; readonly manifestId: ManifestId };
+    const done = (outcome: {
+      readonly flushedSeq: SeqNum;
+      readonly committed: Option.Option<VersionedManifest>;
+    }): FlushAttempt => ({ _tag: "Done", ...outcome });
+    const flushOnce = Effect.gen(function* () {
+      const ready = yield* ensureReady(databaseId);
+      const meta = yield* memTable.meta.pipe(Effect.mapError(unavailable(databaseId, "flush")));
+      const cut = meta.lastSeq;
+      yield* Effect.annotateCurrentSpan({ "database.id": databaseId, seq: cut });
+      const nothingCommitted = Option.none<VersionedManifest>();
+      if (cut <= meta.flushedSeq) {
+        yield* settleCountersWithNothingToFlush(databaseId);
+        return done({ flushedSeq: meta.flushedSeq, committed: nothingCommitted });
+      }
+      const options = ready.manifest.manifest.options;
+      const written = yield* ssts
+        .write({
+          owner: databaseId,
+          kind: "Compacted",
+          objectKey: (id) => sstKey(databaseId, id),
+          // Only the versions a read of this SST can reach: every such read is at a snapshot
+          // at or after `cut`, since one at an older snapshot takes these rows from this
+          // writer (they stay in SQLite) or reads an older manifest. A key rewritten many
+          // times since the last flush is then one row, not one per write (D70).
+          rows: keepReachableVersions(memTable.rowsUpTo(meta.flushedSeq, cut)),
+        })
+        .pipe(
+          Effect.catchTags({
+            MemTableError: (error) => Effect.fail(unavailable(databaseId, "flush")(error)),
+            ObjectStoreUnavailableError: (error) =>
+              Effect.fail(unavailable(databaseId, "flush")(error)),
+          }),
+        );
+      if (Option.isNone(written)) {
+        // No row in (flushedSeq, cut] (sequence numbers without rows): just record it.
+        yield* memTable
+          .markFlushed(cut, Option.none(), yield* Clock.currentTimeMillis)
+          .pipe(Effect.mapError(unavailable(databaseId, "flush")));
+        yield* settleCountersWithNothingToFlush(databaseId);
+        return done({ flushedSeq: cut, committed: nothingCommitted });
+      }
+      const changelog = Option.isSome(options.changelog)
+        ? yield* exportChangelog(databaseId, meta.flushedSeq, cut)
+        : Option.none();
+      // From the writer's own view: usually nothing else committed since, so the commit is one
+      // create with no load (D56).
+      // The manifest a stale refusal was made against (the edit runs against the newest).
+      let staleAgainst = Option.none<ManifestId>();
+      const commit = yield* manifests
+        .updateFrom(ready.manifest, (manifest, manifestId) =>
+          Result.flatMap(
+            Result.mapError(
+              commitL0Flush(manifest, {
+                writerEpoch: ready.writerEpoch,
+                sst: written.value.handle,
+                afterSeq: meta.flushedSeq,
+                lastSeq: cut,
+                clockTick: meta.clockTick,
+                changelog,
+              }),
+              (error) => {
+                if (error._tag === "FlushedSeqStaleError") staleAgainst = Option.some(manifestId);
+                return error;
+              },
+            ),
+            (flushed) => alsoCommit(flushed, manifestId),
+          ),
+        )
+        .pipe(
+          Effect.map((committed) => Result.succeed(committed)),
+          Effect.catchTag("FlushedSeqStaleError", (error) => Effect.succeed(Result.fail(error))),
+          Effect.catchTags(manifestFailures(databaseId, "flush")),
+          // The upload outlasted GC's boundary (a stall longer than `gcMinAge`): the rows are
+          // still in SQLite, so the next flush writes them to a new SST; this one is an orphan.
+          Effect.catchTags({
+            SstBelowGcBoundaryError: (error) =>
+              Effect.fail(unavailable(databaseId, "flush")(error)),
+            // A database being removed is gone for its writer.
+            DatabaseRemovedError: (error) =>
+              Effect.fail(new DatabaseNotFoundError({ databaseId, message: error.message })),
+          }),
+          Effect.tapError((error) =>
+            error._tag === "WriterFencedError"
+              ? markFenced(databaseId, ready.writerEpoch, error)
+              : Effect.void,
+          ),
+        );
+      if (Result.isFailure(commit)) {
+        const manifestId = Option.getOrElse(staleAgainst, () => ready.manifest.id);
+        return { _tag: "Stale", lastL0Seq: commit.failure.lastL0Seq, manifestId } as const;
+      }
+      const committed = commit.success;
+      // Recorded only after the manifest commit: a crash before this line leaves rows the next
+      // start records as flushed (they are in L0), or that a later flush writes again with the
+      // same sequence numbers, which merging deduplicates. The rows stay for transactions until
+      // a trim, which never removes the newest flush (D58).
+      yield* memTable
+        .markFlushed(cut, Option.some(committed.id), yield* Clock.currentTimeMillis)
+        .pipe(Effect.mapError(unavailable(databaseId, "flush")));
+      yield* memTable
+        .trim({
+          nowMs: yield* Clock.currentTimeMillis,
+          retentionMs: settings.transactionRetentionMs,
+          maxRetainedBytes: settings.maxRetainedBytes,
+        })
+        .pipe(Effect.mapError(unavailable(databaseId, "flush")));
+      // Only over the phase this flush started from, and only over an older view (D115).
+      yield* Ref.update(phase, (current) =>
+        current._tag === "Ready" &&
+        current.writerEpoch === ready.writerEpoch &&
+        current.manifest.id < committed.id
+          ? { ...current, manifest: committed }
+          : current,
+      );
+      yield* refreshUnflushedCounters(databaseId);
+      yield* Metric.update(flushBytes, written.value.info.sizeBytes);
+      // Enough L0 SSTs to compact: wake the compactor (an idle database has no compactor alarm).
+      if (committed.manifest.l0.length >= settings.minCompactionSources) {
+        yield* wakeCompactor(databaseId);
+      }
+      yield* Effect.annotateCurrentSpan({
+        "sst.id": written.value.handle.id,
+        "sst.size": written.value.info.sizeBytes,
+        "manifest.id": committed.id,
+      });
+      return done({ flushedSeq: cut, committed: Option.some(committed) });
+    });
+    return flushLock
       .withPermits(1)(
         Effect.gen(function* () {
-          const ready = yield* ensureReady(databaseId);
-          const meta = yield* memTable.meta.pipe(Effect.mapError(unavailable(databaseId, "flush")));
-          const cut = meta.lastSeq;
-          yield* Effect.annotateCurrentSpan({ "database.id": databaseId, seq: cut });
-          const nothingCommitted = Option.none<VersionedManifest>();
-          if (cut <= meta.flushedSeq) {
-            yield* settleCountersWithNothingToFlush(databaseId);
-            return { flushedSeq: meta.flushedSeq, committed: nothingCommitted };
-          }
-          const options = ready.manifest.manifest.options;
-          const written = yield* ssts
-            .write({
-              owner: databaseId,
-              kind: "Compacted",
-              objectKey: (id) => sstKey(databaseId, id),
-              // Only the versions a read of this SST can reach: every such read is at a snapshot
-              // at or after `cut`, since one at an older snapshot takes these rows from this
-              // writer (they stay in SQLite) or reads an older manifest. A key rewritten many
-              // times since the last flush is then one row, not one per write (D70).
-              rows: keepReachableVersions(memTable.rowsUpTo(meta.flushedSeq, cut)),
-            })
-            .pipe(
-              Effect.catchTags({
-                MemTableError: (error) => Effect.fail(unavailable(databaseId, "flush")(error)),
-                ObjectStoreUnavailableError: (error) =>
-                  Effect.fail(unavailable(databaseId, "flush")(error)),
-              }),
-            );
-          if (Option.isNone(written)) {
-            // No row in (flushedSeq, cut] (sequence numbers without rows): just record it.
+          for (let attempt = 1; ; attempt++) {
+            const outcome = yield* flushOnce;
+            if (outcome._tag === "Done") return outcome;
+            // An earlier flush of this writer committed and its response was lost, so its rows
+            // were not recorded as flushed. Record the manifest's flushed state, as a start does,
+            // and flush again from it: no row is exported or uploaded twice, and none is skipped
+            // (D113). This attempt's SSTs are orphans GC collects. Under the flush lock nothing
+            // else commits a flush, so a second attempt cannot be stale again.
+            yield* Effect.annotateCurrentSpan({ "writer.flushed_seq_stale": outcome.lastL0Seq });
             yield* memTable
-              .markFlushed(cut, Option.none(), yield* Clock.currentTimeMillis)
+              .markFlushed(
+                outcome.lastL0Seq,
+                Option.some(outcome.manifestId),
+                yield* Clock.currentTimeMillis,
+              )
               .pipe(Effect.mapError(unavailable(databaseId, "flush")));
-            yield* settleCountersWithNothingToFlush(databaseId);
-            return { flushedSeq: cut, committed: nothingCommitted };
-          }
-          const changelog = Option.isSome(options.changelog)
-            ? yield* exportChangelog(databaseId, meta.flushedSeq, cut)
-            : Option.none();
-          // From the writer's own view: usually nothing else committed since, so the commit is one
-          // create with no load (D56).
-          const committed = yield* manifests
-            .updateFrom(ready.manifest, (manifest, manifestId) =>
-              Result.flatMap(
-                commitL0Flush(manifest, {
-                  writerEpoch: ready.writerEpoch,
-                  sst: written.value.handle,
-                  lastSeq: cut,
-                  clockTick: meta.clockTick,
-                  changelog,
+            if (attempt >= 2) {
+              return yield* Effect.fail(
+                unavailable(
+                  databaseId,
+                  "flush",
+                )({
+                  message: `its flushed sequence number was stale twice (the manifest is at ${outcome.lastL0Seq}); retry the flush`,
                 }),
-                (flushed) => alsoCommit(flushed, manifestId),
-              ),
-            )
-            .pipe(
-              Effect.catchTags(manifestFailures(databaseId, "flush")),
-              // The upload outlasted GC's boundary (a stall longer than `gcMinAge`): the rows are
-              // still in SQLite, so the next flush writes them to a new SST; this one is an orphan.
-              Effect.catchTags({
-                SstBelowGcBoundaryError: (error) =>
-                  Effect.fail(unavailable(databaseId, "flush")(error)),
-                // A database being removed is gone for its writer.
-                DatabaseRemovedError: (error) =>
-                  Effect.fail(new DatabaseNotFoundError({ databaseId, message: error.message })),
-              }),
-              Effect.tapError((error) =>
-                error._tag === "WriterFencedError"
-                  ? markFenced(databaseId, ready.writerEpoch, error)
-                  : Effect.void,
-              ),
-            );
-          // Recorded only after the manifest commit: a crash before this line leaves rows the next
-          // start records as flushed (they are in L0), or that a later flush writes again with the
-          // same sequence numbers, which merging deduplicates. The rows stay for transactions until
-          // a trim, which never removes the newest flush (D58).
-          yield* memTable
-            .markFlushed(cut, Option.some(committed.id), yield* Clock.currentTimeMillis)
-            .pipe(Effect.mapError(unavailable(databaseId, "flush")));
-          yield* memTable
-            .trim({
-              nowMs: yield* Clock.currentTimeMillis,
-              retentionMs: settings.transactionRetentionMs,
-              maxRetainedBytes: settings.maxRetainedBytes,
-            })
-            .pipe(Effect.mapError(unavailable(databaseId, "flush")));
-          // Only over the phase this flush started from, and only over an older view (D115).
-          yield* Ref.update(phase, (current) =>
-            current._tag === "Ready" &&
-            current.writerEpoch === ready.writerEpoch &&
-            current.manifest.id < committed.id
-              ? { ...current, manifest: committed }
-              : current,
-          );
-          yield* refreshUnflushedCounters(databaseId);
-          yield* Metric.update(flushBytes, written.value.info.sizeBytes);
-          // Enough L0 SSTs to compact: wake the compactor (an idle database has no compactor alarm).
-          if (committed.manifest.l0.length >= settings.minCompactionSources) {
-            yield* wakeCompactor(databaseId);
+              );
+            }
           }
-          yield* Effect.annotateCurrentSpan({
-            "sst.id": written.value.handle.id,
-            "sst.size": written.value.info.sizeBytes,
-            "manifest.id": committed.id,
-          });
-          return { flushedSeq: cut, committed: Option.some(committed) };
         }),
       )
       .pipe(Effect.withSpan("DbWriter.flush"));
+  };
 
   const flushNow = (databaseId: DatabaseId) =>
     flushThen(databaseId, (manifest) => Result.succeed(manifest)).pipe(

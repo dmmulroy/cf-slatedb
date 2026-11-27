@@ -55,7 +55,10 @@ A write is **flushed** when a manifest with `lastL0Seq` at or above its sequence
 
 A crash between any two steps loses nothing: before step 2 the rows are still unflushed and the SST
 is an orphan GC removes; before step 3 the next start records the manifest's `lastL0Seq` as
-`flushed_seq`.
+`flushed_seq`. A commit that lands and loses its response leaves the writer running with a stale
+`flushed_seq`: its next commit is refused (`FlushedSeqStaleError`), and the writer records the
+manifest's `lastL0Seq` and flushes again from it, so no change is exported twice (D113,
+`ChangeFeed.tla`).
 
 | Enforced by                                                                                       | Checked by                                                                                                                                                                                                                                                                                                                                                           |
 | ------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

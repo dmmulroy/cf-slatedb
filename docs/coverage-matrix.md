@@ -690,3 +690,11 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   seal interrupted while a flush is in flight (D115)", "DbWriter flush fenced by its own writer's
   restart (D115)"). Formal: `WriterObject` (`NeverSelfFenced`; `beforeD115`,
   `markFencedAnyPhase`).
+- **A flush is exact about where it starts; the feed reads each change once (D113)** — done.
+  `commitL0Flush`'s `afterSeq` and `FlushedSeqStaleError` (lsm-core `manifest.ts`), `flushThen`'s
+  second attempt (`db-writer.ts`), `changelogRows`' skip (`db-reader.ts`). Tests:
+  `db-writer.test.ts` ("DbWriter changelog after a flush commit whose response was lost (D113)"),
+  `change-feed.test.ts` ("change feed over a changelog entry an earlier one overlaps (D113)"),
+  `manifest.test.ts` ("commitL0Flush's start (D113)"). Formal: `ChangeFeed.tla` (`ExactlyOnce`,
+  `NoOverlappingEntries`; `beforeD113`, `lostResponseReexport`, `noExpiredCheck`,
+  `appendAfterCut`), skill `.agents/skills/verify-change-feed`.

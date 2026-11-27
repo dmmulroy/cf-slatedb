@@ -163,6 +163,7 @@ const apply = (world: World, step: Step) => {
       const result = commitL0Flush(manifest, {
         writerEpoch: step.staleEpoch && held > 0 ? WriterEpoch.make(held - 1) : held,
         sst,
+        afterSeq: manifest.lastL0Seq,
         lastSeq,
         clockTick: Timestamp.make(world.now),
         changelog: Option.some({
