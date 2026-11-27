@@ -1,0 +1,1492 @@
+<!doctype html>
+<html lang="en" class="antialiased">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>shaledb system architecture</title>
+    <link rel="preconnect" href="https://rsms.me/" />
+    <link rel="stylesheet" href="https://rsms.me/inter/inter.css" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <style type="text/tailwindcss">
+      @theme {
+        --font-sans: "InterVariable", ui-sans-serif, system-ui, sans-serif;
+        --font-sans--font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+        --font-mono: "Geist Mono", ui-monospace, monospace;
+      }
+      @utility flowing {
+        stroke-dasharray: 6 6;
+        animation: dash 0.6s linear infinite;
+      }
+      @keyframes dash { to { stroke-dashoffset: -12; } }
+      @keyframes ping-once { 0% { transform: scale(1); opacity: 0.7; } 100% { transform: scale(1.8); opacity: 0; } }
+      @utility ping-once { animation: ping-once 0.7s ease-out 1; transform-box: fill-box; transform-origin: center; }
+      @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+      @utility rise { animation: rise 0.35s ease-out both; }
+      html { scroll-padding-top: 5rem; }
+      details::details-content { transition: height 0.25s ease, content-visibility 0.25s allow-discrete; height: 0; overflow: clip; }
+      details[open]::details-content { height: auto; }
+      :root { interpolate-size: allow-keywords; }
+      @media (prefers-reduced-motion: reduce) {
+        *, *::before, *::after { animation: none !important; transition: none !important; }
+      }
+    </style>
+  </head>
+  <body class="bg-white font-sans text-zinc-950 dark:bg-zinc-950 dark:text-zinc-100">
+    <!-- Mobile top bar -->
+    <div class="sticky top-0 z-30 flex items-center justify-between border-b border-zinc-950/5 bg-white/90 px-4 py-3 backdrop-blur lg:hidden dark:border-white/10 dark:bg-zinc-950/90">
+      <a href="#top" class="text-base font-semibold">shaledb architecture</a>
+      <button type="button" id="menu-open" class="relative rounded-md px-2.5 py-1.5 text-sm font-medium text-zinc-700 ring-1 ring-zinc-950/10 dark:text-zinc-300 dark:ring-white/15" aria-label="Open navigation">
+        Menu
+        <span class="absolute top-1/2 left-1/2 size-[max(100%,3rem)] -translate-1/2 pointer-fine:hidden" aria-hidden="true"></span>
+      </button>
+    </div>
+    <dialog id="menu" class="m-0 h-dvh max-h-none w-72 max-w-none bg-white p-6 backdrop:bg-zinc-950/40 dark:bg-zinc-900">
+      <div class="flex items-center justify-between">
+        <p class="text-base font-semibold">Sections</p>
+        <button type="button" id="menu-close" class="rounded-md px-2.5 py-1.5 text-sm text-zinc-600 ring-1 ring-zinc-950/10 dark:text-zinc-400 dark:ring-white/15">Close</button>
+      </div>
+      <nav class="mt-6" data-nav></nav>
+    </dialog>
+
+    <div class="isolate mx-auto flex max-w-[90rem]">
+      <!-- Sidebar -->
+      <aside class="sticky top-0 h-dvh w-64 shrink-0 overflow-y-auto border-r border-zinc-950/5 px-6 py-10 max-lg:hidden dark:border-white/10">
+        <a href="#top" class="text-sm font-semibold">shaledb</a>
+        <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400">System architecture.</p>
+        <nav class="mt-8" data-nav></nav>
+        <p class="mt-10 text-xs/5 text-zinc-500 dark:text-zinc-500">Built from the code on 2026-11-27. Numbers are the defaults in <code class="font-mono">DEFAULT_LSM_SETTINGS</code>.</p>
+      </aside>
+
+      <main id="top" class="min-w-0 flex-1 px-4 py-10 sm:px-8 lg:px-12">
+        <!-- Header -->
+        <header class="border-b border-zinc-950/5 pb-10 dark:border-white/10">
+          <p class="font-mono text-xs font-medium tracking-wide text-orange-700 uppercase dark:text-orange-400">A SlateDB-style log-structured merge tree on Cloudflare</p>
+          <h1 class="mt-3 max-w-[24ch] text-4xl font-semibold tracking-tight text-balance sm:text-5xl">How shaledb works</h1>
+          <p class="mt-5 max-w-[56ch] text-base/7 text-pretty text-zinc-600 sm:text-lg/8 dark:text-zinc-400">Each database has one writer and many readers. shaledb stores immutable SSTs in R2 and versions each database's manifest with compare-and-swap, or CAS. The writer is a Durable Object whose SQLite table is both the write-ahead log and the memtable. A Cloudflare Workflow runs compaction. Click the diagrams to step through them.</p>
+          <dl class="mt-10 grid grid-cols-2 gap-y-6 sm:grid-cols-4">
+            <div class="pr-6 sm:border-r sm:border-zinc-950/10 dark:sm:border-white/10"><dt class="truncate text-sm text-zinc-500 dark:text-zinc-400">Workers</dt><dd class="mt-1 text-3xl font-semibold tracking-tight tabular-nums">5</dd></div>
+            <div class="pl-6 sm:border-r sm:border-zinc-950/10 sm:px-6 dark:sm:border-white/10"><dt class="truncate text-sm text-zinc-500 dark:text-zinc-400">Durable Object classes</dt><dd class="mt-1 text-3xl font-semibold tracking-tight tabular-nums">4</dd></div>
+            <div class="sm:border-r sm:border-zinc-950/10 sm:px-6 dark:sm:border-white/10"><dt class="truncate text-sm text-zinc-500 dark:text-zinc-400">Public endpoints</dt><dd class="mt-1 text-3xl font-semibold tracking-tight tabular-nums">23</dd></div>
+            <div class="pl-6"><dt class="truncate text-sm text-zinc-500 dark:text-zinc-400">Timers and crons</dt><dd class="mt-1 text-3xl font-semibold tracking-tight tabular-nums">4</dd></div>
+          </dl>
+        </header>
+
+        <!-- 1 Topology -->
+        <section id="topology" data-section="Topology" class="py-14">
+          <div class="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+            <div>
+              <p class="font-mono text-xs tracking-wide text-zinc-500 uppercase">01</p>
+              <h2 class="mt-2 text-2xl font-semibold tracking-tight text-balance">Topology</h2>
+              <p class="mt-2 max-w-[56ch] text-base/7 text-pretty text-zinc-600 sm:text-sm/6 dark:text-zinc-400">One Alchemy Stack deploys every part. Each database has its own writer and compactor Durable Object, and stores all of its data under <code class="font-mono">db/&lt;id&gt;/</code>. Pick a flow to animate it, or click a node to see what it does.</p>
+            </div>
+            <div id="legend" class="flex flex-wrap gap-x-4 gap-y-2 text-sm text-zinc-600 dark:text-zinc-400"></div>
+          </div>
+
+          <div class="mt-7 -mx-4 overflow-x-auto px-3 sm:-mx-1 sm:px-0">
+            <div role="group" aria-label="Flows" id="flow-buttons" class="flex w-max gap-2 p-1"></div>
+          </div>
+
+          <div class="mt-4 grid gap-8 2xl:grid-cols-[23fr_9fr]">
+            <div class="min-w-0">
+              <p class="mb-2 text-sm text-zinc-500 sm:hidden">Scroll sideways to see the whole diagram.</p>
+              <div class="-mx-4 overflow-x-auto sm:mx-0">
+                <svg id="topo" viewBox="0 0 1090 700" class="h-auto w-[68rem] max-w-none sm:w-full" role="img" aria-label="shaledb deployment topology"></svg>
+              </div>
+            </div>
+            <div class="min-w-0 border-t border-zinc-950/10 pt-6 2xl:border-t-0 2xl:border-l 2xl:pt-0 2xl:pl-6 dark:border-white/10">
+              <div id="flow-panel" class="max-w-2xl"></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 2 Abstractions -->
+        <section id="layers" data-section="Abstractions" class="border-t border-zinc-950/5 py-14 dark:border-white/10">
+          <p class="font-mono text-xs tracking-wide text-zinc-500 uppercase">02</p>
+          <h2 class="mt-2 text-2xl font-semibold tracking-tight text-balance">Abstractions, layer by layer</h2>
+          <p class="mt-2 max-w-[56ch] text-base/7 text-pretty text-zinc-600 sm:text-sm/6 dark:text-zinc-400">Each layer calls only the layers below it. <code class="font-mono">lsm-core</code> has no Cloudflare imports. Point at a service, or tab to it, to see what it does.</p>
+          <div id="layer-stack" class="mt-8 flex flex-col"></div>
+          <div class="mt-6 flex min-h-20 items-start gap-4 rounded-lg bg-zinc-50 p-4 dark:bg-white/5" aria-live="polite">
+            <div id="layer-detail" class="min-w-0 text-base/7 sm:text-sm/6"></div>
+          </div>
+        </section>
+
+        <!-- 3 Endpoints -->
+        <section id="endpoints" data-section="Endpoints" class="border-t border-zinc-950/5 py-14 dark:border-white/10">
+          <p class="font-mono text-xs tracking-wide text-zinc-500 uppercase">03</p>
+          <h2 class="mt-2 text-2xl font-semibold tracking-tight text-balance">Every endpoint and its code path</h2>
+          <p class="mt-2 max-w-[56ch] text-base/7 text-pretty text-zinc-600 sm:text-sm/6 dark:text-zinc-400"><code class="font-mono">DbApiWorker</code>, <code class="font-mono">GcWorker</code>, and <code class="font-mono">ShardRouterWorker</code> serve the public routes under <code class="font-mono">/v1</code>. The internal APIs carry HTTP requests between Workers and Durable Objects. Open a row to see its call tree.</p>
+          <div class="mt-8 flex flex-col gap-4 sm:flex-row sm:items-center">
+            <div class="min-w-0 flex-1 sm:max-w-xs">
+              <label for="ep-search" class="sr-only">Filter endpoints</label>
+              <input id="ep-search" name="ep-search" type="search" placeholder="Filter by path or function" class="w-full rounded-md bg-white px-3 py-2 text-base text-zinc-950 ring-1 ring-zinc-950/10 placeholder:text-zinc-400 focus-visible:outline-2 focus-visible:-outline-offset-1 focus-visible:outline-orange-600 sm:text-sm/6 dark:bg-white/5 dark:text-white dark:ring-white/10" />
+            </div>
+            <div class="-mx-4 overflow-x-auto px-3 sm:-mx-1 sm:px-0">
+              <div role="group" aria-label="Endpoint groups" id="ep-groups" class="flex w-max gap-1 p-1"></div>
+            </div>
+          </div>
+          <ul role="list" id="ep-list" class="mt-6 divide-y divide-zinc-950/5 border-y border-zinc-950/5 dark:divide-white/10 dark:border-white/10"></ul>
+          <p id="ep-empty" class="mt-6 text-base text-zinc-500 sm:text-sm" hidden>No endpoint matches that filter.</p>
+        </section>
+
+        <!-- 4 Write -->
+        <section id="write" data-section="Write and flush" class="border-t border-zinc-950/5 py-14 dark:border-white/10">
+          <p class="font-mono text-xs tracking-wide text-zinc-500 uppercase">04</p>
+          <h2 class="mt-2 text-2xl font-semibold tracking-tight text-balance">Write path and flush</h2>
+          <p class="mt-2 max-w-[56ch] text-base/7 text-pretty text-zinc-600 sm:text-sm/6 dark:text-zinc-400">A write is durable once SQLite commits it. A flush uploads the unflushed rows as one L0 SST and commits a new manifest by CAS. Only then does the writer mark the rows flushed. The rows stay in SQLite for transactions until a trim removes them.</p>
+          <div class="mt-8" id="seq-write"></div>
+          <div class="mt-10 grid *:min-w-0 gap-x-12 gap-y-8 lg:grid-cols-2">
+            <div>
+              <h3 class="text-base font-semibold sm:text-sm">Crash and fencing cases</h3>
+              <dl id="write-safety" class="mt-4 divide-y divide-zinc-950/5 dark:divide-white/10"></dl>
+            </div>
+            <div>
+              <h3 class="text-base font-semibold sm:text-sm">DbWriter.flush, step by step</h3>
+              <pre class="mt-4 overflow-x-auto rounded-lg bg-zinc-50 p-4 font-mono text-[0.8125rem]/6 text-zinc-700 dark:bg-white/5 dark:text-zinc-300"><code>flushLock
+  flushOnce
+    cut = memTable.meta.lastSeq
+    ssts.write(keepReachableVersions(rows))
+    exportChangelog                    <span class="text-zinc-400"># only with a changelog</span>
+    manifests.updateFrom(commitL0Flush)
+      on WriterFencedError, markFenced
+      on FlushedSeqStaleError, markFlushed and retry once
+    memTable.markFlushed(cut), then trim
+    refreshUnflushedCounters
+    wakeCompactor if L0 has 4 SSTs     <span class="text-zinc-400"># in the background</span></code></pre>
+            </div>
+          </div>
+        </section>
+
+        <!-- 5 Read -->
+        <section id="read" data-section="Reads" class="border-t border-zinc-950/5 py-14 dark:border-white/10">
+          <p class="font-mono text-xs tracking-wide text-zinc-500 uppercase">05</p>
+          <h2 class="mt-2 text-2xl font-semibold tracking-tight text-balance">Read path</h2>
+          <p class="mt-2 max-w-[56ch] text-base/7 text-pretty text-zinc-600 sm:text-sm/6 dark:text-zinc-400">Reads run in the API Worker's isolate, not in the writer. The consistency level decides whether a read calls the writer. Block bytes come from two caches in front of R2.</p>
+          <div class="mt-8 grid *:min-w-0 gap-x-12 gap-y-12 lg:grid-cols-2">
+            <div>
+              <h3 class="text-base font-semibold sm:text-sm">Consistency decides the path</h3>
+              <div role="group" aria-label="Consistency" id="consistency" class="mt-4 inline-flex rounded-lg bg-zinc-100 p-1 dark:bg-white/5"></div>
+              <p id="consistency-desc" class="mt-4 max-w-[56ch] text-base/7 text-pretty text-zinc-600 sm:text-sm/6 dark:text-zinc-400"></p>
+              <ol role="list" id="read-steps" class="mt-6"></ol>
+            </div>
+            <div>
+              <h3 class="text-base font-semibold sm:text-sm">Where block bytes come from</h3>
+              <div role="group" aria-label="Cache scenario" id="cache-buttons" class="mt-4 flex flex-wrap gap-2"></div>
+              <div id="cache-tiers" class="mt-6 flex flex-col gap-3"></div>
+              <p id="cache-caption" class="mt-5 max-w-[56ch] text-base/7 text-pretty text-zinc-600 sm:text-sm/6 dark:text-zinc-400" aria-live="polite"></p>
+            </div>
+          </div>
+        </section>
+
+        <!-- 6 Timers -->
+        <section id="timers" data-section="Timers and crons" class="border-t border-zinc-950/5 py-14 dark:border-white/10">
+          <p class="font-mono text-xs tracking-wide text-zinc-500 uppercase">06</p>
+          <h2 class="mt-2 text-2xl font-semibold tracking-tight text-balance">Timers, crons, and background work</h2>
+          <p class="mt-2 max-w-[56ch] text-base/7 text-pretty text-zinc-600 sm:text-sm/6 dark:text-zinc-400">Nothing runs a polling loop. Every periodic process is a Durable Object alarm, a cron trigger, a Workflow, or <code class="font-mono">waitUntil</code>. An idle database has no alarm set. The simulation below plays ten minutes of steady writes. The write rate and the job durations are made up. The timers use the default settings.</p>
+
+          <div class="mt-8 flex flex-wrap items-center gap-3">
+            <button type="button" id="sim-play" class="rounded-md bg-orange-600 px-3 py-2 text-sm font-semibold text-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-orange-600 dark:bg-orange-500 dark:text-zinc-950">Play simulation</button>
+            <button type="button" id="sim-reset" class="rounded-md px-3 py-2 text-sm font-medium text-zinc-700 ring-1 ring-zinc-950/10 dark:text-zinc-300 dark:ring-white/15">Reset</button>
+            <div class="inline-grid grid-cols-[1fr_--spacing(8)]">
+              <label for="sim-speed" class="sr-only">Speed</label>
+              <select id="sim-speed" name="sim-speed" class="col-span-full row-start-1 appearance-none rounded-md bg-transparent py-2 pr-8 pl-3 text-base text-zinc-700 ring-1 ring-zinc-950/10 sm:text-sm dark:text-zinc-300 dark:ring-white/15">
+                <option value="15">15 times speed</option>
+                <option value="30" selected>30 times speed</option>
+                <option value="60">60 times speed</option>
+              </select>
+              <svg viewBox="0 0 8 5" width="8" height="5" fill="none" class="pointer-events-none col-start-2 row-start-1 place-self-center stroke-zinc-500"><path d="M.5.5 4 4 7.5.5" /></svg>
+            </div>
+            <p class="font-mono text-sm text-zinc-500 tabular-nums" aria-live="off">t = <span id="sim-clock">0:00</span></p>
+          </div>
+
+          <div class="mt-6 grid gap-8 xl:grid-cols-[3fr_1fr]">
+            <div class="min-w-0">
+              <div class="-mx-4 overflow-x-auto px-4 sm:mx-0 sm:px-0">
+                <div id="lanes" class="relative min-w-[44rem]"></div>
+              </div>
+              <h3 class="mt-8 text-base font-semibold sm:text-sm">Event log</h3>
+              <ol role="list" id="sim-log" class="mt-3 max-h-56 overflow-y-auto font-mono text-[0.8125rem]/6 text-zinc-600 dark:text-zinc-400"></ol>
+            </div>
+            <div class="min-w-0">
+              <dl id="sim-state" class="grid grid-cols-2 gap-x-6 gap-y-4 xl:grid-cols-1"></dl>
+            </div>
+          </div>
+
+          <h3 class="mt-14 text-base font-semibold sm:text-sm">Every trigger</h3>
+          <div class="mt-4 -mx-4 -my-2 overflow-x-auto whitespace-nowrap sm:-mx-8 lg:-mx-12">
+            <div class="inline-block min-w-full px-4 py-2 align-middle sm:px-8 lg:px-12">
+              <table class="w-full text-left text-sm/6">
+                <thead class="text-zinc-500 dark:text-zinc-400">
+                  <tr><th class="py-2 pr-6 font-medium whitespace-nowrap">Trigger</th><th class="py-2 pr-6 font-medium whitespace-nowrap">Kind</th><th class="py-2 pr-6 font-medium whitespace-nowrap">Where</th><th class="py-2 pr-6 font-medium whitespace-nowrap">When</th><th class="py-2 font-medium whitespace-nowrap">Does</th></tr>
+                </thead>
+                <tbody id="timer-table" class="divide-y divide-zinc-950/5 border-t border-zinc-950/10 dark:divide-white/10 dark:border-white/10"></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- 7 Compaction -->
+        <section id="compaction" data-section="Compaction" class="border-t border-zinc-950/5 py-14 dark:border-white/10">
+          <p class="font-mono text-xs tracking-wide text-zinc-500 uppercase">07</p>
+          <h2 class="mt-2 text-2xl font-semibold tracking-tight text-balance">Compaction</h2>
+          <p class="mt-2 max-w-[56ch] text-base/7 text-pretty text-zinc-600 sm:text-sm/6 dark:text-zinc-400">The compactor plans jobs, and a Workflow runs them. The compactor records each job in its state before it launches the job. A job's commit replaces exactly its inputs and records its job id, so a retried commit changes nothing.</p>
+          <div class="mt-8" id="seq-compaction"></div>
+          <div class="mt-12">
+            <h3 class="text-base font-semibold sm:text-sm">The compactor Durable Object, as a state machine</h3>
+            <p class="mt-1 max-w-[56ch] text-base/7 text-pretty text-zinc-600 sm:text-sm/6 dark:text-zinc-400">Click an event to move the compactor to its next state. The buttons show only the events that the current state accepts.</p>
+            <div id="sm-compactor" class="mt-6"></div>
+          </div>
+        </section>
+
+        <!-- 8 GC -->
+        <section id="gc" data-section="Garbage collection" class="border-t border-zinc-950/5 py-14 dark:border-white/10">
+          <p class="font-mono text-xs tracking-wide text-zinc-500 uppercase">08</p>
+          <h2 class="mt-2 text-2xl font-semibold tracking-tight text-balance">Garbage collection and the maintenance sweep</h2>
+          <p class="mt-2 max-w-[56ch] text-base/7 text-pretty text-zinc-600 sm:text-sm/6 dark:text-zinc-400">Each database's compactor runs that database's garbage collection, one collection at a time. The cron sweep handles the cases that no compactor handles: removed databases, lost wakes, and holds that forks keep on their sources.</p>
+          <div class="mt-8 grid *:min-w-0 gap-x-12 gap-y-12 lg:grid-cols-2">
+            <div>
+              <h3 class="text-base font-semibold sm:text-sm">GarbageCollector.collect, per database</h3>
+              <ol role="list" id="gc-collect" class="mt-5"></ol>
+            </div>
+            <div>
+              <h3 class="text-base font-semibold sm:text-sm">MaintenanceSweep.sweepPage(50), every five minutes</h3>
+              <ol role="list" id="gc-sweep" class="mt-5"></ol>
+            </div>
+          </div>
+        </section>
+
+        <!-- 9 Lifecycle -->
+        <section id="lifecycle" data-section="Lifecycle and sharding" class="border-t border-zinc-950/5 py-14 dark:border-white/10">
+          <p class="font-mono text-xs tracking-wide text-zinc-500 uppercase">09</p>
+          <h2 class="mt-2 text-2xl font-semibold tracking-tight text-balance">Database lifecycle and sharding</h2>
+          <p class="mt-2 max-w-[56ch] text-base/7 text-pretty text-zinc-600 sm:text-sm/6 dark:text-zinc-400">Every lifecycle change is a manifest CAS. A fork copies no data. It references the source's SSTs and holds the source until the fork's compactions have rewritten them.</p>
+          <div id="sm-lifecycle" class="mt-8"></div>
+          <div class="mt-12">
+            <h3 class="text-base font-semibold sm:text-sm">ShardSplit.split, step by step</h3>
+            <div class="mt-4" id="seq-split"></div>
+          </div>
+        </section>
+
+        <!-- 10 Storage -->
+        <section id="storage" data-section="Storage layout" class="border-t border-zinc-950/5 py-14 dark:border-white/10">
+          <p class="font-mono text-xs tracking-wide text-zinc-500 uppercase">10</p>
+          <h2 class="mt-2 text-2xl font-semibold tracking-tight text-balance">Storage layout</h2>
+          <p class="mt-2 max-w-[56ch] text-base/7 text-pretty text-zinc-600 sm:text-sm/6 dark:text-zinc-400">Select an entry to see which processes write it, read it, and delete it.</p>
+          <div class="mt-8 grid *:min-w-0 gap-x-12 gap-y-8 lg:grid-cols-2">
+            <ul role="list" id="storage-tree" class="font-mono text-[0.8125rem]/7"></ul>
+            <div id="storage-detail" class="lg:sticky lg:top-10 lg:self-start" aria-live="polite"></div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script>
+      // ────────────────────────────────────────────────────────── helpers
+      const $ = (sel, root = document) => root.querySelector(sel);
+      const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
+      const h = (tag, attrs = {}, html = "") => {
+        const el = document.createElement(tag);
+        for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+        el.innerHTML = html;
+        return el;
+      };
+      const SVG = "http://www.w3.org/2000/svg";
+      const s = (tag, attrs = {}) => {
+        const el = document.createElementNS(SVG, tag);
+        for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+        return el;
+      };
+      const esc = (t) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+      const sleep = (ms) => new Promise((r) => setTimeout(r, reduced ? 0 : ms));
+      const code = (t) => `<code class="font-mono text-[0.92em] text-zinc-950 dark:text-white">${esc(t)}</code>`;
+
+      // Segmented / pill button helpers (secondary styles; the page has one primary button)
+      const pillClass =
+        "rounded-full px-3 py-1.5 text-sm font-medium whitespace-nowrap text-zinc-600 ring-1 ring-zinc-950/10 hover:bg-zinc-50 aria-pressed:bg-orange-50 aria-pressed:text-orange-800 aria-pressed:ring-orange-600/30 dark:text-zinc-400 dark:ring-white/15 dark:hover:bg-white/5 dark:aria-pressed:bg-orange-400/10 dark:aria-pressed:text-orange-300 dark:aria-pressed:ring-orange-400/30";
+      const segClass =
+        "rounded-md px-3 py-1.5 text-sm font-medium text-zinc-600 hover:text-zinc-950 aria-pressed:bg-white aria-pressed:text-zinc-950 aria-pressed:shadow-xs aria-pressed:ring-1 aria-pressed:ring-zinc-950/5 dark:text-zinc-400 dark:hover:text-white dark:aria-pressed:bg-white/10 dark:aria-pressed:text-white dark:aria-pressed:shadow-none dark:aria-pressed:ring-white/10";
+      const ghostBtn =
+        "rounded-md px-2.5 py-1.5 text-sm font-medium text-zinc-700 ring-1 ring-zinc-950/10 hover:bg-zinc-50 disabled:opacity-40 dark:text-zinc-300 dark:ring-white/15 dark:hover:bg-white/5";
+      const press = (group, btn) => {
+        $$("button", group).forEach((b) => b.setAttribute("aria-pressed", String(b === btn)));
+      };
+
+      // Color tokens for each kind of node
+      const KINDS = {
+        actor: { label: "Caller", node: "fill-white stroke-zinc-300 dark:fill-zinc-900 dark:stroke-zinc-700", dot: "bg-zinc-400", text: "fill-zinc-950 dark:fill-white" },
+        worker: { label: "Worker", node: "fill-zinc-50 stroke-zinc-300 dark:fill-zinc-900 dark:stroke-zinc-600", dot: "bg-zinc-500", text: "fill-zinc-950 dark:fill-white" },
+        do: { label: "Durable Object", node: "fill-teal-50 stroke-teal-600/40 dark:fill-teal-400/10 dark:stroke-teal-400/40", dot: "bg-teal-500", text: "fill-teal-950 dark:fill-teal-100" },
+        wf: { label: "Workflow", node: "fill-amber-50 stroke-amber-600/40 dark:fill-amber-400/10 dark:stroke-amber-400/40", dot: "bg-amber-500", text: "fill-amber-950 dark:fill-amber-100" },
+        cache: { label: "Cache", node: "fill-sky-50 stroke-sky-600/40 dark:fill-sky-400/10 dark:stroke-sky-400/40", dot: "bg-sky-500", text: "fill-sky-950 dark:fill-sky-100" },
+        r2: { label: "R2", node: "fill-violet-50 stroke-violet-600/40 dark:fill-violet-400/10 dark:stroke-violet-400/40", dot: "bg-violet-500", text: "fill-violet-950 dark:fill-violet-100" },
+        timer: { label: "Cron", node: "fill-rose-50 stroke-rose-600/40 dark:fill-rose-400/10 dark:stroke-rose-400/40", dot: "bg-rose-500", text: "fill-rose-950 dark:fill-rose-100" },
+      };
+      const kindBadge = (k) =>
+        `<span class="inline-flex items-center gap-1.5 text-sm text-zinc-600 dark:text-zinc-400"><span class="size-2 shrink-0 rounded-full ${KINDS[k].dot}"></span>${KINDS[k].label}</span>`;
+
+      // ────────────────────────────────────────────────────────── nav + scrollspy
+      const sections = $$("[data-section]");
+      $$("[data-nav]").forEach((nav) => {
+        const ul = h("ul", { role: "list", class: "flex flex-col gap-0.5" });
+        sections.forEach((sec, i) => {
+          const li = h(
+            "li",
+            {},
+            `<a href="#${sec.id}" data-spy="${sec.id}" class="flex gap-3 rounded-md px-2 py-1.5 text-base text-zinc-600 hover:bg-zinc-50 hover:text-zinc-950 aria-current:bg-zinc-100 aria-current:text-zinc-950 sm:text-sm dark:text-zinc-400 dark:hover:bg-white/5 dark:hover:text-white dark:aria-current:bg-white/10 dark:aria-current:text-white"><span class="w-5 shrink-0 font-mono text-xs/6 text-zinc-400 tabular-nums sm:text-xs/5">${String(i + 1).padStart(2, "0")}</span><span class="min-w-0 truncate">${sec.dataset.section}</span></a>`,
+          );
+          ul.append(li);
+        });
+        nav.append(ul);
+      });
+      const spy = new IntersectionObserver(
+        (entries) => {
+          for (const e of entries) {
+            if (!e.isIntersecting) continue;
+            $$("[data-spy]").forEach((a) => (a.dataset.spy === e.target.id ? a.setAttribute("aria-current", "true") : a.removeAttribute("aria-current")));
+          }
+        },
+        { rootMargin: "-30% 0px -60% 0px" },
+      );
+      sections.forEach((sec) => spy.observe(sec));
+      const menu = $("#menu");
+      $("#menu-open").onclick = () => menu.showModal();
+      $("#menu-close").onclick = () => menu.close();
+      menu.addEventListener("click", (e) => e.target.closest("a") && menu.close());
+
+      // ────────────────────────────────────────────────────────── topology
+      const C = { c0: [20, 120], c1: [180, 230], c2: [450, 210], c3: [700, 170] };
+      const N = {
+        client: { col: "c0", y: 50, kind: "actor", title: "Client", sub: "Bearer token" },
+        operator: { col: "c0", y: 440, kind: "actor", title: "Operator", sub: "Collection API" },
+        cron: { col: "c0", y: 520, kind: "timer", title: "Cron", sub: "*/5 * * * *" },
+        sclient: { col: "c0", y: 610, kind: "actor", title: "Sharded client", sub: "/v1/groups" },
+        api: { col: "c1", y: 50, kind: "worker", title: "DbApiWorker", sub: "DbHttpApi at /v1" },
+        dbclient: { col: "c1", y: 130, kind: "worker", title: "DbClient", sub: "Read views and transactions" },
+        reader: { col: "c1", y: 250, kind: "worker", title: "DbReader", sub: "Manifest cache, L1 block cache" },
+        lifecycle: { col: "c1", y: 340, kind: "worker", title: "DatabaseLifecycle", sub: "Create, fork, seal, remove" },
+        gc: { col: "c1", y: 500, kind: "worker", title: "GcWorker", sub: "MaintenanceSweep" },
+        router: { col: "c1", y: 610, kind: "worker", title: "ShardRouterWorker", sub: "ShardRouter, ShardSplit" },
+        writer: { col: "c2", y: 50, kind: "do", title: "WriterServer", sub: "One per database, SQLite" },
+        blocks: { col: "c2", y: 180, kind: "worker", title: "BlockServerWorker", sub: "Service binding only" },
+        compactor: { col: "c2", y: 340, kind: "do", title: "CompactorServer", sub: "One per database" },
+        budget: { col: "c2", y: 440, kind: "do", title: "CompactionBudget", sub: "One global instance" },
+        directory: { col: "c2", y: 610, kind: "do", title: "ShardDirectory", sub: "One per shard group" },
+        wcache: { col: "c3", y: 180, kind: "cache", title: "Workers Cache", sub: "Tag db:<id>" },
+        workflow: { col: "c3", y: 410, kind: "wf", title: "CompactionWorkflow", sub: "One instance per job" },
+        r2: { x: 910, w: 160, y: 40, h: 630, kind: "r2", title: "R2 bucket", sub: "db/<id>/" },
+      };
+      for (const n of Object.values(N)) {
+        if (n.col) [n.x, n.w] = C[n.col];
+        n.h ??= 56;
+      }
+      const center = (n) => [n.x + n.w / 2, n.y + n.h / 2];
+      const anchor = (n, side, y) => {
+        if (side === "r") return [n.x + n.w, y ?? n.y + n.h / 2];
+        if (side === "l") return [n.x, y ?? n.y + n.h / 2];
+        if (side === "t") return [n.x + n.w / 2, n.y];
+        return [n.x + n.w / 2, n.y + n.h];
+      };
+      const curve = (a, b, horizontal) => {
+        const [x1, y1] = a, [x2, y2] = b;
+        if (horizontal) {
+          const mx = (x1 + x2) / 2;
+          return `M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`;
+        }
+        const my = (y1 + y2) / 2;
+        return `M${x1},${y1} C${x1},${my} ${x2},${my} ${x2},${y2}`;
+      };
+      const autoPath = (f, t) => {
+        const A = N[f], B = N[t];
+        if (t === "r2") {
+          const y = Math.min(B.y + B.h - 20, Math.max(B.y + 20, A.y + A.h / 2));
+          return curve(anchor(A, "r"), anchor(B, "l", y), true);
+        }
+        const [ax, ay] = center(A), [bx, by] = center(B);
+        const dx = bx - ax, dy = by - ay;
+        if (Math.abs(dx) > 60) return dx > 0 ? curve(anchor(A, "r"), anchor(B, "l"), true) : curve(anchor(A, "l"), anchor(B, "r"), true);
+        return dy > 0 ? curve(anchor(A, "b"), anchor(B, "t"), false) : curve(anchor(A, "t"), anchor(B, "b"), false);
+      };
+      const bulge = (f, fs, t, ts, x) => {
+        const a = anchor(N[f], fs), b = anchor(N[t], ts);
+        return `M${a[0]},${a[1]} C${x},${a[1]} ${x},${b[1]} ${b[0]},${b[1]}`;
+      };
+      const E = {
+        "client-api": {},
+        "api-writer": {},
+        "api-dbclient": {},
+        "api-lifecycle": { d: () => bulge("api", "l", "lifecycle", "l", 150) },
+        "dbclient-writer": {},
+        "dbclient-reader": {},
+        "reader-blocks": {},
+        "reader-r2": {},
+        "blocks-wcache": {},
+        "wcache-r2": {},
+        "writer-r2": {},
+        "writer-compactor": { async: true, d: () => bulge("writer", "r", "compactor", "r", 690) },
+        "lifecycle-writer": { d: () => { const a = anchor(N.lifecycle, "r", 356), b = anchor(N.writer, "l", 92); return `M${a[0]},${a[1]} C440,${a[1]} 420,${b[1]} ${b[0]},${b[1]}`; } },
+        "lifecycle-compactor": {},
+        "compactor-budget": {},
+        "compactor-workflow": {},
+        "workflow-r2": {},
+        "compactor-r2": {},
+        "operator-gc": {},
+        "cron-gc": {},
+        "gc-compactor": {},
+        "gc-r2": {},
+        "sclient-router": {},
+        "router-directory": {},
+      };
+
+      const DETAILS = {
+        client: { file: "", body: "Calls the public API with the stage's access token. A write returns a receipt with `seq` and `createTs`. An `AtLeast` read uses `seq` to see the caller's own write.", fns: [] },
+        operator: { file: "gc-http-api.ts", body: "Asks the garbage collection API to collect one database now, or to run one page of the maintenance sweep. This API checks the same access token as the public API.", fns: ["POST /v1/gc/databases/:id", "POST /v1/gc"] },
+        cron: { file: "gc-worker-entry.ts", body: "The cron trigger of `GcWorker`. Each run visits one page of 50 databases, so the cost of a run does not grow with the number of databases.", fns: ["schedule: */5 * * * *"] },
+        sclient: { file: "shard-router-worker.ts", body: "A client of the optional sharding layer. The sharding layer routes each key to the database that owns its key range, and it uses only public APIs.", fns: [] },
+        api: { file: "db-api-worker.ts, db-http-handlers.ts", body: "Serves the public `/v1` API and hosts every writer Durable Object. Reads run in this Worker's isolate. Writes and `Latest` probes go to the writer. Each isolate builds the manifest cache, the L1 block cache, and the clients once.", fns: ["WriterClient", "DbClient", "DatabaseLifecycle", "CompactorClient", "ManifestReader"] },
+        dbclient: { file: "db-client.ts", body: "Builds a read view for the consistency level the caller asks for. A `Latest` read asks the writer. An `AtLeast` read asks the writer only when the cached manifest is behind. `Flushed` and snapshot reads never ask the writer. DbClient also retries a read that a flush overtakes, pages scans with `resumeFrom`, and runs transactions and the change feed.", fns: ["getRow", "scan", "scanUnflushed", "beginTransaction", "getAt", "scanAtPage", "commitTransaction", "changes", "snapshot"] },
+        reader: { file: "db-reader.ts, manifest-cache.ts, block-cache.ts", body: "Merges the memtable rows, the L0 SSTs newest first, and the sorted runs. For each SST it checks the bloom filter, then the index, then the block. The manifest cache refreshes at most once a second and keeps a manifest for at most half of `gcMinAge`. The L1 cache in each isolate holds 32 MiB of data blocks and 16 MiB of metadata.", fns: ["getRow", "scan", "sstVersions", "changelogRows"] },
+        lifecycle: { file: "database-lifecycle.ts", body: "Commits every operation as a manifest CAS. A fork references the source's SSTs without copying them, then starts its own writer and compactor in the background. A removal sets the manifest state to Removed, destroys the writer state and the compactor state, deletes the objects, and purges the database's cache tag.", fns: ["create", "createCheckpoint", "pinSnapshot", "deleteCheckpoint", "seal", "forkRange", "remove", "dropSst"] },
+        gc: { file: "gc-worker.ts, maintenance-sweep.ts", body: "Each cron run calls `sweepPage(50)`. A request to collect one database now goes to that database's compactor, because the compactor runs that database's garbage collection.", fns: ["sweepPage", "collect"] },
+        router: { file: "lsm-sharding/shard-router-worker.ts", body: "The example sharded API. It routes each key with the group's shard map. When a split is pending, it waits up to 30 seconds, then finishes the split itself.", fns: ["put", "delete", "get", "scan", "split", "resumePending"] },
+        writer: { file: "db-writer.ts, mem-table.ts, writer-server.ts", body: "One per database. The SQLite tables `memtable_rows`, `writer_meta`, and `flush_marks` hold the write-ahead log and the memtable. On start the writer increments `writerEpoch` in the manifest. It takes `commitLock` for each write and `flushLock` for each flush, and its alarm runs the flushes.", fns: ["write", "commitTransaction", "probe", "probeAt", "scan", "flush", "changes", "status", "seal", "destroy", "runAlarm"] },
+        blocks: { file: "block-server-worker.ts", body: "Has no public URL. The API Worker calls it with a plain `fetch()` over a service binding, not RPC, so every request goes through Workers Cache. It serves block ranges, metadata ranges, and manifests, and it purges cached blocks by tag.", fns: ["GET block/:range", "GET meta/:range", "GET manifests/latest", "GET manifests/:id", "POST purge"] },
+        wcache: { file: "block-server-worker.ts", body: "A cache in each Cloudflare data center, in front of R2. BlockServer tags each block `db:<id>`, so a removal can purge a database's blocks. A Stack restricted to one jurisdiction turns Workers Cache off. Local development does not emulate it.", fns: [] },
+        compactor: { file: "compactor.ts, compactor-server.ts", body: "One per database. On its first wake it increments `compactorEpoch` in the manifest. While it has work, its alarm polls every 5 seconds. It plans size-tiered jobs of 4 to 8 source SSTs and records each job in its state before it launches the job. It also runs its database's garbage collection. With no work, it sets no alarm.", fns: ["wake", "poll", "collect", "requestCollection", "dropSst", "status", "destroy", "runAlarm"] },
+        budget: { file: "compaction-budget-server.ts", body: "A single instance named `global` holds the lease ledger. It grants at most 32 leases and divides them fairly across budget groups. A lease lasts 15 minutes and each poll renews it, so a lost job frees its slot.", fns: ["acquire", "release"] },
+        directory: { file: "lsm-sharding/shard-directory-server.ts", body: "One per shard group. It stores the shard map and the pending split. `awaitMap` is a long poll that returns the next map.", fns: ["create", "map", "awaitMap", "beginSplit", "completeSplit", "reportSplitFailed"] },
+        workflow: { file: "compaction-workflow.ts, compaction-executor.ts", body: "One instance per job id. Its steps are `prepare`, one `output-n` step per output SST, and `commit`. Each output step writes at most 64 MiB and reads at most 1.5 times that. A retried `commit` changes nothing, because the commit records the job id. Inputs stream straight from R2 and skip the caches. Outputs upload in 8 MiB multipart parts.", fns: ["prepare", "writeOutput", "commit"] },
+        r2: { file: "object-store.ts, object-keys.ts", body: "One bucket per Stack, in one fixed jurisdiction. The engine writes each manifest with putIfAbsent, so two writers cannot both create the same manifest id. An SST never changes after upload, and each SST name is a ULID.", fns: ["manifest/", "compacted/", "changelog/", "gc/"] },
+      };
+
+      const FLOWS = [
+        { id: "write", label: "Write", steps: [
+          ["client-api", 1, "The client sends POST /v1/databases/:id/batches."],
+          ["api-writer", 1, "WriterClient forwards the batch to DbWriter.write in the writer."],
+          ["@writer", 0, "The writer takes commitLock, checks the stall limits, sets an alarm, and commits the rows to SQLite."],
+          ["api-writer", -1, "The writer returns seq and createTs."],
+          ["client-api", -1, "The API returns 200. The write is durable."],
+        ] },
+        { id: "flush", label: "Flush", steps: [
+          ["@writer", 0, "The writer alarm fires, because the oldest row is 60 seconds old or 64 MiB is unflushed."],
+          ["writer-r2", 1, "SstStore.write uploads one L0 SST to db/<id>/compacted/."],
+          ["writer-r2", 1, "ManifestStore.updateFrom commits the flush as a manifest CAS. A writer with an older epoch fails here."],
+          ["@writer", 0, "The writer marks the rows flushed and trims rows older than the transaction window."],
+          ["writer-compactor", 1, "L0 now has 4 SSTs, so the writer wakes the compactor in the background."],
+        ] },
+        { id: "latest", label: "Latest read", steps: [
+          ["client-api", 1, "The client sends POST /get with Latest consistency."],
+          ["api-dbclient", 1, "DbClient.getRow builds a read view for the key."],
+          ["dbclient-writer", 1, "writer.probe returns the key's unflushed versions, flushedSeq, and snapshotSeq."],
+          ["dbclient-reader", 1, "DbReader.getRow reads the key through that view."],
+          ["reader-r2", 1, "The manifest cache supplies a manifest whose lastL0Seq is at least flushedSeq."],
+          ["reader-blocks", 1, "The block is not in L1, so BlockSource fetches it from BlockServer."],
+          ["blocks-wcache", 1, "BlockServer looks the block up in Workers Cache."],
+          ["wcache-r2", 1, "Workers Cache misses, so BlockServer reads the byte range from R2."],
+        ] },
+        { id: "flushed", label: "Flushed read", steps: [
+          ["client-api", 1, "The client sends POST /get with Flushed consistency."],
+          ["api-dbclient", 1, "DbClient.getRow uses the flushed view and does not call the writer."],
+          ["dbclient-reader", 1, "DbReader.getRow reads the key."],
+          ["reader-r2", 1, "The manifest cache supplies a manifest at most 1 second old."],
+          ["reader-blocks", 1, "The blocks come from the L1 cache or from BlockServer."],
+        ] },
+        { id: "compact", label: "Compaction", steps: [
+          ["writer-compactor", 1, "A flush leaves 4 L0 SSTs, so the writer wakes the compactor."],
+          ["compactor-r2", 1, "On its first wake, the compactor increments compactorEpoch in the manifest."],
+          ["@compactor", 0, "The poll plans a size-tiered job of 4 to 8 source SSTs."],
+          ["compactor-budget", 1, "The compaction budget grants a lease for the job."],
+          ["compactor-workflow", 1, "The compactor records the job, then starts a Workflow instance for it."],
+          ["workflow-r2", 1, "The prepare and output steps stream the inputs, merge them, and upload the outputs."],
+          ["workflow-r2", 1, "The commit step replaces the inputs with the outputs in one manifest CAS."],
+          ["compactor-budget", 1, "The next poll finds the job finished, releases the lease, and schedules garbage collection 1 hour later."],
+        ] },
+        { id: "gc", label: "Cron sweep", steps: [
+          ["cron-gc", 1, "The cron fires every 5 minutes and calls MaintenanceSweep.sweepPage(50)."],
+          ["gc-r2", 1, "The sweep lists the database prefixes after its stored cursor."],
+          ["gc-compactor", 1, "The sweep wakes a compactor, or requests a collection, for each database that needs one."],
+          ["compactor-r2", 1, "The compactor runs GarbageCollector.collect, which advances the boundaries and deletes unreferenced SSTs and old manifests."],
+        ] },
+        { id: "fork", label: "Fork", steps: [
+          ["client-api", 1, "The client sends POST /forks with a checkpoint id, a key range, and a fork id."],
+          ["api-lifecycle", 1, "The API calls DatabaseLifecycle.forkRange."],
+          ["@lifecycle", 0, "ManifestStore.initialize creates the fork's manifest. The manifest references the source's SSTs, so no data is copied."],
+          ["lifecycle-writer", 1, "In the background, the fork's writer starts."],
+          ["lifecycle-compactor", 1, "In the background, the fork's compactor wakes and starts rewriting the source's SSTs."],
+        ] },
+        { id: "split", label: "Shard split", steps: [
+          ["sclient-router", 1, "The client sends POST /v1/groups/:group/splits."],
+          ["router-directory", 1, "The shard directory records the pending split and allocates 2 database ids."],
+          ["@router", 0, "The router calls DatabaseLifecycle.seal with the 2 new ids as successors."],
+          ["@writer", 0, "The shard's writer flushes, seals, and takes a hold for each successor, all in one CAS."],
+          ["@router", 0, "The router forks the left range and the right range from those holds."],
+          ["router-directory", 1, "The shard directory publishes the new shard map."],
+        ] },
+      ];
+
+      const topo = $("#topo");
+      const defs = s("defs");
+      defs.innerHTML = `
+        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,1 L9,5 L0,9 z" class="fill-zinc-500 dark:fill-zinc-600"/></marker>
+        <marker id="arrow-on" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,1 L9,5 L0,9 z" class="fill-orange-600 dark:fill-orange-400"/></marker>`;
+      topo.append(defs);
+      // group frames
+      const drawFrame = (x, y, w, h2, label) => {
+        topo.append(s("rect", { x, y, width: w, height: h2, rx: 14, class: "fill-none stroke-zinc-950/10 dark:stroke-white/10", "stroke-dasharray": "4 4" }));
+        const t = s("text", { x: x + 10, y: y - 6, class: "fill-zinc-500 font-mono text-[10px]" });
+        t.textContent = label;
+        topo.append(t);
+      };
+      drawFrame(168, 30, 254, 384, "DbApiWorker isolate");
+      drawFrame(438, 324, 444, 186, "CompactorWorker");
+      const edgeLayer = s("g"), nodeLayer = s("g"), dotLayer = s("g");
+      topo.append(edgeLayer, nodeLayer, dotLayer);
+      const edgeEls = {};
+      for (const [id, e] of Object.entries(E)) {
+        const [f, t] = id.split("-");
+        const d = e.d ? e.d() : autoPath(f, t);
+        const p = s("path", { d, fill: "none", "stroke-width": 1.5, "marker-end": "url(#arrow)", class: "stroke-zinc-400 dark:stroke-zinc-700", "data-edge": id });
+        if (e.async) p.setAttribute("stroke-dasharray", "4 4");
+        edgeLayer.append(p);
+        edgeEls[id] = p;
+      }
+      const nodeEls = {};
+      for (const [id, n] of Object.entries(N)) {
+        const g = s("g", { tabindex: 0, role: "button", "aria-label": `${n.title}: details`, class: "cursor-pointer outline-none", "data-node": id });
+        const halo = s("rect", { x: n.x - 4, y: n.y - 4, width: n.w + 8, height: n.h + 8, rx: 14, class: "fill-none stroke-orange-500 opacity-0", "stroke-width": 2, "data-halo": "" });
+        const r = s("rect", { x: n.x, y: n.y, width: n.w, height: n.h, rx: 10, "stroke-width": 1, class: KINDS[n.kind].node });
+        const tx = id === "r2" ? n.x + n.w / 2 : n.x + 14;
+        const ty = id === "r2" ? n.y + n.h / 2 - 6 : n.y + 23;
+        const anchorAttr = id === "r2" ? "middle" : "start";
+        const t1 = s("text", { x: tx, y: ty, "text-anchor": anchorAttr, class: `text-[14px] font-semibold ${KINDS[n.kind].text}` });
+        t1.textContent = n.title;
+        const t2 = s("text", { x: tx, y: ty + 17, "text-anchor": anchorAttr, class: "fill-zinc-500 text-[11.5px] dark:fill-zinc-400" });
+        t2.textContent = n.sub;
+        const base = s("rect", { x: n.x, y: n.y, width: n.w, height: n.h, rx: 10, class: "fill-white dark:fill-zinc-950" });
+        g.append(halo, base, r, t1, t2);
+        if (id === "r2") {
+          ["manifest/", "compacted/", "changelog/", "gc/"].forEach((p, i) => {
+            const pt = s("text", { x: n.x + 20, y: n.y + 40 + i * 20, class: "fill-violet-700/70 font-mono text-[10.5px] dark:fill-violet-300/70" });
+            pt.textContent = p;
+            g.append(pt);
+          });
+        }
+        nodeLayer.append(g);
+        nodeEls[id] = g;
+        const enter = () => highlightNeighbors(id, true);
+        const leave = () => highlightNeighbors(id, false);
+        g.addEventListener("mouseenter", enter);
+        g.addEventListener("mouseleave", leave);
+        g.addEventListener("focus", enter);
+        g.addEventListener("blur", leave);
+        g.addEventListener("click", () => showNode(id));
+        g.addEventListener("keydown", (ev) => (ev.key === "Enter" || ev.key === " ") && (ev.preventDefault(), showNode(id)));
+      }
+      function highlightNeighbors(id, on) {
+        if (flowState.running) return;
+        for (const [eid, p] of Object.entries(edgeEls)) {
+          const touches = eid.split("-").includes(id);
+          p.classList.toggle("opacity-25", on && !touches);
+          p.classList.toggle("stroke-zinc-500", on && touches);
+          p.classList.toggle("dark:stroke-zinc-400", on && touches);
+        }
+      }
+      $("#legend").innerHTML = ["worker", "do", "wf", "cache", "r2", "timer"].map(kindBadge).join("");
+
+      // Flow panel
+      const flowState = { flow: null, i: -1, running: false, token: 0 };
+      const flowBtns = $("#flow-buttons");
+      FLOWS.forEach((f) => {
+        const b = h("button", { type: "button", class: pillClass, "aria-pressed": "false" }, f.label);
+        b.onclick = () => selectFlow(f.id, true);
+        flowBtns.append(b);
+      });
+      const panel = $("#flow-panel");
+
+      function showNode(id) {
+        stopFlow();
+        press(flowBtns, null);
+        const n = N[id], d = DETAILS[id];
+        setHalo(id);
+        panel.innerHTML = `
+          <div class="rise">
+            <div class="flex items-center justify-between gap-4">${kindBadge(n.kind)}<button type="button" class="${ghostBtn}" data-close>Back to flows</button></div>
+            <h3 class="mt-3 text-lg font-semibold tracking-tight">${esc(n.title)}</h3>
+            ${d.file ? `<p class="mt-1 font-mono text-xs text-zinc-500">${esc(d.file)}</p>` : ""}
+            <p class="mt-3 text-base/7 text-pretty text-zinc-600 sm:text-sm/6 dark:text-zinc-400">${esc(d.body).replace(/`([^`]+)`/g, (_, c) => code(c))}</p>
+            ${d.fns.length ? `<ul role="list" class="mt-4 flex flex-wrap gap-1.5">${d.fns.map((f) => `<li class="rounded-md bg-zinc-100 px-2 py-0.5 font-mono text-xs/5 text-zinc-700 dark:bg-white/5 dark:text-zinc-300">${esc(f)}</li>`).join("")}</ul>` : ""}
+            <p class="mt-5 text-sm text-zinc-500">Connected to ${Object.keys(E).filter((e) => e.split("-").includes(id)).map((e) => e.split("-").find((x) => x !== id)).map((x) => `<button type="button" class="font-medium text-zinc-950 underline decoration-zinc-950/20 underline-offset-4 hover:decoration-zinc-950 dark:text-white dark:decoration-white/30" data-jump="${x}">${esc(N[x].title)}</button>`).join(", ")}</p>
+          </div>`;
+        $("[data-close]", panel).onclick = () => { setHalo(null); renderFlowPanel(); };
+        $$("[data-jump]", panel).forEach((b) => (b.onclick = () => showNode(b.dataset.jump)));
+      }
+      function setHalo(id) {
+        Object.entries(nodeEls).forEach(([k, g]) => {
+          const halo = $("[data-halo]", g);
+          halo.classList.toggle("opacity-0", k !== id);
+        });
+      }
+      function renderFlowPanel() {
+        const f = FLOWS.find((x) => x.id === flowState.flow);
+        if (!f) {
+          panel.innerHTML = `<p class="text-base/7 text-zinc-600 sm:text-sm/6 dark:text-zinc-400">Pick a flow above to watch a request move through the system one step at a time. Click a node to see what it does.</p>`;
+          return;
+        }
+        panel.innerHTML = `
+          <div class="flex items-center justify-between gap-3">
+            <h3 class="text-base font-semibold sm:text-sm">${f.label}</h3>
+            <div class="flex gap-1.5">
+              <button type="button" class="${ghostBtn}" data-act="prev" aria-label="Previous step">Prev</button>
+              <button type="button" class="${ghostBtn}" data-act="play">${flowState.running ? "Pause" : "Replay"}</button>
+              <button type="button" class="${ghostBtn}" data-act="next" aria-label="Next step">Next</button>
+            </div>
+          </div>
+          <ol role="list" class="mt-5 flex flex-col">
+            ${f.steps.map((st, i) => `
+              <li class="relative flex gap-3 pb-4 last:pb-0" data-step="${i}">
+                <div class="flex flex-col items-center">
+                  <span data-bullet class="grid size-6 shrink-0 place-items-center rounded-full font-mono text-xs tabular-nums ring-1 ${i < flowState.i ? "bg-orange-600 text-white ring-orange-600 dark:bg-orange-500 dark:text-zinc-950 dark:ring-orange-500" : i === flowState.i ? "bg-orange-50 text-orange-800 ring-orange-600 dark:bg-orange-400/10 dark:text-orange-300 dark:ring-orange-400" : "bg-white text-zinc-500 ring-zinc-950/10 dark:bg-zinc-900 dark:ring-white/15"}">${i + 1}</span>
+                  ${i < f.steps.length - 1 ? `<span class="mt-1 w-px flex-1 ${i < flowState.i ? "bg-orange-600/50" : "bg-zinc-950/10 dark:bg-white/10"}"></span>` : ""}
+                </div>
+                <div class="min-w-0 pb-1">
+                  <p class="font-mono text-xs text-zinc-500">${st[0].startsWith("@") ? esc(N[st[0].slice(1)].title) : st[0].split("-").map((x) => N[x].title)[st[1] < 0 ? "reverse" : "slice"]().join(" to ")}</p>
+                  <p class="mt-0.5 text-base/6 text-pretty sm:text-sm/6 ${i <= flowState.i ? "text-zinc-950 dark:text-white" : "text-zinc-500"}">${esc(st[2])}</p>
+                </div>
+              </li>`).join("")}
+          </ol>`;
+        $$("[data-act]", panel).forEach((b) => (b.onclick = () => {
+          const a = b.dataset.act;
+          if (a === "play") flowState.running ? stopFlow(true) : playFlow(flowState.i >= f.steps.length - 1 ? 0 : flowState.i + 1);
+          if (a === "next") { stopFlow(true); gotoStep(Math.min(f.steps.length - 1, flowState.i + 1), true); }
+          if (a === "prev") { stopFlow(true); gotoStep(Math.max(0, flowState.i - 1), true); }
+        }));
+      }
+      function clearEdges() {
+        Object.values(edgeEls).forEach((p) => {
+          p.setAttribute("class", "stroke-zinc-400 dark:stroke-zinc-700");
+          p.setAttribute("marker-end", "url(#arrow)");
+          p.removeAttribute("marker-start");
+        });
+        dotLayer.innerHTML = "";
+      }
+      async function gotoStep(i, animate) {
+        const f = FLOWS.find((x) => x.id === flowState.flow);
+        flowState.i = i;
+        clearEdges();
+        setHalo(null);
+        // mark visited edges
+        f.steps.slice(0, i + 1).forEach(([eid], k) => {
+          if (eid.startsWith("@")) return;
+          const p = edgeEls[eid];
+          p.setAttribute("class", k === i ? "stroke-orange-600 flowing dark:stroke-orange-400" : "stroke-orange-600/40 dark:stroke-orange-400/40");
+          p.setAttribute("stroke-width", k === i ? 2.5 : 1.75);
+        });
+        Object.values(edgeEls).forEach((p) => { if (!p.getAttribute("class").includes("orange")) p.setAttribute("stroke-width", 1.5); });
+        renderFlowPanel();
+        const [eid, dir] = f.steps[i];
+        if (eid.startsWith("@")) {
+          const id = eid.slice(1);
+          setHalo(id);
+          const n = N[id];
+          const ring = s("rect", { x: n.x, y: n.y, width: n.w, height: n.h, rx: 10, class: "fill-none stroke-orange-500 ping-once", "stroke-width": 2 });
+          dotLayer.append(ring);
+          return sleep(900);
+        }
+        const p = edgeEls[eid];
+        p.setAttribute("marker-end", dir > 0 ? "url(#arrow-on)" : "url(#arrow)");
+        if (dir < 0) { p.removeAttribute("marker-end"); p.setAttribute("marker-start", "url(#arrow-on)"); }
+        if (!animate || reduced) return;
+        const len = p.getTotalLength();
+        const dot = s("circle", { r: 5, class: "fill-orange-600 dark:fill-orange-400" });
+        dotLayer.append(dot);
+        const token = flowState.token;
+        const dur = Math.max(600, len * 2.2);
+        const t0 = performance.now();
+        await new Promise((res) => {
+          const tick = (now) => {
+            if (token !== flowState.token) return res();
+            const k = Math.min(1, (now - t0) / dur);
+            const e = k < 0.5 ? 2 * k * k : 1 - (-2 * k + 2) ** 2 / 2;
+            const pt = p.getPointAtLength(len * (dir > 0 ? e : 1 - e));
+            dot.setAttribute("cx", pt.x);
+            dot.setAttribute("cy", pt.y);
+            k < 1 ? requestAnimationFrame(tick) : res();
+          };
+          requestAnimationFrame(tick);
+        });
+        const to = dir > 0 ? eid.split("-")[1] : eid.split("-")[0];
+        const n = N[to];
+        dotLayer.append(s("rect", { x: n.x, y: n.y, width: n.w, height: n.h, rx: 10, class: "fill-none stroke-orange-500 ping-once", "stroke-width": 2 }));
+        await sleep(250);
+      }
+      async function playFlow(from = 0) {
+        const f = FLOWS.find((x) => x.id === flowState.flow);
+        const token = ++flowState.token;
+        flowState.running = true;
+        for (let i = from; i < f.steps.length; i++) {
+          if (token !== flowState.token) return;
+          await gotoStep(i, true);
+          await sleep(350);
+        }
+        if (token === flowState.token) { flowState.running = false; renderFlowPanel(); }
+      }
+      function stopFlow(keep) {
+        flowState.token++;
+        flowState.running = false;
+        if (!keep) { clearEdges(); flowState.i = -1; }
+      }
+      function selectFlow(id, autoplay) {
+        stopFlow();
+        flowState.flow = id;
+        press(flowBtns, [...flowBtns.children][FLOWS.findIndex((f) => f.id === id)]);
+        renderFlowPanel();
+        if (autoplay) playFlow(0);
+      }
+      renderFlowPanel();
+
+      // ────────────────────────────────────────────────────────── layers
+      const LAYERS = [
+        { name: "Entry Workers", note: "*-worker.ts", items: [
+          ["DbApiWorker", "Serves the public /v1 API and hosts the writer Durable Object. Builds DbClient, DatabaseLifecycle, and the clients once per isolate."],
+          ["CompactorWorker", "Has no routes. Hosts CompactorServer, CompactionBudgetServer, and CompactionWorkflow."],
+          ["BlockServerWorker", "Serves byte ranges through Workers Cache. Only the API Worker can reach it, over a service binding."],
+          ["GcWorker", "Runs MaintenanceSweep from a cron trigger every 5 minutes, and serves the garbage collection API."],
+          ["ShardRouterWorker", "The example sharded API. It uses only public APIs and hosts ShardDirectoryServer."],
+          ["TraceCollector, CPU tail", "Deployed on live stages only. They store OpenTelemetry spans and the CPU time of each invocation in a separate R2 bucket."],
+        ] },
+        { name: "Actors", note: "Durable Objects, Workflow", items: [
+          ["DbWriter", "Runs inside WriterServer. Handles write, commitTransaction, probe, scan, flush, seal, and runAlarm. Uses initLock, commitLock, flushLock, and scheduleLock."],
+          ["Compactor", "Runs inside CompactorServer. Handles wake, poll, collect, dropSst, and runAlarm. Uses planLock and a collection lock."],
+          ["CompactionExecutor", "Runs inside CompactionWorkflow. Each of prepare, writeOutput, and commit is a durable step."],
+          ["CompactionBudget", "Holds the global lease ledger and gives each budget group a fair share."],
+          ["ShardDirectory", "Holds the shard map and the pending split for one group."],
+        ] },
+        { name: "Engine services", note: "lsm-cloudflare", items: [
+          ["DbClient", "Picks the consistency level, asks the writer again after a flush, pages scans, and runs transactions and the change feed."],
+          ["DbReader", "Resolves a key through a read view, in this order: memtable, L0, sorted runs."],
+          ["DatabaseLifecycle", "Creates databases, checkpoints, pinned snapshots, seals, forks, and removals. Drops corrupt SSTs."],
+          ["GarbageCollector", "Runs collect and collectLeftovers for one database."],
+          ["MaintenanceSweep", "Visits every database, 50 per run, with its cursor stored in R2."],
+          ["WriterClient, CompactorClient", "Typed HTTP clients for the writer and compactor Durable Objects."],
+          ["BackgroundWork", "Runs work after the response with waitUntil in Workers and Durable Objects, and inline in a Workflow step."],
+        ] },
+        { name: "Storage layer", note: "lsm-cloudflare", items: [
+          ["ManifestStore", "Creates and updates manifests by CAS. Advances the LATEST hint in the background."],
+          ["ManifestReader", "Loads a manifest by id. Loads the newest manifest by reading the LATEST hint, then checking for newer ids."],
+          ["ManifestCache", "Keeps one manifest per database in each isolate. Refreshes it at most once a second, and keeps it for at most half of gcMinAge."],
+          ["SstStore", "Encodes an SST as a stream and uploads it in multipart parts."],
+          ["BlockSource, BlockCache", "Reads a block from the L1 cache, then BlockServer, then R2. Also reads R2 directly when BlockServer takes longer than 50 ms."],
+          ["MemTable", "Owns the SQLite tables memtable_rows, writer_meta, and flush_marks."],
+          ["ObjectStore", "Wraps the R2 operations get, put, putIfAbsent, list, and delete."],
+          ["DurableObjectAlarm", "Wraps the single platform alarm of a Durable Object. After a failure it retries in 1 second, then doubles the delay each time."],
+        ] },
+        { name: "lsm-core", note: "TypeScript, no I/O", items: [
+          ["manifest", "Defines the manifest schema and its edits, such as fenceWriter, commitL0Flush, commitCompaction, and checkpoints."],
+          ["sst-codec, block-codec", "Encode and decode SSTs, with blocks, an index, a bloom filter, and CRC32C checksums."],
+          ["merge-iterator", "Merges sorted inputs into one stream and resolves each key's tombstones, TTLs, and merge operators."],
+          ["size-tiered-compaction-scheduler", "Plans compaction jobs from L0 and the sorted runs."],
+          ["garbage-collection-plan", "Decides what garbage collection keeps and where it moves the boundaries."],
+          ["compaction-budget-ledger", "Grants and expires leases, and computes each group's fair share."],
+          ["lsm-settings", "Defines DEFAULT_LSM_SETTINGS and validates settings."],
+        ] },
+      ];
+      const stack = $("#layer-stack");
+      const layerDetail = $("#layer-detail");
+      const setLayerDetail = (name, desc, layer) =>
+        (layerDetail.innerHTML = `<p class="font-medium text-zinc-950 dark:text-white">${esc(name)}</p>${layer ? `<p class="text-sm text-zinc-500">${esc(layer)}</p>` : ""}<p class="mt-1 text-pretty text-zinc-600 dark:text-zinc-400">${esc(desc)}</p>`);
+      setLayerDetail("Select a service", "Its description appears here.", "");
+      LAYERS.forEach((L, li) => {
+        const row = h("div", { class: `grid gap-3 py-4 sm:grid-cols-[12rem_1fr] sm:gap-6 ${li ? "border-t border-zinc-950/5 dark:border-white/10" : ""}` });
+        row.innerHTML = `<div><p class="text-base font-medium sm:text-sm">${L.name}</p><p class="font-mono text-xs text-zinc-500">${L.note}</p></div>`;
+        const chips = h("div", { class: "flex flex-wrap content-start items-start gap-1.5" });
+        L.items.forEach(([name, desc]) => {
+          const b = h("button", { type: "button", class: "rounded-md bg-zinc-50 px-2 py-1 font-mono text-xs/5 text-zinc-700 ring-1 ring-zinc-950/5 hover:bg-orange-50 hover:text-orange-800 hover:ring-orange-600/20 focus-visible:outline-2 focus-visible:outline-orange-600 dark:bg-white/5 dark:text-zinc-300 dark:ring-white/10 dark:hover:bg-orange-400/10 dark:hover:text-orange-300" }, esc(name));
+          const show = () => setLayerDetail(name, desc, L.name);
+          b.addEventListener("mouseenter", show);
+          b.addEventListener("focus", show);
+          b.addEventListener("click", show);
+          chips.append(b);
+        });
+        row.append(chips);
+        stack.append(row);
+      });
+
+      // ────────────────────────────────────────────────────────── endpoints
+      const EP = [
+        ["Data", "POST", "/v1/databases/:id/batches", "write", "WriterClient.write\n  WriterServer runs DbWriter.write\n    commitBatch\n      take commitLock\n      refuse with WriteStalledError at 256 MiB unflushed or 16 L0 SSTs\n      collapseWriteBatch applies merge operators and checks the key range\n      ensureAlarmBeforeCommit\n      MemTable.commit writes the rows to SQLite\n    scheduleFlush", "write"],
+        ["Data", "POST", "/v1/databases/:id/flush", "flush", "WriterClient.flush\n  DbWriter.requestFlush\n    flushThen\n      SstStore.write uploads the L0 SST\n      ManifestStore.updateFrom(commitL0Flush)\n      MemTable.markFlushed, then MemTable.trim\n      wakeCompactor runs in the background", "flush"],
+        ["Data", "POST", "/v1/databases/:id/get", "get", "DbClient.getRow\n  pointView picks the read view\n    use snapshotView when the read has a snapshot\n    use FLUSHED_VIEW when the cached manifest covers the read\n    otherwise call WriterClient.probe(key)\n  DbReader.getRow(view)\n    ManifestCache supplies the manifest\n    read the memtable rows, then L0, then the sorted runs\n      BlockSource reads from L1, then BlockServer, then R2\n  if a flush overtook the read, ask the writer again", "latest"],
+        ["Data", "POST", "/v1/databases/:id/scan", "scan", "DbClient.scan\n  for Latest, or AtLeast that the cached manifest does not cover\n    scanUnflushed reads WriterClient.scan pages of 1,000 rows\n      DbReader.scan(segment, view) for each segment\n  for Flushed, covered AtLeast, or a snapshot\n    fromManifest calls DbReader.scan\n  a page that stops early returns resumeFrom", "latest"],
+        ["Data", "POST", "/v1/databases/:id/snapshots", "snapshot", "DbClient.snapshot\n  fixes snapshotSeq and manifestId for later reads", null],
+        ["Data", "GET", "/v1/databases/:id/changes", "changes", "DbClient.changes(afterSeq, limit)\n  WriterClient.changes returns the unflushed rows and flushedSeq\n  DbReader.changelogRows(afterSeq, flushedSeq)\n    reads db/<id>/changelog/*.sst\n  the page is the flushed rows, then the unflushed rows, with no gap", null],
+        ["Transactions", "POST", "/v1/databases/:id/transactions/begin", "beginTransaction", "DbClient.beginTransaction\n  returns readSeq and manifestId", null],
+        ["Transactions", "POST", "/v1/databases/:id/transactions/get", "transactionGet", "DbClient.getAt(key, readSeq, manifestId)\n  WriterClient.probeAt reads the rows the writer retains\n  DbReader.getRow", null],
+        ["Transactions", "POST", "/v1/databases/:id/transactions/scan", "transactionScan", "DbClient.scanAtPage(range, readSeq, limit)", null],
+        ["Transactions", "POST", "/v1/databases/:id/transactions/commit", "commitTransaction", "DbClient.commitTransaction\n  WriterClient.commitTransaction\n    DbWriter.commitTransaction\n      refuse with SnapshotTooOld if retainedFromSeq is past readSeq\n      MemTable.writtenAfter(readSeq, keys, readRanges)\n        refuse with TransactionConflictError on a conflict\n      commitBatch", null],
+        ["Lifecycle", "POST", "/v1/databases", "createDatabase", "DatabaseLifecycle.create\n  ManifestStore.initialize\n    putIfAbsent db/<id>/manifest/00000000000000000001", null],
+        ["Lifecycle", "POST", "/v1/databases/:id/checkpoints", "createCheckpoint", "DatabaseLifecycle.createCheckpoint\n  a manifest CAS adds a checkpoint\n    garbage collection keeps the checkpoint's manifest", null],
+        ["Lifecycle", "GET", "/v1/databases/:id/checkpoints", "listCheckpoints", "ManifestReader.loadLive\n  returns manifest.checkpoints", null],
+        ["Lifecycle", "DELETE", "/v1/databases/:id/checkpoints/:checkpointId", "deleteCheckpoint", "DatabaseLifecycle.deleteCheckpoint\n  a manifest CAS removes the checkpoint", null],
+        ["Lifecycle", "POST", "/v1/databases/:id/snapshots/pinned", "pinSnapshot", "DatabaseLifecycle.pinSnapshot(lifetimeMs)\n  adds a checkpoint that expires after lifetimeMs", null],
+        ["Lifecycle", "POST", "/v1/databases/:id/seal", "seal", "DatabaseLifecycle.seal\n  WriterClient.seal\n    DbWriter.seal\n      flushThen(alsoCommit: Sealed with successors)\n        one CAS commits the final flush and the seal", null],
+        ["Lifecycle", "POST", "/v1/databases/:id/forks", "fork", "DatabaseLifecycle.forkRange\n  ManifestStore.initialize(fork)\n    the fork references the source's SSTs and holds the source\n  WriterClient.status(fork) runs in the background\n  CompactorClient.wake(fork) runs in the background", "fork"],
+        ["Lifecycle", "DELETE", "/v1/databases/:id", "removeDatabase", "DatabaseLifecycle.remove\n  a manifest CAS sets the state to Removed\n  WriterClient.destroy and CompactorClient.destroy\n  advance the garbage collection manifest boundary\n  delete the objects under db/<id>/, one page at a time\n  BlockSource.purge purges the Workers Cache tag db:<id>", null],
+        ["Operations", "GET", "/v1/databases/:id/status", "status", "WriterClient.status returns the writer counters\nManifestReader.loadLive returns l0Count", null],
+        ["Operations", "GET", "/v1/databases/:id/compaction", "compaction", "ManifestReader.loadLive returns L0 and the sorted runs\nCompactorClient.status returns the running jobs and corruptSsts", null],
+        ["Operations", "POST", "/v1/databases/:id/ssts/:sstId/drop", "dropSst", "DatabaseLifecycle.dropSst\n  CompactorClient.dropSst\n    Compactor.dropSst takes planLock\n      refuse unless a compaction reported the SST corrupt, or force is set\n      refuse if a running job reads the SST's source\n      a manifest CAS drops the SST and records it in droppedSsts", null],
+        ["Garbage collection", "POST", "/v1/gc/databases/:id", "collect", "CompactorClient.collect\n  Compactor.collect takes the collection lock\n    GarbageCollector.collect\n    schedule the next collection from the report", "gc"],
+        ["Garbage collection", "POST", "/v1/gc", "sweep", "MaintenanceSweep.sweepPage(50)\n  does the same work as one cron run", "gc"],
+        ["Sharding", "POST", "/v1/groups/:group/splits", "split", "ShardSplit.split\n  ShardDirectory.beginSplit\n  DatabaseLifecycle.seal(shard, [left, right], hold)\n  forkRange(left) and forkRange(right) in parallel\n  ShardDirectory.completeSplit", "split"],
+        ["Sharding", "POST", "/v1/groups/:group/{put,delete,get,scan}", "routed operations", "ShardRouter\n  find the key's database id in the shard map\n  call the public database APIs through WriterClient and DbClient\n  during a pending split, wait on awaitMap for up to 30 seconds\n    then call resumePending", null],
+        ["Internal", "HTTP", "WriterHttpApi /v1/databases/:id/*", "write, commitTransaction, probe, probeAt, scan, flush, changes, status, destroy, seal", "The writer Durable Object serves these routes.\nWriterClient calls them.", null],
+        ["Internal", "HTTP", "CompactorHttpApi /v1/databases/:id/compactor/*", "wake, destroy, collect, requestCollection, dropSst, status", "The compactor Durable Object serves these routes.\nCompactorClient calls them.", null],
+        ["Internal", "HTTP", "BlockServerHttpApi /v1/databases/:id/*", "block, meta, latestManifest, manifest, purge", "BlockServerWorker serves these routes behind Workers Cache.\nBlockSource calls them with plain fetch() over a service binding.", null],
+        ["Internal", "HTTP", "CompactionBudgetHttpApi /v1/compaction-budget/*", "acquire, release", "The global CompactionBudgetServer serves these routes.\nEach compactor poll calls them.", null],
+      ];
+      const METHOD = { GET: "text-sky-700 dark:text-sky-400", POST: "text-emerald-700 dark:text-emerald-400", DELETE: "text-rose-700 dark:text-rose-400", HTTP: "text-zinc-500" };
+      const groups = ["All", ...new Set(EP.map((e) => e[0]))];
+      let epGroup = "All";
+      const groupBox = $("#ep-groups");
+      groups.forEach((g) => {
+        const b = h("button", { type: "button", class: pillClass, "aria-pressed": String(g === "All") }, g);
+        b.onclick = () => { epGroup = g; press(groupBox, b); renderEps(); };
+        groupBox.append(b);
+      });
+      const list = $("#ep-list");
+      function renderEps() {
+        const q = $("#ep-search").value.trim().toLowerCase();
+        list.innerHTML = "";
+        const shown = EP.filter((e) => (epGroup === "All" || e[0] === epGroup) && (!q || e.join(" ").toLowerCase().includes(q)));
+        $("#ep-empty").hidden = shown.length > 0;
+        shown.forEach(([group, method, path, handler, tree, flow]) => {
+          const li = h("li");
+          li.innerHTML = `
+            <details class="group">
+              <summary class="-mx-2 flex cursor-pointer list-none items-center gap-4 rounded-md px-2 py-3 hover:bg-zinc-50 dark:hover:bg-white/3 [&::-webkit-details-marker]:hidden">
+                <span class="w-14 shrink-0 font-mono text-xs font-semibold ${METHOD[method]}">${method}</span>
+                <span class="min-w-0 flex-1 font-mono text-[0.8125rem] wrap-break-word text-zinc-950 sm:truncate dark:text-white">${esc(path).replace(/\//g, "/<wbr>")}</span>
+                <span class="hidden max-w-[40%] truncate text-sm text-zinc-500 md:block">${esc(handler)}</span>
+                <svg viewBox="0 0 16 16" class="size-4 shrink-0 fill-zinc-400 transition-transform duration-200 group-open:rotate-90"><path fill-rule="evenodd" d="M6.22 4.22a.75.75 0 0 1 1.06 0l3.25 3.25a.75.75 0 0 1 0 1.06l-3.25 3.25a.75.75 0 0 1-1.06-1.06L8.94 8 6.22 5.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd"/></svg>
+              </summary>
+              <div class="pb-5">
+                <div class="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm text-zinc-500"><span>${group}</span><span class="md:hidden">${esc(handler)}</span></div>
+                <pre class="mt-3 overflow-x-auto rounded-lg bg-zinc-50 p-4 font-mono text-[0.8125rem]/6 text-zinc-700 dark:bg-white/5 dark:text-zinc-300"><code>${esc(tree)}</code></pre>
+                ${flow ? `<button type="button" class="mt-3 text-sm font-medium text-orange-700 hover:text-orange-900 dark:text-orange-400 dark:hover:text-orange-300" data-flow="${flow}">Animate this path on the topology diagram</button>` : ""}
+              </div>
+            </details>`;
+          list.append(li);
+        });
+        $$("[data-flow]", list).forEach((b) => (b.onclick = () => { $("#topology").scrollIntoView({ behavior: reduced ? "auto" : "smooth" }); setTimeout(() => selectFlow(b.dataset.flow, true), reduced ? 0 : 450); }));
+      }
+      $("#ep-search").addEventListener("input", renderEps);
+      renderEps();
+
+      // ────────────────────────────────────────────────────────── sequence renderer
+      function sequence(el, participants, messages) {
+        const n = participants.length;
+        const ids = participants.map((p) => p[0]);
+        const col = (id) => ids.indexOf(id);
+        const wrap = h("div");
+        wrap.innerHTML = `
+          <div class="flex items-center gap-2">
+            <button type="button" class="${ghostBtn}" data-play>Step through</button>
+            <button type="button" class="${ghostBtn}" data-all>Show all</button>
+            <p class="ml-2 text-sm text-zinc-500 tabular-nums" data-count></p>
+          </div>
+          <div class="-mx-4 mt-4 overflow-x-auto px-4 sm:mx-0 sm:px-0">
+            <div class="relative" style="min-width:${n * 9.5}rem">
+              <div class="pointer-events-none absolute inset-x-0 top-5 bottom-0 grid" style="grid-template-columns:repeat(${n},minmax(0,1fr))">${ids.map(() => `<div class="mx-auto w-px bg-zinc-950/10 dark:bg-white/10"></div>`).join("")}</div>
+              <div class="relative grid gap-2" style="grid-template-columns:repeat(${n},minmax(0,1fr))">
+                ${participants.map(([id, label, kind]) => `<div class="flex justify-center px-1 pt-1 pb-2"><span class="inline-flex items-center gap-1.5 rounded-full bg-white px-2.5 py-1 text-xs/5 font-medium ring-1 ring-zinc-950/10 dark:bg-zinc-950 dark:ring-white/15"><span class="size-1.5 shrink-0 rounded-full ${KINDS[kind].dot}"></span>${esc(label)}</span></div>`).join("")}
+              </div>
+              <ol role="list" class="relative flex flex-col" data-rows></ol>
+            </div>
+          </div>`;
+        el.append(wrap);
+        const rows = $("[data-rows]", wrap);
+        messages.forEach((m, i) => {
+          const li = h("li", { class: "relative transition-opacity duration-300", "data-row": i });
+          if (m.note) {
+            li.innerHTML = `<div class="relative mx-2 my-2 rounded-md bg-zinc-50 px-3 py-2 text-center text-sm/6 text-zinc-600 ring-1 ring-zinc-950/5 dark:bg-zinc-900 dark:text-zinc-400 dark:ring-white/10">${esc(m.note)}</div>`;
+          } else if (m.from === m.to) {
+            const c = col(m.from);
+            const w = Math.min(1.6, n) / n, l = Math.min(Math.max((c + 0.5) / n - w / 2, 0), 1 - w);
+            li.innerHTML = `<div class="px-2 py-1.5" style="margin-left:${l * 100}%;width:${w * 100}%"><div class="rounded-md bg-white px-2.5 py-1.5 text-center text-xs/5 text-balance text-zinc-700 ring-1 ring-zinc-950/10 dark:bg-zinc-900 dark:text-zinc-300 dark:ring-white/15" data-chip>${esc(m.text)}</div></div>`;
+          } else {
+            const a = col(m.from), b = col(m.to);
+            const lo = Math.min(a, b), hi = Math.max(a, b);
+            const left = ((lo + 0.5) / n) * 100, width = ((hi - lo) / n) * 100;
+            const right = b > a;
+            li.innerHTML = `
+              <div class="relative pt-2 pb-3" style="margin-left:${left}%;width:${width}%">
+                <p class="px-2 text-center text-xs/5 text-balance text-zinc-700 dark:text-zinc-300">${esc(m.text)}</p>
+                <div class="relative mt-1.5">
+                  <div class="h-px ${m.async ? "border-t border-dashed border-zinc-400 dark:border-zinc-500" : "bg-zinc-500 dark:bg-zinc-400"}" data-line></div>
+                  <div class="absolute -top-[4.5px] size-0 border-y-[5px] border-y-transparent ${right ? "-right-px border-l-[8px] border-l-zinc-500 dark:border-l-zinc-400" : "-left-px border-r-[8px] border-r-zinc-500 dark:border-r-zinc-400"}" data-head></div>
+                </div>
+              </div>`;
+          }
+          rows.append(li);
+        });
+        const count = $("[data-count]", wrap);
+        let cur = -1, timer = null;
+        const paint = () => {
+          $$("[data-row]", rows).forEach((r, i) => {
+            r.classList.toggle("opacity-25", cur >= 0 && i > cur);
+            const on = i === cur;
+            $$("[data-line]", r).forEach((l) => { l.classList.toggle("!bg-orange-600", on && !l.className.includes("dashed")); l.classList.toggle("!border-orange-600", on); });
+            $$("[data-head]", r).forEach((hd) => { hd.classList.toggle("!border-l-orange-600", on); hd.classList.toggle("!border-r-orange-600", on); });
+            $$("[data-chip]", r).forEach((c) => { c.classList.toggle("!ring-orange-600", on); });
+            $$("p", r).forEach((p) => { p.classList.toggle("!text-orange-800", on); p.classList.toggle("dark:!text-orange-300", on); });
+          });
+          count.textContent = cur >= 0 ? `Step ${cur + 1} of ${messages.length}` : "";
+        };
+        $("[data-play]", wrap).onclick = (e) => {
+          clearInterval(timer);
+          cur = cur >= messages.length - 1 ? 0 : cur + 1;
+          e.target.textContent = "Next step";
+          paint();
+        };
+        $("[data-all]", wrap).onclick = () => { cur = -1; $("[data-play]", wrap).textContent = "Step through"; paint(); };
+        paint();
+      }
+
+      sequence($("#seq-write"),
+        [["c", "Client", "actor"], ["a", "DbApiWorker", "worker"], ["w", "WriterServer", "do"], ["q", "SQLite", "do"], ["r", "R2", "r2"], ["k", "CompactorServer", "do"]],
+        [
+          { from: "c", to: "a", text: "POST /batches" },
+          { from: "a", to: "w", text: "WriterClient.write" },
+          { from: "w", to: "w", text: "On the first call, ensureReady increments writerEpoch" },
+          { from: "w", to: "w", text: "Take commitLock and check the stall limits" },
+          { from: "w", to: "w", text: "ensureAlarmBeforeCommit sets an alarm if none exists" },
+          { from: "w", to: "q", text: "MemTable.commit(rows, seq)" },
+          { from: "w", to: "w", text: "scheduleFlush sets the alarm 60 s after the oldest row" },
+          { from: "w", to: "c", text: "Return seq and createTs" },
+          { note: "Later, the alarm fires, or a client calls POST /flush." },
+          { from: "w", to: "r", text: "SstStore.write uploads the L0 SST" },
+          { from: "w", to: "r", text: "updateFrom(commitL0Flush) commits the manifest" },
+          { from: "w", to: "q", text: "markFlushed(cut), then trim" },
+          { from: "w", to: "k", text: "Wake in the background when L0 has 4 SSTs", async: true },
+        ]);
+
+      sequence($("#seq-compaction"),
+        [["w", "WriterServer", "do"], ["k", "CompactorServer", "do"], ["b", "CompactionBudget", "do"], ["f", "CompactionWorkflow", "wf"], ["r", "R2", "r2"]],
+        [
+          { from: "w", to: "k", text: "Wake when L0 has 4 SSTs", async: true },
+          { from: "k", to: "r", text: "On the first wake, fenceCompactor increments compactorEpoch" },
+          { note: "The alarm runs a poll every 5 seconds while there is work." },
+          { from: "k", to: "f", text: "Read the status of running jobs" },
+          { from: "k", to: "r", text: "Load the newest manifest" },
+          { from: "k", to: "k", text: "planCompactionsAround picks 4 to 8 sources" },
+          { from: "k", to: "b", text: "acquire(group, database/job)" },
+          { from: "k", to: "k", text: "Record the job in the compactor state" },
+          { from: "k", to: "f", text: "launcher.start(jobId)" },
+          { from: "f", to: "r", text: "prepare fixes the input ids and the time" },
+          { from: "f", to: "r", text: "Each output step streams, merges, and uploads one SST" },
+          { from: "f", to: "r", text: "commit replaces the inputs in one manifest CAS" },
+          { from: "k", to: "b", text: "Release the lease and set collectionDueAt 1 hour later" },
+        ]);
+
+      sequence($("#seq-split"),
+        [["r", "ShardRouter", "worker"], ["d", "ShardDirectory", "do"], ["w", "WriterServer", "do"], ["l", "DatabaseLifecycle", "worker"], ["s", "R2", "r2"]],
+        [
+          { from: "r", to: "d", text: "beginSplit records the split and allocates 2 ids" },
+          { from: "r", to: "w", text: "seal(shard, [left, right], hold)" },
+          { from: "w", to: "s", text: "One CAS commits the flush, the seal, and a hold per successor" },
+          { note: "A router that gets DatabaseSealedError waits on awaitMap." },
+          { from: "r", to: "l", text: "forkRange(left) and forkRange(right)" },
+          { from: "l", to: "s", text: "Create each fork's manifest without copying data" },
+          { from: "r", to: "d", text: "completeSplit publishes the new map" },
+          { note: "On a failure, the router calls reportSplitFailed. A router that waits 30 seconds calls resumePending." },
+        ]);
+
+      // write safety list
+      $("#write-safety").innerHTML = [
+        ["Writer epoch", "Each start of the writer increments writerEpoch in the manifest. A commit from an older writer instance then fails its CAS."],
+        ["Crash after upload, before the CAS", "No manifest references the uploaded SST, so garbage collection deletes it. The rows are still in SQLite, and the next flush uploads them again."],
+        ["Crash after the CAS, before markFlushed", "On the next start, the writer marks every row at or below lastL0Seq as flushed."],
+        ["Lost flush response", "The next flush fails with FlushedSeqStaleError. The writer records the manifest's flushed position and flushes once more."],
+        ["Upload older than gcSstBoundary", "The commit fails with SstBelowGcBoundaryError, and the next flush uploads the rows again."],
+      ].map(([t, d], i) => `<div class="grid gap-1 ${i ? "pt-3" : ""} pb-3 sm:grid-cols-[13rem_1fr] sm:gap-4"><dt class="text-base font-medium sm:text-sm">${t}</dt><dd class="text-base/7 text-zinc-600 sm:text-sm/6 dark:text-zinc-400">${d}</dd></div>`).join("");
+
+      // ────────────────────────────────────────────────────────── reads
+      const READ_STEPS = [
+        ["DbClient.getRow", "Every read starts in the API Worker's isolate."],
+        ["Is there a snapshot?", "The read uses snapshotView, which fixes a sequence number and a manifest, and does not call the writer."],
+        ["Does the cached manifest cover the read?", "For Flushed, always. For AtLeast(seq), only when lastL0Seq is at least seq."],
+        ["writer.probe(key)", "The writer returns the key's unflushed versions, flushedSeq, and snapshotSeq."],
+        ["The manifest cache picks a manifest", "The manifest's lastL0Seq must be at least minLastL0Seq and at most maxLastL0Seq."],
+        ["DbReader merges", "It reads the memtable rows, then L0 newest first, then the sorted runs. For each SST it checks the bloom filter, then the index, then the block."],
+        ["Did a flush overtake the read?", "If the only manifest found was committed after the snapshot, DbClient asks the writer again, up to a fixed number of attempts."],
+      ];
+      const CONS = {
+        Latest: { desc: "Sees every acknowledged write. Each read probes the writer once. SlateDB calls this Memory durability.", on: [0, 3, 4, 5, 6], note: { 3: "The read always calls the writer.", 4: "Any manifest that holds every flushed row works." } },
+        "AtLeast(seq)": { desc: "Sees at least the write with sequence number seq, such as the caller's own write from a WriteReceipt. Skips the writer when the cached manifest already covers seq.", on: [0, 2, 3, 4, 5, 6], note: { 2: "If the manifest covers seq, the read skips the writer. Otherwise the read probes the writer.", 3: "Only when the cached manifest does not cover seq." } },
+        Flushed: { desc: "Sees L0 and the levels below it, so it can miss the newest unflushed rows. Never calls the writer. SlateDB calls this Remote durability.", on: [0, 2, 4, 5], note: { 2: "Always covered.", 4: "The cache reloads a manifest older than 1 second." } },
+        Snapshot: { desc: "Reads at a snapshot the caller took earlier. If the snapshot has expired, the read fails and does not retry.", on: [0, 1, 4, 5], note: { 1: "Yes. The snapshot fixes snapshotSeq and manifestId." } },
+      };
+      const consBox = $("#consistency");
+      const readSteps = $("#read-steps");
+      function renderCons(name) {
+        const c = CONS[name];
+        $("#consistency-desc").textContent = c.desc;
+        readSteps.innerHTML = READ_STEPS.map(([t, d], i) => {
+          const on = c.on.includes(i);
+          const last = i === READ_STEPS.length - 1;
+          return `<li class="relative flex gap-4 ${last ? "" : "pb-5"} transition-opacity duration-300 ${on ? "" : "opacity-35"}">
+            ${last ? "" : `<span class="absolute top-6 left-[0.6875rem] h-full w-px ${on && c.on.includes(i + 1) ? "bg-orange-600/50" : "bg-zinc-950/10 dark:bg-white/10"}"></span>`}
+            <span class="relative grid size-6 shrink-0 place-items-center rounded-full font-mono text-xs tabular-nums ring-1 ${on ? "bg-orange-600 text-white ring-orange-600 dark:bg-orange-500 dark:text-zinc-950 dark:ring-orange-500" : "bg-white text-zinc-400 ring-zinc-950/10 dark:bg-zinc-950 dark:ring-white/15"}">${i + 1}</span>
+            <div class="min-w-0"><p class="text-base font-medium sm:text-sm">${esc(t)}${on ? "" : ` <span class="ml-1 font-normal text-zinc-500">Skipped</span>`}</p><p class="mt-0.5 text-base/6 text-pretty text-zinc-600 sm:text-sm/6 dark:text-zinc-400">${esc(c.note[i] ?? d)}</p></div>
+          </li>`;
+        }).join("");
+      }
+      Object.keys(CONS).forEach((name, i) => {
+        const b = h("button", { type: "button", class: segClass, "aria-pressed": String(i === 0) }, name);
+        b.onclick = () => { press(consBox, b); renderCons(name); };
+        consBox.append(b);
+      });
+      renderCons("Latest");
+
+      // cache tiers
+      const TIERS = [
+        ["l1", "L1 BlockCache", "In each isolate, 32 MiB data and 16 MiB metadata", "worker"],
+        ["bs", "BlockServer", "fetch() over a service binding", "worker"],
+        ["wc", "Workers Cache", "In each data center, tagged db:<id>", "cache"],
+        ["r2", "R2 range GET", "The source of truth", "r2"],
+      ];
+      const SCEN = {
+        "L1 hit": { path: ["l1"], cap: "The block is already in this isolate's L1 cache. The read makes no subrequest." },
+        "Workers Cache hit": { path: ["l1", "bs", "wc"], cap: "The read misses L1 and fetches the block from BlockServer over the service binding. Workers Cache returns the block, and the reader stores it in L1." },
+        "Full miss": { path: ["l1", "bs", "wc", "r2"], cap: "Every cache misses. BlockServer reads the byte range from R2 and stores it in Workers Cache under the database's tag." },
+        "Hedged": { path: ["l1", "bs", "r2"], hedge: true, cap: "BlockServer is slow or failed. After 50 ms, hedgedBlockRead also reads R2 directly. The first read to succeed returns the bytes, and the other read is cancelled." },
+        "Checksum audit": { path: ["l1", "r2"], audit: true, cap: "The bytes failed their CRC32C check. The read audit skips every cache, so it can tell a damaged cached copy from a corrupt object in R2." },
+      };
+      const tierBox = $("#cache-tiers");
+      tierBox.innerHTML = TIERS.map(([id, t, sub, k], i) => `
+        <div class="flex items-center gap-3" data-tier="${id}">
+          <span class="grid size-6 shrink-0 place-items-center rounded-full font-mono text-xs text-zinc-500 tabular-nums ring-1 ring-zinc-950/10 dark:ring-white/15" data-tier-n>${i + 1}</span>
+          <div class="relative min-w-0 flex-1 overflow-hidden rounded-lg px-3 py-2 ring-1 ring-zinc-950/10 dark:ring-white/10">
+            <div class="absolute inset-0 origin-left scale-x-0 bg-orange-50 transition-transform duration-500 ease-out dark:bg-orange-400/10" data-fill></div>
+            <div class="relative flex items-center justify-between gap-3">
+              <div class="min-w-0"><p class="truncate text-base font-medium sm:text-sm">${t}</p><p class="truncate text-sm text-zinc-500">${esc(sub)}</p></div>
+              <span class="shrink-0 rounded-full bg-orange-600 px-2 py-0.5 text-xs/5 font-medium text-white opacity-0 transition-opacity dark:bg-orange-500 dark:text-zinc-950" data-hit>hit</span>
+            </div>
+          </div>
+        </div>`).join("");
+      const cacheBtns = $("#cache-buttons");
+      let cacheToken = 0;
+      async function runScenario(name) {
+        const sc = SCEN[name];
+        const token = ++cacheToken;
+        $("#cache-caption").textContent = sc.cap;
+        $$("[data-tier]", tierBox).forEach((r) => {
+          $("[data-fill]", r).classList.add("scale-x-0");
+          $("[data-hit]", r).classList.add("opacity-0");
+          $("[data-hit]", r).textContent = "hit";
+          $("[data-tier-n]", r).className = "grid size-6 shrink-0 place-items-center rounded-full font-mono text-xs text-zinc-500 tabular-nums ring-1 ring-zinc-950/10 dark:ring-white/15";
+        });
+        for (const [k, id] of sc.path.entries()) {
+          if (token !== cacheToken) return;
+          const r = $(`[data-tier="${id}"]`, tierBox);
+          $("[data-fill]", r).classList.remove("scale-x-0");
+          $("[data-tier-n]", r).className = "grid size-6 shrink-0 place-items-center rounded-full bg-orange-600 font-mono text-xs text-white tabular-nums ring-1 ring-orange-600 dark:bg-orange-500 dark:text-zinc-950";
+          await sleep(450);
+          if (k === sc.path.length - 1) {
+            $("[data-hit]", r).textContent = sc.hedge ? "won" : sc.audit ? "direct" : id === "r2" ? "read" : "hit";
+            $("[data-hit]", r).classList.remove("opacity-0");
+          }
+        }
+      }
+      Object.keys(SCEN).forEach((name, i) => {
+        const b = h("button", { type: "button", class: pillClass, "aria-pressed": String(i === 2) }, name);
+        b.onclick = () => { press(cacheBtns, b); runScenario(name); };
+        cacheBtns.append(b);
+      });
+      runScenario("Full miss");
+
+      // ────────────────────────────────────────────────────────── timers sim
+      const T_END = 600;
+      const LANES = [
+        ["writes", "Client writes", "actor"],
+        ["walarm", "Writer alarm and flush", "do"],
+        ["hint", "LATEST hint", "worker"],
+        ["cpoll", "Compactor poll alarm", "do"],
+        ["job", "Compaction Workflow", "wf"],
+        ["lease", "Budget lease", "do"],
+        ["cron", "Cron sweep", "timer"],
+      ];
+      const ev = []; // {t, lane, label, dur?, fx}
+      const sim = { l0: 0, unflushed: 0, alarm: null, jobs: 0, leases: 0, polls: 0, flushes: 0, gcDue: null };
+      for (let t = 2, i = 0; t < T_END; t += 6 + ((i * 7) % 5), i++) ev.push({ t, lane: "writes", label: "POST /batches commits to SQLite.", fx: (st) => { st.unflushed++; if (st.alarm === null) st.alarm = t + 60; } });
+      // flush at oldest + 60
+      const writeTimes = ev.map((e) => e.t);
+      let fl = [], cursor = 0;
+      while (cursor < writeTimes.length) {
+        const due = writeTimes[cursor] + 60;
+        if (due >= T_END) break;
+        fl.push(due);
+        while (cursor < writeTimes.length && writeTimes[cursor] <= due) cursor++;
+      }
+      const jobsAt = [];
+      let l0 = 0;
+      fl.forEach((t) => {
+        l0++;
+        const n = l0;
+        ev.push({ t, lane: "walarm", dur: 2, label: "The alarm fires. The writer uploads an L0 SST and commits the manifest.", fx: (st) => { st.unflushed = 0; st.l0++; st.flushes++; st.alarm = null; } });
+        ev.push({ t: t + 2.5, lane: "hint", label: "The writer advances manifest/LATEST in the background.", fx: () => {} });
+        if (n >= 4 && !jobsAt.some((j) => t < j + 80)) { jobsAt.push(t); l0 -= 4; }
+      });
+      jobsAt.forEach((t0) => {
+        const end = t0 + 78;
+        ev.push({ t: t0 + 0.5, lane: "cpoll", label: "The flush wakes the compactor. The compactor fences in and polls.", fx: (st) => { st.polls++; } });
+        for (let p = t0 + 5.5; p <= end + 6; p += 5) ev.push({ t: p, lane: "cpoll", small: true, label: "The compactor polls, reads the job status, and renews the lease.", fx: (st) => st.polls++ });
+        ev.push({ t: t0 + 1, lane: "lease", dur: end + 5 - (t0 + 1), label: "The compactor acquires a lease that lasts 15 minutes.", fx: (st) => { st.leases++; } });
+        ev.push({ t: t0 + 1.5, lane: "job", dur: 4, label: "The prepare step runs.", fx: (st) => { st.jobs++; } });
+        ev.push({ t: t0 + 6, lane: "job", dur: 34, label: "The output-1 step writes a 64 MiB SST.", fx: () => {} });
+        ev.push({ t: t0 + 40, lane: "job", dur: 34, label: "The output-2 step writes a 64 MiB SST.", fx: () => {} });
+        ev.push({ t: end - 4, lane: "job", dur: 4, label: "The commit step replaces 4 L0 SSTs in one manifest CAS.", fx: (st) => { st.l0 -= 4; } });
+        ev.push({ t: end + 5.5, lane: "lease", label: "The next poll finds the job done, releases the lease, and schedules garbage collection 1 hour later.", fx: (st) => { st.leases--; st.jobs--; st.gcDue = end + 5.5 + 3600; } });
+      });
+      [300, 600].forEach((t) => ev.push({ t: Math.min(t, T_END - 4), lane: "cron", label: "The cron runs sweepPage(50).", fx: () => {} }));
+      ev.sort((a, b) => a.t - b.t);
+
+      const lanesEl = $("#lanes");
+      const ticks = [0, 60, 120, 180, 240, 300, 360, 420, 480, 540, 600];
+      const fmt = (t) => `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, "0")}`;
+      lanesEl.innerHTML = `
+        <div class="grid grid-cols-[11rem_1fr] text-xs text-zinc-500">
+          <div></div>
+          <div class="relative h-5">${ticks.filter((t) => t % 120 === 0).map((t) => `<span class="absolute font-mono tabular-nums ${t === T_END ? "-translate-x-full" : t === 0 ? "" : "-translate-x-1/2"}" style="left:${(t / T_END) * 100}%">${fmt(t)}</span>`).join("")}</div>
+        </div>
+        ${LANES.map(([id, label, kind]) => `
+          <div class="grid grid-cols-[11rem_1fr] items-center border-t border-zinc-950/5 dark:border-white/10">
+            <p class="flex items-center gap-2 truncate py-2.5 pr-3 text-sm"><span class="size-2 shrink-0 rounded-full ${KINDS[kind].dot}"></span>${label}</p>
+            <div class="relative h-9" data-lane="${id}">${ticks.map((t) => `<span class="absolute inset-y-0 w-px bg-zinc-950/5 dark:bg-white/5" style="left:${(t / T_END) * 100}%"></span>`).join("")}</div>
+          </div>`).join("")}
+        <div class="pointer-events-none absolute top-5 bottom-10 left-44 right-0"><div id="playhead" class="absolute inset-y-0 w-px bg-orange-600 dark:bg-orange-400" style="left:0%"><span class="absolute -top-1 -left-1 size-2 rounded-full bg-orange-600 dark:bg-orange-400"></span></div></div>
+        <p class="mt-3 text-sm text-zinc-500">The compactor's first collection is due at about <span class="font-mono tabular-nums" id="gc-due">1:05:00</span>. That is gcMinAge, 1 hour by default, after its first job finishes, so it falls outside this window.</p>`;
+      const evEls = ev.map((e) => {
+        const lane = $(`[data-lane="${e.lane}"]`, lanesEl);
+        const kind = LANES.find((l) => l[0] === e.lane)[2];
+        const el = document.createElement("span");
+        el.title = `${fmt(e.t)}, ${e.label}`;
+        const left = (e.t / T_END) * 100;
+        if (e.dur) {
+          el.className = `absolute top-1/2 h-3 -translate-y-1/2 rounded-sm opacity-25 transition-opacity duration-300 ${KINDS[kind].dot}`;
+          el.style.left = `${left}%`;
+          el.style.width = `${(e.dur / T_END) * 100}%`;
+        } else {
+          el.className = `absolute top-1/2 -translate-1/2 rounded-full opacity-25 transition-[opacity,transform] duration-300 ${KINDS[kind].dot} ${e.small ? "size-1.5" : "size-2.5"}`;
+          el.style.left = `${left}%`;
+        }
+        lane.append(el);
+        return el;
+      });
+      const stateEl = $("#sim-state");
+      const logEl = $("#sim-log");
+      const renderState = (st, t) => {
+        const items = [
+          ["Unflushed batches", st.unflushed],
+          ["L0 SSTs", Math.max(0, st.l0)],
+          ["Writer alarm", st.alarm === null ? "none" : `at ${fmt(st.alarm)}`],
+          ["Running jobs", st.jobs],
+          ["Budget leases", `${st.leases} / 32`],
+          ["Next cron sweep", fmt(t < 300 ? 300 : 600)],
+        ];
+        stateEl.innerHTML = items.map(([k, v]) => `<div class="border-t border-zinc-950/10 pt-3 dark:border-white/10"><dt class="truncate text-sm text-zinc-500">${k}</dt><dd class="mt-1 text-xl font-semibold tracking-tight tabular-nums sm:text-lg">${v}</dd></div>`).join("");
+      };
+      let simT = 0, simIdx = 0, simState, simRAF = null, simLast = 0, simRunning = false;
+      const simPlayBtn = $("#sim-play");
+      function resetSim() {
+        cancelAnimationFrame(simRAF);
+        simRunning = false;
+        simPlayBtn.textContent = "Play simulation";
+        simT = 0; simIdx = 0;
+        simState = { ...sim };
+        evEls.forEach((el) => { el.classList.add("opacity-25"); el.classList.remove("scale-150"); });
+        logEl.innerHTML = `<li class="text-zinc-400">Press play to start the clock.</li>`;
+        $("#playhead").style.left = "0%";
+        $("#sim-clock").textContent = fmt(0);
+        renderState(simState, 0);
+      }
+      function advance(to) {
+        while (simIdx < ev.length && ev[simIdx].t <= to) {
+          const e = ev[simIdx];
+          e.fx(simState);
+          const el = evEls[simIdx];
+          el.classList.remove("opacity-25");
+          if (e.lane !== "writes") {
+            if (logEl.firstElementChild?.classList.contains("text-zinc-400")) logEl.innerHTML = "";
+            const li = h("li", { class: "rise flex gap-3 border-b border-zinc-950/5 py-1 dark:border-white/5" }, `<span class="w-10 shrink-0 tabular-nums text-zinc-400">${fmt(e.t)}</span><span class="min-w-0">${esc(e.label)}</span>`);
+            logEl.prepend(li);
+          }
+          simIdx++;
+        }
+        if (simState.gcDue) $("#gc-due").textContent = `${Math.floor(simState.gcDue / 3600)}:${String(Math.floor((simState.gcDue % 3600) / 60)).padStart(2, "0")}:${String(Math.floor(simState.gcDue % 60)).padStart(2, "0")}`;
+        renderState(simState, to);
+      }
+      function frame(now) {
+        const dt = (now - simLast) / 1000;
+        simLast = now;
+        simT = Math.min(T_END, simT + dt * Number($("#sim-speed").value));
+        $("#playhead").style.left = `${(simT / T_END) * 100}%`;
+        $("#sim-clock").textContent = fmt(simT);
+        advance(simT);
+        if (simT >= T_END) { simRunning = false; simPlayBtn.textContent = "Replay simulation"; return; }
+        if (simRunning) simRAF = requestAnimationFrame(frame);
+      }
+      simPlayBtn.onclick = () => {
+        if (simT >= T_END) resetSim();
+        if (reduced) { simT = T_END; $("#playhead").style.left = "100%"; $("#sim-clock").textContent = fmt(T_END); advance(T_END); return; }
+        simRunning = !simRunning;
+        simPlayBtn.textContent = simRunning ? "Pause" : "Resume";
+        if (simRunning) { simLast = performance.now(); simRAF = requestAnimationFrame(frame); }
+      };
+      $("#sim-reset").onclick = resetSim;
+      resetSim();
+
+      // trigger table
+      $("#timer-table").innerHTML = [
+        ["Writer flush alarm", "do", "DbWriter.runAlarm", "60 s after the oldest unflushed row, or at once at 64 MiB unflushed. Settings maxL0Age and l0SstSize.", "Flushes if a flush is due, then sets the next alarm. After a failure it retries in 1 s and doubles the delay, up to 60 s. It stops when the writer is fenced or the database is removed."],
+        ["Compactor poll", "do", "Compactor.runAlarm", "Every 5 s while jobs run or wait for budget. Setting compactorPollInterval.", "Fences in again if fenced, reads job progress, renews leases, and plans and launches jobs."],
+        ["Compactor collection", "do", "runCollection", "At collectionDueAt, 1 hour after a job finishes. Setting gcMinAge.", "Runs GarbageCollector.collect. After a storage error it retries 5 minutes later. Setting gcInterval."],
+        ["Cron sweep", "timer", "GcWorker", "Every 5 minutes, on the cron */5 * * * *.", "Runs MaintenanceSweep.sweepPage(50). The sweep stores its cursor in R2."],
+        ["Compaction job", "wf", "CompactionWorkflow", "When a poll launches it.", "Runs the durable steps prepare, output-n, and commit. Workflows retries each step."],
+        ["Budget lease", "do", "CompactionBudgetServer", "Lasts 15 minutes. Setting compactionLeaseMs.", "Each poll renews the lease. A lost job frees its slot when the lease expires."],
+        ["Compactor wake", "worker", "DbWriter.wakeCompactor", "After a flush leaves 4 L0 SSTs, when L0 stalls a write, and after a fork.", "Calls CompactorClient.wake in the background with waitUntil."],
+        ["LATEST hint", "worker", "ManifestStore", "After each manifest create.", "Advances manifest/LATEST in the background. Readers check for manifests newer than a stale hint."],
+        ["Manifest refresh", "worker", "ManifestCache", "On a read, when the cached manifest is older than 1 s.", "Reloads the newest manifest. A reader never uses a manifest for longer than half of gcMinAge."],
+        ["Memtable trim", "do", "MemTable.trim", "After each flush.", "Drops flushed rows older than 60 s or beyond 64 MiB. Transactions read the rows inside that window."],
+      ].map(([a, k, w, when, does]) => `<tr class="align-top"><td class="py-3 pr-6 font-medium">${a}</td><td class="py-3 pr-6">${kindBadge(k)}</td><td class="py-3 pr-6 font-mono text-xs text-zinc-600 dark:text-zinc-400">${w}</td><td class="min-w-56 py-3 pr-6 whitespace-normal text-zinc-600 dark:text-zinc-400">${when}</td><td class="min-w-80 py-3 whitespace-normal text-zinc-600 dark:text-zinc-400">${does}</td></tr>`).join("");
+
+      // ────────────────────────────────────────────────────────── state machines
+      function stateMachine(el, cfg) {
+        const wrap = h("div", { class: "grid gap-8 lg:grid-cols-[3fr_2fr]" });
+        wrap.innerHTML = `
+          <div class="-mx-4 overflow-x-auto px-4 sm:mx-0 sm:px-0"><svg viewBox="0 0 ${cfg.w} ${cfg.h}" class="h-auto w-[40rem] max-w-none sm:w-full" data-svg role="img" aria-label="${cfg.label}"></svg></div>
+          <div>
+            <p class="text-sm text-zinc-500">Current state</p>
+            <p class="mt-1 text-xl font-semibold tracking-tight" data-cur></p>
+            <p class="mt-2 text-base/7 text-pretty text-zinc-600 sm:text-sm/6 dark:text-zinc-400" data-desc></p>
+            <p class="mt-6 text-sm text-zinc-500">Events</p>
+            <div class="mt-2 flex flex-wrap gap-2" data-events></div>
+            <ol role="list" class="mt-6 max-h-40 overflow-y-auto font-mono text-xs/6 text-zinc-500" data-log></ol>
+          </div>`;
+        el.append(wrap);
+        const svg = $("[data-svg]", wrap);
+        const d = s("defs");
+        d.innerHTML = `<marker id="${cfg.id}-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,1 L9,5 L0,9 z" class="fill-zinc-400 dark:fill-zinc-600"/></marker><marker id="${cfg.id}-on" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,1 L9,5 L0,9 z" class="fill-orange-600 dark:fill-orange-400"/></marker>`;
+        svg.append(d);
+        const tEls = {};
+        const box = (id) => cfg.states[id];
+        const edgeKey = (a, b) => `${a}>${b}`;
+        const seen = new Set();
+        for (const [from, evs] of Object.entries(cfg.events)) {
+          for (const e of evs) {
+            const key = edgeKey(from, e.to);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            const A = box(from), B = box(e.to);
+            let dPath;
+            if (from === e.to) {
+              const x = A.x + A.w / 2, y = A.y;
+              dPath = `M${x - 18},${y} C${x - 30},${y - 46} ${x + 30},${y - 46} ${x + 18},${y}`;
+            } else {
+              const ac = [A.x + A.w / 2, A.y + A.h / 2], bc = [B.x + B.w / 2, B.y + B.h / 2];
+              const back = cfg.events[e.to]?.some((x) => x.to === from);
+              const off = back ? 9 : 0;
+              const edgePt = (bx, c, other) => {
+                const dx = other[0] - c[0], dy = other[1] - c[1];
+                const sx = bx.w / 2 / Math.abs(dx || 1e-9), sy = bx.h / 2 / Math.abs(dy || 1e-9);
+                const k = Math.min(sx, sy);
+                return [c[0] + dx * k, c[1] + dy * k];
+              };
+              const nx = -(bc[1] - ac[1]), ny = bc[0] - ac[0];
+              const nl = Math.hypot(nx, ny) || 1;
+              const o = [(nx / nl) * off, (ny / nl) * off];
+              const p1 = edgePt(A, [ac[0] + o[0], ac[1] + o[1]], [bc[0] + o[0], bc[1] + o[1]]);
+              const p2 = edgePt(B, [bc[0] + o[0], bc[1] + o[1]], [ac[0] + o[0], ac[1] + o[1]]);
+              dPath = `M${p1[0]},${p1[1]} L${p2[0] - Math.sign(p2[0] - p1[0]) * 2},${p2[1] - Math.sign(p2[1] - p1[1]) * 2}`;
+            }
+            const p = s("path", { d: dPath, fill: "none", "stroke-width": 1.5, class: "stroke-zinc-300 dark:stroke-zinc-700", "marker-end": `url(#${cfg.id}-a)` });
+            svg.append(p);
+            tEls[key] = p;
+          }
+        }
+        const sEls = {};
+        for (const [id, b] of Object.entries(cfg.states)) {
+          const g = s("g");
+          const r = s("rect", { x: b.x, y: b.y, width: b.w, height: b.h, rx: b.h / 2, "stroke-width": 1.5, class: "fill-white stroke-zinc-300 transition-colors dark:fill-zinc-900 dark:stroke-zinc-700" });
+          const t = s("text", { x: b.x + b.w / 2, y: b.y + b.h / 2 + 5, "text-anchor": "middle", class: "fill-zinc-950 text-[14px] font-medium dark:fill-white" });
+          t.textContent = b.label ?? id;
+          g.append(r, t);
+          svg.append(g);
+          sEls[id] = { r, t };
+        }
+        const cur = $("[data-cur]", wrap), desc = $("[data-desc]", wrap), evBox = $("[data-events]", wrap), log = $("[data-log]", wrap);
+        let state = cfg.start;
+        const paint = (via) => {
+          for (const [id, { r, t }] of Object.entries(sEls)) {
+            const on = id === state;
+            r.setAttribute("class", on ? "fill-orange-50 stroke-orange-600 dark:fill-orange-400/10 dark:stroke-orange-400" : "fill-white stroke-zinc-300 dark:fill-zinc-900 dark:stroke-zinc-700");
+            t.setAttribute("class", `text-[14px] font-medium ${on ? "fill-orange-900 dark:fill-orange-200" : "fill-zinc-950 dark:fill-white"}`);
+          }
+          for (const [k, p] of Object.entries(tEls)) {
+            const on = k === via;
+            const avail = k.startsWith(`${state}>`);
+            p.setAttribute("class", on ? "stroke-orange-600 flowing dark:stroke-orange-400" : avail ? "stroke-zinc-500 dark:stroke-zinc-400" : "stroke-zinc-300 opacity-50 dark:stroke-zinc-700");
+            p.setAttribute("stroke-width", on ? 2.25 : 1.5);
+            p.setAttribute("marker-end", `url(#${cfg.id}-${on ? "on" : "a"})`);
+          }
+          if (via) {
+            const b = cfg.states[state];
+            const ring = s("rect", { x: b.x, y: b.y, width: b.w, height: b.h, rx: b.h / 2, class: "fill-none stroke-orange-500 ping-once", "stroke-width": 2 });
+            svg.append(ring);
+            setTimeout(() => ring.remove(), 800);
+          }
+          cur.textContent = cfg.states[state].label ?? state;
+          desc.textContent = cfg.states[state].desc;
+          evBox.innerHTML = "";
+          const evs = cfg.events[state] ?? [];
+          evs.forEach((e) => {
+            const b = h("button", { type: "button", class: ghostBtn }, esc(e.label));
+            b.onclick = () => {
+              const from = state;
+              state = e.to;
+              log.prepend(h("li", { class: "rise" }, `${esc(cfg.states[from].label ?? from)} to ${esc(cfg.states[e.to].label ?? e.to)}, on ${esc(e.label)}.${e.note ? ` <span class="text-zinc-400">${esc(e.note)}</span>` : ""}`));
+              paint(edgeKey(from, e.to));
+            };
+            evBox.append(b);
+          });
+          if (!evs.length) {
+            const b = h("button", { type: "button", class: ghostBtn }, "Start over");
+            b.onclick = () => { state = cfg.start; log.innerHTML = ""; paint(); };
+            evBox.append(b);
+          }
+        };
+        paint();
+      }
+
+      stateMachine($("#sm-compactor"), {
+        id: "smc", label: "Compactor state machine", w: 640, h: 360, start: "Idle",
+        states: {
+          Idle: { x: 20, y: 160, w: 120, h: 44, desc: "No jobs are running and no collection is due, so the compactor sets no alarm and makes no requests." },
+          Polling: { x: 240, y: 50, w: 140, h: 44, desc: "Jobs are running or waiting for budget. Every 5 seconds the alarm reads job progress, renews leases, and plans more jobs." },
+          CollectionDue: { x: 230, y: 280, w: 160, h: 44, label: "Collection due", desc: "collectionDueAt is set, so the alarm stays set even when compaction is idle." },
+          Fenced: { x: 490, y: 50, w: 130, h: 44, desc: "The manifest holds a newer compactorEpoch. This instance discards its jobs until it fences in again." },
+          Gone: { x: 490, y: 160, w: 130, h: 44, label: "Destroyed", desc: "The database was removed. The state and the alarm are gone, and running jobs fail to commit against the Removed manifest." },
+        },
+        events: {
+          Idle: [
+            { label: "wake", to: "Polling", note: "The compactor increments compactorEpoch." },
+            { label: "requestCollection", to: "CollectionDue", note: "The sweep sends this request." },
+            { label: "destroy", to: "Gone" },
+          ],
+          Polling: [
+            { label: "job still running", to: "Polling", note: "The next alarm is 5 seconds later." },
+            { label: "last job finished", to: "CollectionDue", note: "The collection is due after gcMinAge." },
+            { label: "newer epoch found", to: "Fenced" },
+            { label: "destroy", to: "Gone" },
+          ],
+          CollectionDue: [
+            { label: "collect, nothing more due", to: "Idle" },
+            { label: "collect, more due later", to: "CollectionDue", note: "The report sets nextCollectionAt." },
+            { label: "wake", to: "Polling" },
+            { label: "destroy", to: "Gone" },
+          ],
+          Fenced: [{ label: "wake or alarm", to: "Polling", note: "The compactor fences in again." }],
+          Gone: [],
+        },
+      });
+
+      stateMachine($("#sm-lifecycle"), {
+        id: "sml", label: "Database lifecycle", w: 640, h: 300, start: "None",
+        states: {
+          None: { x: 20, y: 130, w: 110, h: 44, label: "No database", desc: "No manifest exists under db/<id>/." },
+          Open: { x: 190, y: 50, w: 120, h: 44, desc: "The database accepts writes. Flushes, compactions, garbage collection, checkpoints, and forks all commit by manifest CAS." },
+          Sealed: { x: 460, y: 50, w: 120, h: 44, desc: "One CAS committed the final flush and the Sealed state with its successors. Reads work. Writes fail with DatabaseSealedError, which names the successors." },
+          Removed: { x: 455, y: 220, w: 130, h: 44, desc: "A CAS set the state to Removed, which stops every later commit. The writer state and the compactor state are destroyed, the objects are deleted, and the cache tag is purged. The newest manifest stays as a tombstone for gcMinAge." },
+          Cleared: { x: 190, y: 220, w: 120, h: 44, desc: "The tombstone and every leftover object are gone. A new database can reuse the id." },
+        },
+        events: {
+          None: [{ label: "POST /databases", to: "Open", note: "This creates manifest 1." }],
+          Open: [
+            { label: "write or flush", to: "Open" },
+            { label: "POST /seal", to: "Sealed" },
+            { label: "DELETE", to: "Removed" },
+          ],
+          Sealed: [
+            { label: "read", to: "Sealed" },
+            { label: "DELETE", to: "Removed", note: "Remove a sealed database after its forks release their holds." },
+          ],
+          Removed: [{ label: "gcMinAge passes", to: "Cleared", note: "The sweep deletes the leftovers." }],
+          Cleared: [{ label: "POST /databases with the same id", to: "Open" }],
+        },
+      });
+
+      // ────────────────────────────────────────────────────────── GC rails
+      const rail = (el, items) => {
+        el.innerHTML = items.map(([t, d], i) => `
+          <li class="relative flex gap-4 ${i < items.length - 1 ? "pb-5" : ""}">
+            ${i < items.length - 1 ? `<span class="absolute top-6 left-[0.6875rem] h-full w-px bg-zinc-950/10 dark:bg-white/10"></span>` : ""}
+            <span class="relative grid size-6 shrink-0 place-items-center rounded-full bg-white font-mono text-xs text-zinc-500 tabular-nums ring-1 ring-zinc-950/10 dark:bg-zinc-950 dark:ring-white/15">${i + 1}</span>
+            <div class="min-w-0"><p class="text-base font-medium sm:text-sm">${t}</p><p class="mt-0.5 text-base/6 text-pretty text-zinc-600 sm:text-sm/6 dark:text-zinc-400">${d}</p></div>
+          </li>`).join("");
+      };
+      rail($("#gc-collect"), [
+        ["List compacted/", "List the SST objects under the database's own prefix. A fork's borrowed SSTs live under the source's prefix, so this collection never lists them."],
+        ["Advance gcSstBoundary by CAS", "Only when something can be collected. The boundary moves to gcMinAge before now, but no later than 1 minute before the oldest running job started. The same commit drops expired checkpoints and changelog entries past retention."],
+        ["Pick the manifests to keep", "Keep the newest manifest, every checkpoint's manifest, and every manifest younger than gcMinAge. A reader can still hold a recently replaced manifest."],
+        ["Delete unreferenced SSTs", "Delete an SST only when no kept manifest references it and it was created before the boundary."],
+        ["Advance gc/manifest.boundary", "Then delete the other manifests. This step follows SlateDB RFC 0026."],
+        ["Schedule the next collection", "The report's nextCollectionAt becomes the compactor's collectionDueAt."],
+      ]);
+      rail($("#gc-sweep"), [
+        ["List database prefixes after the cursor", "Up to 50 databases per run. The cursor is stored in R2, so consecutive runs visit every database."],
+        ["No manifest", "The prefix holds a removed database's leftovers. finishRemoval and collectLeftovers delete the objects older than gcMinAge."],
+        ["Still reads a source's SSTs", "The database is a fork that has not rewritten its source's SSTs yet. The sweep wakes its compactor, so a lost wake only delays the rewrite."],
+        ["Holds a source it no longer reads", "The sweep calls requestCollection, and that collection releases the hold."],
+        ["Too many uncollected manifests", "More than MAX_UNCOLLECTED_MANIFESTS manifests sit past the boundary, so the sweep calls requestCollection."],
+        ["Failures", "The sweep logs a database that fails, skips it, and continues with the page."],
+      ]);
+
+      // ────────────────────────────────────────────────────────── storage tree
+      const STORE = [
+        { depth: 0, name: "R2 bucket", kind: "r2", header: true },
+        { depth: 1, name: "db/<id>/", desc: "Everything one database owns. The same id names the database's cache tag, db:<id>.", w: ["DatabaseLifecycle.create"], r: ["Everything below"], d: ["DatabaseLifecycle.remove", "MaintenanceSweep.finishRemoval"] },
+        { depth: 2, name: "manifest/00000000000000000042", desc: "One manifest per id, never changed after it is written. putIfAbsent makes each write a CAS, so two committers cannot both create id 42.", w: ["DbWriter flush", "CompactionExecutor.commit", "Compactor fence-in", "DatabaseLifecycle", "GarbageCollector, for boundary edits"], r: ["ManifestReader", "ManifestCache", "Every committer"], d: ["GarbageCollector, for old manifests"] },
+        { depth: 2, name: "manifest/LATEST", desc: "A hint that names the newest known manifest id. The hint may lag, so readers check for newer ids.", w: ["ManifestStore, in the background"], r: ["ManifestReader.loadLatest"], d: ["DatabaseLifecycle.remove"] },
+        { depth: 2, name: "compacted/<ulid>.sst", desc: "L0 and sorted-run SSTs. An SST never changes after upload. Its name is a ULID, which encodes its creation time.", w: ["DbWriter flush, for L0", "CompactionWorkflow output steps"], r: ["DbReader, through BlockSource", "CompactionWorkflow, directly from R2"], d: ["GarbageCollector"] },
+        { depth: 2, name: "changelog/<lastSeq>-<ulid>.sst", desc: "Change data capture. Each file holds the rows of one flush in sequence order. The writer writes these files only when the database has a changelog.", w: ["DbWriter.exportChangelog"], r: ["DbReader.changelogRows, for GET /changes"], d: ["GarbageCollector, after retention"] },
+        { depth: 2, name: "gc/manifest.boundary", desc: "Garbage collection can delete the manifests below this boundary. Readers start above it.", w: ["GarbageCollector", "DatabaseLifecycle.remove"], r: ["ManifestReader.loadManifestBoundary"], d: ["DatabaseLifecycle.remove"] },
+        { depth: 0, name: "Durable Object storage", kind: "do", header: true },
+        { depth: 1, name: "WriterServer memtable_rows", desc: "A SQLite table with the columns key, seq, kind, payload, create_ts, and expire_ts. It is both the write-ahead log and the memtable.", w: ["MemTable.commit"], r: ["probe", "scan", "flush", "writtenAfter"], d: ["MemTable.trim", "destroy"] },
+        { depth: 1, name: "WriterServer writer_meta", desc: "Holds databaseId, writerEpoch, lastSeq, flushedSeq, and the clock tick.", w: ["DbWriter.start", "markFlushed"], r: ["Every writer call"], d: ["destroy"] },
+        { depth: 1, name: "WriterServer flush_marks", desc: "One row per flush, with its cut and commit time. MemTable.trim reads it to find how old the flushed rows are.", w: ["markFlushed"], r: ["MemTable.trim"], d: ["MemTable.trim"] },
+        { depth: 1, name: "CompactorServer state", desc: "Holds compactorEpoch, the fenced flag, the running jobs, the corrupt SSTs, and collectionDueAt.", w: ["Compactor.poll", "Compactor fence-in", "dropSst", "runCollection"], r: ["runAlarm", "status"], d: ["Compactor.destroy"] },
+        { depth: 1, name: "CompactionBudgetServer ledger", desc: "Holds each lease, keyed by database and job, with its budget group and expiry time.", w: ["acquire", "release"], r: ["acquire"], d: ["release", "Lease expiry"] },
+        { depth: 1, name: "ShardDirectoryServer map", desc: "Holds the shard map and the pending split of one group.", w: ["create", "beginSplit", "completeSplit"], r: ["map", "awaitMap"], d: [] },
+      ];
+      const tree = $("#storage-tree");
+      const detail = $("#storage-detail");
+      const showStore = (it) => {
+        const col = (label, arr) => `<div class="border-t border-zinc-950/10 pt-3 dark:border-white/10"><dt class="text-sm font-medium">${label}</dt><dd class="mt-1 text-base/7 text-zinc-600 sm:text-sm/6 dark:text-zinc-400">${arr.length ? arr.map(esc).join("<br>") : "Nothing"}</dd></div>`;
+        detail.innerHTML = `<div class="rise"><p class="font-mono text-sm font-medium break-all">${esc(it.name)}</p><p class="mt-2 text-base/7 text-pretty text-zinc-600 sm:text-sm/6 dark:text-zinc-400">${esc(it.desc)}</p><dl class="mt-5 grid gap-4 sm:grid-cols-3">${col("Written by", it.w)}${col("Read by", it.r)}${col("Deleted by", it.d)}</dl></div>`;
+      };
+      STORE.forEach((it, i) => {
+        const li = h("li");
+        if (it.header) {
+          li.innerHTML = `<p class="${i ? "mt-6" : ""} flex items-center gap-2 font-sans text-sm font-medium"><span class="size-2 shrink-0 rounded-full ${KINDS[it.kind].dot}"></span>${it.name}</p>`;
+        } else {
+          li.innerHTML = `<button type="button" class="w-full truncate rounded-md py-0.5 pr-2 text-left text-zinc-700 hover:bg-zinc-50 aria-pressed:bg-orange-50 aria-pressed:text-orange-800 dark:text-zinc-300 dark:hover:bg-white/5 dark:aria-pressed:bg-orange-400/10 dark:aria-pressed:text-orange-300" style="padding-left:${it.depth * 1.25}rem" aria-pressed="false"><span class="text-zinc-400">${it.depth > 1 ? (STORE[i + 1]?.depth === it.depth ? "├ " : "└ ") : ""}</span>${esc(it.name)}</button>`;
+          const b = $("button", li);
+          b.onclick = () => { $$("button", tree).forEach((x) => x.setAttribute("aria-pressed", String(x === b))); showStore(it); };
+        }
+        tree.append(li);
+      });
+      $$("button", tree)[3].click();
+    </script>
+  </body>
+</html>
