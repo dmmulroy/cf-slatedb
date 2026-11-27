@@ -29,7 +29,7 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `compactor-worker.ts`; writers wake compactors (`compaction-trigger.ts`, `compactor-client.ts`).
   Tests: `compactor.test.ts` (fence-once, idle, fencing, shared budget; D78: concurrent first
   wakes share one fence-in, no state write over a newer epoch or a requested collection, a fenced
-  compactor fences in again on wake and alarm; D94: a job unseen for `compactionLeaseMs` is
+  compactor fences in again on wake and alarm; D102: a failing poll backs off to its ceiling; D94: a job unseen for `compactionLeaseMs` is
   finished), `compaction-executor.test.ts`
   (oracle property across flushes and compactions, key-ordered outputs, bottom deletes, inputs
   changed, fenced), `writer.workerd.ts` (four flushes → compactor wake → Workflow → commit, reads at
