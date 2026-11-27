@@ -486,5 +486,11 @@ same time, six runs: no `exceededMemory` and no reset. The one reset seen was th
 - Whether Durable Object SQLite's page cache counts against the 128 MB isolate limit, as such: no
   API reports a Durable Object's memory. What matters was measured instead: a writer holding
   `maxUnflushedBytes` (256 MiB) unflushed, then flushing it, never reported `exceededMemory` (D61).
-- The Workflows concurrent-instance limit itself: 200 compactions started at once all ran (D61);
-  production's compaction budget (32) stays far below that.
+- The Workflows concurrent-instance limit was not measured. It is documented as 50,000 per
+  account (developers.cloudflare.com/workflows/reference/limits, 2026-11-10; D92). 200 compactions
+  started at once all ran (D61), and production's compaction budget (32) is refused above the
+  documented limit.
+- No platform limit in D92's "derived" rows was reached on a preview. Not measured, for example:
+  a compaction over deleted or expired data, a large compaction's first step result, a `Latest`
+  scan over a full memtable, and garbage collection after an hour of commits several a second.
+- Worker startup time (1 s limit) was not measured. Each Worker uploads 3.3 MB.

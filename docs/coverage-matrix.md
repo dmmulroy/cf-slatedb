@@ -485,6 +485,13 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   Metrics are emitted and not collected (`docs/operations.md`, "What to watch"). Tests:
   `health-report.test.ts`; the span attributes in `db-writer.test.ts`, `object-store.test.ts`,
   `compactor.test.ts`; the exported keys in `lsm-trace-policy.test.ts`.
+- **Platform limits (D92)** — partial. The settings Cloudflare's limits cannot hold are refused
+  (`LSM_PLATFORM_LIMITS` and the combination rules in `lsm-core/src/lsm-settings.ts`). Tests:
+  `lsm-settings.test.ts` (each rule at its edge), `shaledb-stack-config.test.ts` (the bound
+  settings fit a Worker variable's 5 KB). Open, with failing tests in the audit's directory:
+  the compaction step result size, a step over dropped rows, a `Latest` scan's and every page's
+  memory, and the garbage collection's reads per run. The table of limits is D92;
+  `docs/operations.md` "Platform limits" is the operator's summary.
 - **Production readiness (v1 workstream 9)** — done (D64).
   - **Tokens.** `lsmAccessGateFrom`, `lsmAccessGateOver`, `LsmAccessTokenSource`, and
     `lsmStageAccessTokens` (`lsm-access-gate.ts`). In infra: `shaledbAccessTokens`

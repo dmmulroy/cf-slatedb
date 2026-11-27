@@ -128,7 +128,7 @@ Measured on preview stages with production settings ([`measurements.md`](measure
 | L0 SSTs before writes stall     | 16 (`l0MaxSsts`)                                                   |
 | Manifest commit (one CAS)       | p50 ~357 ms beside the bucket; ~550 ms from Europe; ~1 s from APAC |
 | Small flush                     | p50 ~709 ms                                                        |
-| 60 MiB flush                    | ~1 s CPU (max ~4 s), ~14 s wall                                    |
+| 60 MiB flush                    | ~4 s CPU per flush (D73), ~14 s wall                               |
 | Compaction step (64 MiB output) | ~10 s CPU (max ~18 s)                                              |
 | Split (seal and fork)           | writes pause ~3 s                                                  |
 | Transactions held open          | at least 60 s (`transactionRetentionMs`) across flushes            |
@@ -137,6 +137,33 @@ Measured on preview stages with production settings ([`measurements.md`](measure
 
 Throughput per database is one writer's. A workload that needs more uses more databases, for
 example with range sharding.
+
+## Platform limits
+
+The Cloudflare limits an operator must know, from developers.cloudflare.com as read on 2026-11-26
+(the full table, with sources and margins, is D92). "Measured" means on a preview with production
+settings, "derived" computed from the code and the settings, "docs" from the documentation only.
+
+| Limit                                                            | What it means for shaledb                                                                                                                                                                              | Act                                                                                                                      | Kind     |
+| ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------ | -------- |
+| CPU per invocation (30 s default, up to 5 min)                   | Set to 30 s for the API Worker and writers and 60 s for the compactor. Largest seen: 9.8 s (a 256 MiB flush) and 17.7 s (a compaction step)                                                            | `exceededCpu` in `measure health` (What to watch); raise `SHALEDB_API_CPU_MS` / `SHALEDB_COMPACTOR_CPU_MS` up to 300,000 | measured |
+| A compaction step whose rows are all dropped                     | One step reads every input of its job (D92, finding 2): a job over a few hundred MiB of deleted or expired data can exceed the compactor's CPU on every retry, and L0 then fills                       | Watch the L0 backlog after mass deletes or TTL expiry; raising the compactor's CPU limit buys room until the fix         | derived  |
+| Memory per isolate (128 MB)                                      | A `Latest` scan holds every unflushed row of its range, and pages are bounded by rows (1,000), not bytes, with values up to 1 MiB (D92, finding 3)                                                     | Use small scan limits over large values; `exceededMemory` in `measure health`                                            | derived  |
+| Subrequests per invocation (10,000) and alarm wall time (15 min) | One garbage collection reads every manifest superseded within the hour, one after another (D92, finding 4): about 5,000 reads and 350 s at 1.4 commits a second                                        | Avoid flushing or pinning snapshots several times a second on one database; GC failures in `measure health`              | derived  |
+| Workflows step result (1 MiB)                                    | A compaction's first step carries every input SST's handle: about 220 bytes each with short keys, 44 KB with 16 KiB keys (D92, finding 1)                                                              | Prefer short keys; a database whose L0 stops draining with jobs failing at `prepare` has hit it                          | derived  |
+| Durable Object storage (10 GB per object)                        | A writer holds at most `maxRetainedBytes` + 2 × `maxUnflushedBytes` + one batch: 584 MiB by default. Settings that exceed 10 GB are refused                                                            | None with the defaults                                                                                                   | derived  |
+| R2: 10,000 parts, 5 GiB less 5 MiB per part                      | 32 parts for the largest flush; settings that exceed either are refused                                                                                                                                | None with the defaults                                                                                                   | derived  |
+| R2: one write per second to one key                              | The `LATEST` hint is written on every commit; above one commit a second some hint writes get 429 and the hint lags, which readers tolerate (D56)                                                       | None                                                                                                                     | derived  |
+| Workflows: 50,000 concurrent instances per account               | The compaction budget (32) is refused above it                                                                                                                                                         | None with the defaults                                                                                                   | docs     |
+| `waitUntil` (30 s after the response)                            | Background hint writes, fork warming, and compactor wakes: a cold wake took 5 to 9 s                                                                                                                   | None                                                                                                                     | measured |
+| Secrets Store (100 secrets per account, open beta)               | Two per live stage; delete orphaned ones (`docs/final-handoff-draft.md`)                                                                                                                               | Keep the account under 100                                                                                               | docs     |
+| `workers.dev`                                                    | Cloudflare treats it as a Free website, "intended for personal or hobby projects that aren't business-critical", and recommends a route or custom domain for production; production uses it today (P3) | Put production behind a custom domain when the account has a zone                                                        | docs     |
+| Tail Workers                                                     | What is dropped under load is not documented                                                                                                                                                           | Treat tail-record counts as a lower bound                                                                                | docs     |
+
+Costs that grow without use: the maintenance sweep runs every 5 minutes on every live stage; an
+idle database keeps its newest flush's rows (up to 64 MiB) in its writer's SQLite; checkpoints
+without a lifetime and long changelog retention keep SSTs and grow the manifest; traces and tail
+records are kept 14 days.
 
 ## Telemetry
 
