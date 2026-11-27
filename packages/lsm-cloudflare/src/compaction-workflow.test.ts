@@ -9,7 +9,7 @@ const encode = Schema.encodeSync(CompactionJobOutcome);
 
 describe("compactionJobProgressOf", () => {
   it("is running while the instance can still commit, and finished with its outcome otherwise", () => {
-    for (const status of ["queued", "running", "paused", "waiting", "waitingForPause", "unknown"]) {
+    for (const status of ["queued", "running", "paused", "waiting", "waitingForPause"]) {
       expect(compactionJobProgressOf(status, undefined)).toEqual({ _tag: "Running" });
     }
     const committed = { _tag: "Committed" as const, manifestId: ManifestId.make(7) };
@@ -45,9 +45,11 @@ describe("isWorkflowInstanceNotFound", () => {
   });
 
   it("does not count a status this code does not know as running", () => {
-    expect(compactionJobProgressOf("someFutureStatus", undefined)).toEqual({
-      _tag: "Finished",
-      outcome: Option.none(),
-    });
+    for (const status of ["unknown", "someFutureStatus"]) {
+      expect(compactionJobProgressOf(status, undefined)).toEqual({
+        _tag: "Finished",
+        outcome: Option.none(),
+      });
+    }
   });
 });

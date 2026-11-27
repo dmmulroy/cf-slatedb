@@ -104,14 +104,18 @@ export const isWorkflowInstanceNotFound = (cause: Cause.Cause<unknown>): boolean
 /** The message Workflows' `get` rejects with for an instance it does not hold. */
 const WORKFLOW_INSTANCE_NOT_FOUND = "instance.not_found";
 
-/** Workflow statuses after which a job can still commit. */
+/**
+ * Workflow statuses after which a job can still commit. Any other status, `unknown` and any this
+ * code does not know included, finishes the job without an outcome: its sources are planned
+ * again, and if the instance commits after all, the commit's exact-inputs check refuses it once
+ * another job took them (D94, D103).
+ */
 const RUNNING_STATUSES: ReadonlySet<string> = new Set([
   "queued",
   "running",
   "paused",
   "waiting",
   "waitingForPause",
-  "unknown",
 ]);
 
 /**
