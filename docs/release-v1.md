@@ -696,7 +696,6 @@ them.
   partial). Test gaps closed: the commit lock against a seal, the stored row kinds, the start
   failures, concurrent first requests, concurrent flushes, the trim's bounds, and a restarted
   writer scheduling its flush. No wrong behavior found.
-- **D123, span events pass the trace policy.**
 - **D125, every scan surface is bounded** (the second review, above).
 - **D128, the mutation sweep of the request edge and sharding.** 165 mutants. It found one defect,
   by reading the code beside a survivor: a read of a corrupted SST answered `InternalFailure`,
