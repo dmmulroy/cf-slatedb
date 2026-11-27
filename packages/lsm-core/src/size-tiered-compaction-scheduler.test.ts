@@ -3,6 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import { DatabaseId, SeqNum, SortedRunId, SstId, Timestamp } from "./ids.ts";
 import { assertProperty } from "./lsm-core-arbitraries.ts";
+import { DEFAULT_LSM_SETTINGS, LsmSettings } from "./lsm-settings.ts";
 import {
   commitCompaction,
   commitL0Flush,
@@ -95,6 +96,27 @@ const optionsArbitrary: Arbitrary.Arbitrary<SizeTieredCompactionOptions> = Arbit
   ),
 );
 
+const decodeLsmSettings = Schema.decodeUnknownOption(LsmSettings);
+
+/**
+ * Settings an operator may configure (any that `LsmSettings` accepts), with the scheduler's and the
+ * write path's L0 limits drawn across their whole small range.
+ */
+const validSettingsArbitrary = Arbitrary.all({
+  l0MaxSsts: smallInt(1, 20),
+  minCompactionSources: smallInt(2, 10),
+  extra: smallInt(0, 6),
+}).pipe(
+  Arbitrary.map(({ l0MaxSsts, minCompactionSources, extra }) =>
+    decodeLsmSettings({
+      ...DEFAULT_LSM_SETTINGS,
+      l0MaxSsts,
+      minCompactionSources,
+      maxCompactionSources: minCompactionSources + extra,
+    }),
+  ),
+);
+
 const sourceKey = (source: CompactionJob["sources"][number]) =>
   source._tag === "L0" ? `l0:${source.sstId}` : `sr:${source.id}`;
 
@@ -146,6 +168,25 @@ const jobIsValid = (
 };
 
 describe("planCompactions", () => {
+  it("plans a job that shrinks L0 whenever writes are refused for L0 backlog and nothing runs (D87)", () => {
+    assertProperty(
+      Arbitrary.all({ settings: validSettingsArbitrary, base: manifestArbitrary }),
+      ({ settings, base }) => {
+        // Settings the schema refuses never reach a writer or a compactor.
+        if (Option.isNone(settings)) return true;
+        const { l0MaxSsts } = settings.value;
+        // L0 exactly at the limit at which the writer refuses writes; any sorted runs.
+        const manifest = withLsm(
+          Array.from({ length: l0MaxSsts }, () => handle(1000)),
+          base.sortedRuns,
+        );
+        const planned = planCompactions(manifest, [], settings.value);
+        return planned.some((job) => job.sources.some((source) => source._tag === "L0"));
+      },
+      { runs: 300 },
+    );
+  });
+
   it("plans valid jobs that never overlap each other or a job in flight", () => {
     assertProperty(
       Arbitrary.all({ manifest: manifestArbitrary, options: optionsArbitrary }),
@@ -182,6 +223,46 @@ describe("planCompactions", () => {
       },
       { runs: 400 },
     );
+  });
+
+  it("keeps the number of sorted runs logarithmic in the data over a long run of flushes (Workflow audit)", () => {
+    // 2,000 flushes of one L0 SST each, every planned job committed at once, with the default
+    // options: size-tiered merging keeps fewer than minCompactionSources runs per size tier, and
+    // tiers grow at least includeSizeThreshold-fold, so runs stay within that many per tier.
+    const options = DEFAULT_SIZE_TIERED_COMPACTION_OPTIONS;
+    let current = withLsm([], []);
+    let mostRuns = 0;
+    let flushes = 0;
+    const sizeOf = (manifest: Manifest) =>
+      manifest.sortedRuns.reduce(
+        (sum, run) => sum + run.ssts.reduce((inner, sst) => inner + sst.sizeBytes, 0),
+        0,
+      ) + manifest.l0.reduce((sum, sst) => sum + sst.sizeBytes, 0);
+    for (; flushes < 2_000; flushes++) {
+      current = withLsm([handle(1000), ...current.l0], current.sortedRuns);
+      for (;;) {
+        const [job] = planCompactions(current, [], options);
+        if (job === undefined) break;
+        const inputs = job.sources.flatMap((source) =>
+          source._tag === "L0"
+            ? current.l0.filter((sst) => sst.id === source.sstId)
+            : (current.sortedRuns.find((run) => run.id === source.id)?.ssts ?? []),
+        );
+        const output = handle(inputs.reduce((sum, sst) => sum + sst.sizeBytes, 0));
+        current = Result.getOrThrow(
+          commitCompaction(current, {
+            compactorEpoch: current.compactorEpoch,
+            job,
+            outputs: [output],
+          }),
+        );
+      }
+      mostRuns = Math.max(mostRuns, current.sortedRuns.length);
+    }
+    const tiers =
+      Math.ceil(Math.log(sizeOf(current) / 1000) / Math.log(options.includeSizeThreshold)) + 1;
+    expect(current.l0.length).toBeLessThan(options.minCompactionSources);
+    expect(mostRuns).toBeLessThanOrEqual(options.minCompactionSources * tiers);
   });
 
   it("converges: committing planned jobs until none remain terminates with fewer sources than the minimum per group", () => {

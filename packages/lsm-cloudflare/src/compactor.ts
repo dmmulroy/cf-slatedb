@@ -549,6 +549,8 @@ export const makeCompactor = Effect.gen(function* () {
           waitingForBudget = true;
           break;
         }
+        // Before the launch: the job's outputs are written after it, so none is older (D96).
+        const startedAt = Timestamp.make(yield* Clock.currentTimeMillis);
         const started = yield* launcher
           .start({ databaseId, compactorEpoch: state.compactorEpoch, jobId, job })
           .pipe(
@@ -565,7 +567,7 @@ export const makeCompactor = Effect.gen(function* () {
           jobId,
           job,
           budgetGroup: group,
-          startedAt: Timestamp.make(yield* Clock.currentTimeMillis),
+          startedAt,
         });
       }
       // A finished job left garbage (its inputs, older manifests): collectable after gcMinAge.
@@ -635,7 +637,13 @@ export const makeCompactor = Effect.gen(function* () {
       Effect.gen(function* () {
         const before = yield* cell.get;
         const dueBefore = Option.flatMap(before, (state) => state.collectionDueAt);
-        const report = yield* collector.collect(databaseId);
+        // A job running longer than gcMinAge keeps its outputs and its commit (D96).
+        const oldestRunning = Option.flatMap(before, (state) =>
+          state.running.length === 0
+            ? Option.none<Timestamp>()
+            : Option.some(Timestamp.make(Math.min(...state.running.map((job) => job.startedAt)))),
+        );
+        const report = yield* collector.collect(databaseId, oldestRunning);
         // A request or a finished compaction that moved the due time during this collection
         // stands: the report predates it (D78).
         const stored = yield* updateExisting(databaseId, (state) => ({

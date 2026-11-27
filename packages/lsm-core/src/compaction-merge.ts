@@ -14,6 +14,38 @@ export interface CompactionRetention {
   readonly mergeOperator: Option.Option<MergeOperator>;
 }
 
+/** One key of a compaction: its versions in the inputs and those that survive. */
+export interface CompactedKey {
+  /** The key's versions read from the inputs, newest first. */
+  readonly input: Arr.NonEmptyReadonlyArray<Row>;
+  /** The versions the output keeps (none when every version is dropped). */
+  readonly kept: ReadonlyArray<Row>;
+}
+
+/**
+ * Merges compaction inputs key by key, in key order: every key read, with what it keeps.
+ *
+ * **Details**
+ *
+ * Unlike {@link compactRowStreams}, a key whose versions are all dropped is still emitted (with
+ * nothing kept), so a caller can bound a step by what it read, not only by what it wrote (D97).
+ */
+export const compactKeys = <E, R>(
+  sources: ReadonlyArray<Stream.Stream<Row, E, R>>,
+  retention: CompactionRetention,
+): Stream.Stream<CompactedKey, E, R> =>
+  groupRowsByKey(mergeRowStreams(sources)).pipe(
+    Stream.map((input) => ({
+      input,
+      kept: retainKeyVersions(input, {
+        now: retention.now,
+        retainAboveSeq: Option.none(),
+        isBottom: retention.isBottom,
+        mergeOperator: retention.mergeOperator,
+      }),
+    })),
+  );
+
 /**
  * Merges compaction inputs into each key's surviving versions, in key order.
  *
@@ -34,14 +66,8 @@ export const compactRowStreams = <E, R>(
   sources: ReadonlyArray<Stream.Stream<Row, E, R>>,
   retention: CompactionRetention,
 ): Stream.Stream<Arr.NonEmptyReadonlyArray<Row>, E, R> =>
-  groupRowsByKey(mergeRowStreams(sources)).pipe(
-    Stream.filterMap((versions) => {
-      const kept = retainKeyVersions(versions, {
-        now: retention.now,
-        retainAboveSeq: Option.none(),
-        isBottom: retention.isBottom,
-        mergeOperator: retention.mergeOperator,
-      });
-      return Arr.isReadonlyArrayNonEmpty(kept) ? Result.succeed(kept) : Result.failVoid;
-    }),
+  compactKeys(sources, retention).pipe(
+    Stream.filterMap(({ kept }) =>
+      Arr.isReadonlyArrayNonEmpty(kept) ? Result.succeed(kept) : Result.failVoid,
+    ),
   );

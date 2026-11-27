@@ -2,12 +2,12 @@ import {
   DatabaseId,
   hasSstCollectionCandidates,
   nextCollectionTime,
-  type Manifest,
   ManifestId,
   planManifestCollection,
   planSstCollection,
+  addRetainedManifest,
+  emptyRetainedReferences,
   prepareGarbageCollection,
-  releasableExternalRefs,
   removeCheckpoint,
   removeExternalRef,
   SstId,
@@ -81,14 +81,41 @@ export const gcDeletedObjects = Metric.counter("lsm_gc_deleted_objects", {
  * source's prefix, which this database's collection never lists.
  */
 export interface IGarbageCollector {
+  /**
+   * Collects `databaseId`. Only its compactor calls this (D60): it knows the compactions running.
+   *
+   * @param oldestRunningJobStartedAt - When the oldest compaction job still running started, by
+   *   the compactor's clock, or none. The collection then neither deletes an unreferenced SST
+   *   created after {@link RUNNING_JOB_CLOCK_MARGIN_MS} before it nor advances `gcSstBoundary`
+   *   past that time, so a job running longer than `gcMinAge` keeps its outputs and can commit
+   *   (D96).
+   */
   readonly collect: (
     databaseId: DatabaseId,
+    oldestRunningJobStartedAt: Option.Option<Timestamp>,
   ) => Effect.Effect<
     GarbageCollectionReport,
     GarbageCollectorUnavailableError | DatabaseNotFoundError,
     RuntimeContext
   >;
+  /**
+   * Deletes what a removed database left under its prefix, once older than `gcMinAge`, when it has
+   * no manifest; does nothing to a database that has one (its compactor collects it). For the
+   * maintenance sweep.
+   */
+  readonly collectLeftovers: (
+    databaseId: DatabaseId,
+  ) => Effect.Effect<GarbageCollectionReport, GarbageCollectorUnavailableError, RuntimeContext>;
 }
+
+/**
+ * How long before a running job's start (by the compactor's clock) its outputs may have been
+ * minted. A job's outputs are named by ULIDs minted by the clock of the Workflow that writes them,
+ * which may run behind the compactor's; a job's first output is written after its `prepare` step
+ * reads the manifest, at least a manifest load after the start, so a minute covers any skew
+ * between Cloudflare machines with room to spare (D96).
+ */
+export const RUNNING_JOB_CLOCK_MARGIN_MS = 60_000;
 
 /** The contextual garbage collector. */
 export class GarbageCollector extends Context.Service<GarbageCollector, IGarbageCollector>()(
@@ -165,11 +192,59 @@ export const makeGarbageCollector = Effect.gen(function* () {
       };
     });
 
-  const collect = Effect.fn("GarbageCollector.collect")(function* (databaseId: DatabaseId) {
+  const collectLeftovers = Effect.fn("GarbageCollector.collectLeftovers")(function* (
+    databaseId: DatabaseId,
+  ) {
+    yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
+    const now = Timestamp.make(yield* Clock.currentTimeMillis);
+    const cutoff = Timestamp.make(Math.max(0, now - settings.gcMinAge));
+    const found = yield* reader.loadLatest(databaseId).pipe(
+      Effect.map(Option.some),
+      Effect.catchTags({
+        ManifestReadError: unavailable(databaseId),
+        DatabaseNotFoundError: () => Effect.succeed(Option.none<VersionedManifest>()),
+      }),
+    );
+    // A database with a manifest is its compactor's to collect: it knows the running jobs.
+    if (Option.isSome(found)) {
+      return {
+        databaseId,
+        manifestId: Option.some(found.value.id),
+        sstBoundary: found.value.manifest.gcSstBoundary,
+        deletedSsts: 0,
+        deletedManifests: 0,
+        nextCollectionAt: Option.none<Timestamp>(),
+      };
+    }
+    return yield* sweepLeftovers(databaseId, cutoff);
+  });
+
+  const collect = Effect.fn("GarbageCollector.collect")(function* (
+    databaseId: DatabaseId,
+    oldestRunningJobStartedAt: Option.Option<Timestamp>,
+  ) {
     yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
     const now = Timestamp.make(yield* Clock.currentTimeMillis);
     // Nothing is older than gcMinAge yet while the clock itself is younger (fresh test clocks).
-    const cutoff = Timestamp.make(Math.max(0, now - settings.gcMinAge));
+    // Nor is anything a running job may have written: its outputs are unreferenced until it
+    // commits, and deleting them, or moving the boundary past them, would refuse that commit (D96).
+    const cutoff = Timestamp.make(
+      Math.max(
+        0,
+        Math.min(
+          now - settings.gcMinAge,
+          Option.match(oldestRunningJobStartedAt, {
+            onNone: () => Number.POSITIVE_INFINITY,
+            onSome: (startedAt) => startedAt - RUNNING_JOB_CLOCK_MARGIN_MS,
+          }),
+        ),
+      ),
+    );
+    if (Option.isSome(oldestRunningJobStartedAt)) {
+      yield* Effect.annotateCurrentSpan({
+        "gc.oldest_running_job_started_at": oldestRunningJobStartedAt.value,
+      });
+    }
     const objectFailed = objectFailures(databaseId);
 
     const ssts: Array<StoredSst> = [];
@@ -215,15 +290,36 @@ export const makeGarbageCollector = Effect.gen(function* () {
       now,
       minAge: settings.gcMinAge,
     });
-    const retained: Array<Manifest> = [committed.manifest];
+    // Each retained manifest's references are folded in as it is read, and the manifest dropped:
+    // a busy database retains thousands (D98). Past the load budget the rest are not read, and SST
+    // deletion waits for a run that can read them all.
+    const references = emptyRetainedReferences();
+    addRetainedManifest(references, committed.manifest);
     const missing: Array<ManifestId> = [];
+    let loads = 0;
+    let unread = 0;
     for (const id of plan.retained) {
       if (id === committed.id) continue;
+      if (loads >= settings.gcMaxRetainedManifestLoads) {
+        unread++;
+        continue;
+      }
+      loads++;
       const manifest = yield* reader
         .load(databaseId, id)
         .pipe(Effect.catchTags({ ManifestReadError: unavailable(databaseId) }));
       if (Option.isNone(manifest)) missing.push(id);
-      retained.push(...Option.toArray(manifest));
+      else addRetainedManifest(references, manifest.value);
+    }
+    const sstCollectionDeferred = unread > 0;
+    if (sstCollectionDeferred) {
+      yield* Effect.annotateCurrentSpan({
+        "gc.sst_collection_deferred": unread,
+        "gc.retained_manifests": plan.retained.length,
+      });
+      yield* Effect.logWarning(
+        `Garbage collection of database ${databaseId} retains ${plan.retained.length} manifests, more than the ${settings.gcMaxRetainedManifestLoads} one collection reads, so it left ${unread} unread and deleted no SST: deleting on partial knowledge could remove an SST an unread manifest names. Old manifests were still deleted. SST collection resumes once the database commits fewer manifests per gcMinAge (docs/operations.md, "Garbage collection and removal").`,
+      );
     }
     const everyRetainedLoaded = missing.length === 0;
     // A retained manifest listed a moment ago and gone now. Another collection deletes manifests
@@ -246,9 +342,12 @@ export const makeGarbageCollector = Effect.gen(function* () {
     // A fork releases its hold on its source once no manifest kept here names another database's
     // SST (D77). Each step is an idempotent CAS: first the owner's checkpoint, then the reference,
     // so a crash between them leaves the reference, and the next collection releases again.
-    const released = everyRetainedLoaded
-      ? releasableExternalRefs(committed.manifest, retained)
-      : [];
+    // `releasableExternalRefs` over the folded references: none while any kept manifest reads
+    // another database's SST, or while one was not read.
+    const released =
+      everyRetainedLoaded && !sstCollectionDeferred && !references.readsAnotherDatabase
+        ? committed.manifest.externalRefs
+        : [];
     for (const ref of released) {
       yield* manifests
         .update(ref.owner, (manifest) =>
@@ -272,7 +371,9 @@ export const makeGarbageCollector = Effect.gen(function* () {
     }
     const sstBoundary =
       committed.manifest.gcSstBoundary < cutoff ? committed.manifest.gcSstBoundary : cutoff;
-    const deletedSsts = planSstCollection({ retained, stored: ssts, boundary: sstBoundary });
+    const deletedSsts = sstCollectionDeferred
+      ? []
+      : planSstCollection({ live: references.live, stored: ssts, boundary: sstBoundary });
     yield* objects
       .delete(deletedSsts.map((object) => object.key))
       .pipe(Effect.catchTags(objectFailed));
@@ -301,7 +402,7 @@ export const makeGarbageCollector = Effect.gen(function* () {
       latestId: committed.id,
       latest: committed.manifest,
       retainedIds: plan.retained,
-      retained,
+      live: references.live,
       stored: ssts,
       boundary: sstBoundary,
       now,
@@ -320,7 +421,7 @@ export const makeGarbageCollector = Effect.gen(function* () {
     };
   });
 
-  return GarbageCollector.of({ collect });
+  return GarbageCollector.of({ collect, collectLeftovers });
 });
 
 /**

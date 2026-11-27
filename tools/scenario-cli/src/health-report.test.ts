@@ -27,6 +27,7 @@ const none: HealthSpans = {
   polls: [],
   uploads: [],
   failedCollections: [],
+  collections: [],
   failedSweeps: [],
   errors: [],
 };
@@ -152,6 +153,28 @@ describe("summarizeHealth (D82)", () => {
     expect(summarizeHealth([], flushes(30_000)).issues).toEqual([]);
     expect(summarizeHealth([], flushes(30_001)).issues).toEqual([
       "flush p99 is 30001 ms, above 30000 ms",
+    ]);
+  });
+
+  it("makes a database whose latest collection deferred SST deletion an issue, and one that caught up not (D98)", () => {
+    const collection = (database: string, attributes: Record<string, unknown> = {}) =>
+      span("GarbageCollector.collect", { "database.id": database, ...attributes });
+    const deferred = { "gc.sst_collection_deferred": 120, "gc.retained_manifests": 5_120 };
+    const report = summarizeHealth([], {
+      ...none,
+      collections: [
+        collection("orders", deferred),
+        collection("users"),
+        collection("users", deferred),
+        collection("events", deferred),
+        collection("events"),
+      ],
+    });
+    expect(report.healthy).toBe(false);
+    expect(report.gc.sstCollectionDeferred).toEqual(["orders", "users"]);
+    expect(report.issues).toEqual([
+      "database orders's collection deferred SST deletion: it retains 5120 manifests and left 120 unread, so its garbage SSTs stay until it commits fewer manifests per gcMinAge (D98)",
+      "database users's collection deferred SST deletion: it retains 5120 manifests and left 120 unread, so its garbage SSTs stay until it commits fewer manifests per gcMinAge (D98)",
     ]);
   });
 

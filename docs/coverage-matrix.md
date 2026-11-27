@@ -31,7 +31,12 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   wakes share one fence-in, no state write over a newer epoch or a requested collection, a fenced
   compactor fences in again on wake and alarm), `compaction-executor.test.ts`
   (oracle property across flushes and compactions, key-ordered outputs, bottom deletes, inputs
-  changed, fenced), `writer.workerd.ts` (four flushes → compactor wake → Workflow → commit, reads at
+  changed, fenced; D97: a step whose rows are all dropped ends after a bounded input and
+  writes nothing; D96: a job running longer than `gcMinAge` keeps its outputs through a
+  collection and commits, older garbage still goes, a discarded job's outputs go later, and the
+  compactor passes the oldest running job's start, taken before its launch; D86: the `prepare` step result of the largest planned merge fits Workflows'
+  1 MiB, and a later step of a job whose inputs left the manifest is discarded),
+  `writer.workerd.ts` (four flushes → compactor wake → Workflow → commit, reads at
   every consistency, span assertions). D33–D36.
 - **Readers in any Worker; `Latest`/`AtLeast` through the writer** — done. `db-reader.ts` runs
   in the caller's isolate; `db-client.ts` builds `Latest` views from the writer's probe. Trace: the
@@ -211,7 +216,8 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `db-writer.ts` (sequence oracle and clock in the commit transaction, D20; `ChangelogExport` is
   `exportChangelog`), `writer-client.ts`, `writer-server.ts`, `writer-http-api.ts`.
 - **`CompactionScheduler` (pure)** — done. `lsm-core/src/size-tiered-compaction-scheduler.ts`;
-  `size-tiered-compaction-scheduler.test.ts` over `Arbitrary` manifests and options: jobs are
+  `size-tiered-compaction-scheduler.test.ts` over `Arbitrary` manifests and options (D87: with L0
+  at `l0MaxSsts` and nothing running, every valid setting plans an L0 job): jobs are
   consecutive, all-L0 or all-runs, within min/max sources and `includeSizeThreshold`, never overlap
   each other or a job in flight, have the right destination and `isBottom`; repeatedly committing
   planned jobs converges (fallback consolidation terminates). Shown failing with the size
@@ -219,8 +225,10 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
 - **`DatabaseLifecycle`, `GarbageCollector`, `CompactionBudget`** — done. `database-lifecycle.ts`
   (`create`, `createCheckpoint`, `deleteCheckpoint`, `seal`, `forkRange`, `remove`),
   `garbage-collector.ts`, `compaction-budget.ts` + `compaction-budget-server.ts` (lsm-core
-  `compaction-budget-ledger.ts`). Tests: `database-lifecycle.test.ts`, `garbage-collector.test.ts`,
-  `compactor.test.ts`, `writer.workerd.ts`.
+  `compaction-budget-ledger.ts`). Tests: `database-lifecycle.test.ts`, `garbage-collector.test.ts`
+  (D96: a running job's outputs are kept; D98: over the manifest-read budget, old manifests go and
+  SST deletion is deferred), `compactor.test.ts`, `writer.workerd.ts`; `health-report.test.ts`
+  (D98: a deferring database is an issue).
 
 ## §8 Public API and semantics
 

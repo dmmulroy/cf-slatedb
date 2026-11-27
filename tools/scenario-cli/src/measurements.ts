@@ -1531,6 +1531,7 @@ export const measureHealth = (minutes: number) =>
       polls: yield* named("Compactor.poll"),
       uploads: yield* named("ObjectStore.putMultipart"),
       failedCollections: yield* named("GarbageCollector.collect", "--error"),
+      collections: yield* named("GarbageCollector.collect"),
       failedSweeps: yield* named("MaintenanceSweep.sweepPage", "--error"),
       errors: yield* spansSince(store, sinceMs, ["--error"]),
     });

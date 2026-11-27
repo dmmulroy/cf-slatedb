@@ -6,7 +6,7 @@ import {
   CompactorEpoch,
   CompactorFencedError,
   commitCompaction,
-  compactRowStreams,
+  compactKeys,
   DatabaseId,
   decodeDataBlock,
   decodeSstMeta,
@@ -20,6 +20,7 @@ import {
   type SstBelowGcBoundaryError,
   type SstCorruptedError,
   SstHandle,
+  SstId,
   sstHandleOwner,
   sstHandleVisibleRange,
   Timestamp,
@@ -55,14 +56,19 @@ import { SstStore, sstStoreLayerWithoutDependencies } from "./sst-store.ts";
  *
  * **Details**
  *
- * `inputs` are newest first: each L0 SST alone (newest first), then each sorted run's SSTs in key
- * order (newest run first). `now` is the time TTL is evaluated at.
+ * `inputIds` are the input SSTs, newest first: each L0 SST alone (newest first), then each sorted
+ * run's SSTs in key order (newest run first). `now` is the time TTL is evaluated at.
+ *
+ * Only the ids are kept, not the SSTs' handles: this is a Workflow step's result, which Workflows
+ * store only up to 1 MiB, and handles carry two keys of up to 16 KiB each. A merge of eight sorted
+ * runs of 128 SSTs with 1 KiB keys was 2.9 MB of handles and 0.04 MB of ids (D86). Each later step
+ * reads the handles from the newest manifest by id ({@link resolvePreparedInputs}).
  */
 export const PreparedCompaction = Schema.Struct({
   databaseId: DatabaseId,
   compactorEpoch: CompactorEpoch,
   job: CompactionJob,
-  inputs: Schema.Array(Schema.Array(SstHandle)),
+  inputIds: Schema.Array(Schema.Array(SstId)),
   now: Timestamp,
   mergeOperator: Schema.OptionFromNullOr(MergeOperatorName),
 });
@@ -111,6 +117,15 @@ export type CompactionError =
  */
 export const COMPACTION_READ_CHUNK_BYTES = 2 * 1024 * 1024;
 
+/**
+ * How much input one output step merges at most, as a multiple of `compactionOutputSstSize`
+ * (D97). A step's CPU grows with what it reads, and a step whose rows are mostly dropped (deletes
+ * at the bottom, expired values, many versions of a key) would otherwise read every input before
+ * its output filled. D61 measured at most 17.7 s of CPU for a step of 64 MiB in and out, 0.28 s per
+ * input MiB; 1.5 × 64 MiB is then at most 27 s, half the compactor's 60 s limit.
+ */
+export const COMPACTION_STEP_INPUT_FACTOR = 1.5;
+
 /** Compactions committed, by kind of input (SlateDB RFC-0021 parity). */
 export const compactionsCommitted = Metric.counter("lsm_compactions_committed", {
   description: "Compactions whose output was committed to the manifest",
@@ -125,7 +140,9 @@ export const compactionsCommitted = Metric.counter("lsm_compactions_committed", 
  * Each output step re-opens the inputs from its start key and streams them block by block straight
  * from R2 (never through the block caches), merges them with {@link compactRowStreams}, and streams
  * the output SST out as a multipart upload, so no input or output is ever fully buffered. Outputs
- * split only between keys, so a sorted run's SSTs never overlap.
+ * split only between keys, so a sorted run's SSTs never overlap. A step ends when its output
+ * reaches `compactionOutputSstSize` or its input reaches {@link COMPACTION_STEP_INPUT_FACTOR}
+ * times that, so a step may write no SST and only say where the next one starts (D97).
  */
 export interface ICompactionExecutor {
   /** Resolves the job's inputs in the newest manifest and fixes the time. */
@@ -284,11 +301,49 @@ export const makeCompactionExecutor = Effect.gen(function* () {
       databaseId,
       compactorEpoch,
       job,
-      inputs: [...l0Inputs, ...runInputs],
+      inputIds: [...l0Inputs, ...runInputs].map((level) => level.map((handle) => handle.id)),
       now,
       mergeOperator: manifest.options.mergeOperator,
     };
   });
+
+  /**
+   * The prepared inputs' handles, read by id from the newest manifest: exactly the SSTs `prepare`
+   * resolved, since an SST id names one immutable object and the handle a manifest holds for it.
+   *
+   * @returns The handles by level, or `CompactionInputsChangedError` when the newest manifest no
+   *   longer holds every input (another compaction or a repair replaced one): the commit would
+   *   refuse such a job anyway, so it is discarded before it writes more.
+   */
+  const resolvePreparedInputs = (prepared: PreparedCompaction) =>
+    Effect.gen(function* () {
+      const { databaseId } = prepared;
+      const { manifest } = yield* reader.loadLatest(databaseId).pipe(
+        Effect.catchTags({
+          ManifestReadError: (error) => Effect.fail(unavailable(databaseId)(error)),
+        }),
+      );
+      const held = new Map<string, SstHandle>();
+      for (const handle of manifest.l0) held.set(handle.id, handle);
+      for (const run of manifest.sortedRuns)
+        for (const handle of run.ssts) held.set(handle.id, handle);
+      const inputs: Array<Array<SstHandle>> = [];
+      for (const level of prepared.inputIds) {
+        const handles: Array<SstHandle> = [];
+        for (const id of level) {
+          const handle = held.get(id);
+          if (handle === undefined) {
+            return yield* new CompactionInputsChangedError({
+              databaseId,
+              message: `Input SST ${id} of a compaction of database ${databaseId} is no longer in the newest manifest. The compaction is discarded and planned again from the current manifest.`,
+            });
+          }
+          handles.push(handle);
+        }
+        inputs.push(handles);
+      }
+      return inputs;
+    });
 
   const writeOutput = Effect.fn("CompactionExecutor.writeOutput")(function* (
     prepared: PreparedCompaction,
@@ -299,29 +354,36 @@ export const makeCompactionExecutor = Effect.gen(function* () {
       "database.id": databaseId,
       "compaction.resumed": Option.isSome(startKey),
     });
-    const sources = prepared.inputs.map((level) =>
+    const inputs = yield* resolvePreparedInputs(prepared);
+    const sources = inputs.map((level) =>
       Stream.fromIterable(level).pipe(
         Stream.flatMap((handle) => sstRows(databaseId, handle, startKey)),
       ),
     );
     const target = settings.compactionOutputSstSize;
+    const inputBound = target * COMPACTION_STEP_INPUT_FACTOR;
     let size = 0;
+    let read = 0;
     let resumeFrom = Option.none<Uint8Array>();
-    const rows = compactRowStreams(sources, {
+    const rows = compactKeys(sources, {
       now: prepared.now,
       isBottom: prepared.job.isBottom,
       mergeOperator: Option.map(prepared.mergeOperator, (name) => MERGE_OPERATORS[name]),
     }).pipe(
-      // Close this output between keys once it reaches the target; the next step starts there.
-      Stream.takeWhile((versions) => {
-        if (size >= target) {
-          resumeFrom = Option.some(versions[0].key);
+      // Close this output between keys once it reaches the target, or once the step has merged
+      // its share of input (a step whose rows are dropped writes little); the next step starts
+      // there.
+      Stream.takeWhile(({ input, kept }) => {
+        if (size >= target || read >= inputBound) {
+          resumeFrom = Option.some(input[0].key);
           return false;
         }
-        for (const row of versions) size += rowEncodedSizeEstimate(row);
+        for (const row of input) read += rowEncodedSizeEstimate(row);
+        for (const row of kept) size += rowEncodedSizeEstimate(row);
         return true;
       }),
-      Stream.flattenArray,
+      Stream.map(({ kept }) => kept),
+      Stream.flattenIterable,
     );
     const written = yield* ssts
       .write({
@@ -338,6 +400,7 @@ export const makeCompactionExecutor = Effect.gen(function* () {
     yield* Effect.annotateCurrentSpan({
       "sst.id": Option.match(written, { onNone: () => "", onSome: (sst) => sst.handle.id }),
       "compaction.done": Option.isNone(resumeFrom),
+      "compaction.step_input_bytes": read,
     });
     return { output: Option.map(written, (sst) => sst.handle), resumeFrom };
   });

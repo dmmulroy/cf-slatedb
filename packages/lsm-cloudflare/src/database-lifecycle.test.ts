@@ -478,8 +478,8 @@ describe("DatabaseLifecycle", () => {
         const rewritten = (yield* reader.loadLatest(LEFT)).manifest;
         // Seconds after the rewrite the fork collects (an operator's collect-now, or the
         // maintenance sweep's request), then the source collects and an operator tries to remove it.
-        yield* gc.collect(LEFT);
-        yield* gc.collect(SOURCE);
+        yield* gc.collect(LEFT, Option.none());
+        yield* gc.collect(SOURCE, Option.none());
         const removeAttempt = yield* Effect.result(lifecycle.remove(SOURCE));
         const soon = {
           holds: (yield* reader.loadLatest(SOURCE)).manifest.checkpoints.length,
@@ -490,8 +490,8 @@ describe("DatabaseLifecycle", () => {
         // Just under gcMinAge later the snapshot is still promised, and still readable.
         yield* TestClock.adjust(HOUR - 10_000);
         yield* left.runDue;
-        yield* gc.collect(LEFT);
-        yield* gc.collect(SOURCE);
+        yield* gc.collect(LEFT, Option.none());
+        yield* gc.collect(SOURCE, Option.none());
         const late = {
           holds: (yield* reader.loadLatest(SOURCE)).manifest.checkpoints.length,
           read: yield* readAtSnapshot(LEFT, "b", snapshot),
@@ -580,7 +580,7 @@ describe("DatabaseLifecycle", () => {
         const middle = yield* compactorOf(MIDDLE);
         yield* TestClock.adjust(HOUR);
         yield* middle.runDue;
-        yield* gc.collect(GRANDCHILD);
+        yield* gc.collect(GRANDCHILD, Option.none());
         const middleRewritten = {
           onOwner: yield* holdsOn(SOURCE),
           onMiddle: yield* holdsOn(MIDDLE),
@@ -601,7 +601,7 @@ describe("DatabaseLifecycle", () => {
         };
         // The middle database's next collection (the maintenance sweep asks for it) releases the
         // owner: none of its kept manifests names the owner's SSTs any more.
-        yield* gc.collect(MIDDLE);
+        yield* gc.collect(MIDDLE, Option.none());
         const middleReleased = {
           onOwner: yield* holdsOn(SOURCE),
           middleRefs: yield* refsOf(MIDDLE),
@@ -649,16 +649,16 @@ describe("DatabaseLifecycle", () => {
         yield* Ref.set(faults, { ...NO_STORE_FAULTS, hideGet: (key) => beforeRewrite.has(key) });
         // Above GC's manifest boundary nothing but a removal deletes a manifest, so the collection
         // fails, deleting and releasing nothing (D83).
-        const unexplained = yield* Effect.flip(gc.collect(LEFT));
+        const unexplained = yield* Effect.flip(gc.collect(LEFT, Option.none()));
         const whileUnexplained = yield* holdsAndRefs;
         // A later collection moved the boundary past them and deleted them: this one goes on
         // without them, and still releases nothing, because it cannot know what they named.
         yield* (yield* ManifestStore).advanceManifestBoundary(LEFT, ManifestId.make(rewriteId - 1));
-        yield* gc.collect(LEFT);
+        yield* gc.collect(LEFT, Option.none());
         const whileMissing = yield* holdsAndRefs;
         // Their loads fail instead: the collection fails, and releases nothing either.
         yield* Ref.set(faults, { ...NO_STORE_FAULTS, failGet: (key) => beforeRewrite.has(key) });
-        const failed = yield* Effect.flip(gc.collect(LEFT));
+        const failed = yield* Effect.flip(gc.collect(LEFT, Option.none()));
         const whileFailing = yield* holdsAndRefs;
         // Storage answers again; gcMinAge after the rewrite the fork's due collection releases.
         yield* Ref.set(faults, NO_STORE_FAULTS);
@@ -697,10 +697,10 @@ describe("DatabaseLifecycle", () => {
           failCreate: (key, body) =>
             key.startsWith(manifestPrefix(LEFT)) && body.includes(`"externalRefs":[]`),
         });
-        const failed = yield* Effect.flip(gc.collect(LEFT));
+        const failed = yield* Effect.flip(gc.collect(LEFT, Option.none()));
         const interrupted = yield* holdsAndRefs;
         yield* Ref.set(faults, NO_STORE_FAULTS);
-        yield* gc.collect(LEFT);
+        yield* gc.collect(LEFT, Option.none());
         const finished = yield* holdsAndRefs;
         yield* lifecycle.remove(SOURCE);
         return { failed: failed._tag, interrupted, finished };
@@ -773,8 +773,8 @@ describe("DatabaseLifecycle", () => {
         yield* right.runDue;
         // The second split's halves collect before their own rewrite (an operator's collect-now, or
         // a due collection); they still read the shard's SSTs through the left half, so keep it.
-        yield* gc.collect(A1);
-        yield* gc.collect(A2);
+        yield* gc.collect(A1, Option.none());
+        yield* gc.collect(A2, Option.none());
         const middleRewritten = {
           onShard: yield* holdsOn(SOURCE),
           onLeft: yield* holdsOn(LEFT),
@@ -794,7 +794,7 @@ describe("DatabaseLifecycle", () => {
         yield* a2.runDue;
         const halvesReleased = { onShard: yield* holdsOn(SOURCE), onLeft: yield* holdsOn(LEFT) };
         // The left half's next collection (the maintenance sweep asks for it) releases the shard.
-        yield* gc.collect(LEFT);
+        yield* gc.collect(LEFT, Option.none());
         const leftReleased = { onShard: yield* holdsOn(SOURCE), leftRefs: yield* refsOf(LEFT) };
         yield* lifecycle.remove(LEFT);
         yield* lifecycle.remove(SOURCE);
@@ -991,15 +991,15 @@ describe("DatabaseLifecycle", () => {
           yield* client.flush(SOURCE);
         }
         yield* TestClock.adjust(HOUR + 1);
-        yield* gc.collect(SOURCE);
+        yield* gc.collect(SOURCE, Option.none());
         const afterAnHour = {
           unpinned: yield* readAt(unpinned),
           pinned: yield* readAt(pinned.snapshot),
         };
         // Past its lifetime the checkpoint is dropped, and its manifest collected like any other.
         yield* TestClock.adjust(2 * HOUR);
-        yield* gc.collect(SOURCE);
-        yield* gc.collect(SOURCE);
+        yield* gc.collect(SOURCE, Option.none());
+        yield* gc.collect(SOURCE, Option.none());
         return { fresh, afterAnHour, afterExpiry: yield* readAt(pinned.snapshot), pinned };
       }),
     );

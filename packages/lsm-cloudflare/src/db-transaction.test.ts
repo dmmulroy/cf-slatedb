@@ -447,7 +447,7 @@ describe("transactions", () => {
       const flushManifest = (yield* client.beginTransaction(DB)).manifestId;
       yield* compact;
       yield* TestClock.adjust("60 seconds");
-      const collected = yield* (yield* GarbageCollector).collect(DB);
+      const collected = yield* (yield* GarbageCollector).collect(DB, Option.none());
       const stillStored = yield* (yield* ManifestReader).load(DB, Option.getOrThrow(flushManifest));
       // The writer still hands out that manifest. Reads use the newest one instead: nothing was
       // flushed since, so it holds exactly the rows the begin manifest held.

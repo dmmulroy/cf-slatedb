@@ -231,7 +231,7 @@ describe("fault injection", () => {
             refuseSealed: false,
           });
           yield* TestClock.adjust("11 seconds");
-          const report = yield* (yield* GarbageCollector).collect(DB);
+          const report = yield* (yield* GarbageCollector).collect(DB, Option.none());
           const afterGc = (yield* objects.list(compactedPrefix(DB), Option.none())).objects.length;
           return {
             failed: failed._tag,

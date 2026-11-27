@@ -103,7 +103,10 @@ export const makeMaintenanceSweep = Effect.gen(function* () {
     Effect.gen(function* () {
       const latest = yield* reader.loadLatest(databaseId).pipe(Effect.option);
       if (Option.isNone(latest)) {
-        const report = yield* collector.collect(databaseId);
+        // Only a prefix with no manifest: a database that has one is collected by its compactor,
+        // which knows the compactions running (D96). A manifest this load could not read is left
+        // alone; a later sweep visits again.
+        const report = yield* collector.collectLeftovers(databaseId);
         return { visit: "Leftovers", report: Option.some(report) };
       }
       const manifest = latest.value.manifest;

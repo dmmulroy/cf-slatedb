@@ -2770,3 +2770,201 @@ snapshot scan, and a transaction read. Three mutations fail it.
 
 These hold by reading the code (`resolveVisibleRow`, `retainKeyVersions`, `DbWriter.commitBatch`,
 the executor's `prepare`). No code changed for them.
+
+## D86. A compaction's `prepare` step records its inputs' ids, not their handles
+
+**Found by the Workflow audit.** Cloudflare Workflows store a step's result only up to 1 MiB
+(the Workflows limits page: "Maximum non-stream step result per step"). `prepare` returned every
+input `SstHandle`. A handle carries the SST's first and last keys, each up to 16 KiB (`MAX_KEY_BYTES`).
+
+- **The case the test builds.** The scheduler merges eight sorted runs that are within
+  `includeSizeThreshold` of each other: eight runs of 8 GiB in 128 SSTs of 64 MiB, with 1 KiB keys.
+  That `prepare` result encodes to 2,973,046 bytes.
+- **The effect.** `prepare` fails on every retry. The Workflow ends errored, the compactor plans the
+  same job again, and that merge never runs. Sorted runs then pile up, which raises read
+  amplification. A fork's full rewrite holds every SST of the fork, so a large fork never releases
+  its source.
+- **With 32-byte keys** the limit is reached at about 3,500 input SSTs.
+
+**The rule.** `PreparedCompaction` records `inputIds`: each input level's SST ids, newest first.
+Each output step reads the handles by id from the newest manifest (`resolvePreparedInputs`). An SST
+id names one immutable object and the one handle a manifest holds for it, so these are the handles
+`prepare` resolved. When the newest manifest no longer holds every input id, the step fails with
+`CompactionInputsChangedError` and the job is discarded. The commit would refuse that job anyway;
+now it stops before it writes more outputs. The same merge's ids encode to about 40 KB, so a job can
+hold about 26,000 input SSTs before the limit.
+
+**At deploy.** A Workflow instance in flight holds a `prepare` result in the old format. Its next
+step fails to decode it, the instance ends errored, and the compactor plans the job again. Its
+outputs so far are orphans that GC removes after `gcMinAge`, as for any discarded job.
+
+**Cost.** One manifest load per output step (the `LATEST` hint and GC's boundary, then the newest
+manifest). Before, each step loaded nothing.
+
+**Tests** (`compaction-executor.test.ts`):
+
+- **The largest planned merge's `prepare` result fits in 1 MiB.** It fails on the code before, at
+  2,973,046 bytes.
+- **An output step of a job whose inputs another compaction replaced is discarded.** The mutation
+  that ignores a missing id fails it.
+
+## D87. Settings must leave L0 enough SSTs to compact before writes stop
+
+**Found by the Workflow audit** with a property test: from a manifest whose L0 holds `l0MaxSsts`
+SSTs, with nothing running, the scheduler must plan a job that shrinks L0.
+
+**The defect.** `LsmSettings` accepted `l0MaxSsts` below `minCompactionSources` (for example 1
+and 2). Two rules then never meet:
+
+- **The writer** refuses writes once L0 holds `l0MaxSsts` SSTs (`WriteStalledError`, `L0Backlog`).
+- **The scheduler** compacts L0 only once it holds `minCompactionSources` SSTs.
+
+L0 never reaches the scheduler's threshold, so writes stall for good. The settings come from the
+Stack's `SHALEDB_LSM_SETTINGS` override, so an operator could deploy them.
+
+**The rule.** A combination rule refuses such settings at plan time: `minCompactionSources <=
+l0MaxSsts`. The defaults (4 and 16) satisfy it.
+
+**Test.** `size-tiered-compaction-scheduler.test.ts`, "plans a job that shrinks L0 whenever writes
+are refused for L0 backlog and nothing runs". Over every settings value the schema accepts, with
+any sorted runs, the plan includes an L0 job. It fails without the rule (shrunk to `l0MaxSsts` 1
+and `minCompactionSources` 2), and the mutation that drops the rule fails it.
+
+## D96. A collection keeps what a running compaction may have written
+
+**Found by the Workflow audit.**
+
+1. A compaction job writes its outputs one step at a time and commits them at the end. Until then
+   no manifest names them.
+2. If the job's steps span more than `gcMinAge` (retries, waits for budget, a large merge), a
+   collection meanwhile deletes its early outputs: they are unreferenced and older than
+   `now - gcMinAge`. It also moves `gcSstBoundary` past them.
+3. The commit is refused (`SstBelowGcBoundaryError`). The replanned job takes as long, so a merge
+   or fork rewrite longer than about an hour of steps never commits (about 15 GiB at D61's ~15 s
+   per 64 MiB step).
+4. Sorted runs then pile up, and a large fork never releases its source.
+
+**The rule.** A collection never deletes an unreferenced SST, and never advances `gcSstBoundary`,
+at or past the start of the oldest job its compactor records as running. The cutoff is
+`min(now - gcMinAge, oldest running job's startedAt - 60 s)`.
+
+- **Only the compactor collects a database that has a manifest.** Every collection of a database
+  with a manifest runs in its compactor (`Compactor.collect`, `requestCollection`, and the alarm,
+  all through `runCollection`), which passes the oldest running job's start. The maintenance sweep
+  called `GarbageCollector.collect` itself whenever it could not load a manifest, for any reason.
+  It now calls `collectLeftovers`, which deletes only what a database with no manifest left, and
+  leaves alone one that has a manifest.
+- **The start is taken before the launch.** `startedAt` is read before `launcher.start`, so no
+  output is minted before it. Before, it was read after `start` returned.
+- **The 60 s margin** covers skew between the Workflow's clock, which mints the outputs' ULIDs,
+  and the compactor's clock, which records the start. The first output is written after
+  `prepare` has read the manifest.
+- **When the cap is lifted.** A finished, failed, or discarded job leaves `running` at the next
+  poll. Its outputs are then collected `gcMinAge` after they were written, as before. D94 bounds
+  how long a job can be recorded as running.
+- **Safety.** A lower cutoff deletes a subset of what a collection deleted before, and never
+  lowers the boundary, so GC safety is unchanged. The `verify-gc-safety` skill records this; no
+  model step changed.
+
+**Tests.**
+
+- `garbage-collector.test.ts`: a job whose steps span more than `gcMinAge` keeps its output
+  through a collection given its start, and commits. Older garbage is still deleted, the sweep's
+  leftover pass deletes nothing from it, and a discarded job's output is collected `gcMinAge`
+  later.
+- `compactor.test.ts`: a collection is told the running job's start, and the start precedes the
+  launch.
+- Four mutations caught: the cap ignored, the compactor passing none, `startedAt` taken after the
+  launch, and the leftover pass collecting a live database.
+
+## D97. A compaction step is bounded by the input it merges
+
+**Found by `audit-limits`.**
+
+- **The defect.** An output step ended only when its output reached `compactionOutputSstSize`.
+  When most input rows are dropped, one step merges every input of the job in one invocation.
+  That happens with deletes at the bottom, values expiring together, or a key rewritten many
+  times. Their failing test (`zz-limits-compaction-step.test.ts`): with 2,000 deleted 10 KB rows,
+  the first step made 13 reads, all of the input, and wrote nothing.
+- **The effect.** D61 measured up to 17.7 s of CPU for a step of 64 MiB in and out, about 0.28 s
+  per input MiB. Against the compactor's 60 s, a step over roughly 0.2 GiB of droppable input
+  fails on every retry. The job never commits, L0 fills, and writes are refused.
+
+**The rule.** A step also ends once it has merged `COMPACTION_STEP_INPUT_FACTOR` (1.5) ×
+`compactionOutputSstSize` of input, counted with the same row-size estimate as the output. It
+ends between keys and returns the key the next step starts at. For 64 MiB outputs that is 96 MiB
+of input, at most 27 s at D61's worst rate: half the limit. No setting is needed: the bound scales
+with the output target.
+
+- **How it counts dropped keys.** lsm-core's `compactKeys` emits every key with what it keeps
+  (possibly nothing), so the bound also counts keys whose versions are all dropped.
+  `compactRowStreams` is that stream without the empty keys.
+- **A step may write no SST.** Its result is then `{ output: none, resumeFrom: key }`.
+  - `runCompactionJob` already adds only present outputs.
+  - The commit accepts no outputs.
+  - The result's size is one key, at most 16 KiB, well inside D86's bound.
+- **More steps.** A job takes up to (its input ÷ 96 MiB) + its outputs steps, far below the 10,000
+  steps a Workflow may take.
+- **A span attribute.** `compaction.step_input_bytes` on `CompactionExecutor.writeOutput`
+  records each step's input.
+
+**Tests.**
+
+- `compaction-executor.test.ts`: 200 deleted rows at the bottom. The first step writes nothing and
+  resumes, the job takes more than 10 steps, commits with no output, and reads find nothing.
+- `audit-limits`' test passes on this code.
+- Two mutations caught: no input bound, and input not counted.
+
+## D98. A collection that retains too many manifests still makes progress
+
+**Found by `audit-limits`** (failing test `zz-limits-gc-loads.test.ts`).
+
+- **The defect.** One collection loaded every manifest superseded less than `gcMinAge` ago, one R2
+  read each, and held them all. After 400 commits that was 404 loads against 24 after 20.
+- **What drives it.** The demand grows with the commit rate over the last hour, not with the data.
+- **The effect.** Above about 2.8 commits a second, sustained for an hour, a collection exceeds an
+  invocation's 10,000 subrequests. It then fails on every retry, so garbage is never collected and
+  the pile only grows.
+
+**The rule.**
+
+- **References are folded as each manifest is read.** Each retained manifest's SST references go
+  into one set (`RetainedReferences`, lsm-core), with a flag for "reads another database's SST",
+  and the manifest is dropped. Memory holds SST ids, not manifests.
+  `planSstCollection` and `nextCollectionTime` take that set.
+- **A budget on reads.** One collection reads at most `gcMaxRetainedManifestLoads` (5,000, a new
+  setting) retained manifests. That is half of the 10,000 subrequests; the rest is listings and
+  deletes. Over it, the collection:
+  - still deletes the manifests older than `gcMinAge`, which need no read, and advances GC's
+    manifest boundary;
+  - **defers SST deletion**: it deletes no SST, since an unread manifest may name one;
+  - **does not release a fork's hold** (D77), as for a manifest it could not load;
+  - records `gc.sst_collection_deferred` (the count left unread) and `gc.retained_manifests` on its
+    span and logs a warning that names them;
+  - still reports `nextCollectionAt`.
+- **The documented limit** (`docs/operations.md`, "Garbage collection and removal"): 5,000 per
+  `gcMinAge` is about 1.4 commits a second sustained for an hour. `measure health` reports a
+  database whose latest collection deferred as an issue (`health-report.ts`). The `gc.` namespace is
+  already among the trace policy's exported attribute namespaces, so no allowlist entry was needed.
+
+**Rejected for v1: each manifest records what it stopped referencing.** If each commit wrote down
+the SSTs it dropped, a collection would read only the newest manifest and the dropped lists of the
+last `gcMinAge`, with no full manifest reads. That removes the limit, but it changes the manifest
+format, every commit edit (`commitL0Flush`, `commitCompaction`, repairs, forks), and
+`GcSafety.tla`'s model of what a collection knows. Too large for v1; the budget bounds the failure
+to deferred deletion, which reverses itself when the commit rate falls.
+
+**Tests.**
+
+- `garbage-collector.test.ts`: twenty recent commits against a budget of five. The collection
+  deletes old manifests, deletes no SST, records the count left unread, and schedules the next run.
+  An hour later a collection deletes the four garbage SSTs, and reads return every row.
+- `health-report.test.ts`: the latest collection of each database decides the issue.
+- `garbage-collection-plan.test.ts`: `planSstCollection` over the folded set.
+- Mutations caught: the budget ignored, and SSTs deleted on partial knowledge.
+- One mutation survives, and is equivalent: releasing a fork's hold despite deferral. Retained
+  manifests are read oldest first, and a fork's manifests read its source only before its
+  rewrite, so when a deferred run's read manifests do not read the source, the unread newer ones
+  do not either. The guard stays as stated.
+- `audit-limits`' test still fails as written: it asks that loads not grow with commits. They now
+  grow only up to the budget, which is the decision for v1.
