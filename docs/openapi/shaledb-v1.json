@@ -5448,9 +5448,21 @@
                         "required": ["key", "seq", "value", "createTs", "expireTs"],
                         "additionalProperties": false
                       }
+                    },
+                    "resumeFrom": {
+                      "anyOf": [
+                        {
+                          "type": "string",
+                          "format": "byte",
+                          "contentEncoding": "base64"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
                     }
                   },
-                  "required": ["rows"],
+                  "required": ["rows", "resumeFrom"],
                   "additionalProperties": false,
                   "examples": [
                     {

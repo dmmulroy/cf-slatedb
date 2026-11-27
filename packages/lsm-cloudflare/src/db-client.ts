@@ -19,7 +19,7 @@ import {
   type WriteBatch,
   type WriteReceipt,
 } from "@shaledb/lsm-core";
-import { Bytes, Context, Effect, Layer, Option, Result, Schema, Stream } from "effect";
+import { Bytes, Cause, Context, Effect, Layer, Option, Result, Schema, Stream } from "effect";
 
 import { backgroundWorkTestLayer } from "./background-work.ts";
 import { blockCacheLayerWithoutDependencies } from "./block-cache.ts";
@@ -32,8 +32,8 @@ import {
   type DbReadError,
   type ChangelogUnavailableError,
   ReaderUnavailableError,
-  SCAN_PAGE_EXAMINED_BYTES,
   ScanBudget,
+  ScanPageBudget,
   type ReadView,
 } from "./db-reader.ts";
 import { compactionTriggerTestLayer } from "./compaction-trigger.ts";
@@ -210,6 +210,23 @@ export interface IDbClient {
     readSeq: SeqNum,
     manifestId: Option.Option<ManifestId>,
   ) => Effect.Effect<Option.Option<Row>, DbTransactionError, DbReaderServices>;
+  /**
+   * One page of a transaction's scan at `readSeq` (D125): at most `limit` rows, and `resumeFrom`,
+   * the key the next page starts at (another request at the same `readSeq` and manifest), or none
+   * when the range is exhausted. A page whose examined-bytes budget is spent ends early, with
+   * fewer rows or none, and a `resumeFrom`.
+   */
+  readonly scanAtPage: (
+    databaseId: DatabaseId,
+    range: KeyRange,
+    readSeq: SeqNum,
+    limit: number,
+    manifestId: Option.Option<ManifestId>,
+  ) => Effect.Effect<
+    { readonly rows: ReadonlyArray<Row>; readonly resumeFrom: Option.Option<Uint8Array> },
+    DbTransactionError,
+    DbReaderServices
+  >;
   /** Up to `limit` visible rows in `range` at `readSeq` (a stateless transaction read; see getAt). */
   readonly scanAt: (
     databaseId: DatabaseId,
@@ -530,6 +547,7 @@ export const makeDbClient = Effect.gen(function* () {
                                   reason: "StorageUnavailable",
                                   message: `Database ${databaseId} was flushed during the scan after it had returned rows, so the rest cannot be read at the same snapshot. Resume the scan from resumeFrom (the next range start).`,
                                   resumeFrom: segmentStart,
+                                  pageEnd: "OvertakenByFlush",
                                 }),
                               );
                             }
@@ -556,10 +574,29 @@ export const makeDbClient = Effect.gen(function* () {
       }),
     );
 
-  const scan = (databaseId: DatabaseId, range: KeyRange, options: ScanReadOptions) => {
-    // A scan with a limit is a page: it examines a bounded amount and may end early with
-    // resumeFrom (D108). One without reads its whole range, as an in-Worker stream may.
-    const budget = Option.map(options.limit, () => new ScanBudget(SCAN_PAGE_EXAMINED_BYTES));
+  const scan = (databaseId: DatabaseId, range: KeyRange, options: ScanReadOptions) =>
+    Stream.unwrap(
+      Effect.map(Effect.service(ScanPageBudget), (pageBudget) =>
+        scanWithBudget(
+          databaseId,
+          range,
+          options,
+          // A scan with a limit is a page: it examines a bounded amount and may end early with
+          // resumeFrom (D108). One without reads its whole range, as an in-Worker stream may. A
+          // routed page passes its shared budget down (D125).
+          Option.map(options.limit, () =>
+            Option.getOrElse(pageBudget.shared, () => new ScanBudget(pageBudget.maxBytes)),
+          ),
+        ),
+      ),
+    );
+
+  const scanWithBudget = (
+    databaseId: DatabaseId,
+    range: KeyRange,
+    options: ScanReadOptions,
+    budget: Option.Option<ScanBudget>,
+  ) => {
     // The reader checks the manifest before it emits a row, so asking again repeats no row.
     const fromManifest = (
       number: number,
@@ -669,6 +706,120 @@ export const makeDbClient = Effect.gen(function* () {
       .pipe(Effect.catchTags(expiredIsTooOld(databaseId, readSeq)));
   });
 
+  /**
+   * A transaction's scan at `readSeq` (D58, D125): the writer's rows at or below `readSeq` (with the
+   * rows it keeps above `retained_from_seq` when the begin manifest is pinned), pulled a page at a
+   * time as the merge needs them, as a `Latest` scan pulls them (D93), never all at once.
+   *
+   * **Details**
+   *
+   * Segments as in `scanUnflushed`: writer pages for the rest of the range at `readSeq`, until
+   * the rows hold a second key; the segment is the keys before the last key read. Every segment
+   * reads at the same `readSeq` and merges with a manifest within the transaction's bounds (at
+   * least the largest `retained_from_seq`, or `flushed_seq` without a begin manifest, seen so
+   * far; at most `readSeq`). Any manifest within those bounds gives the same answer at `readSeq`
+   * (D70), so segments, and pages, may use different ones. With a budget, the scan ends before
+   * the next key once it is spent, with `resumeFrom` (`BudgetSpent`), as a regular page does.
+   */
+  const scanAtSegments = (
+    databaseId: DatabaseId,
+    range: KeyRange,
+    readSeq: SeqNum,
+    manifestId: Option.Option<ManifestId>,
+    limit: Option.Option<number>,
+    budget: Option.Option<ScanBudget>,
+  ): Stream.Stream<Row, DbTransactionError, DbReaderServices> =>
+    Stream.unwrap(
+      Effect.sync(() => {
+        const pinned = Option.isSome(manifestId);
+        let emitted = 0;
+        let start = range.start;
+        let retainedFromSeq = SeqNum.make(0);
+        let flushedSeq = SeqNum.make(0);
+        const remaining = () => Option.map(limit, (most) => Math.max(0, most - emitted));
+        const readSegment = Effect.gen(function* () {
+          const rows: Array<Row> = [];
+          let cursor = Option.none<MemTableCursor>();
+          for (;;) {
+            const page = yield* writer.scan(databaseId, {
+              range: { start, end: range.end },
+              snapshotSeq: Option.some(readSeq),
+              cursor,
+              limit: MEMTABLE_PAGE_ROWS,
+              includeRetained: pinned,
+            });
+            if (!pinned && page.flushedSeq > readSeq) return yield* tooOld(databaseId, readSeq);
+            // Across pages a trim may raise the horizon: the read needs a manifest past the highest.
+            retainedFromSeq = SeqNum.make(Math.max(retainedFromSeq, page.retainedFromSeq));
+            flushedSeq = SeqNum.make(Math.max(flushedSeq, page.flushedSeq));
+            rows.push(...page.rows);
+            if (Option.isNone(page.nextCursor)) {
+              return { rows, segment: { start, end: range.end }, next: Option.none<Uint8Array>() };
+            }
+            cursor = page.nextCursor;
+            const [first] = rows;
+            const last = rows[rows.length - 1];
+            if (
+              first !== undefined &&
+              last !== undefined &&
+              !Bytes.Equivalence(first.key, last.key)
+            ) {
+              // The last key read may have more versions on the next page: it opens the next one.
+              const lastKey = last.key;
+              return {
+                rows: rows.filter((row) => Bytes.Order(row.key, lastKey) < 0),
+                segment: { start, end: Option.some(lastKey) },
+                next: Option.some(lastKey),
+              };
+            }
+          }
+        });
+        const segments: Stream.Stream<Row, DbTransactionError, DbReaderServices> = Stream.suspend(
+          () =>
+            Option.exists(remaining(), (left) => left === 0)
+              ? Stream.empty
+              : Stream.unwrap(
+                  Effect.map(readSegment, ({ rows, segment, next }) => {
+                    const view: ReadView = {
+                      // Without a begin manifest the pages hold only unflushed rows, so the
+                      // manifest must hold every flushed one.
+                      minLastL0Seq: pinned ? retainedFromSeq : flushedSeq,
+                      snapshotSeq: Option.some(readSeq),
+                      memtable: rows,
+                      manifestId,
+                      maxLastL0Seq: Option.some(readSeq),
+                      freshness: "Recent",
+                      manifestHint: Option.none(),
+                    };
+                    return reader
+                      .scan(databaseId, segment, view, { limit: remaining(), budget })
+                      .pipe(
+                        Stream.tap(() =>
+                          Effect.sync(() => {
+                            emitted++;
+                          }),
+                        ),
+                        Stream.catchTags({
+                          ReaderUnavailableError: (error) =>
+                            error.reason === "SnapshotExpired"
+                              ? Stream.fail(tooOld(databaseId, readSeq))
+                              : Stream.fail(error),
+                        }),
+                        Stream.concat(
+                          Stream.suspend(() => {
+                            if (Option.isNone(next)) return Stream.empty;
+                            start = next.value;
+                            return segments;
+                          }),
+                        ),
+                      );
+                  }),
+                ),
+        );
+        return segments;
+      }),
+    );
+
   const scanAt = Effect.fn("DbClient.scanAt")(function* (
     databaseId: DatabaseId,
     range: KeyRange,
@@ -676,45 +827,62 @@ export const makeDbClient = Effect.gen(function* () {
     limit: number,
     manifestId: Option.Option<ManifestId>,
   ) {
-    const pinned = Option.isSome(manifestId);
     yield* Effect.annotateCurrentSpan({
       "database.id": databaseId,
       "transaction.read_seq": readSeq,
     });
-    const rows: Array<Row> = [];
-    let cursor = Option.none<MemTableCursor>();
-    let retainedFromSeq = SeqNum.make(0);
-    let flushedSeq = SeqNum.make(0);
-    for (;;) {
-      const page = yield* writer.scan(databaseId, {
-        range,
-        snapshotSeq: Option.some(readSeq),
-        cursor,
-        limit: MEMTABLE_PAGE_ROWS,
-        includeRetained: pinned,
-      });
-      if (!pinned && page.flushedSeq > readSeq) return yield* tooOld(databaseId, readSeq);
-      // Across pages a trim may raise the horizon: the read needs a manifest past the highest.
-      retainedFromSeq = SeqNum.make(Math.max(retainedFromSeq, page.retainedFromSeq));
-      flushedSeq = SeqNum.make(Math.max(flushedSeq, page.flushedSeq));
-      rows.push(...page.rows);
-      if (Option.isNone(page.nextCursor)) break;
-      cursor = page.nextCursor;
-    }
-    const view: ReadView = {
-      // Without a begin manifest the pages hold only unflushed rows, so the manifest must hold
-      // every flushed one: a cached manifest from before the last flush would miss its rows.
-      minLastL0Seq: pinned ? retainedFromSeq : flushedSeq,
-      snapshotSeq: Option.some(readSeq),
-      memtable: rows,
-      manifestId,
-      maxLastL0Seq: Option.some(readSeq),
-      freshness: "Recent",
-      manifestHint: Option.none(),
-    };
+    // An in-Worker read of up to `limit` rows: bounded by its limit, not by a page budget.
     return yield* Stream.runCollect(
-      reader.scan(databaseId, range, view, { limit: Option.some(limit), budget: Option.none() }),
-    ).pipe(Effect.catchTags(expiredIsTooOld(databaseId, readSeq)));
+      scanAtSegments(databaseId, range, readSeq, manifestId, Option.some(limit), Option.none()),
+    );
+  });
+
+  const scanAtPage = Effect.fn("DbClient.scanAtPage")(function* (
+    databaseId: DatabaseId,
+    range: KeyRange,
+    readSeq: SeqNum,
+    limit: number,
+    manifestId: Option.Option<ManifestId>,
+  ) {
+    yield* Effect.annotateCurrentSpan({
+      "database.id": databaseId,
+      "transaction.read_seq": readSeq,
+    });
+    const pageBudget = yield* Effect.service(ScanPageBudget);
+    const budget = Option.getOrElse(pageBudget.shared, () => new ScanBudget(pageBudget.maxBytes));
+    const rows: Array<Row> = [];
+    // One extra row tells whether another page follows.
+    const scanned = yield* Effect.exit(
+      Stream.runForEach(
+        scanAtSegments(
+          databaseId,
+          range,
+          readSeq,
+          manifestId,
+          Option.some(limit + 1),
+          Option.some(budget),
+        ),
+        (row) => Effect.sync(() => void rows.push(row)),
+      ),
+    );
+    if (scanned._tag === "Failure") {
+      const failure = Cause.findErrorOption(scanned.cause);
+      // The page's budget was spent (D108): the rows so far, possibly none, and where to go on.
+      if (
+        Option.isSome(failure) &&
+        failure.value._tag === "ReaderUnavailableError" &&
+        failure.value.pageEnd === "BudgetSpent" &&
+        failure.value.resumeFrom !== undefined
+      ) {
+        return { rows, resumeFrom: Option.some(failure.value.resumeFrom) };
+      }
+      return yield* Effect.failCause(scanned.cause);
+    }
+    const next = rows[limit];
+    return {
+      rows: rows.slice(0, limit),
+      resumeFrom: next === undefined ? Option.none<Uint8Array>() : Option.some(next.key),
+    };
   });
 
   const changes = Effect.fn("DbClient.changes")(function* (
@@ -933,6 +1101,7 @@ export const makeDbClient = Effect.gen(function* () {
     beginTransaction,
     getAt,
     scanAt,
+    scanAtPage,
     commitTransaction,
   });
 });

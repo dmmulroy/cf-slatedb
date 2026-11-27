@@ -14,6 +14,8 @@ import {
   type DbReaderServices,
   type DbWriteError,
   type ReaderUnavailableError,
+  ScanBudget,
+  ScanPageBudget,
   type ReadOptions,
   type ScanReadOptions,
 } from "@shaledb/lsm-cloudflare";
@@ -114,6 +116,16 @@ const ROUTING_WAIT_MS = 30_000;
  * staleness to about the lag a `Flushed` read already has.
  */
 export const SHARD_MAP_MAX_AGE_FOR_UNPROBED_READS_MS = 1_000;
+
+/**
+ * One routed scan page (D125): the budget every shard it reads shares, and the rows it still may
+ * return.
+ */
+interface RoutedPage {
+  readonly budget: { readonly maxBytes: number; readonly shared: Option.Option<ScanBudget> };
+  readonly remaining: () => Option.Option<number>;
+  readonly emitted: () => void;
+}
 
 /** Constructs the router over the contextual database client and shard directory. */
 export const makeShardRouter = Effect.gen(function* () {
@@ -282,6 +294,7 @@ export const makeShardRouter = Effect.gen(function* () {
     range: KeyRange,
     options: ScanReadOptions,
     deadline: number,
+    page: RoutedPage,
   ): Stream.Stream<Row, DbClientReadError | ShardDirectoryError, DbReaderServices> =>
     Stream.unwrap(
       Effect.gen(function* () {
@@ -290,15 +303,22 @@ export const makeShardRouter = Effect.gen(function* () {
         if (first === undefined) return Stream.empty;
         const part = intersectKeyRanges(range, first.range);
         if (Option.isNone(part)) return Stream.empty;
+        // Each shard gets the page's remaining rows and its shared budget (D125): a routed page does
+        // no more work than one database's page, wherever its shards' boundaries fall.
         const head = client
-          .scan(first.databaseId, part.value, { ...options, limit: Option.none() })
+          .scan(first.databaseId, part.value, { ...options, limit: page.remaining() })
           .pipe(
+            Stream.provideService(ScanPageBudget, page.budget),
+            Stream.tap(() => Effect.sync(() => page.emitted())),
             // A scan overtaken by a flush after it returned rows (D93): the rest of this shard's
             // part from the key it names, within the same deadline; the shards after it follow
-            // below. Every row before it was returned.
+            // below. Every row before it was returned. A page whose budget is spent ends instead:
+            // its `resumeFrom` is the routed page's continuation.
             Stream.catchIf(
               (error): error is ReaderUnavailableError & { readonly resumeFrom: Uint8Array } =>
-                error._tag === "ReaderUnavailableError" && error.resumeFrom !== undefined,
+                error._tag === "ReaderUnavailableError" &&
+                error.resumeFrom !== undefined &&
+                error.pageEnd === "OvertakenByFlush",
               (error) =>
                 Stream.unwrap(
                   Effect.map(Clock.currentTimeMillis, (now) =>
@@ -309,6 +329,7 @@ export const makeShardRouter = Effect.gen(function* () {
                           { start: error.resumeFrom, end: part.value.end },
                           options,
                           deadline,
+                          page,
                         ),
                   ),
                 ),
@@ -321,7 +342,7 @@ export const makeShardRouter = Effect.gen(function* () {
                   const waited = yield* directory.awaitMap(group, map.version, remaining);
                   yield* remember(group, waited.map);
                   return waited.outcome === "Newer"
-                    ? scanFrom(group, range, options, deadline)
+                    ? scanFrom(group, range, options, deadline, page)
                     : Stream.fail(error);
                 }),
               ),
@@ -334,7 +355,9 @@ export const makeShardRouter = Effect.gen(function* () {
             Option.isSome(range.end) && Bytes.Order(range.end.value, end) <= 0
               ? Stream.empty
               : Stream.suspend(() =>
-                  scanFrom(group, { start: end, end: range.end }, options, deadline),
+                  Option.exists(page.remaining(), (left) => left === 0)
+                    ? Stream.empty
+                    : scanFrom(group, { start: end, end: range.end }, options, deadline, page),
                 ),
         });
         return Stream.concat(head, rest);
@@ -343,16 +366,29 @@ export const makeShardRouter = Effect.gen(function* () {
 
   const scan = (group: ShardGroup, range: KeyRange, options: ScanReadOptions) =>
     Stream.unwrap(
-      Effect.map(
-        Effect.andThen(refreshForUnprobedRead(group, options), Clock.currentTimeMillis),
-        (now) => {
-          const all = scanFrom(group, range, options, now + ROUTING_WAIT_MS);
-          return Option.match(options.limit, {
-            onNone: () => all,
-            onSome: (limit) => Stream.take(all, limit),
-          });
-        },
-      ),
+      Effect.gen(function* () {
+        yield* refreshForUnprobedRead(group, options);
+        const now = yield* Clock.currentTimeMillis;
+        const pageBudget = yield* Effect.service(ScanPageBudget);
+        // One budget for the whole routed page, shared by every shard it reads (D125).
+        const shared = Option.getOrElse(
+          pageBudget.shared,
+          () => new ScanBudget(pageBudget.maxBytes),
+        );
+        let emitted = 0;
+        const page: RoutedPage = {
+          budget: { maxBytes: pageBudget.maxBytes, shared: Option.some(shared) },
+          remaining: () => Option.map(options.limit, (limit) => Math.max(0, limit - emitted)),
+          emitted: () => {
+            emitted += 1;
+          },
+        };
+        const all = scanFrom(group, range, options, now + ROUTING_WAIT_MS, page);
+        return Option.match(options.limit, {
+          onNone: () => all,
+          onSome: (limit) => Stream.take(all, limit),
+        });
+      }),
     ).pipe(Stream.withSpan("ShardRouter.scan", { attributes: { "shard.group": group } }));
 
   return ShardRouter.of({
