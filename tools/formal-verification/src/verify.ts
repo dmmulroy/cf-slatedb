@@ -108,6 +108,20 @@ const tlcErrorSummary = (output: string): string => {
   return detail.slice(0, 4).join(" | ") || "no result";
 };
 
+/** The config's only temporal property, when its `PROPERTIES` section names exactly one. */
+const singleProperty = (config: string): string | undefined => {
+  const lines = config.split("\n").map((line) => line.trim());
+  const start = lines.findIndex((line) => line === "PROPERTIES" || line === "PROPERTY");
+  if (start < 0) return undefined;
+  const names: Array<string> = [];
+  for (const line of lines.slice(start + 1)) {
+    if (line === "") continue;
+    if (/^[A-Z_]+(\s|$)/.test(line)) break;
+    names.push(...line.split(/\s+/));
+  }
+  return names.length === 1 ? names[0] : undefined;
+};
+
 const runTlc = (
   tools: { readonly java: string; readonly jar: string },
   check: FormalCheck,
@@ -147,9 +161,14 @@ const runTlc = (
     }, run.timeLimitSeconds * 1000);
     child.on("close", () => {
       clearTimeout(timer);
-      const violated = /(?:Invariant|Temporal property|Action property) (\w+) is violated/.exec(
-        output,
-      )?.[1];
+      // TLC names a violated invariant or action property, but not a temporal one: a config
+      // with one temporal property names it (D110).
+      const temporal = output.includes("Temporal properties were violated")
+        ? singleProperty(config)
+        : undefined;
+      const violated =
+        /(?:Invariant|Temporal property|Action property) (\w+) is violated/.exec(output)?.[1] ??
+        temporal;
       const passed = output.includes("Model checking completed. No error has been found.");
       const states = /(\d[\d,]*) distinct states found/.exec(
         output.split("\n").reverse().join("\n"),

@@ -225,4 +225,77 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
       },
     ],
   },
+  {
+    // D110: the compactor Durable Object at await granularity, with its jobs, lease, GC, eviction.
+    name: "compactor-object",
+    spec: "CompactorObject.tla",
+    runs: [
+      { config: "CompactorObject.cfg", broken: "none", expect: "pass", timeLimitSeconds: 300 },
+      {
+        config: "CompactorObject.cfg",
+        broken: "twoFenceIns",
+        expect: "EpochNeverRegresses",
+        timeLimitSeconds: 120,
+      },
+      {
+        config: "CompactorObject.cfg",
+        broken: "noJobRecord",
+        expect: "OutcomeTrue",
+        timeLimitSeconds: 120,
+      },
+      { config: "CompactorObjectL0.cfg", broken: "none", expect: "pass", timeLimitSeconds: 300 },
+      {
+        config: "CompactorObjectL0.cfg",
+        broken: "beforeD78",
+        expect: "L0Drains",
+        timeLimitSeconds: 300,
+      },
+      {
+        config: "CompactorObjectL0.cfg",
+        broken: "gcIgnoresRunning",
+        expect: "L0Drains",
+        timeLimitSeconds: 300,
+      },
+      { config: "CompactorObjectJobs.cfg", broken: "none", expect: "pass", timeLimitSeconds: 300 },
+      {
+        config: "CompactorObjectJobs.cfg",
+        broken: "noUnseenBound",
+        expect: "RunningJobsLeave",
+        timeLimitSeconds: 300,
+      },
+    ],
+  },
+  {
+    // D112: a shard split end to end, with crashes, stale routers, and the change feed.
+    name: "shard-split",
+    spec: "ShardSplit.tla",
+    runs: [
+      { config: "ShardSplit.cfg", broken: "none", expect: "pass", timeLimitSeconds: 60 },
+      {
+        config: "ShardSplit.cfg",
+        broken: "noFlushedRefresh",
+        expect: "NoStaleBeyondBound",
+        timeLimitSeconds: 60,
+      },
+      {
+        config: "ShardSplit.cfg",
+        broken: "resealOthers",
+        expect: "HoldsMatchSeal",
+        timeLimitSeconds: 60,
+      },
+      {
+        config: "ShardSplit.cfg",
+        broken: "feedGap",
+        expect: "ConsumerMissesNothing",
+        timeLimitSeconds: 60,
+      },
+      { config: "ShardSplitLiveness.cfg", broken: "none", expect: "pass", timeLimitSeconds: 60 },
+      {
+        config: "ShardSplitLiveness.cfg",
+        broken: "noResume",
+        expect: "WaitingWritesLand",
+        timeLimitSeconds: 60,
+      },
+    ],
+  },
 ];
