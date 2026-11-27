@@ -51,9 +51,21 @@ being produced.
   - **D106:** the soak now exercises the classes of defect the audits found.
   - **D123:** span events pass the trace policy, so no log line's object parts or annotations can
     export a key or value.
-  - **What that says:** `docs/release-v1.md` §8. It covers 27 defects by class and by how each
-    was found. Every gate that runs the system passed with them in the code; reading the code
-    against a stated rule found them.
+  - **Round 3** (models, mutation sweeps, the owner's second review, the runtime; D109 to D129):
+    - **Models.** A writer fenced by its own restart (D115, two paths); a fork's hold deleted while
+      the fork was being created, and a dropped SST's rows coming back from an unrecorded job
+      (D116); the change feed repeating a change after a lost flush response (D113, not fixed).
+    - **The owner's review.** Unbounded transaction and sharded scans (D125). The snapshot and TTL
+      rule written down; the code already did it.
+    - **`mut-read`.** A reused id serving an old snapshot or an old compaction (D119), and a
+      checkpoint cap that would have stopped SST deletion (D129, now 128).
+    - **A sweep.** A corrupted SST answered `InternalFailure` (D128; the fix is on
+      `proto/audit-api`).
+    - **The runtime.** A request body read twice, so every `POST` failed in workerd (D100), and
+      an error span on every create.
+  - **What that says:** `docs/release-v1.md` §8. It covers 40 defects by class, by how each was
+    found, and by round. Every gate that runs the system passed with most of them in the code. The
+    21.6-minute soak on `d89beba` passed with 11 in it.
 - **Read path (D67, D72).**
   - A read reuses any cached manifest holding the writer's flushed rows, and a refresh takes one
     round trip from the manifest held.
@@ -72,7 +84,8 @@ being produced.
     production included, by `--collector-url` with `SHALEDB_TRACE_TOKEN`.
     `preview-cli trace-token <stage>` writes that token only into a pipe.
 - **The baseline (D75).** A plain Durable Object SQLite baseline in the probe Worker and
-  `measure baseline`. PENDING(baseline): its result.
+  `measure baseline`. One provisional run is published (`ed4e787`, `preview-3`), in the README and
+  `docs/measurements.md`. PENDING(baseline): the three runs on the release commit.
 - **The invariants guide.** `docs/invariants.md` ties each invariant (acknowledged, flushed, what
   each read may see, when GC may reclaim an SST) to the code that enforces it and the test or model
   that checks it.
@@ -114,20 +127,32 @@ final code, each against its target.
 - **`docs/api-compatibility.md`** lists every limit of v1, pinned to the constants by
   `api-compatibility-limits.test.ts`.
 
-- **D90 to D108 and D123 are merged** (`proto/integration-2` at `7dfed3f`), each with its tests;
-  D91 adds `ManifestCasFencingRemove.cfg`, so `formal-checks.ts` lists 33 runs.
+- **D90 to D129 are merged** (`proto/integration-2` at `c149afb`), each with its tests. Not merged:
+  D128's fix (`proto/audit-api`, `edfe57b`) and one D127 test (`proto/audit-workflow`).
+- **The formal checks:** `formal-checks.ts` lists 9 specs and 73 runs (`docs/release-v1.md` §4).
+  Each new spec's runs were observed alone by the agent that wrote it. The 73 have not been observed
+  in one run, and `Transactions.cfg` timed out under load at 420 s (D111).
+- **The mutation sweeps:** 1,683 mutants in four sweeps (`lsm-core` 800; reader, manifest, and GC
+  400; writer and compactor 318; request edge and sharding 165). Their tests are merged. One defect
+  came from a sweep (D128). PENDING(mutation): `mut-write2` (D127) and `mut-read`'s `db-client.ts`
+  round, both running.
+- **On `d89beba`, the 21.6-minute `eu` soak on `preview-2` passed** with the D106 workload: no
+  mismatch, no failure, and no unexpected error span (`docs/release-v1.md` §5). This is evidence
+  about `d89beba`, not the release gate.
 
-PENDING(formal): the two formal agents' models (D109 and on), merged with their runs.
-
-PENDING(mutation): the three mutation sweeps (D117 to D122), merged with their survivors and fixes.
+PENDING(soak-preview-1-d89beba): the 130-minute soak on `d89beba` on `preview-1`, running since
+02:14 UTC.
 
 ## What is left
 
 - **P6.** Dillon decides with `docs/release-v1.md`. If he says go, the production deploy, its smoke
   test, and the production URLs (`apiUrl`, `traceCollectorUrl`) are recorded here.
-- **D90, D91, D102, D103** are merged, then the release soaks run on the release commit.
-- **Not reached by the audits** (`docs/release-v1.md` §8): `MemTable` migrations, the `BlockServer`
-  under a hostile caller, a compaction step's memory with 8 inputs, and the tools.
+- **Not fixed at `c149afb`:** D113 (the change feed's repeat), and D128 until `edfe57b` is merged.
+- **No decision entry yet:** D116 and D127; their code and tests cite them.
+- **The sharded scan in workerd** (D125): no workerd test hosts the shard router.
+- **The release runs** on the release commit: both soaks, step 4's measurements, the baseline, and
+  `vp run ready` and `vp run verify`.
+- **What remains unexamined:** the list at the end of `docs/release-v1.md` §8.
 - **The database size limit is about 312 GiB**, set by Workflows' 10,000 steps per compaction
   (D103). Raising the Workflow's `limits.steps` to 25,000 would move it to about 1.5 TiB; that is
   not done.
@@ -137,15 +162,26 @@ PENDING(mutation): the three mutation sweeps (D117 to D122), merged with their s
 - **Metrics are emitted, not collected (D82).** Every signal `docs/operations.md` names is now
   read from a span or a tail record, and `measure health` judges each one. The `lsm_*` counters
   stay for a future collector. The new span attributes are not yet deployed or tried live.
-- `docs/progress.md`'s workstream table still says "this commit" for workstream 9. It is `8a96667`.
 - Everything in `docs/release-v1.md` §9 ("Known limitations").
 
 ## Destroying what is left on Cloudflare (Dillon runs these; agents never do)
 
-Run these in your own terminal, not through an agent. The deployment guard blocks an
-`alchemy destroy` an agent types directly, whatever its allowlist says, but in this allowlisted
-repository it does not resolve `vp run` tasks, so it would not stop an agent running these
-(`docs/release-v1.md`, section 10). Keep agents off them by instruction. Each command needs Alchemy logged in to
+Run these in your own terminal, not through an agent. **No agent runs any `destroy:*` task: the
+commands are for Dillon.** Do not count on the deployment guard to stop one:
+
+- **Once this repository is allowlisted,** the guard does not block a destroy run through a
+  `vp run` task here. That is what `scripts/allowlist-shaledb-deploys.sh` does, and
+  `docs/release-v1.md` §10 step 2 asks for it. In an allowlisted repository and in every worktree
+  of it, the guard checks only a deployment CLI named in the command itself. So
+  `vp run @shaledb/infra#destroy:preview-1`, whose task runs `alchemy destroy`, passes. This is
+  `audit-prod`'s finding: `evaluate.ts`, the `destructiveOnly` branch, before
+  `evaluatePackageTask`.
+- **Today the repository is not allowlisted.** The allowlist's only entry for it names the
+  pre-rename `.../infra/cf-slatedb/alchemy.run.ts`, which no longer exists. `policy.ts` skips that
+  entry (`ignoredEntries`), so the guard resolves package tasks here for now. That changes when the
+  script runs.
+
+Keep agents off these commands by instruction. Each command needs Alchemy logged in to
 account `99459fce09d9a9eec83befd957af4ec5`; live stacks keep their state in that account's
 Cloudflare state store (D43).
 
@@ -226,9 +262,9 @@ the `Shaledb` stacks, which have their own state.
 
 What could make it fail:
 
-- **The guard, if run through an agent.** The guard blocks a directly typed `alchemy destroy` for
-  agents always, but not a `vp run @shaledb/infra#destroy:<stage>` task in this repository: it does
-  not resolve package tasks in an allowlisted repository (`docs/release-v1.md`, section 10).
+- **The guard, if run through an agent.** Agents do not run these. The guard blocks a directly
+  typed `alchemy destroy` for agents always. Once this repository is allowlisted, it does not
+  block a `vp run …#destroy:<stage>` task here (above; `docs/release-v1.md`, section 10).
   Its allowlist names `/Users/dmmulroy/Code/personal/cf-slatedb/infra/cf-slatedb/alchemy.run.ts`,
   which no longer exists in the main checkout, so the guard skips that entry. That entry is only
   relevant if you allowlist the old worktree. In your own terminal the guard does not run.

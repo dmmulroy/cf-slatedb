@@ -30,8 +30,9 @@ The unit of scale is the database, and each database has one writer Durable Obje
 grows by adding databases (and, for one key space, by splitting it with range sharding), not by
 making one database's writer faster.
 
-One database holds at most about 312 GiB: past that, a compaction of the whole database outgrows
-what one Cloudflare Workflow may run (D103). Long keys lower it, because the manifest lists every
+One database holds at most about 312 GiB (derived, not measured: the largest compaction run live
+was about 0.5 GiB): past that, a compaction of the whole database outgrows what one Cloudflare
+Workflow may run (D103). Long keys lower it, because the manifest lists every
 SST's first and last key (D99). Larger data is split into several databases with range sharding.
 Every limit a caller can meet is listed in [`docs/api-compatibility.md`](docs/api-compatibility.md),
 "Limits of v1".
@@ -39,6 +40,12 @@ Every limit a caller can meet is listed in [`docs/api-compatibility.md`](docs/ap
 One database's write rate is bounded by its writer, which commits one batch at a time. The highest
 rates measured on one writer (`preview-1`, production settings, 16-byte keys and 100-byte values,
 a laptop client on a US residential connection, so latencies include an internet round trip):
+
+Every measured number in this README says what it rests on. The rule is in
+[`docs/release-v1.md`](docs/release-v1.md) §3, and none is measured on the release commit yet. The
+rates below were measured at `308defd` (workstream 6, D61). The writer's code has changed since
+(`git diff 308defd..c149afb -- db-writer.ts mem-table.ts`). The release-commit runs will replace
+them.
 
 <!-- STEP4-NUMBERS: begin -->
 
@@ -62,7 +69,8 @@ Reads cost the writer differently by consistency:
   cover the sequence number). They scale with readers, and a `Flushed` read may lag the newest
   flush by about a second and unflushed writes by up to a minute.
 
-Both are measured in [`docs/measurements.md`](docs/measurements.md), "Read latency".
+Both are measured in [`docs/measurements.md`](docs/measurements.md), "Read latency", at
+`9776317` (D70–D73). The read path has changed since (D93, D108, D125).
 [`docs/invariants.md`](docs/invariants.md) states exactly what each read may see.
 
 It is not a fit for:
@@ -71,7 +79,7 @@ It is not a fit for:
 - workloads that need atomic writes or transactions across databases: batches and transactions are
   atomic within one database only;
 - `Latest` reads under 10 ms from far away: with the writer in the EU and the API Worker in the
-  US, a `Latest` get took about 130 ms at p50 in the API Worker, against 19 ms on `preview-3`, whose
+  US, a `Latest` get took about 130 ms at p50 in the API Worker (measured at `9776317`), against 19 ms on `preview-3`, whose
   writers answered probes in 10 ms;
 - anything [`docs/measurements.md`](docs/measurements.md) does not cover (its "Not measured" list
   names what is open).
@@ -86,7 +94,10 @@ on a new database or object: 8 writers each sending 100-row batches (16-byte key
 values) and 8 readers each doing point reads of preloaded keys, for 30 seconds.
 
 > **Provisional.** One run, 2026-11-27, at commit `ed4e787`, while a local test run loaded the
-> client during the plain-table part. The release checklist repeats it three times on the release
+> client during the plain-table part. The writer and reader code has changed since
+> (`git diff ed4e787..c149afb -- db-writer.ts mem-table.ts db-client.ts db-reader.ts`). The
+> memtable's insert and delete statements, which set the rows-written counts, have not changed; it
+> gained three `SELECT` statements. The release checklist repeats it three times on the release
 > commit ([`docs/release-v1.md`](docs/release-v1.md)); this table is replaced by those runs.
 
 | Target                      | Rows/s acknowledged | Write p50 / p90 / p99 (ms) | Reads/s | Read p50 / p90 / p99 (ms) |

@@ -5,18 +5,18 @@
 **v1 for production** ([`docs/handoff-v1.md`](handoff-v1.md)): ten workstreams, then the release
 checklist and Dillon's go-ahead (P6). The decisions asked of Dillon are under "Open questions".
 
-| Workstream                                | Status      | Commit               |
-| ----------------------------------------- | ----------- | -------------------- |
-| 1. The Stack owns its configuration       | done        | `012bdb5`            |
-| 2. Fast manifest commits                  | done        | `774ed7b`            |
-| 3. Splits pause briefly, never fail       | done        | `393758c`            |
-| 4. Transactions exact across flushes      | done        | `5f2850b`, `5df4099` |
-| 5. GC and maintenance that scale          | done        | `e06f3eb`            |
-| 6. Writer throughput and limits           | done        | `308defd`            |
-| 7. Corruption: prevent, detect, repair    | done        | `2cb5116`            |
-| 8. Production telemetry                   | done        | `62eab3d`            |
-| 9. Production readiness                   | done        | `8a96667`            |
-| 10. Soak, release checklist, the go-ahead | in progress |                      |
+| Workstream                                | Status      | Commit                  |
+| ----------------------------------------- | ----------- | ----------------------- |
+| 1. The Stack owns its configuration       | done        | `012bdb5`               |
+| 2. Fast manifest commits                  | done        | `774ed7b`               |
+| 3. Splits pause briefly, never fail       | done        | `393758c`               |
+| 4. Transactions exact across flushes      | done        | `5f2850b`, `5df4099`    |
+| 5. GC and maintenance that scale          | done        | `e06f3eb`               |
+| 6. Writer throughput and limits           | done        | `308defd`               |
+| 7. Corruption: prevent, detect, repair    | done        | `2cb5116`               |
+| 8. Production telemetry                   | done        | `62eab3d`               |
+| 9. Production readiness                   | done        | `8a96667`               |
+| 10. Soak, release checklist, the go-ahead | in progress | `docs/release-v1.md` §2 |
 
 The previous round (all ten build phases and `docs/handoff.md`'s seven items) is complete; its
 hand-off is below.
@@ -385,8 +385,8 @@ hand-off is below.
   - **D108:** a scan page examines at most 16 MiB and ends early, resumably.
   - **D123:** span events pass the trace policy, so no log line's object parts or annotations
     export a key or value.
-  - **Still on their branches:** the formal models (D109 and on) and the mutation sweeps (D117 to
-    D122).
+  - **Merged since** (`proto/integration-2` at `c149afb`): the formal models and the mutation
+    sweeps, D109 to D129. See the entry for 2026-11-27 under "Remaining-work log".
 - **Mutation sweep of `lsm-core` (D117, D118).**
   - 800 mutants. 286 survived the first pass. Tests for the untested edges were added. 82 survive:
     80 equivalent, 2 performance-only (block seek).
@@ -407,6 +407,28 @@ hand-off is below.
   manifest's state and flushes again; `changelogRows` reads each change once, which also makes
   older manifests safe. New model `ChangeFeed.tla` (6 runs). Tests in `db-writer.test.ts`,
   `change-feed.test.ts`, `manifest.test.ts`; mutations 6 of 6. Gates below.
+- **Round 3 and the second review (2026-11-27, 01:25–03:25 UTC; integration at `c149afb`).**
+  - **The methods.**
+    - TLA+ models at await granularity and end to end: D109 to D116.
+    - Mutation sweeps: D117, D122, D127, D128, and `mut-read`'s.
+    - Dillon's second review of `d89beba`: D125, and the snapshot and TTL statement.
+    - Integration in the Workers runtime: D100's body read twice, and an error span on every
+      create.
+  - **What they found.** 13 defects in all, 40 since `f3b2ad2`:
+    - the models 5: D113, D115 twice, and D116 twice;
+    - the review 2: the transaction and sharded scans, D125;
+    - the runtime 2;
+    - `mut-read` 3: D119 twice, from D90's open list, and D129, by a measurement;
+    - a sweep 1: D128.
+  - **By agent-hour:** about 1.4 for the models and about 0.9 for the mutation agents, against
+    about 5 in round 1 and about 9 in round 2's first briefs.
+  - **Mutants.** 1,683 run in the four sweeps that have reported. Every killed survivor but D128's
+    was a test gap, now closed.
+  - **Not fixed at `c149afb`:** D113, and D128, whose fix is on `proto/audit-api`.
+  - **Soaks.** On `d89beba`, the 21.6-minute `eu` soak on `preview-2` passed with the D106
+    workload. The 130-minute soak on `preview-1` is running.
+  - **Detail:** `docs/release-v1.md` §8 (the table by class, method, and round, the sweeps, and
+    what remains unexamined) and the second-review section near its top.
 
 - **D111, D113 (formal audit, 2026-11-26).** Liveness: `TransactionsLive.cfg` (`EveryTxnCommits`;
   `beforeD76` fails) and `NoAckedWriteLostLive.cfg` (`EventuallyFlushed`; `noWake` fails), with
