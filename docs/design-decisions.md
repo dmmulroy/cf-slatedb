@@ -4924,3 +4924,54 @@ regular, transaction, and routed page. A routed page holds one shard's segment a
   - The sharded form is not there: no workerd test hosts the shard router. Its router is covered
     in-process by `shard-scan-bounds.test.ts` and the routed oracle; its HTTP response shape only
     by the schema. A workerd stack for the shard router is the open item.
+
+## D128. Mutation sweep of the request edge and the sharding services
+
+- **Scope.** The request bound (`db-http-request.ts`, D100), the public error translation
+  (`db-public-error-translation.ts`), the access gate (`lsm-access-gate.ts`, D64), the trace policy
+  (`lsm-trace-policy.ts`, D63, D123), and `lsm-sharding`'s `shard-directory.ts` and
+  `shard-split.ts`. Same generator and method as D117: 165 mutants, each run against every test
+  file that imports its module, one worker, `nice -n 15`.
+- **Result.**
+
+  | File                             | Mutants | Survived, first pass | Survived, after new tests         |
+  | -------------------------------- | ------- | -------------------- | --------------------------------- |
+  | `lsm-access-gate.ts`             | 31      | 0                    | 0                                 |
+  | `lsm-trace-policy.ts`            | 37      | 5                    | 1 (equivalent)                    |
+  | `db-http-request.ts`             | 30      | 10                   | 4 (2 need workerd, 2 no contract) |
+  | `db-public-error-translation.ts` | 32      | 21                   | 0                                 |
+  | `shard-directory.ts`             | 22      | 0                    | 0                                 |
+  | `shard-split.ts`                 | 13      | 1                    | 1 (equivalent)                    |
+  | **Total**                        | **165** | **37**               | **6**                             |
+
+- **Unintended behavior found: one.** A read of a corrupted SST answers `InternalFailure`, not the
+  `StoredDataInvalid` that D53 and the corruption runbook (`docs/operations.md`) promise. It has
+  done so since Phase 4. `SstCorruptedError` carries no database id, and `StoredDataInvalid`'s
+  details need one, so the fix belongs where the id is known: the handlers' `publicFailures`
+  (`db-http-handlers.ts`) or the reader. It is open; `db-public-error-translation.test.ts` keeps the
+  promise as an `it.fails` case that turns red when it is fixed.
+- **What the new tests pin.**
+  - Every internal error's public code, error, `retryable`, and details, one case each
+    (`db-public-error-translation.test.ts`). Before, 21 of 32 mutants survived: 20 of them changed
+    a `retryable`, so a caller could have been told to give up on a request that would succeed, or
+    to repeat one that never will. Also pinned: the "may have committed" advice only on an
+    unreachable writer for a write or transaction (D88), and only on a `WriteConflict`.
+  - The shared request middleware over a probe API (`db-http-request-middleware.test.ts`): a
+    handler defect and a response that fails its own schema both answer `InternalFailure` (500,
+    not retryable), never `InvalidRequest`; a schema issue reaches the caller whole.
+  - A declared body of exactly 16 MiB reaches its handler (`db-http-request.test.ts`).
+  - `withLsmTracePolicy` registers the policy at runtime and only binds at plan time
+    (`lsm-trace-policy-layer.test.ts`). Without it, spans would reach the exporter unredacted.
+  - An event with no attributes passes through; the inner tracer's context hook is kept; rate 1
+    keeps every trace whatever its id (`telemetry-leaks.test.ts`, `lsm-trace-policy.test.ts`).
+- **What survives.**
+  - `lsm-trace-policy.ts:125`, the `!Array.isArray` guard removed: equivalent, since a JSON text
+    that starts with `[` parses only to an array.
+  - `shard-split.ts:105`, fork concurrency 2 to 3: equivalent, since there are two forks.
+  - `db-http-request.ts:169`, the declared-length refusal removed, and `:202`, the `BodyTooLarge`
+    branch flipped: need workerd. In Node, Effect's `MaxBodySize` already refuses a declared length
+    over the bound, and an oversized chunked body arrives as a defect (`bodyTooLarge`), not as the
+    `RequestParseError` tag. D100's correction says the Workers runtime differs, and only the
+    workerd tests run it.
+  - `db-http-request.ts:61` and `:79`, the 300-character issue cap moved by one: no contract
+    names the exact cap.

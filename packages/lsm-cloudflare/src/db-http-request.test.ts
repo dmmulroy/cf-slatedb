@@ -128,6 +128,21 @@ describe("request bodies are bounded (D100)", () => {
     expect(pulled.count).toBeLessThanOrEqual(1);
   });
 
+  it("passes a declared body of exactly 16 MiB to its handler (mutation sweep, D128)", async () => {
+    const batch = '{"operations":[{"_tag":"Put","key":"AQ==","value":"Ag==","ttlMillis":null}]}';
+    const body = batch + " ".repeat(MAX_REQUEST_BODY_BYTES - batch.length);
+    const answer = await send({
+      method: "POST",
+      body,
+      headers: {
+        "content-type": "application/json",
+        "content-length": String(MAX_REQUEST_BODY_BYTES),
+      },
+    });
+    // The write handler answered (this harness has no writer), so the bound let the body through.
+    expect(answer.body).toMatchObject({ operation: "write" });
+  });
+
   it("refuses a chunked body once it passes 16 MiB, without reading the rest", async () => {
     const { stream, pulled } = chunked(64);
     const answer = await send({

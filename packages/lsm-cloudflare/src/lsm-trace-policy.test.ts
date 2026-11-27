@@ -81,6 +81,11 @@ describe("traceIdSampled (D63)", () => {
     expect(traceIdSampled(id("ffffffff"), 1)).toBe(true);
     expect(traceIdSampled(id("00000000"), 0)).toBe(false);
   });
+
+  it("keeps every trace at rate 1, even one whose id is not hex (D128)", () => {
+    expect(traceIdSampled("not-a-trace-id", 1)).toBe(true);
+    expect(traceIdSampled("not-a-trace-id", 0.99)).toBe(false);
+  });
 });
 
 describe("lsmPolicyTracer (D63)", () => {
