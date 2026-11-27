@@ -280,9 +280,13 @@ it runs in phases: `workload`, `final-reads`, `storage`, `telemetry`, `done`.
 - **The data checks come first.** `final-reads` reads every key at `Latest`, then at `Flushed`
   after a flush, against the model, along with every counter and the sharded group. `storage`
   checks that no database keeps more old SSTs than its manifest uses.
-- **Telemetry comes last, and is bounded.** Each final telemetry read (the tail catch-up,
-  `measure health` over 15 minutes, the span pull, the error grep) has a budget of
-  `--telemetry-budget-minutes` (default 10). An overrun is a failure naming how far the read got.
+- **Telemetry is read while the soak runs, and bounded at the end** (D132). Tail records and spans
+  are both pulled during the workload; spans every 30 s, one pull at a time. After it, each final
+  read (the tail catch-up, the span catch-up, `measure health` over the last 15 minutes from the
+  store, the error grep) has a budget of `--telemetry-budget-minutes` (default 10). An overrun is a
+  failure naming how far the read got. Each `grep` reads only the trace files written in its
+  window. Before D132 the 130-minute soak on `d89beba` passed every data check and failed here:
+  its health report ran ten greps over the stage's whole 1.1 GB store, about 160 s each.
 - **The report is never lost.** `--report-file` is replaced atomically every minute, at each phase
   change, and at `done`. At `done` it equals what the soak prints.
 - **Late events are skipped.** A split or redeploy planned at or after `--minutes` does not run.
