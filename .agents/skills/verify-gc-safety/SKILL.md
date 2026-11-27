@@ -111,6 +111,17 @@ moment ago counted as old and its SSTs could be deleted under a reader. `ownUplo
 
 ## Maintenance notes
 
+- D96: a collection's cutoff is now `min(now - gcMinAge, oldest running job's start - 60 s)`,
+  passed by the compactor, so a compaction running longer than `gcMinAge` keeps its outputs and
+  can commit. That only lowers `Cutoff` for some runs. A lower cutoff deletes a subset of what
+  the model's run deletes, and never moves `gcSstBoundary` back (`advanceGcSstBoundary` raises it
+  only). So every invariant that holds with `Cutoff = gNow - MinAge` holds with any smaller
+  cutoff, and no model step changed. A variant "the boundary passes a running job's outputs" is
+  not modeled: the commit's `SstBelowGcBoundary` refusal (`BoundaryAllows`) already keeps it
+  safe, and the new rule is about liveness, which this model does not check. D94 bounds how long
+  the compactor records a job as running, so the cap cannot hold forever. Not rerun: no spec or
+  model-covered step changed.
+
 - D83 (review): `GarbageCollector.collect` now re-reads `gc/manifest.boundary` when a retained
   manifest it listed cannot be loaded, and fails before deleting anything when that manifest is
   above the boundary (deleted by something other than a collection). One at or below it was

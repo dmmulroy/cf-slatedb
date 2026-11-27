@@ -81,14 +81,41 @@ export const gcDeletedObjects = Metric.counter("lsm_gc_deleted_objects", {
  * source's prefix, which this database's collection never lists.
  */
 export interface IGarbageCollector {
+  /**
+   * Collects `databaseId`. Only its compactor calls this (D60): it knows the compactions running.
+   *
+   * @param oldestRunningJobStartedAt - When the oldest compaction job still running started, by
+   *   the compactor's clock, or none. The collection then neither deletes an unreferenced SST
+   *   created after {@link RUNNING_JOB_CLOCK_MARGIN_MS} before it nor advances `gcSstBoundary`
+   *   past that time, so a job running longer than `gcMinAge` keeps its outputs and can commit
+   *   (D96).
+   */
   readonly collect: (
     databaseId: DatabaseId,
+    oldestRunningJobStartedAt: Option.Option<Timestamp>,
   ) => Effect.Effect<
     GarbageCollectionReport,
     GarbageCollectorUnavailableError | DatabaseNotFoundError,
     RuntimeContext
   >;
+  /**
+   * Deletes what a removed database left under its prefix, once older than `gcMinAge`, when it has
+   * no manifest; does nothing to a database that has one (its compactor collects it). For the
+   * maintenance sweep.
+   */
+  readonly collectLeftovers: (
+    databaseId: DatabaseId,
+  ) => Effect.Effect<GarbageCollectionReport, GarbageCollectorUnavailableError, RuntimeContext>;
 }
+
+/**
+ * How long before a running job's start (by the compactor's clock) its outputs may have been
+ * minted. A job's outputs are named by ULIDs minted by the clock of the Workflow that writes them,
+ * which may run behind the compactor's; a job's first output is written after its `prepare` step
+ * reads the manifest, at least a manifest load after the start, so a minute covers any skew
+ * between Cloudflare machines with room to spare (D96).
+ */
+export const RUNNING_JOB_CLOCK_MARGIN_MS = 60_000;
 
 /** The contextual garbage collector. */
 export class GarbageCollector extends Context.Service<GarbageCollector, IGarbageCollector>()(
@@ -165,11 +192,59 @@ export const makeGarbageCollector = Effect.gen(function* () {
       };
     });
 
-  const collect = Effect.fn("GarbageCollector.collect")(function* (databaseId: DatabaseId) {
+  const collectLeftovers = Effect.fn("GarbageCollector.collectLeftovers")(function* (
+    databaseId: DatabaseId,
+  ) {
+    yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
+    const now = Timestamp.make(yield* Clock.currentTimeMillis);
+    const cutoff = Timestamp.make(Math.max(0, now - settings.gcMinAge));
+    const found = yield* reader.loadLatest(databaseId).pipe(
+      Effect.map(Option.some),
+      Effect.catchTags({
+        ManifestReadError: unavailable(databaseId),
+        DatabaseNotFoundError: () => Effect.succeed(Option.none<VersionedManifest>()),
+      }),
+    );
+    // A database with a manifest is its compactor's to collect: it knows the running jobs.
+    if (Option.isSome(found)) {
+      return {
+        databaseId,
+        manifestId: Option.some(found.value.id),
+        sstBoundary: found.value.manifest.gcSstBoundary,
+        deletedSsts: 0,
+        deletedManifests: 0,
+        nextCollectionAt: Option.none<Timestamp>(),
+      };
+    }
+    return yield* sweepLeftovers(databaseId, cutoff);
+  });
+
+  const collect = Effect.fn("GarbageCollector.collect")(function* (
+    databaseId: DatabaseId,
+    oldestRunningJobStartedAt: Option.Option<Timestamp>,
+  ) {
     yield* Effect.annotateCurrentSpan({ "database.id": databaseId });
     const now = Timestamp.make(yield* Clock.currentTimeMillis);
     // Nothing is older than gcMinAge yet while the clock itself is younger (fresh test clocks).
-    const cutoff = Timestamp.make(Math.max(0, now - settings.gcMinAge));
+    // Nor is anything a running job may have written: its outputs are unreferenced until it
+    // commits, and deleting them, or moving the boundary past them, would refuse that commit (D96).
+    const cutoff = Timestamp.make(
+      Math.max(
+        0,
+        Math.min(
+          now - settings.gcMinAge,
+          Option.match(oldestRunningJobStartedAt, {
+            onNone: () => Number.POSITIVE_INFINITY,
+            onSome: (startedAt) => startedAt - RUNNING_JOB_CLOCK_MARGIN_MS,
+          }),
+        ),
+      ),
+    );
+    if (Option.isSome(oldestRunningJobStartedAt)) {
+      yield* Effect.annotateCurrentSpan({
+        "gc.oldest_running_job_started_at": oldestRunningJobStartedAt.value,
+      });
+    }
     const objectFailed = objectFailures(databaseId);
 
     const ssts: Array<StoredSst> = [];
@@ -320,7 +395,7 @@ export const makeGarbageCollector = Effect.gen(function* () {
     };
   });
 
-  return GarbageCollector.of({ collect });
+  return GarbageCollector.of({ collect, collectLeftovers });
 });
 
 /**

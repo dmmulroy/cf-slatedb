@@ -2829,3 +2829,50 @@ l0MaxSsts`. The defaults (4 and 16) satisfy it.
 are refused for L0 backlog and nothing runs". Over every settings value the schema accepts, with
 any sorted runs, the plan includes an L0 job. It fails without the rule (shrunk to `l0MaxSsts` 1
 and `minCompactionSources` 2), and the mutation that drops the rule fails it.
+
+## D96. A collection keeps what a running compaction may have written
+
+**Found by the Workflow audit.**
+
+1. A compaction job writes its outputs one step at a time and commits them at the end. Until then
+   no manifest names them.
+2. If the job's steps span more than `gcMinAge` (retries, waits for budget, a large merge), a
+   collection meanwhile deletes its early outputs: they are unreferenced and older than
+   `now - gcMinAge`. It also moves `gcSstBoundary` past them.
+3. The commit is refused (`SstBelowGcBoundaryError`). The replanned job takes as long, so a merge
+   or fork rewrite longer than about an hour of steps never commits (about 15 GiB at D61's ~15 s
+   per 64 MiB step).
+4. Sorted runs then pile up, and a large fork never releases its source.
+
+**The rule.** A collection never deletes an unreferenced SST, and never advances `gcSstBoundary`,
+at or past the start of the oldest job its compactor records as running. The cutoff is
+`min(now - gcMinAge, oldest running job's startedAt - 60 s)`.
+
+- **Only the compactor collects a database that has a manifest.** Every collection of a database
+  with a manifest runs in its compactor (`Compactor.collect`, `requestCollection`, and the alarm,
+  all through `runCollection`), which passes the oldest running job's start. The maintenance sweep
+  called `GarbageCollector.collect` itself whenever it could not load a manifest, for any reason.
+  It now calls `collectLeftovers`, which deletes only what a database with no manifest left, and
+  leaves alone one that has a manifest.
+- **The start is taken before the launch.** `startedAt` is read before `launcher.start`, so no
+  output is minted before it. Before, it was read after `start` returned.
+- **The 60 s margin** covers skew between the Workflow's clock, which mints the outputs' ULIDs,
+  and the compactor's clock, which records the start. The first output is written after
+  `prepare` has read the manifest.
+- **When the cap is lifted.** A finished, failed, or discarded job leaves `running` at the next
+  poll. Its outputs are then collected `gcMinAge` after they were written, as before. D94 bounds
+  how long a job can be recorded as running.
+- **Safety.** A lower cutoff deletes a subset of what a collection deleted before, and never
+  lowers the boundary, so GC safety is unchanged. The `verify-gc-safety` skill records this; no
+  model step changed.
+
+**Tests.**
+
+- `garbage-collector.test.ts`: a job whose steps span more than `gcMinAge` keeps its output
+  through a collection given its start, and commits. Older garbage is still deleted, the sweep's
+  leftover pass deletes nothing from it, and a discarded job's output is collected `gcMinAge`
+  later.
+- `compactor.test.ts`: a collection is told the running job's start, and the start precedes the
+  launch.
+- Four mutations caught: the cap ignored, the compactor passing none, `startedAt` taken after the
+  launch, and the leftover pass collecting a live database.

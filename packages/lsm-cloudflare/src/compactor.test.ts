@@ -7,7 +7,18 @@ import {
   SstId,
   Timestamp,
 } from "@shaledb/lsm-core";
-import { Context, Deferred, Effect, Fiber, Layer, Option, Ref, Result, Tracer } from "effect";
+import {
+  Clock,
+  Context,
+  Deferred,
+  Effect,
+  Fiber,
+  Layer,
+  Option,
+  Ref,
+  Result,
+  Tracer,
+} from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -146,15 +157,16 @@ const startGatedCompactor = Effect.gen(function* () {
   });
   const collector = yield* GarbageCollector;
   const gatedCollector = GarbageCollector.of({
-    collect: (databaseId) =>
+    collect: (databaseId, oldestRunningJobStartedAt) =>
       Effect.gen(function* () {
         const gate = yield* Ref.getAndSet(gates.collect, Option.none());
         if (Option.isSome(gate)) {
           yield* Deferred.succeed(gate.value.loaded, undefined);
           yield* Deferred.await(gate.value.resume);
         }
-        return yield* collector.collect(databaseId);
+        return yield* collector.collect(databaseId, oldestRunningJobStartedAt);
       }),
+    collectLeftovers: collector.collectLeftovers,
   });
   const shared = yield* Effect.context<
     CompactionLauncher | CompactionBudget | LsmConfiguration | GarbageCollector
@@ -390,6 +402,54 @@ describe("Compactor", () => {
       (span) => span.name === "Compactor.poll" && span.attributes.get("compactor.fenced") === true,
     );
     expect(fenced.map((span) => span.attributes.get("database.id"))).toEqual([ORDERS]);
+  });
+
+  it("collects around its running jobs: a collection is told when the oldest started, a time taken before its launch (D96)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createWithL0(ORDERS, 4);
+        const collector = yield* GarbageCollector;
+        const told: Array<Option.Option<Timestamp>> = [];
+        const launchedAt: Array<number> = [];
+        // A job that keeps running, launched a moment after the compactor read its clock.
+        const heldLauncher = CompactionLauncher.of({
+          start: () =>
+            Effect.gen(function* () {
+              yield* TestClock.adjust(1);
+              launchedAt.push(yield* Clock.currentTimeMillis);
+            }),
+          progress: () => Effect.succeed({ _tag: "Running" as const }),
+        });
+        const recordingCollector = GarbageCollector.of({
+          collect: (databaseId, oldestRunningJobStartedAt) =>
+            Effect.sync(() => told.push(oldestRunningJobStartedAt)).pipe(
+              Effect.andThen(collector.collect(databaseId, oldestRunningJobStartedAt)),
+            ),
+          collectLeftovers: collector.collectLeftovers,
+        });
+        return yield* Effect.gen(function* () {
+          const orders = yield* startCompactor;
+          yield* orders.compactor.collect(ORDERS);
+          yield* orders.compactor.wake(ORDERS);
+          yield* orders.fire;
+          yield* orders.compactor.collect(ORDERS);
+          const state = yield* orders.cell.get;
+          return {
+            told,
+            launchedAt,
+            startedAt: Option.map(state, (current) => current.running.map((job) => job.startedAt)),
+          };
+        }).pipe(
+          Effect.provideService(CompactionLauncher, heldLauncher),
+          Effect.provideService(GarbageCollector, recordingCollector),
+        );
+      }),
+    );
+    const [startedAt] = Option.getOrElse(outcome.startedAt, () => []);
+    expect(startedAt).toBeDefined();
+    expect(outcome.told).toEqual([Option.none(), Option.some(startedAt)]);
+    // The recorded start precedes the launch, so no output of the job is older than it.
+    expect(startedAt).toBeLessThan(outcome.launchedAt[0] ?? 0);
   });
 
   it("shares the compaction budget: a second database waits until the first job's lease is released", async () => {

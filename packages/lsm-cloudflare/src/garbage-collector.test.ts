@@ -15,7 +15,7 @@ import {
   SstId,
   Timestamp,
 } from "@shaledb/lsm-core";
-import { Deferred, Effect, Fiber, Layer, Option, Ref, Stream } from "effect";
+import { Clock, Deferred, Effect, Fiber, Layer, Option, Ref, Stream } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -216,13 +216,13 @@ const interleavedCollections = (options: {
     // so X retains it; the L0 SSTs it names are older than X's boundary (4 s).
     yield* TestClock.adjust(9_000);
     const gc = yield* GarbageCollector;
-    const x = yield* Effect.forkChild(Effect.result(gc.collect(DB)));
+    const x = yield* Effect.forkChild(Effect.result(gc.collect(DB, Option.none())));
     yield* Deferred.await(reached);
     phase.current = "Y";
     yield* TestClock.adjust(options.laterBy);
     const y = options.deleteSupersededWhileStopped
       ? Option.none()
-      : Option.some(yield* gc.collect(DB));
+      : Option.some(yield* gc.collect(DB, Option.none()));
     if (options.deleteSupersededWhileStopped) {
       yield* (yield* ObjectStore).delete([manifestKey(DB, superseded)]);
       deleted.Y.clear();
@@ -320,6 +320,74 @@ describe("GarbageCollector", () => {
     expect(outcome.deletedByX).toBe(0);
   });
 
+  it("a compaction running longer than gcMinAge keeps its outputs and commits; older garbage still goes, and a discarded job's outputs go later (D96)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* create;
+        // Old garbage: four L0 SSTs at 0 s that a compaction replaces at once.
+        yield* writeAndFlush([1, 2, 3, 4]);
+        const oldGarbage = yield* storedKeys(compactedPrefix(DB));
+        yield* compactL0;
+        // At 100 s, a job over four new L0 SSTs starts and writes its first output.
+        yield* TestClock.adjust(100_000);
+        yield* writeAndFlush([5, 6, 7, 8]);
+        const { manifest } = yield* (yield* ManifestReader).loadLatest(DB);
+        const job: CompactionJob = {
+          sources: manifest.l0.map((sst) => ({ _tag: "L0" as const, sstId: sst.id })),
+          destination: SortedRunId.make(1),
+          isBottom: false,
+        };
+        const startedAt = Timestamp.make(yield* Clock.currentTimeMillis);
+        const executor = yield* CompactionExecutor;
+        const prepared = yield* executor.prepare(DB, manifest.compactorEpoch, job);
+        const first = yield* executor.writeOutput(prepared, Option.none());
+        const outputKeys = Option.toArray(first.output).map((sst) => sstKey(DB, sst.id));
+        // Its later steps wait past gcMinAge, and the compactor collects meanwhile.
+        yield* TestClock.adjust(MIN_AGE + 1);
+        const gc = yield* GarbageCollector;
+        // The sweep's leftover pass leaves a database that has a manifest to its compactor.
+        const leftovers = yield* gc.collectLeftovers(DB);
+        const during = yield* gc.collect(DB, Option.some(startedAt));
+        const storedDuring = new Set(yield* storedKeys(compactedPrefix(DB)));
+        const commit = yield* Effect.result(
+          executor.commit(prepared, Option.toArray(first.output)),
+        );
+        // A second job over the same kind of inputs is discarded after writing an output: once it
+        // is no longer running, its output is collected gcMinAge after it was written.
+        yield* writeAndFlush([9, 10, 11, 12]);
+        const next = (yield* (yield* ManifestReader).loadLatest(DB)).manifest;
+        const discardedJob: CompactionJob = {
+          sources: next.l0.map((sst) => ({ _tag: "L0" as const, sstId: sst.id })),
+          destination: SortedRunId.make(2),
+          isBottom: false,
+        };
+        const discarded = yield* executor.prepare(DB, next.compactorEpoch, discardedJob);
+        const orphan = yield* executor.writeOutput(discarded, Option.none());
+        const orphanKeys = Option.toArray(orphan.output).map((sst) => sstKey(DB, sst.id));
+        yield* TestClock.adjust(MIN_AGE + 1);
+        yield* gc.collect(DB, Option.none());
+        const storedAfter = new Set(yield* storedKeys(compactedPrefix(DB)));
+        return {
+          leftoversDeleted: leftovers.deletedSsts,
+          oldGone: oldGarbage.every((key) => !storedDuring.has(key)),
+          outputKept: outputKeys.length === 1 && outputKeys.every((key) => storedDuring.has(key)),
+          boundary: during.sstBoundary,
+          startedAt,
+          commit: commit._tag,
+          orphanGone: orphanKeys.length === 1 && orphanKeys.every((key) => !storedAfter.has(key)),
+          rows: yield* readAll,
+        };
+      }),
+    );
+    expect(outcome.leftoversDeleted).toBe(0);
+    expect(outcome.oldGone).toBe(true);
+    expect(outcome.outputKept).toBe(true);
+    expect(outcome.boundary).toBeLessThanOrEqual(outcome.startedAt);
+    expect(outcome.commit).toBe("Success");
+    expect(outcome.orphanGone).toBe(true);
+    expect(outcome.rows).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+  });
+
   it("keeps young manifests and their SSTs, then collects them once older than gcMinAge", async () => {
     const outcome = await run(
       Effect.gen(function* () {
@@ -328,16 +396,16 @@ describe("GarbageCollector", () => {
         const l0Keys = yield* storedKeys(compactedPrefix(DB));
         yield* compactL0;
         const gc = yield* GarbageCollector;
-        const young = yield* gc.collect(DB);
+        const young = yield* gc.collect(DB, Option.none());
         const manifestsWhileYoung = (yield* storedKeys(manifestPrefix(DB))).filter(
           (key) => !key.endsWith("/LATEST"),
         ).length;
         yield* TestClock.adjust(MIN_AGE + 1);
-        const old = yield* gc.collect(DB);
+        const old = yield* gc.collect(DB, Option.none());
         const remaining = yield* storedKeys(compactedPrefix(DB));
         const latest = yield* (yield* ManifestReader).loadLatest(DB);
         // Collecting an idle database writes no manifest.
-        const idle = yield* gc.collect(DB);
+        const idle = yield* gc.collect(DB, Option.none());
         return {
           l0Keys,
           young,
@@ -392,7 +460,7 @@ describe("GarbageCollector", () => {
         );
         yield* compactL0;
         yield* TestClock.adjust(MIN_AGE + 1);
-        const report = yield* (yield* GarbageCollector).collect(DB);
+        const report = yield* (yield* GarbageCollector).collect(DB, Option.none());
         const stillThere = yield* storedKeys(compactedPrefix(DB));
         return { report, pinned, stillThere };
       }),
@@ -424,7 +492,7 @@ describe("GarbageCollector", () => {
           }),
         );
         yield* TestClock.adjust(MIN_AGE + 1);
-        const report = yield* (yield* GarbageCollector).collect(DB);
+        const report = yield* (yield* GarbageCollector).collect(DB, Option.none());
         const late = yield* (yield* ManifestStore)
           .update(DB, (manifest) =>
             commitL0Flush(manifest, {
@@ -456,9 +524,9 @@ describe("GarbageCollector", () => {
         // A compaction output uploaded after removal deleted everything else: no manifest remains.
         yield* objects.put(sstKey(DB, SstId.make("01JD0000000000000000000ZZZ")), Uint8Array.of(1));
         const gc = yield* GarbageCollector;
-        const young = yield* gc.collect(DB);
+        const young = yield* gc.collect(DB, Option.none());
         yield* TestClock.adjust(MIN_AGE + 1);
-        const old = yield* gc.collect(DB);
+        const old = yield* gc.collect(DB, Option.none());
         return { young, old, left: yield* storedKeys(compactedPrefix(DB)) };
       }),
     );
