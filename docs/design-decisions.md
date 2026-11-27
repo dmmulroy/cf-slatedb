@@ -2881,3 +2881,140 @@ bound settings fit a Worker variable.
 - **Workflow instance state.** Each compaction's state is kept 7 days by the platform.
 - **Stale multipart uploads.** R2 aborts them after a day (D63).
 - **Idle compactors cost nothing:** an idle database with no garbage sets no alarm (D60).
+
+## D99. Bounds on what a caller can grow: checkpoints, the changelog, merged values, the manifest; the compactor's subrequests
+
+D92 found lists and values that a caller can grow without limit. The manifest holds most of them,
+and it is rewritten whole on every commit and decoded on every cold read. This decision sets each
+bound from a measured size budget. It also sets the compactor Worker's subrequest limit.
+
+**The manifest's size budget.** `manifest-size.test.ts` (lsm-core) measures the encoded size of
+each item, and Node's time to encode and decode a whole manifest (`Schema` over `JSON`, as
+`ManifestStore` and `ManifestReader` do):
+
+| Item                     | Bytes in the manifest |
+| ------------------------ | --------------------: |
+| SST handle, 16-byte keys |                   217 |
+| SST handle, 16 KiB keys  |                43,868 |
+| Checkpoint               |                   130 |
+| Changelog entry          |                   286 |
+
+| Manifest | SST handles | Encode | Decode | Heap of the decoded manifest |
+| -------: | ----------: | -----: | -----: | ---------------------------: |
+|    1 MiB |       4,832 |  10 ms |  12 ms |                      ~10 MiB |
+|   10 MiB |      48,321 | 100 ms |  90 ms |               not determined |
+|   50 MiB |     241,607 | 600 ms | 410 ms |                     ~194 MiB |
+
+The heap figures were taken without a forced GC, so they are rough; the 10 MiB reading was
+negative. They cover the decoded objects only, beside the JSON text.
+
+**The budget is 4 MiB.** At 4 MiB a commit spends about 40 ms encoding and a cold read about 40 ms
+decoding. The decoded manifest takes about 16 to 40 MiB of an isolate that also holds 48 MiB of L1
+caches and serves many requests, so it fits within 128 MB. At 10 MiB, 100 ms per commit and per
+cold read, plus up to 100 MiB of heap, is the point where a commit or a cold read becomes a
+problem. These times were measured in Node; workerd was not measured.
+
+**Checkpoints: at most 1,000 per database** (`MAX_CHECKPOINTS_PER_DATABASE`, lsm-core
+`addCallerCheckpoint`).
+
+- **What counts.** Checkpoints and pinned snapshots that callers create. A fork's or successor's
+  hold is not counted, so a split or fork never fails because of a caller's checkpoints.
+- **The 1,001st.** It is refused with `CheckpointLimitError`. The public error is
+  `CheckpointLimitReached` (409, not retryable). It names how many exist and says to delete one, or
+  to wait for a pinned snapshot to expire.
+- **A repeat is never refused.**
+- **Cost.** 1,000 checkpoints are about 127 KiB, 3% of the budget.
+
+**The changelog: at most its newest 2,048 flushes** (`MAX_CHANGELOG_ENTRIES`, `capChangelog`,
+applied in `commitL0Flush`).
+
+- **The bound holds however short the flush interval.** The oldest entries are dropped first, and
+  `changelogAfterSeq` is raised past them (D80). A consumer behind them gets a clean `Expired`, and
+  GC collects the dropped SSTs.
+- **What it holds.** At one flush a minute (`maxL0Age`) that is about 34 hours of changes; a
+  database that flushes more often keeps fewer hours.
+- **Cost.** About 570 KiB, 14% of the budget.
+- **Retention.** `changelogRetentionMs` is now at most 30 days (`MAX_CHANGELOG_RETENTION_MS`),
+  like a pinned snapshot's lifetime.
+
+**Strings a caller names.** A checkpoint name may be at most 256 characters, and a budget group at
+most 63 (a database id's length). Both are stored in the manifest; neither had a bound.
+
+**SSTs and sorted runs: the v1 database size limit.**
+
+- **What bounds them.** L0 is bounded by `l0MaxSsts` (16), and D87 makes the scheduler able to
+  drain it. Compaction keeps the rest in sorted runs of `compactionOutputSstSize` SSTs, so the
+  number of handles is about the data's size divided by 64 MiB. Nothing bounds that number but the
+  data.
+- **A handle's size** is about 169 bytes plus 2.67 bytes per byte of the SST's first and last keys
+  (base64), plus as much again for a fork's view.
+- **1 TiB with default settings and 16-byte keys** is about 16,400 SSTs, about 3.4 MiB: inside the
+  budget.
+- **The v1 database size limit is therefore about 1 TiB for keys of up to 16 bytes, and less for
+  longer keys.** About 300 GiB for 256-byte keys, about 90 GiB for 1 KiB keys, and about 6 GiB for
+  16 KiB keys, where every SST's boundary keys are that long.
+- **Larger databases** use range sharding (`packages/lsm-sharding`), or a larger
+  `compactionOutputSstSize`.
+
+**Merged values: at most 1 MiB, the largest value a put may write** (`MAX_MERGED_VALUE_BYTES`).
+
+- **Before.** `MAX_VALUE_BYTES` bounded each operand only. N merges of 1 MiB with `Concat` read
+  back as one N MiB value in the API isolate, and compaction folded them into one row of N MiB, which
+  every read of its block would load.
+- **Reads.** A read whose operands resolve past the bound fails with `MergedValueTooLargeError`;
+  the public error is `MergedValueTooLarge` (409, not retryable). It tells the caller to replace the
+  key with a put (or delete it). This is complete: every read path resolves through
+  `resolveVisibleRow`. A key stays unreadable until it is rewritten.
+- **Compaction never fails on such a key** (D97's lesson). `retainKeyVersions` leaves a run of
+  operands that would fold past the bound as it is, with the base below it. No stored row grows
+  past the bound, and a read over what compaction kept answers as it did before.
+- **Rejected: refusing a merge write once the key's unflushed operands pass the bound.** It is
+  cheap but partial: the writer sees only unflushed operands, so the read bound is needed anyway.
+- **SlateDB** puts no bound on a merged value (`slatedb/src/merge_operator.rs`; RFC 0006).
+
+**Other lists checked.**
+
+- `droppedSsts` keeps its newest 32 entries (D62).
+- `externalRefs` has one entry per database a fork reads from (its source, and the source's own
+  sources in a fork of a fork), bounded by the fork chain.
+- Ids are fixed-length ULIDs and database ids at most 63 characters. Keys in handles are at most
+  16 KiB each (`MAX_KEY_BYTES`).
+
+**The compactor Worker's subrequests: 10 million** (`limits.subrequests`;
+`SHALEDB_COMPACTOR_SUBREQUESTS`, from 1 to 10,000,000).
+
+- **How Cloudflare counts them.** The Workflows documentation counts subrequests per Workflow
+  instance: 10,000 by default, configurable up to 10 million with `limits.subrequests`
+  (developers.cloudflare.com/workflows/reference/limits, 2026-11-10). The Workers documentation
+  counts them per invocation, set per Worker the same way (workers/platform/limits, 2026-11-25). A
+  compaction job is one instance.
+- **What a job needs.** The Workflow audit counted about 8,600 subrequests for a 10 GiB merge:
+  5,100 chunk reads, 1,300 part uploads, 1,300 metadata reads, and 640 manifest reads. That is
+  about 860 per GiB, so the default fails every attempt above about 11 GiB.
+- **What 10 million covers.** About 11 TiB, past the database size limit above. The same Worker's
+  Durable Objects run the compactors' garbage collections: about 5,000 subrequests at 1.4 commits a
+  second over the last hour (D92).
+- **How it is set.** Alchemy passes a Worker's `limits` to the script upload's metadata, whose type
+  has `cpuMs` and `subrequests`. `compactorWorkerLayer` takes an optional `subrequestLimit`, and
+  the Stack's resolves from the configuration at plan time, like the CPU limits (D61).
+- **The API Worker keeps the default.** A flush of 256 MiB makes about 40 subrequests (32 parts and
+  its commits). A scan is bounded by D93's pages. Neither is within 100× of 10,000.
+
+**Tests.**
+
+- `manifest-size.test.ts`: the budget.
+- `manifest-limits.test.ts`: the checkpoint cap at its edge, repeats, and holds; the changelog
+  bound and its `changelogAfterSeq`.
+- `merge-limits.test.ts`: the read at and past the bound; compaction unfolded and consistent.
+- `db-public-error-limits.test.ts`: both public errors; the request bounds on retention, budget
+  group, and checkpoint name.
+- `shaledb-stack-config.test.ts`: the subrequest default, an override, and the refusal above
+  10 million.
+- **Mutations:** 12, each caught (`/tmp/shale-work/agents/audit-limits/mutations.log`). One
+  survived at first (the read bound made inclusive) and is caught since a test reads at exactly
+  the bound.
+
+**Before the release.** Three of these bounds narrow what `/v1` accepted: changelog retention,
+budget-group length, and checkpoint-name length. That is done before v1 is released.
+`docs/api-compatibility.md` forbids tightening a limit only within a released `/v1`, so from the
+release on these bounds are part of the contract.
