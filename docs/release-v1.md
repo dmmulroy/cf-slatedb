@@ -31,21 +31,21 @@ the go-ahead, nothing changes: production stays one command away.
 ## 2. Workstreams 1 to 10
 
 Workstreams 1 to 9 and the first part of 10 are on `main` (up to `f3b2ad2`); the rest of 10 is on
-the integration branch `proto/integration-2` (up to `fec2698`), and D77 and D78 are on their own
-branches until merged. Status comes from the workstream table in `docs/progress.md`.
+the integration branch `proto/integration-2`, merged up to `7dfed3f` for this pass. The formal
+and mutation work (D109 and on) is on its own branches until merged. Status comes from the workstream table in `docs/progress.md`.
 
-| #   | Workstream                            | Done                          | Commit(s)                                                                                                                                                                                                                                                   | Decisions                        |
-| --- | ------------------------------------- | ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------- |
-| 1   | The Stack owns its configuration      | yes                           | `012bdb5`                                                                                                                                                                                                                                                   | D55 (supersedes D54's mechanism) |
-| 2   | Fast manifest commits                 | yes                           | `774ed7b`                                                                                                                                                                                                                                                   | D56                              |
-| 3   | Splits pause briefly, never fail      | yes                           | `393758c`                                                                                                                                                                                                                                                   | D57                              |
-| 4   | Transactions exact across flushes     | yes                           | `5f2850b`, `5df4099` (the D59 routing fix)                                                                                                                                                                                                                  | D58, D59                         |
-| 5   | GC and maintenance that scale         | yes                           | `e06f3eb`                                                                                                                                                                                                                                                   | D60                              |
-| 6   | Writer throughput and limits          | yes                           | `308defd`                                                                                                                                                                                                                                                   | D61                              |
-| 7   | Corruption: prevent, detect, repair   | yes                           | `2cb5116`                                                                                                                                                                                                                                                   | D62                              |
-| 8   | Production telemetry                  | yes                           | `62eab3d`                                                                                                                                                                                                                                                   | D63                              |
-| 9   | Production readiness                  | yes                           | `8a96667`                                                                                                                                                                                                                                                   | D64                              |
-| 10  | Soak, release checklist, the go-ahead | no: soaks pending, P6 pending | `a506228`, `fe552f0`, `18aa655`, `a98eb15`, `93c337c`, `04df0f9`, `9776317`, `5bedcbd`, `c72e0f3`, `c9e7487`, `4082f97`, `335b775`, `af51ae2`, `3d9f70f`, `dddd49a`, `8a36402`, `6f9c4ab`, `fec2698`, `ab5b929`, this checklist; PENDING(d77), PENDING(d78) | D65–D78                          |
+| #   | Workstream                            | Done                          | Commit(s)                                                                                                                                                                                                                                                                                                                       | Decisions                        |
+| --- | ------------------------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------- |
+| 1   | The Stack owns its configuration      | yes                           | `012bdb5`                                                                                                                                                                                                                                                                                                                       | D55 (supersedes D54's mechanism) |
+| 2   | Fast manifest commits                 | yes                           | `774ed7b`                                                                                                                                                                                                                                                                                                                       | D56                              |
+| 3   | Splits pause briefly, never fail      | yes                           | `393758c`                                                                                                                                                                                                                                                                                                                       | D57                              |
+| 4   | Transactions exact across flushes     | yes                           | `5f2850b`, `5df4099` (the D59 routing fix)                                                                                                                                                                                                                                                                                      | D58, D59                         |
+| 5   | GC and maintenance that scale         | yes                           | `e06f3eb`                                                                                                                                                                                                                                                                                                                       | D60                              |
+| 6   | Writer throughput and limits          | yes                           | `308defd`                                                                                                                                                                                                                                                                                                                       | D61                              |
+| 7   | Corruption: prevent, detect, repair   | yes                           | `2cb5116`                                                                                                                                                                                                                                                                                                                       | D62                              |
+| 8   | Production telemetry                  | yes                           | `62eab3d`                                                                                                                                                                                                                                                                                                                       | D63                              |
+| 9   | Production readiness                  | yes                           | `8a96667`                                                                                                                                                                                                                                                                                                                       | D64                              |
+| 10  | Soak, release checklist, the go-ahead | no: soaks pending, P6 pending | `a506228`, `fe552f0`, `18aa655`, `a98eb15`, `93c337c`, `04df0f9`, `9776317`, `5bedcbd`, `c72e0f3`, `c9e7487`, `4082f97`, `335b775`, `af51ae2`, `3d9f70f`, `dddd49a`, `8a36402`, `6f9c4ab`, `fec2698`, `ab5b929`; then the merges into `proto/integration-2` through `7dfed3f` (`git log --merges f3b2ad2..proto/integration-2`) | D65–D108, D123                   |
 
 `docs/progress.md` still lists workstream 9's commit as "this commit"; it is `8a96667`
 (`feat(release): rotatable Secrets Store tokens, production tasks, …`).
@@ -104,18 +104,19 @@ All models assume three things: one writer instance per database (the Durable Ob
 durable SQLite commits before an acknowledgement, and R2 create-if-absent. The last is confirmed on
 real R2 by the `create-race` scenario.
 
-The table is `formal-checks.ts` as integrated (`ddb63dd`, 31 runs listed).
+The table is `formal-checks.ts` as integrated (`7dfed3f`, 33 runs listed).
 
-| Spec and config              | What it proves                                                                                                                                                                                                                     | Bounds                                                                      | Broken variants (must fail)                                                                                                                                               | Runs |
-| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---: |
-| `ManifestCasFencing.cfg`     | Fencing and manifest CAS linearizability: one manifest per id, a commit lands once, no fenced writer or compactor commits, acknowledged data stays visible, the reader finds the head from the hint and from any known manifest    | 2 writers, 2 compactors, 1 job each, manifest ids up to 9, 2 flushes, no GC | `noWriterEpochCheck` → `NoStaleCommit`; `blindCreate` → `CreateOnce`                                                                                                      |    3 |
-| `ManifestCasFencingRace.cfg` | The same, with a compaction whose inputs changed before it committed                                                                                                                                                               | 1 writer, 1 compactor, 2 jobs, ids up to 8, 2 flushes                       | `noInputsCheck` → `AckedDataVisible`                                                                                                                                      |    2 |
-| `ManifestCasFencingGc.cfg`   | The same while GC deletes manifests at or below an advancing boundary and hint writes land late or never                                                                                                                           | 1 writer, 1 compactor, 1 job, ids up to 7, 2 flushes, GC on                 | `noBoundaryReread` → `CommitOnce`; `hintOnlyProbe` → `LoadFindsHead`; `knownIgnoresBoundary` → `LoadFromKnownFindsHead`                                                   |    4 |
-| `NoAckedWriteLost.cfg`       | No acknowledged write is lost across eviction, crash between upload and commit, flush, trim, and compaction; a `Latest` read sees every acknowledged write                                                                         | 4 writes, 2 crashes, 2 reads                                                | `truncateBeforeCommit` → `NoAckedWriteLost`; `nonAtomicProbe` → `LatestSeesAcked`; `trimUnflushed` → `NoAckedWriteLost`; `noSnapshotUpperBound` → `LatestSeesAcked` (D70) |    5 |
-| `GcSafety.cfg`               | GC never deletes an SST that the newest manifest, a manifest a reader may still hold, or a checkpoint references, nor an upload whose commit can still succeed; SST drops included                                                 | 2 SSTs (symmetric), clock 0–3, min age 1, 5 manifests                       | `noBoundaryCheck`, `ownUploadAge`, `dropDeletesObject` → `ReadableManifestsComplete`; `ignorePins` → `PinnedManifestsComplete`                                            |    5 |
-| `GcSafetyFork.cfg`           | With one fork of the database: a fork releases its hold only once no manifest a reader of the fork may hold names the database's SSTs (D77)                                                                                        | 1 SST, clock 0–3, min age 1, up to 6 manifests, `WithFork`                  | `earlyForkRelease` → `ForkReadsComplete`                                                                                                                                  |    2 |
-| `SealSplit.cfg`              | After a seal no write commits; a split leaves every write acknowledged before the seal in exactly one successor                                                                                                                    | 3 keys (1 to the left successor), 4 writes                                  | `sealWithoutLock`, `checkpointBeforeSeal`, `overlappingRanges` → `EveryAckedWriteInExactlyOneSuccessor`; `writerNotFenced` → `NoCommitAfterSeal`                          |    5 |
-| `Transactions.cfg`           | `SerializableSnapshot` transactions admit only serializable histories, and every read returns what the database held at the transaction's begin (`ReadsAtBegin`, D76), with retained rows, trims, and the begin or newest manifest | 2 keys, 2 transactions (symmetric), sequence numbers up to 5                | `snapshotOnly`, `trimWithoutAbort` → `Serializable`; `noReadHorizonCheck`, `noReadUpperBound` → `ReadsAtBegin`                                                            |    5 |
+| Spec and config                | What it proves                                                                                                                                                                                                                     | Bounds                                                                                         | Broken variants (must fail)                                                                                                                                               | Runs |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---: |
+| `ManifestCasFencing.cfg`       | Fencing and manifest CAS linearizability: one manifest per id, a commit lands once, no fenced writer or compactor commits, acknowledged data stays visible, the reader finds the head from the hint and from any known manifest    | 2 writers, 2 compactors, 1 job each, manifest ids up to 9, 2 flushes, no GC                    | `noWriterEpochCheck` → `NoStaleCommit`; `blindCreate` → `CreateOnce`                                                                                                      |    3 |
+| `ManifestCasFencingRace.cfg`   | The same, with a compaction whose inputs changed before it committed                                                                                                                                                               | 1 writer, 1 compactor, 2 jobs, ids up to 8, 2 flushes                                          | `noInputsCheck` → `AckedDataVisible`                                                                                                                                      |    2 |
+| `ManifestCasFencingGc.cfg`     | The same while GC deletes manifests at or below an advancing boundary and hint writes land late or never                                                                                                                           | 1 writer, 1 compactor, 1 job, ids up to 7, 2 flushes, GC on                                    | `noBoundaryReread` → `CommitOnce`; `hintOnlyProbe` → `LoadFindsHead`; `knownIgnoresBoundary` → `LoadFromKnownFindsHead`                                                   |    4 |
+| `ManifestCasFencingRemove.cfg` | The same while `remove` marks the database and deletes its manifests with commits in flight: a removed database never comes back (`NoResurrection`, D91)                                                                           | 1 writer, 1 compactor, 1 job, ids up to 8, 2 flushes, no GC (with GC it passes the time limit) | `removalDeletesHead` → `NoResurrection`                                                                                                                                   |    2 |
+| `NoAckedWriteLost.cfg`         | No acknowledged write is lost across eviction, crash between upload and commit, flush, trim, and compaction; a `Latest` read sees every acknowledged write                                                                         | 4 writes, 2 crashes, 2 reads                                                                   | `truncateBeforeCommit` → `NoAckedWriteLost`; `nonAtomicProbe` → `LatestSeesAcked`; `trimUnflushed` → `NoAckedWriteLost`; `noSnapshotUpperBound` → `LatestSeesAcked` (D70) |    5 |
+| `GcSafety.cfg`                 | GC never deletes an SST that the newest manifest, a manifest a reader may still hold, or a checkpoint references, nor an upload whose commit can still succeed; SST drops included                                                 | 2 SSTs (symmetric), clock 0–3, min age 1, 5 manifests                                          | `noBoundaryCheck`, `ownUploadAge`, `dropDeletesObject` → `ReadableManifestsComplete`; `ignorePins` → `PinnedManifestsComplete`                                            |    5 |
+| `GcSafetyFork.cfg`             | With one fork of the database: a fork releases its hold only once no manifest a reader of the fork may hold names the database's SSTs (D77)                                                                                        | 1 SST, clock 0–3, min age 1, up to 6 manifests, `WithFork`                                     | `earlyForkRelease` → `ForkReadsComplete`                                                                                                                                  |    2 |
+| `SealSplit.cfg`                | After a seal no write commits; a split leaves every write acknowledged before the seal in exactly one successor                                                                                                                    | 3 keys (1 to the left successor), 4 writes                                                     | `sealWithoutLock`, `checkpointBeforeSeal`, `overlappingRanges` → `EveryAckedWriteInExactlyOneSuccessor`; `writerNotFenced` → `NoCommitAfterSeal`                          |    5 |
+| `Transactions.cfg`             | `SerializableSnapshot` transactions admit only serializable histories, and every read returns what the database held at the transaction's begin (`ReadsAtBegin`, D76), with retained rows, trims, and the begin or newest manifest | 2 keys, 2 transactions (symmetric), sequence numbers up to 5                                   | `snapshotOnly`, `trimWithoutAbort` → `Serializable`; `noReadHorizonCheck`, `noReadUpperBound` → `ReadsAtBegin`                                                            |    5 |
 
 The models are bounded. They check every interleaving within these bounds, not beyond them. What
 they leave out is part of section 8.
@@ -129,7 +130,7 @@ epoch in `ManifestCasFencing.tla`, and the overwritten epoch was local state of 
 which the D78 tests check (D78, "Model").
 
 PENDING(final-commit): the number of runs `vp run verify` reports on the release commit, observed
-at exit 0. The last count observed was 28/28, on the D70–D74 code (`docs/progress.md`). The 31 runs
+at exit 0. The last count observed was 28/28, on the D70–D74 code (`docs/progress.md`). The 33 runs
 listed today have not been observed in one run.
 
 ## 5. Soaks
@@ -282,7 +283,7 @@ Dillon delegated P1–P5 ("decide with best judgement"); each took the recommend
 | P5  | Plan and limits  | Workers Paid; `limits.cpu_ms` 30,000 (API and its writers) and 60,000 (compactor)                                                                                            | D61: `DEFAULT_API_CPU_MS`, `DEFAULT_COMPACTOR_CPU_MS` in `shaledb-stack-config.ts`. The account's plan is not visible in the repository; the previews ran with these limits                                            |
 | P6  | Release go-ahead | pending: this checklist                                                                                                                                                      | `plan:production` and `deploy:production` in `infra/shaledb/vite.config.ts`                                                                                                                                            |
 
-## 7. What changed late (D67 to D103)
+## 7. What changed late (D67 to D123)
 
 These landed after the first soaks. The release soaks (section 5) are the first long runs on all of
 them.
@@ -403,10 +404,11 @@ them.
   years, and retried requests get truthful answers. Found by the API audit.
 - **D89, a stale router served a sealed shard at `Flushed` indefinitely.** It now refreshes a map
   older than a second before such a read. Found by the API audit.
-- **D90, D91, a removed database's id.** PENDING(d90): a reader that cached the removed database's
-  manifest served it as the new one's, and a commit landing after the removal brought the database
-  back. The fix keeps the `Removed` manifest at the head for `gcMinAge`, and `create` refuses the id
-  until then (`DatabaseRecentlyRemoved`). Found by the lifecycle audit; not yet merged.
+- **D90, D91, a removed database's id.** A reader that cached the removed database's manifest
+  served it as the new one's, and a commit landing after the removal brought the database back. The
+  `Removed` manifest now stays at the head for `gcMinAge` as a tombstone, and `create` refuses the
+  id until then (`DatabaseRecentlyRemoved`, 409). Model: `ManifestCasFencingRemove.cfg`, whose
+  broken variant `removalDeletesHead` fails `NoResurrection`. Found by the lifecycle audit.
 - **D92.** Cloudflare's platform limits against shaledb's demand; settings the platform cannot hold
   are refused.
 - **D93, a `Latest` scan held every unflushed row; the change feed split large batches.** Scans pull
@@ -430,14 +432,38 @@ them.
   Found by the API audit.
 - **D101, an abandoned split left its range unwritable forever.** A request that waits it out now
   finishes it. Found by the API audit.
-- **D102, the writer's alarm.** PENDING(d102): a failing flush retried every second forever, and an
-  unreadable `writer_meta` set no alarm. Now there is a backoff; the stalled-write reload and two
-  concurrent schedulers no longer move the writer's view or its alarm back. Found by the Durable
-  Object audit; not yet merged.
-- **D103, a retried commit of a compaction with no outputs, and the size of a large compaction.**
-  PENDING(d103): a commit records its job id, so a retry is recognized whatever its outputs. A
-  missing Workflow instance is finished. The derived needs of a large compaction are tabled. Found
-  by the Workflow audit; not yet merged.
+- **D102, one alarm retry rule.** A failing flush retried every second forever, and an unreadable
+  `writer_meta` set no alarm at all. Now both the writer's and the compactor's alarms back off from
+  1 s, doubling to a ceiling, and never throw. The stalled-write reload and two concurrent
+  schedulers no longer move the writer's view or its alarm back. Found by the Durable Object audit.
+- **D103, a retried commit of a compaction with no outputs, and the size of a large compaction.** A
+  commit records its job id, so a retry is recognized whatever its outputs. A missing Workflow
+  instance is finished. The needs of a large compaction are tabled: the largest run live is about
+  0.5 GiB, and Workflows' 10,000 steps per instance stop a bottom merge of a database above about
+  625 GiB. Found by the Workflow audit.
+- **D104.** What the first production deploy creates, its tokens, and its smoke test, read from the
+  code and never run (the production audit).
+- **D105.** Rollback against the stored formats: what `f3b2ad2` and `c3807f7` do with today's
+  records, with fixtures.
+- **D106, the soak exercises the classes of defect the audits found.** The change feed, merge
+  operands with TTLs, paged scans, bursts of flushes, idle databases, forks from checkpoints,
+  recreated ids, and aborted requests, each with a model checked during the soak.
+- **D107, an SST's metadata grew with its keys.** At 16 KiB keys the index was twice the data, and
+  a flush of such keys passed the isolate's memory on every attempt, so writes stalled. A block now
+  holds enough rows to keep metadata near 3%. Found by the read audit.
+- **D108, one scan page could read a whole range of deleted versions,** past the API Worker's CPU
+  on every request. A page now examines at most 16 MiB (`SCAN_PAGE_EXAMINED_BYTES`) and ends early
+  with `resumeFrom`. Found by the read audit.
+- **D123, span events bypassed the trace policy.** A log line's object parts and annotations were
+  exported unfiltered; no call site put a key there, but nothing stopped one. Events now pass the
+  same allowlist as attributes (this audit).
+
+PENDING(formal): the two formal-verification agents' models of the writer and compactor objects,
+liveness, the change feed, the split end to end, and the lifecycle (D109 and on), with their
+findings.
+
+PENDING(mutation): the three mutation sweeps (`lsm-core`; the reader, manifest, and GC services;
+the writer, compactor, and public API: D117 to D122), with their survivors and fixes.
 
 ## 8. Defects found in the last day, and what that says
 
@@ -448,31 +474,35 @@ check its answers (soaks, scenarios, unit and property tests, the existing model
 them. Every one was found by reading code against a stated rule, or by extending a model or a
 measurement past what the gates did.
 
-| Defect                                        | What a caller would have seen                                        | Found by                                | What catches it now                                                                              |
-| --------------------------------------------- | -------------------------------------------------------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| D70: read past its snapshot                   | "not found" for a key that had a value                               | a model extended with compaction        | `noSnapshotUpperBound`; `db-client.test.ts`                                                      |
-| D74b: counter refresh race                    | a row unflushed until a later write                                  | review of a diff                        | `db-writer.test.ts` (`runWithHookedStats`)                                                       |
-| D76: begin manifest collected                 | every transaction read refused, every retry                          | guide checked against code              | `db-transaction.test.ts`; `ReadsAtBegin`                                                         |
-| D77: fork hold released early                 | `StorageUnavailable` on every retry, fork snapshots and transactions | interaction audit                       | `GcSafetyFork.cfg` `earlyForkRelease`; `database-lifecycle.test.ts`, `garbage-collector.test.ts` |
-| D78: compactor fenced against itself          | every write refused, permanently                                     | a measurement (`measure manifest-cas`)  | `compactor.test.ts`, two overlapping cold wakes                                                  |
-| D80: change feed skipped changes              | changes lost without an error                                        | interaction audit                       | `change-feed.test.ts`, `manifest.test.ts`                                                        |
-| D81: compaction folded expiries               | a key absent after a compaction                                      | interaction audit                       | `row-resolution.test.ts`, `compaction-merge.test.ts`                                             |
-| D83: collection without a retained manifest   | SSTs a reader needed deleted                                         | interaction audit                       | `garbage-collector.test.ts`                                                                      |
-| D84: `Snapshot` commit across a trim          | a lost update                                                        | area audit (Durable Objects)            | `db-writer.test.ts`; `Transactions.tla` `Commit`                                                 |
-| D85: seal the writer never saw                | acknowledged writes that never flushed, in no successor              | area audit (Durable Objects)            | `db-writer.test.ts`                                                                              |
-| D86: `prepare` result over 1 MiB              | a large merge never runs; runs pile up                               | area audits (Workflow, limits)          | `compaction-executor.test.ts`                                                                    |
-| D87: `l0MaxSsts` below `minCompactionSources` | writes refused forever                                               | area audit (Workflow)                   | `size-tiered-compaction-scheduler.test.ts`; a settings rule                                      |
-| D88: TTL near 2^53                            | every flush failed, writes stalled                                   | area audit (API)                        | `db-http-limits.test.ts`, `db-http-boundary.property.test.ts`                                    |
-| D89: stale router at `Flushed`                | a sealed shard's old data, without bound                             | area audit (API)                        | `shard-router-staleness.test.ts`                                                                 |
-| D90: recreated id                             | a removed database's data under the new one                          | area audit (lifecycle)                  | PENDING(d90)                                                                                     |
-| D91: commit after a removal                   | a removed database back, acknowledging writes                        | area audit (lifecycle)                  | PENDING(d90)                                                                                     |
-| D93a: `Latest` scan held all unflushed rows   | `exceededMemory` on an allowed scan                                  | area audit (limits)                     | `db-client-scan.test.ts`                                                                         |
-| D93b: change feed split a large batch         | 500 of 1,500 changes skipped silently                                | area audit (Durable Objects)            | `change-feed.test.ts`, `mem-table.test.ts`                                                       |
-| D94: job with no Workflow instance            | its sources never compacted again                                    | area audits (Workflow, Durable Objects) | `compactor.test.ts`                                                                              |
-| D95: seal with other successors               | success, with the old successors kept                                | area audit (API)                        | `db-writer.test.ts`                                                                              |
-| D96: compaction longer than `gcMinAge`        | a large merge never commits                                          | area audit (Workflow)                   | `garbage-collector.test.ts`, `compactor.test.ts`                                                 |
-| D97: step over dropped rows                   | compaction stuck after mass deletes; writes refused                  | area audit (limits)                     | `compaction-executor.test.ts`                                                                    |
-| D101: abandoned split                         | a key range unwritable forever                                       | area audit (API)                        | `shard-split-faults.test.ts`                                                                     |
+| Defect                                        | What a caller would have seen                                                    | Found by                                | What catches it now                                                                              |
+| --------------------------------------------- | -------------------------------------------------------------------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| D70: read past its snapshot                   | "not found" for a key that had a value                                           | a model extended with compaction        | `noSnapshotUpperBound`; `db-client.test.ts`                                                      |
+| D74b: counter refresh race                    | a row unflushed until a later write                                              | review of a diff                        | `db-writer.test.ts` (`runWithHookedStats`)                                                       |
+| D76: begin manifest collected                 | every transaction read refused, every retry                                      | guide checked against code              | `db-transaction.test.ts`; `ReadsAtBegin`                                                         |
+| D77: fork hold released early                 | `StorageUnavailable` on every retry, fork snapshots and transactions             | interaction audit                       | `GcSafetyFork.cfg` `earlyForkRelease`; `database-lifecycle.test.ts`, `garbage-collector.test.ts` |
+| D78: compactor fenced against itself          | every write refused, permanently                                                 | a measurement (`measure manifest-cas`)  | `compactor.test.ts`, two overlapping cold wakes                                                  |
+| D80: change feed skipped changes              | changes lost without an error                                                    | interaction audit                       | `change-feed.test.ts`, `manifest.test.ts`                                                        |
+| D81: compaction folded expiries               | a key absent after a compaction                                                  | interaction audit                       | `row-resolution.test.ts`, `compaction-merge.test.ts`                                             |
+| D83: collection without a retained manifest   | SSTs a reader needed deleted                                                     | interaction audit                       | `garbage-collector.test.ts`                                                                      |
+| D84: `Snapshot` commit across a trim          | a lost update                                                                    | area audit (Durable Objects)            | `db-writer.test.ts`; `Transactions.tla` `Commit`                                                 |
+| D85: seal the writer never saw                | acknowledged writes that never flushed, in no successor                          | area audit (Durable Objects)            | `db-writer.test.ts`                                                                              |
+| D86: `prepare` result over 1 MiB              | a large merge never runs; runs pile up                                           | area audits (Workflow, limits)          | `compaction-executor.test.ts`                                                                    |
+| D87: `l0MaxSsts` below `minCompactionSources` | writes refused forever                                                           | area audit (Workflow)                   | `size-tiered-compaction-scheduler.test.ts`; a settings rule                                      |
+| D88: TTL near 2^53                            | every flush failed, writes stalled                                               | area audit (API)                        | `db-http-limits.test.ts`, `db-http-boundary.property.test.ts`                                    |
+| D89: stale router at `Flushed`                | a sealed shard's old data, without bound                                         | area audit (API)                        | `shard-router-staleness.test.ts`                                                                 |
+| D90: recreated id                             | a removed database's data under the new one                                      | area audit (lifecycle)                  | `database-lifecycle.test.ts`; `ManifestCasFencingRemove.cfg`                                     |
+| D91: commit after a removal                   | a removed database back, acknowledging writes                                    | area audit (lifecycle)                  | `database-lifecycle.test.ts`; `ManifestCasFencingRemove.cfg`                                     |
+| D93a: `Latest` scan held all unflushed rows   | `exceededMemory` on an allowed scan                                              | area audit (limits)                     | `db-client-scan.test.ts`                                                                         |
+| D93b: change feed split a large batch         | 500 of 1,500 changes skipped silently                                            | area audit (Durable Objects)            | `change-feed.test.ts`, `mem-table.test.ts`                                                       |
+| D94: job with no Workflow instance            | its sources never compacted again                                                | area audits (Workflow, Durable Objects) | `compactor.test.ts`                                                                              |
+| D95: seal with other successors               | success, with the old successors kept                                            | area audit (API)                        | `db-writer.test.ts`                                                                              |
+| D96: compaction longer than `gcMinAge`        | a large merge never commits                                                      | area audit (Workflow)                   | `garbage-collector.test.ts`, `compactor.test.ts`                                                 |
+| D97: step over dropped rows                   | compaction stuck after mass deletes; writes refused                              | area audit (limits)                     | `compaction-executor.test.ts`                                                                    |
+| D101: abandoned split                         | a key range unwritable forever                                                   | area audit (API)                        | `shard-split-faults.test.ts`                                                                     |
+| D107: metadata grew with key size             | gets re-reading huge metadata; at 16 KiB keys every flush failed, writes stalled | area audit (read)                       | `sst-codec.test.ts`                                                                              |
+| D107b: damaged SST metadata untyped           | a read died as `InternalFailure` (500), naming no SST                            | area audit (read)                       | `sst-codec.test.ts` property                                                                     |
+| D108: scan page over deleted versions         | every request for that range timed out                                           | area audit (read)                       | `db-reader-limits.test.ts`, `db-http-scan.test.ts`                                               |
+| D108b: damaged block cached                   | a block unreadable for as long as Workers Cache kept the bad copy (up to a year) | area audit (read)                       | `block-cache.test.ts`                                                                            |
 
 Risks fixed alongside (not counted above): D98 (GC cost by commit rate), D99 (unbounded caller
 growth), D100 (unbounded bodies), D102 (alarm retry), D103 (a retried zero-output commit).
@@ -486,11 +516,12 @@ name):
 | State shared across an await inside one Durable Object             | D74b, D78, D84, D85                     |      4 |
 | Liveness after long idle periods and after GC                      | D76, D90, D94, D101                     |      4 |
 | Time (TTL, `gcMinAge`, retention)                                  | D81, D88, D96                           |      3 |
-| A limit a caller or the platform sets (not in AUDIT-COMMON's list) | D86, D93a, D97                          |      3 |
+| A limit a caller or the platform sets (not in AUDIT-COMMON's list) | D86, D93a, D97, D107, D108              |      5 |
+| Corruption not handled as corruption (not in AUDIT-COMMON's list)  | D107b, D108b                            |      2 |
 | A property checked at only one moment                              | D95                                     |      1 |
-| **Total**                                                          |                                         | **23** |
+| **Total**                                                          |                                         | **27** |
 
-**By how each was found:** 15 by the round-2 area audits, 4 by the round-1 interaction audit, and
+**By how each was found:** 19 by the round-2 area audits (4 of them by the read audit), 4 by the round-1 interaction audit, and
 1 each by an extended model (D70), a guide checked against the code (D76), a review of a diff
 (D74b), and a measurement (D78).
 
@@ -502,7 +533,7 @@ because finding and fixing overlap.
   agent 22:40–23:00 UTC; the review agent's passes 22:40–22:51, 23:18–23:28, and 23:38–00:04).
   That is about 5 an auditor-hour.
 - **The measurement.** `measure manifest-cas` found D78 at 23:05 UTC.
-- **Round 2: five auditors by area, from 00:12 UTC.** Their first briefs found 12 defects in about
+- **Round 2: five auditors by area from 00:12 UTC, and a sixth (the read path) from 01:09.** Their first briefs found 12 defects in about
   79 auditor-minutes, about 9 an auditor-hour:
   - API: 2 (D88, D89);
   - Durable Objects: 2 (D84, D85);
@@ -510,10 +541,15 @@ because finding and fixing overlap.
   - Workflow: 3 (D86, D87, D96);
   - limits: 2 new (D93a, D97) and D86 again.
 
-  Their second briefs, while fixing, confirmed four more (D93b, D94, D95, D101).
+  Their second briefs, while fixing, confirmed four more (D93b, D94, D95, D101). The read audit
+  found four (D107, D107b, D108, D108b) in 21 minutes, 01:09–01:30 UTC.
 
-- **No round has yet ended without a defect-class finding.** A third round (audit-prod, on the
-  production deploy) started at 00:59 UTC; its result is not in.
+- **The production audit** (00:59–01:30 UTC, D104 and D105) found risks and documentation errors,
+  no defect: an interrupted smoke run's leftovers, the deployment guard overstated, and a rollback
+  across D91 that reopens D91's race for a removed database.
+- **No area round has yet ended without a defect-class finding.** The production audit is the
+  first audit without one; it read deployment and rollback, not the engine. The mutation sweeps are
+  running, and one has already reported a defect (PENDING(mutation)).
 
 **What has had a pass over every await or every field, and what has not** (each report's "Not
 reached"):
@@ -528,13 +564,17 @@ reached"):
   time, what Tail Workers drop, and any live run of a derived limit.
 - **Compaction and GC** (audit-workflow). Not reached: a compaction step's memory with 8 inputs,
   which needs workerd.
-- **Lifecycle** (audit-lifecycle): still finishing D90 and D91; no report yet.
-- **Not audited by area at all:** the tools (`scenario-cli`, `trace-cli`, `preview-cli`), the
-  telemetry policy, and the read path's block cache beyond D72's review.
+- **Lifecycle** (audit-lifecycle): D90 and D91 merged; its report is not in this tree.
+- **The read path** (audit-read, D107, D108). Not reached: offsets that pass D100's digit pattern
+  as floats, `no-store` on `BlockServer` error responses, and live memory and scan-budget
+  measurements.
+- **Not audited by area at all:** the tools (`scenario-cli`, `trace-cli`, `preview-cli`). The
+  telemetry policy had this audit's pass over every attribute, log line, and error message added
+  since `f3b2ad2` (D123).
 
 **What that says.** The checks that run the system at its normal timing found none of these in
 soaks of 132 and 21 minutes. The two rounds' first passes, reading the code against a stated
-rule, found 18 in about 2.4 auditor-hours. The rate went up from round 1 to round 2, not down. Each fix has a
+rule, found 18 in about 2.4 auditor-hours, and the read audit four more in 21 minutes. The rate went up from round 1 to round 2, not down. Each fix has a
 regression test, which closes that defect, not its class. These are the facts as they stand; they
 make no prediction.
 
@@ -601,11 +641,13 @@ What v1 does not do, or has not measured.
 - **Above about 1.4 commits a second, sustained for an hour, SST collection is deferred** (D98). Old
   manifests are still deleted, but unreferenced SSTs wait until the rate falls. Storage grows
   meanwhile, and `measure health` reports the deferral.
-- **A public scan page is bounded by rows, not bytes.** 1,000 rows of values up to 1 MiB can make a
-  page of about 1 GiB in one 128 MB isolate (release3 `STATUS.md`; D93 bounded the memtable pages
-  only). Use small limits over large values.
-- **The writer's alarm.** PENDING(d102): a failing flush retried every second, and an unreadable
-  `writer_meta` set no alarm, until D102 lands.
+- **A public scan page is bounded by 1,000 rows and by 16 MiB of versions examined**
+  (`SCAN_PAGE_EXAMINED_BYTES`, D108). Returned rows count toward the 16 MiB, so a page holds at most
+  about 16 MiB plus one row. A page over deleted or expired rows may return fewer rows, or none,
+  with a `resumeFrom` to follow.
+- **Alarms back off.** A writer's or compactor's alarm that keeps failing retries from 1 s, doubling
+  to a ceiling (`maxL0Age`, 60 s, for the writer), and never stops (D102). An outage of R2 therefore
+  delays flushes by up to a minute after it ends.
 - **Not reached by the audits.** These were not checked:
   - a compaction step's memory with 8 inputs (needs workerd);
   - the `BlockServer` under a hostile caller;
@@ -630,8 +672,8 @@ a demand above a Cloudflare limit. Each is fixed:
 - a `Latest` scan and the memtable pages (D93);
 - the cost of a garbage collection (D98, deferred above the commit rate above).
 
-None has been run live at the derived size. PENDING(d103): the largest compaction run on a preview,
-against D103's table.
+None has been run live at the derived size. The largest compaction run live is about 0.5 GiB
+(D103); everything above it in D103's table is derived.
 
 Settings the platform cannot hold (R2 parts, the Durable Object's storage, the isolate's memory,
 the account's Workflows) are now refused when a deploy is planned.
@@ -645,8 +687,12 @@ the account's Workflows) are now refused when a deploy is planned.
 - **Merged values:** at most 1 MiB. Past that, a read fails with `MergedValueTooLarge` (409) until
   the key is rewritten with a put.
 - **Names:** a checkpoint name is at most 256 characters and a budget group at most 63.
-- **Database size:** about 1 TiB for keys of 16 bytes, less for longer keys (about 90 GiB for 1 KiB
-  keys). Beyond that the manifest passes its 4 MiB budget; such databases are sharded.
+- **Database size: about 312 GiB.** A bottom merge of a larger database runs without 2× headroom
+  under Workflows' 10,000 steps per instance; above about 625 GiB it fails at its last step on every
+  attempt (D103). The manifest's 4 MiB budget is a second bound: about 1 TiB for 16-byte keys, 90 GiB
+  for 1 KiB keys (D99). Larger databases are sharded. Raising the Workflow's step limit to 25,000
+  (Cloudflare's maximum) would move the first bound to about 1.5 TiB; it is not set (release
+  `leaks/STATUS.md`).
 - **The compactor Worker** is set to 10 million subrequests, because Cloudflare counts a
   compaction job's subrequests together. `docs/operations.md`
   ("Platform limits") says what an operator should watch.
@@ -661,7 +707,7 @@ the account's Workflows) are now refused when a deploy is planned.
 - **GC at scale used dev timings** (`gcMinAge` 10 s), not production's 1 hour (D60).
 - **D70's race was never reproduced live.** The fix rests on the model, on `db-client.test.ts`,
   and on mutation checks.
-- **The newest changes have no long soak yet.** That covers D76–D103 (section 5).
+- **The newest changes have no long soak yet.** That covers D76–D108 (section 5).
 - **The rebuilt soak tool ran live once** (`preview-3`, a 6-minute forced-backlog test,
   `/tmp/shale-work/release2/NOTES.md`): it reached `done` with a bounded telemetry phase. The run
   also found that a failed soak exited 0, which is fixed. The production telemetry reads have not
@@ -888,7 +934,7 @@ None of these commands has been run against a live collector yet (section 9).
 | SST collection deferred (D98)              | `measure health`: an issue naming the database; the `gc.sst_collection_deferred` and `gc.retained_manifests` attributes on `GarbageCollector.collect`                                             | It persists: the database commits faster than about 1.4 a second, and its unreferenced SSTs wait |
 | A compaction job finished unseen (D94)     | `node tools/trace-cli/src/trace-cli.ts grep --store "$S" --name Compactor.poll --json \| jq '[.[] \| select(.attributes["compaction.job_abandoned"])] \| length'`; not judged by `measure health` | More than rarely: the Workflow launcher cannot read its jobs                                     |
 | A split finished by a later request (D101) | `measure health`: an issue naming the split, from `shard.resumed_split` on `ShardSplit.resumePending`                                                                                             | Any: a split died, and the writes to its range waited up to 30 s                                 |
-| The writer's alarm backing off (D102)      | PENDING(d102): the signal D102 adds                                                                                                                                                               | —                                                                                                |
+| An alarm backing off (D102)                | `alarm.failures` on `DbWriter.alarm` and `Compactor.alarm` spans, and the warning each failed run logs                                                                                            | —                                                                                                |
 
 ## 12. Rollback
 

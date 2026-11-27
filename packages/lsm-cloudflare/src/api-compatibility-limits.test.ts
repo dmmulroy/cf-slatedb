@@ -24,6 +24,7 @@ import {
   MAX_SEAL_SUCCESSORS,
 } from "./db-http-api.ts";
 import { MAX_REQUEST_BODY_BYTES } from "./db-http-request.ts";
+import { SCAN_PAGE_EXAMINED_BYTES } from "./db-reader.ts";
 import { MAX_MEMTABLE_PAGE_BYTES } from "./mem-table.ts";
 
 /** Each constant `docs/api-compatibility.md`'s "Limits of v1" names, with its value. */
@@ -44,6 +45,7 @@ const LIMITS: Readonly<Record<string, number>> = {
   MAX_CHECKPOINTS_PER_DATABASE,
   MAX_CHANGELOG_ENTRIES,
   MAX_CHANGELOG_RETENTION_MS,
+  SCAN_PAGE_EXAMINED_BYTES,
   gcMaxRetainedManifestLoads: DEFAULT_LSM_SETTINGS.gcMaxRetainedManifestLoads,
 };
 
@@ -70,7 +72,7 @@ describe("the Limits of v1 table in docs/api-compatibility.md", () => {
 
   it("names no constant this test does not check", () => {
     const named = rows.flatMap((line) =>
-      [...line.matchAll(/`(MAX_[A-Z_]+)`/g)].map((match) => match[1]),
+      [...line.matchAll(/`((?:MAX|SCAN)_[A-Z_]+)`/g)].map((match) => match[1]),
     );
     expect(named.filter((name) => name !== undefined && !(name in LIMITS))).toEqual([]);
   });

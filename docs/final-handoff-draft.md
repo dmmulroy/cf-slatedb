@@ -44,7 +44,14 @@ being produced.
     a TTL that made a database unflushable (D88); a stale router serving a sealed shard (D89); a
     removed database's id serving its old data (D90, D91); unbounded scans, pages, and bodies
     (D93, D100); an abandoned split that blocked a range forever (D101).
-  - **What that says:** `docs/release-v1.md` §8. It covers 23 defects by class and by how each
+  - **The read audit** (D107, D108): metadata that grew with the keys, untyped corrupt metadata, a
+    scan page over deleted versions, and a damaged block kept in Workers Cache.
+  - **The production audit** (D104, D105): what the first deploy creates, and rollback against the
+    stored formats; risks and documentation errors, no defect.
+  - **D106:** the soak now exercises the classes of defect the audits found.
+  - **D123:** span events pass the trace policy, so no log line's object parts or annotations can
+    export a key or value.
+  - **What that says:** `docs/release-v1.md` §8. It covers 27 defects by class and by how each
     was found. Every gate that runs the system passed with them in the code; reading the code
     against a stated rule found them.
 - **Read path (D67, D72).**
@@ -107,7 +114,12 @@ final code, each against its target.
 - **`docs/api-compatibility.md`** lists every limit of v1, pinned to the constants by
   `api-compatibility-limits.test.ts`.
 
-PENDING(d90), PENDING(d102), PENDING(d103): D90 and D91, D102, and D103 merged, with their tests.
+- **D90 to D108 and D123 are merged** (`proto/integration-2` at `7dfed3f`), each with its tests;
+  D91 adds `ManifestCasFencingRemove.cfg`, so `formal-checks.ts` lists 33 runs.
+
+PENDING(formal): the two formal agents' models (D109 and on), merged with their runs.
+
+PENDING(mutation): the three mutation sweeps (D117 to D122), merged with their survivors and fixes.
 
 ## What is left
 
@@ -116,7 +128,9 @@ PENDING(d90), PENDING(d102), PENDING(d103): D90 and D91, D102, and D103 merged, 
 - **D90, D91, D102, D103** are merged, then the release soaks run on the release commit.
 - **Not reached by the audits** (`docs/release-v1.md` §8): `MemTable` migrations, the `BlockServer`
   under a hostile caller, a compaction step's memory with 8 inputs, and the tools.
-- **The public scan page is bounded by rows only** (1,000 rows of up to 1 MiB each); open.
+- **The database size limit is about 312 GiB**, set by Workflows' 10,000 steps per compaction
+  (D103). Raising the Workflow's `limits.steps` to 25,000 would move it to about 1.5 TiB; that is
+  not done.
 - **The deployment guard.** Its allowlist names only the pre-rename project path, which the guard
   skips. `scripts/allowlist-shaledb-deploys.sh` must be rerun from the main checkout, and its stage
   list does not keep agents off `production` (`docs/release-v1.md` §10 step 2).
@@ -294,10 +308,13 @@ warns to delete a secret only once nothing deployed uses it, which steps 1 and 2
 
 ## Local worktrees and branches to remove after the merge
 
-The parallel rounds left 27 git worktrees under `/tmp/shale-work/wt/`, each on its own `proto/*`
-branch of the main repository (`git worktree list`, after `proto/integration-2` reached `e33d1a0`).
-They are on this laptop only and were never pushed. Once the release is merged into `main`, every
-branch merged into `proto/integration-2` is contained in `main`, and its worktree can go.
+The parallel rounds left 28 git worktrees under `/tmp/shale-work/wt/`, each on its own `proto/*`
+branch of the main repository (`git worktree list` at `7dfed3f`). They are on this laptop only and
+were never pushed. Once the release is merged into `main`, every branch merged into
+`proto/integration-2` is contained in `main`, and its worktree can go. Two worktrees now hold a
+branch of another name: `audit-lifecycle` holds `proto/mut-read`, and the mutation and formal
+agents' branches (`proto/mut-read`, `proto/formal`, and those of `mut-core` and `mut-write` in
+`audit-workflow` and `audit-api`) are still being worked on.
 
 | Worktree (`/tmp/shale-work/wt/…`)                                                                                                                                                                                                                                   | Branch                                                           | In `proto/integration-2`                                         |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- | ---------------------------------------------------------------- |
@@ -313,13 +330,13 @@ From the main checkout, on `main`, after the merge:
 
 ```sh
 cd /Users/dmmulroy/Code/personal/cf-slatedb
-for name in integ2 audit-api audit-do audit-lifecycle audit-limits audit-workflow review \
+for name in integ2 audit-api audit-do audit-lifecycle audit-limits audit-workflow formal review \
   prod-health feed-ttl fork-hold compactor-fence txn-fix soak-tool docs baseline candidate \
   writer-counters tools newest-flush flush-cpu background-wake hedged-reads limit-read-ahead \
   refresh-from-cached release-doc; do
   git worktree remove "/tmp/shale-work/wt/$name"
 done
-for name in integration-2 audit-api audit-do audit-lifecycle audit-limits audit-workflow review \
+for name in integration-2 audit-api audit-do audit-lifecycle mut-read formal audit-limits audit-workflow review \
   prod-health feed-ttl fork-hold compactor-fence txn-fix soak-tool docs baseline candidate \
   writer-counters tools newest-flush flush-cpu background-wake hedged-reads limit-read-ahead \
   refresh-from-cached release-doc; do
