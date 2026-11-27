@@ -587,8 +587,30 @@ What v1 does not do, or has not measured.
   Today's limits and error semantics are therefore permanent for `/v1`.
 - **A rollback across a format version stops on the newer data**, with `StoredDataInvalid` (D64).
   v1 is format 1.
-- **A split's source lives longer.** PENDING(d77): how long after a split the source stays (about
-  `gcMinAge`, 1 hour in production, before it can be removed), and what a caller sees meanwhile.
+- **A split's source lives longer.** The sealed source cannot be removed until about `gcMinAge`
+  (1 hour in production) after both halves' rewrites (`DatabaseHasDependents` until then). Reads and
+  writes of the halves are unaffected (D77).
+- **An abandoned split finishes only when a request waits it out.** A split that died after its
+  seal and is never retried leaves its range refusing writes and `Latest` reads, each retryable,
+  until a request through the router waits 30 s and finishes it (D101). Nothing finishes it without
+  traffic. A pending split's age is not shown anywhere (an `audit-api` proposal, not built).
+- **A compaction job no progress read has seen running for 15 minutes is finished**
+  (`compactionLeaseMs`, D94), and its sources are planned again. A long job that reads as running
+  is kept. If the abandoned job commits later, the exact-inputs check refuses it once another job
+  has taken its sources: the work is wasted, nothing is wrong.
+- **Above about 1.4 commits a second, sustained for an hour, SST collection is deferred** (D98). Old
+  manifests are still deleted, but unreferenced SSTs wait until the rate falls. Storage grows
+  meanwhile, and `measure health` reports the deferral.
+- **A public scan page is bounded by rows, not bytes.** 1,000 rows of values up to 1 MiB can make a
+  page of about 1 GiB in one 128 MB isolate (release3 `STATUS.md`; D93 bounded the memtable pages
+  only). Use small limits over large values.
+- **The writer's alarm.** PENDING(d102): a failing flush retried every second, and an unreadable
+  `writer_meta` set no alarm, until D102 lands.
+- **Not reached by the audits.** These were not checked:
+  - a compaction step's memory with 8 inputs (needs workerd);
+  - the `BlockServer` under a hostile caller;
+  - `MemTable` migrations;
+  - the tools.
 
 **Storage.**
 
@@ -600,21 +622,16 @@ What v1 does not do, or has not measured.
 - **An idle database keeps its newest flush in SQLite indefinitely** (up to `l0SstSize`, 64 MiB),
   because the trim never removes the newest flush (D58, D92).
 
-**Platform limits (D92).** Four places where the default settings and the schema limits allow a
-demand above a Cloudflare limit. Each has a failing test, and none is fixed in this audit:
+**Platform limits (D92).** D92 found four places where the defaults and the schema limits allowed
+a demand above a Cloudflare limit. Each is fixed:
 
-- **Large compaction jobs.** A large job's first Workflow step result exceeds 1 MiB. That happens
-  at about 1.5 GiB of input with 16 KiB keys, or about 300 GiB with 16-byte keys. The job can never
-  run, so L0 fills and writes are refused.
-- **Dropped rows in one step.** A compaction step whose rows are all dropped reads every input of
-  its job. After deleting or expiring a few hundred MiB, it can exceed the compactor's 60 s of CPU
-  on every retry, with the same result.
-- **Memory on reads.** A `Latest` scan holds every unflushed row of its range, up to 256 MiB.
-  Pages are bounded by rows, not bytes: 1,000 rows of up to 1 MiB each. Either can exceed a
-  128 MB isolate.
-- **Garbage collection.** One collection reads, one after another, every manifest superseded within
-  `gcMinAge`. At a few commits a second it runs past its subrequests (10,000), memory, or alarm
-  wall time (15 min) on every retry, and garbage is then never collected.
+- a large compaction's first step result (D86);
+- a step over dropped rows (D97);
+- a `Latest` scan and the memtable pages (D93);
+- the cost of a garbage collection (D98, deferred above the commit rate above).
+
+None has been run live at the derived size. PENDING(d103): the largest compaction run on a preview,
+against D103's table.
 
 Settings the platform cannot hold (R2 parts, the Durable Object's storage, the isolate's memory,
 the account's Workflows) are now refused when a deploy is planned.
@@ -644,8 +661,11 @@ the account's Workflows) are now refused when a deploy is planned.
 - **GC at scale used dev timings** (`gcMinAge` 10 s), not production's 1 hour (D60).
 - **D70's race was never reproduced live.** The fix rests on the model, on `db-client.test.ts`,
   and on mutation checks.
-- **The newest changes have no long soak yet.** That covers D67–D78 and the counter fix (section 5).
-- **The rebuilt soak tool and the production telemetry reads have not run live** (`docs/progress.md`).
+- **The newest changes have no long soak yet.** That covers D76–D103 (section 5).
+- **The rebuilt soak tool ran live once** (`preview-3`, a 6-minute forced-backlog test,
+  `/tmp/shale-work/release2/NOTES.md`): it reached `done` with a bounded telemetry phase. The run
+  also found that a failed soak exited 0, which is fixed. The production telemetry reads have not
+  run live.
   The guess that `trace-token production` reads `Shaledb/production/TraceCollectorToken` comes from
   the previews' state layout. No production state exists yet (`/tmp/shale-work/agents/prodhealth/REPORT.md`).
 
@@ -850,6 +870,15 @@ node tools/scenario-cli/src/scenario-cli.ts measure latency --collector-url "$SH
 
 None of these commands has been run against a live collector yet (section 9).
 
+**Signals added in audit round 2** (D94, D98, D101, D102):
+
+| Signal                                     | Production command                                                                                                                                                                                | Act when                                                                                         |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| SST collection deferred (D98)              | `measure health`: an issue naming the database; the `gc.sst_collection_deferred` and `gc.retained_manifests` attributes on `GarbageCollector.collect`                                             | It persists: the database commits faster than about 1.4 a second, and its unreferenced SSTs wait |
+| A compaction job finished unseen (D94)     | `node tools/trace-cli/src/trace-cli.ts grep --store "$S" --name Compactor.poll --json \| jq '[.[] \| select(.attributes["compaction.job_abandoned"])] \| length'`; not judged by `measure health` | More than rarely: the Workflow launcher cannot read its jobs                                     |
+| A split finished by a later request (D101) | `measure health`: an issue naming the split, from `shard.resumed_split` on `ShardSplit.resumePending`                                                                                             | Any: a split died, and the writes to its range waited up to 30 s                                 |
+| The writer's alarm backing off (D102)      | PENDING(d102): the signal D102 adds                                                                                                                                                               | —                                                                                                |
+
 ## 12. Rollback
 
 From `docs/operations.md` ("Rolling back"). Redeploy the previous commit with the same task
@@ -864,8 +893,9 @@ forward again to recover. v1 is format 1, the format of all data written so far,
 from v1 to an earlier v1 commit crosses no format change.
 
 A rollback to a commit before D76, D77, or D78 brings back those defects (section 8).
-PENDING(d77) and PENDING(d78): whether either changes stored compactor state in a way an older
-commit reads differently.
+D77 and D78 change no stored format: the compactor state keeps format 1, and D78's
+read-modify-write needs no new field. D94's `lastProgressAt` and D103's `recentCompactionJobIds` are
+optional fields that older code ignores. A rollback past D77 or D78 brings back those defects.
 
 Nothing removes production. Its LSM bucket is retained (`RemovalPolicy.retain` in
 `packages/lsm-cloudflare/src/lsm-bucket.ts`) and is not `forceDestroy`.
