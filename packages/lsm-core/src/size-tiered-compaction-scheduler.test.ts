@@ -225,6 +225,46 @@ describe("planCompactions", () => {
     );
   });
 
+  it("keeps the number of sorted runs logarithmic in the data over a long run of flushes (Workflow audit)", () => {
+    // 2,000 flushes of one L0 SST each, every planned job committed at once, with the default
+    // options: size-tiered merging keeps fewer than minCompactionSources runs per size tier, and
+    // tiers grow at least includeSizeThreshold-fold, so runs stay within that many per tier.
+    const options = DEFAULT_SIZE_TIERED_COMPACTION_OPTIONS;
+    let current = withLsm([], []);
+    let mostRuns = 0;
+    let flushes = 0;
+    const sizeOf = (manifest: Manifest) =>
+      manifest.sortedRuns.reduce(
+        (sum, run) => sum + run.ssts.reduce((inner, sst) => inner + sst.sizeBytes, 0),
+        0,
+      ) + manifest.l0.reduce((sum, sst) => sum + sst.sizeBytes, 0);
+    for (; flushes < 2_000; flushes++) {
+      current = withLsm([handle(1000), ...current.l0], current.sortedRuns);
+      for (;;) {
+        const [job] = planCompactions(current, [], options);
+        if (job === undefined) break;
+        const inputs = job.sources.flatMap((source) =>
+          source._tag === "L0"
+            ? current.l0.filter((sst) => sst.id === source.sstId)
+            : (current.sortedRuns.find((run) => run.id === source.id)?.ssts ?? []),
+        );
+        const output = handle(inputs.reduce((sum, sst) => sum + sst.sizeBytes, 0));
+        current = Result.getOrThrow(
+          commitCompaction(current, {
+            compactorEpoch: current.compactorEpoch,
+            job,
+            outputs: [output],
+          }),
+        );
+      }
+      mostRuns = Math.max(mostRuns, current.sortedRuns.length);
+    }
+    const tiers =
+      Math.ceil(Math.log(sizeOf(current) / 1000) / Math.log(options.includeSizeThreshold)) + 1;
+    expect(current.l0.length).toBeLessThan(options.minCompactionSources);
+    expect(mostRuns).toBeLessThanOrEqual(options.minCompactionSources * tiers);
+  });
+
   it("converges: committing planned jobs until none remain terminates with fewer sources than the minimum per group", () => {
     assertProperty(
       Arbitrary.all({ manifest: manifestArbitrary, options: optionsArbitrary }),
