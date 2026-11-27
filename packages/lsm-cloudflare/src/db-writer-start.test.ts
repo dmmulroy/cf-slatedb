@@ -1,6 +1,7 @@
 /**
- * A writer restarted on its Durable Object's SQLite storage (mutation sweep, D127): the start path
- * alone must leave the object able to flush what it holds, with no further write.
+ * The writer's start path (mutation sweep, D127): a writer restarted on its Durable Object's SQLite
+ * storage must be able to flush what it holds with no further write, and a start that cannot read
+ * or write the manifest must fail with the reason a client acts on.
  */
 import {
   DatabaseId,
@@ -8,18 +9,18 @@ import {
   initialManifest,
   type WriteBatch,
 } from "@shaledb/lsm-core";
-import { Context, Effect, Layer, Option } from "effect";
+import { Context, Effect, Layer, Option, Result } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
 import { backgroundWorkTestLayer } from "./background-work.ts";
 import { compactionTriggerTestLayer } from "./compaction-trigger.ts";
-import { DbWriter, dbWriterLayerWithoutDependencies } from "./db-writer.ts";
+import { DbWriter, dbWriterLayerWithoutDependencies, dbWriterTestLayer } from "./db-writer.ts";
 import { DurableObjectAlarm, durableObjectAlarmTestLayer } from "./durable-object-alarm.ts";
 import { lsmConfigurationTestLayer } from "./lsm-configuration.ts";
 import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
-import { ManifestReader } from "./manifest-reader.ts";
-import { ManifestStore, manifestStoreTestLayer } from "./manifest-store.ts";
+import { ManifestReader, ManifestReadError } from "./manifest-reader.ts";
+import { ManifestStore, manifestStoreTestLayer, ManifestWriteError } from "./manifest-store.ts";
 import { memTableLayerWithoutDependencies } from "./mem-table.ts";
 import { ObjectStore } from "./object-store.ts";
 import { sstStoreLayerWithoutDependencies } from "./sst-store.ts";
@@ -95,5 +96,102 @@ describe("DbWriter restarted with unflushed rows (D127)", () => {
       flushedSeq: 2,
       unflushedAfter: 0,
     });
+  });
+});
+
+describe("DbWriter start failures (D127)", () => {
+  /** The reason a write gives when the start's fence-in fails with `failure`. */
+  const reasonWhenStartFails = (failure: ManifestReadError | ManifestWriteError) =>
+    Effect.gen(function* () {
+      yield* (yield* ManifestStore).initialize(
+        initialManifest(DB, { keyRange: Option.none(), databaseOptions: DEFAULT_DATABASE_OPTIONS }),
+      );
+      const store = yield* ManifestStore;
+      const shared = yield* Effect.context<ManifestStore | ManifestReader | ObjectStore>();
+      const context = yield* Layer.build(
+        dbWriterLayerWithoutDependencies.pipe(
+          Layer.provide(sstStoreLayerWithoutDependencies),
+          Layer.provide(memTableLayerWithoutDependencies),
+          Layer.provide([
+            durableObjectAlarmTestLayer,
+            compactionTriggerTestLayer,
+            backgroundWorkTestLayer,
+            lsmConfigurationTestLayer(),
+          ]),
+          Layer.provide(
+            Layer.succeedContext(
+              shared.pipe(
+                Context.add(
+                  ManifestStore,
+                  ManifestStore.of({ ...store, update: () => Effect.fail(failure) }),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      const exit = yield* Effect.exit(Context.get(context, DbWriter).write(DB, put("a", "1")));
+      return exit._tag === "Failure" && exit.cause.reasons[0]?._tag === "Fail"
+        ? `${exit.cause.reasons[0].error._tag}:${"reason" in exit.cause.reasons[0].error ? exit.cause.reasons[0].error.reason : ""}`
+        : "succeeded";
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(Layer.merge(manifestStoreTestLayer, writerSqlStorageTestLayer)),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.provide(TestClock.layer()),
+      Effect.runPromise,
+    );
+
+  it("maps an unreadable stored manifest to StoredDataInvalid and persistent contention to ManifestContention", async () => {
+    const read = (reason: ManifestReadError["reason"]) =>
+      new ManifestReadError({
+        databaseId: DB,
+        manifestId: Option.none(),
+        reason,
+        message: "read failed",
+      });
+    const write = (reason: ManifestWriteError["reason"]) =>
+      new ManifestWriteError({ databaseId: DB, reason, message: "write failed" });
+    expect([
+      await reasonWhenStartFails(read("StoredManifestInvalid")),
+      await reasonWhenStartFails(read("StorageUnavailable")),
+      await reasonWhenStartFails(write("ContentionPersisted")),
+      await reasonWhenStartFails(write("StorageUnavailable")),
+    ]).toEqual([
+      "WriterUnavailableError:StoredDataInvalid",
+      "WriterUnavailableError:StorageUnavailable",
+      "WriterUnavailableError:ManifestContention",
+      "WriterUnavailableError:StorageUnavailable",
+    ]);
+  });
+});
+
+describe("DbWriter seal of a sealed database, same count of successors (D95, D127)", () => {
+  it("refuses other successors of the same number, and the same successors in another order", async () => {
+    const LEFT = DatabaseId.make("orders-a");
+    const RIGHT = DatabaseId.make("orders-b");
+    const OTHER = DatabaseId.make("orders-c");
+    const outcome = await Effect.gen(function* () {
+      yield* (yield* ManifestStore).initialize(
+        initialManifest(DB, { keyRange: Option.none(), databaseOptions: DEFAULT_DATABASE_OPTIONS }),
+      );
+      const writer = yield* DbWriter;
+      yield* writer.seal(DB, [LEFT, RIGHT], false);
+      const attempt = (successors: ReadonlyArray<DatabaseId>) =>
+        Effect.map(Effect.result(writer.seal(DB, successors, false)), (result) =>
+          Result.isSuccess(result) ? "sealed" : result.failure._tag,
+        );
+      return [
+        yield* attempt([LEFT, OTHER]),
+        yield* attempt([RIGHT, LEFT]),
+        yield* attempt([LEFT, RIGHT]),
+      ];
+    }).pipe(
+      Effect.provide(dbWriterTestLayer()),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.provide(TestClock.layer()),
+      Effect.runPromise,
+    );
+    expect(outcome).toEqual(["DatabaseSealedError", "DatabaseSealedError", "sealed"]);
   });
 });
