@@ -308,10 +308,13 @@ warns to delete a secret only once nothing deployed uses it, which steps 1 and 2
 
 ## Local worktrees and branches to remove after the merge
 
-The parallel rounds left 27 git worktrees under `/tmp/shale-work/wt/`, each on its own `proto/*`
-branch of the main repository (`git worktree list`, after `proto/integration-2` reached `e33d1a0`).
-They are on this laptop only and were never pushed. Once the release is merged into `main`, every
-branch merged into `proto/integration-2` is contained in `main`, and its worktree can go.
+The parallel rounds left 28 git worktrees under `/tmp/shale-work/wt/`, each on its own `proto/*`
+branch of the main repository (`git worktree list` at `7dfed3f`). They are on this laptop only and
+were never pushed. Once the release is merged into `main`, every branch merged into
+`proto/integration-2` is contained in `main`, and its worktree can go. Two worktrees now hold a
+branch of another name: `audit-lifecycle` holds `proto/mut-read`, and the mutation and formal
+agents' branches (`proto/mut-read`, `proto/formal`, and those of `mut-core` and `mut-write` in
+`audit-workflow` and `audit-api`) are still being worked on.
 
 | Worktree (`/tmp/shale-work/wt/…`)                                                                                                                                                                                                                                   | Branch                                                           | In `proto/integration-2`                                         |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- | ---------------------------------------------------------------- |
