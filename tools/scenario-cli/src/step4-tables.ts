@@ -782,6 +782,21 @@ export const readmeWrites = (context: Step4Context, runs: Step4Runs) => {
   ].join("\n");
 };
 
+/**
+ * What the `Flushed` run's Durable Object invocations say about its reads. Each write batch is one
+ * writer invocation, so invocations above the batches are reads that reached a Durable Object.
+ * Tail records can be dropped, so the count is a lower bound and only "more than" proves a read
+ * reached one.
+ */
+export const flushedReachSentence = (invocations: number, batches: number) => {
+  if (!Number.isFinite(invocations) || !Number.isFinite(batches))
+    return "- **Durable Object invocations at `Flushed`:** no run has them.";
+  const counts = `${num(invocations)} in the tail records, against ${num(batches)} write batches`;
+  return invocations <= batches
+    ? `- **Durable Object invocations at \`Flushed\`:** ${counts}: no more than the writes, so no read reached a Durable Object. Tail records may be dropped, so the count is a lower bound.`
+    : `- **Durable Object invocations at \`Flushed\`:** ${counts}: ${num(invocations - batches)} more than the writes, so some reads reached a Durable Object.`;
+};
+
 /** The README's baseline block: the median of each run, and what the comparison measured. */
 export const readmeBaseline = (
   context: Step4Context,
@@ -827,7 +842,10 @@ export const readmeBaseline = (
     "",
     `- **Write p50:** ${num(m(LATEST_TARGET, (t) => t.writeLatencyMs.p50))} ms (\`Latest\` run), ${num(m(FLUSHED_TARGET, (t) => t.writeLatencyMs.p50))} ms (\`Flushed\` run), ${num(m(PLAIN_TARGET, (t) => t.writeLatencyMs.p50))} ms (plain table).`,
     `- **Read p50:** ${num(m(LATEST_TARGET, (t) => t.readLatencyMs.p50))} ms at \`Latest\`, ${num(m(FLUSHED_TARGET, (t) => t.readLatencyMs.p50))} ms at \`Flushed\`, ${num(m(PLAIN_TARGET, (t) => t.readLatencyMs.p50))} ms from the plain table.`,
-    `- **Durable Object invocations at \`Flushed\`:** ${num(m(FLUSHED_TARGET, (t) => t.durableObjectInvocations.count))}, against ${num(m(FLUSHED_TARGET, (t) => t.writeBatchesPerSecond * t.seconds))} write batches: reads at \`Flushed\` reach no Durable Object when the two are equal.`,
+    flushedReachSentence(
+      m(FLUSHED_TARGET, (t) => t.durableObjectInvocations.count),
+      m(FLUSHED_TARGET, (t) => t.writeBatchesPerSecond * t.seconds),
+    ),
     `- **SQLite rows written per row:** ${num(rowCost.memtableInsert + rowCost.memtableTrim)} for shaledb's memtable, ${num(rowCost.plainInsert)} for the plain table.`,
     "",
     `Each target's runs, the stage-side counts, and the price arithmetic are in [\`docs/measurements.md\`](docs/measurements.md), "Step 4".`,

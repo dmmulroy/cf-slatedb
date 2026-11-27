@@ -7,6 +7,7 @@ import {
   baselineCost,
   BaselineReport,
   clientLimited,
+  flushedReachSentence,
   jsonOfOutput,
   median,
   parseRunLog,
@@ -107,6 +108,17 @@ describe("the arithmetic", () => {
         baselineCost(t, ROW_COST_ED4E787).sqlitePerMillionRows.toFixed(2),
       ),
     ).toEqual(["3.00", "3.00", "1.00"]);
+  });
+
+  it("says a Flushed read reached no Durable Object only when the invocations do not pass the writes", () => {
+    expect(flushedReachSentence(1826, 1842)).toContain(
+      "no more than the writes, so no read reached a Durable Object",
+    );
+    expect(flushedReachSentence(2516, 2516)).toContain("no read reached");
+    expect(flushedReachSentence(2600, 2516)).toContain(
+      "84 more than the writes, so some reads reached a Durable Object",
+    );
+    expect(flushedReachSentence(Number.NaN, 1)).toContain("no run has them");
   });
 
   it("calls a writes run client-limited only when its own numbers show it", () => {
