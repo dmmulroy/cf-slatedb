@@ -105,5 +105,6 @@
       "droppedAt": 1795000000000
     }
   ],
-  "changelogAfterSeq": 29
+  "changelogAfterSeq": 29,
+  "recentCompactionJobIds": ["01M8D1PFJZDMYRF1SXCZWT2E2G"]
 }
