@@ -243,12 +243,12 @@ DeleteHoldRead ==
   /\ UNCHANGED <<live, refs, recent, holds, pinned, stored, rpc, stale, aged, inc, cache, wrongInc,
                  reopened, fpc>>
 
-\* ... and deletes the hold only if the holder was gone (D91, D116). Refused, the operator retries
-\* while the hold is an orphan (its forkRange died); a refusal for a created fork is final.
+\* ... and deletes the hold only if the holder was gone (D91, D116). Refused while the fork does not
+\* exist, the operator retries (the hold may be an orphan); a refusal for a created fork is final.
 DeleteHoldCommit ==
   /\ dpc = "read"
   /\ holds' = IF ~dLive THEN [holds EXCEPT !["fork"] = @ \ {"fof"}] ELSE holds
-  /\ dpc' = IF dLive /\ fpc = "dead" THEN "idle" ELSE "done"
+  /\ dpc' = IF dLive /\ live["fof"] = "none" THEN "idle" ELSE "done"
   /\ UNCHANGED <<live, refs, recent, pinned, stored, rpc, stale, aged, inc, cache, wrongInc,
                  reopened, fpc, dLive>>
 

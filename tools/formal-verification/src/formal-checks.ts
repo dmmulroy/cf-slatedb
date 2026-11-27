@@ -243,6 +243,25 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
         expect: "OutcomeTrue",
         timeLimitSeconds: 120,
       },
+      {
+        config: "CompactorObject.cfg",
+        broken: "noStateLock",
+        expect: "RunningStaysRecorded",
+        timeLimitSeconds: 120,
+      },
+      { config: "CompactorObjectDrop.cfg", broken: "none", expect: "pass", timeLimitSeconds: 120 },
+      {
+        config: "CompactorObjectDrop.cfg",
+        broken: "noPlanLock",
+        expect: "DroppedStaysDropped",
+        timeLimitSeconds: 120,
+      },
+      {
+        config: "CompactorObjectDrop.cfg",
+        broken: "launchBeforeRecord",
+        expect: "DroppedStaysDropped",
+        timeLimitSeconds: 120,
+      },
       { config: "CompactorObjectL0.cfg", broken: "none", expect: "pass", timeLimitSeconds: 300 },
       {
         config: "CompactorObjectL0.cfg",
