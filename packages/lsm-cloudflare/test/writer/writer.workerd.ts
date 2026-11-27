@@ -593,9 +593,15 @@ test.provider(
           limit: 1,
         },
       });
-      expect(first.rows).toEqual([]);
-      expect(Option.isSome(first.resumeFrom)).toBe(true);
-      const regularFound: Array<string> = [];
+      // The page is empty with a continuation while the deleted versions are unflushed (24 MiB to
+      // examine, past the budget). This stack flushes after two seconds, and a flush writes only
+      // the tombstones (D70), which one page can examine: then the first page already holds the
+      // live key. Which of the two happens depends on timing; both are the contract, and the
+      // budget's end itself is pinned with an injected budget in `scan-bounds.test.ts`.
+      expect(first.rows.map((row) => decode(row.key))).toEqual(
+        Option.isSome(first.resumeFrom) && first.rows.length === 0 ? [] : [live],
+      );
+      const regularFound: Array<string> = first.rows.map((row) => decode(row.key));
       let start = first.resumeFrom;
       for (let page = 0; page < 100 && Option.isSome(start); page++) {
         const next = yield* client.databases.scan({
@@ -626,9 +632,12 @@ test.provider(
           },
         });
       const firstInTransaction = yield* transactionPage(new Uint8Array(0));
-      expect(firstInTransaction.rows).toEqual([]);
-      expect(Option.isSome(firstInTransaction.resumeFrom)).toBe(true);
-      const transactionFound: Array<string> = [];
+      expect(firstInTransaction.rows.map((row) => decode(row.key))).toEqual(
+        Option.isSome(firstInTransaction.resumeFrom) && firstInTransaction.rows.length === 0
+          ? []
+          : [live],
+      );
+      const transactionFound: Array<string> = firstInTransaction.rows.map((row) => decode(row.key));
       let from = firstInTransaction.resumeFrom;
       for (let page = 0; page < 100 && Option.isSome(from); page++) {
         const next = yield* transactionPage(from.value);
