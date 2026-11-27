@@ -4078,3 +4078,72 @@ caps are limits in code, and the others do not exist. They are not in the fixtur
   older code does with it.
 - A further test shows today's code dropping an unknown field, which is why the format rule
   exists.
+
+## D115. A refused flush marks only its own phase fenced; a seal forgets its phase only after applying its edit
+
+**Found by the `WriterObject` model (D109)**, not by an audit. Two TLC counterexamples, both
+replayed as failing tests in `db-writer.test.ts`.
+
+**What went wrong.** A flush reads the writer's phase (`ready`, epoch e) when it takes the flush
+lock. If the writer starts again while that flush is in flight, the new start fences in at e + 1,
+and the flush's commit at e is refused with `WriterFencedError`. `markFenced` then set the phase to
+`Fenced` unconditionally, over the restarted writer's own `Ready` at e + 1.
+
+- **What it cost.** Every later request to the object failed with `WriterFencedError`.
+  `WriterClient` retries a fenced writer, but the retry reaches the same object. The alarm handler
+  stops on a fenced writer, so acknowledged rows waited with no alarm. It lasted until the object
+  was evicted, which an object under traffic is not.
+- **How the writer starts again under a flush.** Only a seal's `onExit` (D85) forgets the phase
+  while another fiber can hold a `ready`. The two paths TLC found:
+  1. A seal holds the commit lock, waits for the flush lock held by a flush, and its caller hangs
+     up. The seal never applied its edit, but `onExit` forgot the phase anyway.
+  2. A seal with nothing to flush commits outside the flush lock. Its edit is applied and the
+     create fails or its caller hangs up, so `onExit` must forget (the commit may have landed). A
+     flush took the flush lock and its `ready` before that, and reads `writer_meta` after a write
+     has restarted the writer and committed a row. It cuts that row and its commit is refused.
+
+**The rules.**
+
+- **`markFenced` replaces only the `Ready` phase of the epoch the refused commit used.** A newer
+  epoch is this object's own restart and stays.
+- **A flush's manifest view is installed only over the `Ready` phase of its own epoch, and only
+  over an older manifest.** This is the same rule as D102's reload.
+- **The rule is stated once, where `phase` is declared.** A start sets the phase from the manifest
+  it fenced in with. A seal sets it from the manifest it sealed. `destroy` resets it under both
+  locks. A seal whose commit may have landed forgets it. Every other writer changes only the
+  phase it read, at the same epoch. The stalled-write reload already did (D102). The seal's
+  `Ref.set` after its commit is unconditional and stays so: the sealed manifest it commits is
+  the newest truth, and the commit lock keeps any other seal out.
+- **A seal forgets its phase on exit only once its edit was applied** (`commitAttempted`, set by
+  the edit function). Before that, no commit of this seal can land, so the phase is still right.
+
+**Is not forgetting sound?** Yes. D85 forgets because a seal whose commit may have landed could
+leave the writer open over a sealed manifest. A seal whose edit never ran sent no create, so the
+manifest is what the phase says. Not forgetting is also simpler: nothing restarts. It closes path 1
+on its own, but not path 2, where the forget is required. The model shows it:
+
+- `sealForgetsUntried` (the old forget, with the `markFenced` rule) passes.
+- `markFencedAnyPhase` (the old `markFenced`, with the new forget) fails `NeverSelfFenced`
+  through path 2.
+- `beforeD115` (both old) fails `NeverSelfFenced`.
+
+So the `markFenced` rule is what keeps the writer correct, and the seal rule removes a needless
+restart.
+
+**Tests** (`db-writer.test.ts`):
+
+- "a seal interrupted before it applied its edit keeps the phase, and the flush in flight
+  commits". On the code before: the flush fails with `WriterFencedError`, and so does the next
+  write.
+- "a flush refused at an older epoch leaves the restarted writer serving" (path 2, with a gated
+  `MemTable.meta`). On the code before: the next write fails with `WriterFencedError`.
+
+**Mutations: 4 of 6 caught.** Caught: the seal forgetting with no edit applied, `commitAttempted`
+never set, `markFenced` over any phase, and the epoch test inverted. Missed: the two guards on the
+flush's view install (any epoch; over a newer view). They need a flush whose commit lands, a
+restart, and only then the install. Their only effect is a stale view: the next commit reloads
+from it, as before D102, and `status` shows a stale `l0Count`. No test reaches them.
+
+**Model.** `WriterObject` (D109) checks `NeverSelfFenced` with `beforeD115`, `markFencedAnyPhase`,
+and `sealForgetsUntried` as `Broken` values. The model has no manifest view, so the install
+guard is not in it.

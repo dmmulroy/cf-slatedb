@@ -324,6 +324,12 @@ export const makeDbWriter = Effect.gen(function* () {
   const wakeCompactor = (databaseId: DatabaseId) =>
     background.run("wakeCompactor", compaction.wake(databaseId));
 
+  // Who may write `phase` (D115): a start (under initLock) sets it from the manifest it fenced in
+  // with; a seal sets it from the manifest it sealed; destroy resets it under both locks; a seal
+  // whose commit may have landed forgets it. Every other writer works from a `ready` it read
+  // earlier and changes only that same phase: the Ready phase of the same writer epoch (and for a
+  // manifest view, only an older one). A writer started again since then is newer, and an
+  // operation that began under the older phase must never overwrite it.
   const phase = yield* Ref.make<WriterPhase>({ _tag: "Uninitialized" });
   // The unflushed rows' bytes and count, and the commit time of the oldest: everything the flush
   // scheduler, the alarm, backpressure, and `status` need. Kept in memory so that none of them
@@ -568,9 +574,17 @@ export const makeDbWriter = Effect.gen(function* () {
       return ready;
     });
 
-  /** Marks this instance fenced: a newer writer serves the database. */
-  const markFenced = (databaseId: DatabaseId, error: WriterFencedError) =>
-    Ref.set(phase, { _tag: "Fenced", databaseId, error });
+  /**
+   * Marks this instance fenced: a newer writer serves the database. Only over the Ready phase the
+   * refused commit was made from (`writerEpoch`): when this instance started again meanwhile (a
+   * seal forgot its phase, D85), the newer epoch is this instance's own and stays (D115).
+   */
+  const markFenced = (databaseId: DatabaseId, writerEpoch: WriterEpoch, error: WriterFencedError) =>
+    Ref.update(phase, (current): WriterPhase =>
+      current._tag === "Ready" && current.writerEpoch === writerEpoch
+        ? { _tag: "Fenced", databaseId, error }
+        : current,
+    );
 
   /**
    * Flushes every committed row and, in the same manifest commit, applies `alsoCommit` to the flushed
@@ -655,7 +669,9 @@ export const makeDbWriter = Effect.gen(function* () {
                   Effect.fail(new DatabaseNotFoundError({ databaseId, message: error.message })),
               }),
               Effect.tapError((error) =>
-                error._tag === "WriterFencedError" ? markFenced(databaseId, error) : Effect.void,
+                error._tag === "WriterFencedError"
+                  ? markFenced(databaseId, ready.writerEpoch, error)
+                  : Effect.void,
               ),
             );
           // Recorded only after the manifest commit: a crash before this line leaves rows the next
@@ -672,8 +688,13 @@ export const makeDbWriter = Effect.gen(function* () {
               maxRetainedBytes: settings.maxRetainedBytes,
             })
             .pipe(Effect.mapError(unavailable(databaseId, "flush")));
+          // Only over the phase this flush started from, and only over an older view (D115).
           yield* Ref.update(phase, (current) =>
-            current._tag === "Ready" ? { ...current, manifest: committed } : current,
+            current._tag === "Ready" &&
+            current.writerEpoch === ready.writerEpoch &&
+            current.manifest.id < committed.id
+              ? { ...current, manifest: committed }
+              : current,
           );
           yield* refreshUnflushedCounters(databaseId);
           yield* Metric.update(flushBytes, written.value.info.sizeBytes);
@@ -1086,6 +1107,8 @@ export const makeDbWriter = Effect.gen(function* () {
       "seal.successors": successors.length,
       "seal.holds": holdForSuccessors,
     });
+    // Set when the seal's edit is first applied to a manifest: from then its commit may land.
+    let commitAttempted = false;
     // Hold the commit lock: no write can be acknowledged between the final flush and the seal.
     return yield* commitLock.withPermits(1)(
       Effect.gen(function* () {
@@ -1107,6 +1130,7 @@ export const makeDbWriter = Effect.gen(function* () {
           manifest: Manifest,
           manifestId: ManifestId,
         ): Result.Result<Manifest, WriterFencedError | DatabaseRemovedError> => {
+          commitAttempted = true;
           const alreadySealed = manifest.state._tag === "Sealed";
           if (!alreadySealed && manifest.writerEpoch !== ready.writerEpoch) {
             return Result.fail(
@@ -1163,8 +1187,10 @@ export const makeDbWriter = Effect.gen(function* () {
         // after the create-if-absent failed): the manifest may be sealed, with a new writer epoch,
         // while this writer still believes it is open. Forget the phase while the commit lock is
         // still held, so the next request starts again from the manifest and sees the seal (D85).
+        // A seal that never applied its edit committed nothing: its phase is still right, and
+        // forgetting it would start the writer again under a flush still in flight (D115).
         Effect.onExit((exit) =>
-          exit._tag === "Success"
+          exit._tag === "Success" || !commitAttempted
             ? Effect.void
             : Ref.update(phase, (current): WriterPhase =>
                 current._tag === "Ready" ? { _tag: "Uninitialized" } : current,
