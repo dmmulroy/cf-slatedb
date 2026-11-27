@@ -496,8 +496,22 @@ demand above a Cloudflare limit. Each has a failing test, and none is fixed in t
   wall time (15 min) on every retry, and garbage is then never collected.
 
 Settings the platform cannot hold (R2 parts, the Durable Object's storage, the isolate's memory,
-the account's Workflows) are now refused when a deploy is planned. `docs/operations.md`
-("Platform limits") says what an operator should watch.
+the account's Workflows) are now refused when a deploy is planned.
+
+**Bounds a caller meets (D99).**
+
+- **Checkpoints and pinned snapshots:** at most 1,000 per database. The next one is refused with
+  `CheckpointLimitReached` (409).
+- **The changelog:** its newest 2,048 flushes and at most 30 days of retention. A consumer behind
+  them gets `Expired`.
+- **Merged values:** at most 1 MiB. Past that, a read fails with `MergedValueTooLarge` (409) until
+  the key is rewritten with a put.
+- **Names:** a checkpoint name is at most 256 characters and a budget group at most 63.
+- **Database size:** about 1 TiB for keys of 16 bytes, less for longer keys (about 90 GiB for 1 KiB
+  keys). Beyond that the manifest passes its 4 MiB budget; such databases are sharded.
+- **The compactor Worker** is set to 10 million subrequests, because Cloudflare counts a
+  compaction job's subrequests together. `docs/operations.md`
+  ("Platform limits") says what an operator should watch.
 
 **Not measured or not shown.**
 

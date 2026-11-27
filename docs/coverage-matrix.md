@@ -492,6 +492,15 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   the compaction step result size, a step over dropped rows, a `Latest` scan's and every page's
   memory, and the garbage collection's reads per run. The table of limits is D92;
   `docs/operations.md` "Platform limits" is the operator's summary.
+- **Bounds a caller can grow (D99)** — done. lsm-core: `MAX_CHECKPOINTS_PER_DATABASE`,
+  `addCallerCheckpoint`, `CheckpointLimitError`; `MAX_CHANGELOG_ENTRIES`, `capChangelog` (in
+  `commitL0Flush`); `MAX_MERGED_VALUE_BYTES`, `MergedValueTooLargeError` (`resolveVisibleRow`;
+  `retainKeyVersions` leaves oversized runs unfolded). lsm-cloudflare: `CheckpointLimitReached` and
+  `MergedValueTooLarge` public errors; `MAX_CHANGELOG_RETENTION_MS`, `MAX_CHECKPOINT_NAME_LENGTH`
+  and the budget group's length in `db-http-api.ts`. infra: the compactor's `limits.subrequests`
+  (`DEFAULT_COMPACTOR_SUBREQUESTS`, `SHALEDB_COMPACTOR_SUBREQUESTS`). Tests: `manifest-size.test.ts`
+  (the budget), `manifest-limits.test.ts`, `merge-limits.test.ts`, `db-public-error-limits.test.ts`,
+  `shaledb-stack-config.test.ts`.
 - **Production readiness (v1 workstream 9)** — done (D64).
   - **Tokens.** `lsmAccessGateFrom`, `lsmAccessGateOver`, `LsmAccessTokenSource`, and
     `lsmStageAccessTokens` (`lsm-access-gate.ts`). In infra: `shaledbAccessTokens`
