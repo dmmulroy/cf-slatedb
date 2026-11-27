@@ -176,13 +176,16 @@ from `DbHttpApi`, with examples of every request and response. It covers:
 - **Writes:** batches of puts, deletes, and merges, with an optional TTL each. `flush` makes
   everything acknowledged durable in R2. A TTL is judged by the reader's clock: a value expires
   within clock skew of its expiry time, readers on different machines may disagree for up to that
-  skew, and a value compaction has removed does not return (D83).
+  skew, and a value compaction has removed does not return to reads of later manifests (D83). A
+  snapshot, a pinned snapshot, and a transaction fix which writes are visible, not the time TTLs
+  are judged at: a value read at one of them can expire between two reads
+  ([`docs/invariants.md`](docs/invariants.md)).
 - **Reads:** `get` and `scan` at `Latest` (sees every acknowledged write), `AtLeast` a sequence
   number, or `Flushed`; at a snapshot; pinned snapshots that outlive GC. A scan page ends at its
   limit or after examining 16 MiB of versions, whichever comes first, so a page may hold fewer
   rows than asked, or none: follow `resumeFrom` until it is null (D108).
 - **Transactions:** `Snapshot` or `SerializableSnapshot` isolation, with conflicts detected at
-  commit.
+  commit. Conflicts are writes: a value that expires during a transaction is not one.
 - **Change feed:** committed changes in sequence order, when the database's changelog is on.
   It says `Expired` rather than skip changes retention dropped. A fork's or split successor's
   feed starts at its fork point, where the sealed source's feed ends.
