@@ -16,6 +16,14 @@ import {
   spansSince,
 } from "./measurements.ts";
 import { ScenarioStack, uniqueId } from "./scenario.ts";
+import {
+  ChangeLedger,
+  FeedFollower,
+  MergeKeyModel,
+  rowSignature,
+  ScanTraversal,
+  type SoakChange,
+} from "./soak-checks.ts";
 import { soakPassed, type SoakPhase, writeReportFile } from "./soak-report.ts";
 import {
   catchUpTails,
@@ -76,9 +84,16 @@ const HISTORY_KEPT = 6;
  * One database's model of what it must hold: every acknowledged write, the values of the batch in
  * flight, and counters of what was checked.
  */
-class DatabaseModel {
+export class DatabaseModel {
   readonly keys = new Map<string, KeyHistory>();
   readonly pending = new Map<string, Option.Option<string>>();
+  /** Every batch sent, for the change-feed follower (D106). */
+  readonly ledger = new ChangeLedger();
+  /**
+   * Keys written only by requests the soak aborted (D106): each holds its value or nothing, for
+   * good (the soak writes each such key once).
+   */
+  readonly maybe = new Map<string, string>();
   lastAckedSeq = 0;
   counterCommitted = 0;
   counterUncertain = 0;
@@ -108,6 +123,8 @@ class DatabaseModel {
   accepts(key: string, fromSeq: number, value: Option.Option<string>) {
     const same = (candidate: Option.Option<string>) =>
       Option.getOrNull(candidate) === Option.getOrNull(value);
+    const aborted = this.maybe.get(key);
+    if (aborted !== undefined) return Option.isNone(value) || same(Option.some(aborted));
     const history = this.keys.get(key);
     if (history === undefined)
       return Option.isNone(value) || same(this.pending.get(key) ?? Option.none());
@@ -191,6 +208,9 @@ const isRetryable = (error: unknown) =>
         // The sharded API's retryable error (its envelope has no `retryable` field).
         error._tag === "ShardedRequestUnavailableError")));
 
+/** A batch larger than the writer's change-feed page of 1,000 rows (D93b). */
+const BIG_BATCH_ROWS = 1_500;
+
 /** How long one request may take before the soak counts it as lost and retries it. */
 const REQUEST_TIMEOUT = "90 seconds";
 
@@ -260,9 +280,14 @@ const redeploy = (stage: string, traceSampleRate: Option.Option<number>) =>
  * - `TransactionConflictError`: concurrent increments of one counter; the loser retries.
  * - `WriterFencedError`: the redeploy replaces writers; a request on the old one is retried.
  * - `HttpClientError`: the calling side of one of the above.
+ * - `DatabaseHasDependentsError`, `DatabaseRecentlyRemovedError`: the fork-hold and recreate
+ *   checks (D106) provoke them on purpose.
  * Any other exception in the soak's window fails it.
  */
 const EXPECTED_EXCEPTIONS = new Set([
+  // D106: the refused deletion of a fork's hold, and the refused recreation of a removed id.
+  "DatabaseHasDependentsError",
+  "DatabaseRecentlyRemovedError",
   "DatabaseSealedError",
   "DatabaseNotFoundError",
   "TransactionConflictError",
@@ -319,33 +344,83 @@ export const soak = (options: SoakOptions) =>
     const keyOf = (index: number) => `k${index.toString().padStart(6, "0")}`;
     const COUNTER = "counter";
 
-    for (const model of models) {
-      yield* untilSuccess(
+    // Every soak database keeps its changelog longer than the soak runs, so a follower that keeps
+    // up is never behind retention: `Expired` is a failure (D106).
+    const changelogRetentionMs = Math.min(30 * 24 * 3_600_000, (options.minutes + 60) * 60_000);
+    const createWith = (
+      databaseId: DatabaseId,
+      extra: { readonly changelog?: boolean; readonly concat?: boolean } = {},
+    ) =>
+      untilSuccess(
         ledger,
         "create",
         api.databases.createDatabase({
           payload: {
-            databaseId: model.databaseId,
+            databaseId,
             keyRange: Option.none(),
-            mergeOperator: Option.none(),
-            changelogRetentionMs: Option.none(),
+            mergeOperator: extra.concat === true ? Option.some("Concat" as const) : Option.none(),
+            changelogRetentionMs:
+              extra.changelog === true ? Option.some(changelogRetentionMs) : Option.none(),
             budgetGroup: Option.none(),
           },
         }),
       );
-    }
+    for (const model of models) yield* createWith(model.databaseId, { changelog: true });
+
+    let abortedWrites = 0;
+    /**
+     * Sends one small batch on keys no other write touches, and aborts it after a few milliseconds
+     * (the fetch is cancelled; the writer may still commit it). The model then holds either value
+     * for those keys, and the feed may show the batch once (D106).
+     */
+    const abortedWrite = (model: DatabaseModel) =>
+      Effect.gen(function* () {
+        const round = abortedWrites++;
+        const changes: Array<SoakChange> = [0, 1, 2].map((index) => ({
+          _tag: "Put",
+          key: `u${round.toString().padStart(6, "0")}-${index}`,
+          value: `aborted-${round}-${index}`,
+        }));
+        for (const change of changes)
+          if (change._tag === "Put") model.maybe.set(change.key, change.value);
+        model.ledger.maybe(changes);
+        const sent = yield* Effect.result(
+          api.databases
+            .write({
+              params: { databaseId: model.databaseId },
+              payload: {
+                operations: changes.map((change) => ({
+                  _tag: "Put" as const,
+                  key: bytesOf(change.key),
+                  value: bytesOf(change._tag === "Put" ? change.value : ""),
+                  ttlMillis: Option.none(),
+                })),
+              },
+            })
+            .pipe(Effect.timeout(`${2 + Math.floor(Math.random() * 20)} millis`)),
+        );
+        if (sent._tag === "Success") {
+          model.ledger.ack(sent.success.seq, changes);
+          ledger.checked("write.aborted_landed");
+        } else ledger.checked("write.aborted");
+      });
 
     /** Writes batches to one database: puts and deletes on its keys, each acknowledged write recorded. */
     const writer = (model: DatabaseModel) =>
       Effect.gen(function* () {
         let counter = 0;
+        let batches = 0;
         while (yield* running) {
-          const size = 20 + Math.floor(Math.random() * 120);
+          batches += 1;
+          // Now and then a batch larger than the writer's 1,000-row page (D93b), on its own keys.
+          const big = batches % 60 === 0;
+          const size = big ? BIG_BATCH_ROWS : 20 + Math.floor(Math.random() * 120);
           const chosen = new Set<number>();
+          if (big) for (let index = 0; index < size; index++) chosen.add(index);
           while (chosen.size < size)
             chosen.add(Math.floor(Math.random() * options.keysPerDatabase));
           const operations = [...chosen].map((index) => {
-            const key = keyOf(index);
+            const key = big ? `big${index.toString().padStart(5, "0")}` : keyOf(index);
             counter += 1;
             const value =
               Math.random() < 0.1
@@ -354,6 +429,13 @@ export const soak = (options: SoakOptions) =>
             model.pending.set(key, value);
             return { key, value };
           });
+          const changes = operations.map(({ key, value }): SoakChange =>
+            Option.match(value, {
+              onNone: () => ({ _tag: "Delete", key }),
+              onSome: (text) => ({ _tag: "Put", key, value: text }),
+            }),
+          );
+          if (big) ledger.checked("write.big_batch");
           let replayed = false;
           const receipt = yield* untilSuccess(
             ledger,
@@ -377,14 +459,26 @@ export const soak = (options: SoakOptions) =>
                   ),
                 },
               }),
-            ).pipe(Effect.tapError(() => Effect.sync(() => (replayed = true)))),
+            ).pipe(
+              // A failed attempt may have committed: the feed may show it once (D106).
+              Effect.tapError(() =>
+                Effect.sync(() => {
+                  replayed = true;
+                  model.ledger.maybe(changes);
+                }),
+              ),
+            ),
           );
           if (Option.isSome(receipt)) {
             for (const { key, value } of operations)
               model.record(key, receipt.value.seq, value, replayed);
             model.lastAckedSeq = Math.max(model.lastAckedSeq, receipt.value.seq);
+            model.ledger.ack(receipt.value.seq, changes);
           }
           for (const { key } of operations) model.pending.delete(key);
+          // One write in fifty is aborted by the client mid-request (D106; D74b's and D85's
+          // class): on its own keys, written once, so each holds its value or nothing.
+          if (Math.random() < 0.02) yield* abortedWrite(model);
           yield* Effect.sleep("700 millis");
         }
       });
@@ -495,8 +589,14 @@ export const soak = (options: SoakOptions) =>
             onNone: () => 0,
             onSome: (row) => (row.value._tag === "Value" ? Number(stringOf(row.value.bytes)) : 0),
           });
+          const change: SoakChange = { _tag: "Put", key: COUNTER, value: String(current + 1) };
+          // One commit in twenty is aborted by the client after a few milliseconds (D106): its
+          // outcome is unknown, like a commit that timed out.
+          const aborted = Math.random() < 0.05;
           const commit = yield* Effect.result(
-            Effect.timeout(REQUEST_TIMEOUT)(
+            Effect.timeout(
+              aborted ? `${2 + Math.floor(Math.random() * 20)} millis` : REQUEST_TIMEOUT,
+            )(
               timed(
                 ledger,
                 "transaction.commit",
@@ -524,11 +624,14 @@ export const soak = (options: SoakOptions) =>
           );
           if (commit._tag === "Success") {
             model.counterCommitted += 1;
-            ledger.checked("transaction.commit");
+            model.ledger.ack(commit.success.seq, [change]);
+            ledger.checked(aborted ? "transaction.aborted_landed" : "transaction.commit");
           } else if (tagOf(commit.failure) === "TransactionConflictPublicError") {
             ledger.checked("transaction.conflict");
           } else if (isRetryable(commit.failure)) {
             model.counterUncertain += 1;
+            model.ledger.maybe([change]);
+            if (aborted) ledger.checked("transaction.aborted");
             ledger.retry("transaction.commit");
             ledger.note("transaction.commit", `uncertain: ${tagOf(commit.failure)}`);
           } else {
@@ -644,6 +747,741 @@ export const soak = (options: SoakOptions) =>
         if (after._tag === "Success" || tagOf(after.failure) !== "DatabaseNotFoundPublicError") {
           ledger.mismatch(`${databaseId} still answers after removal`);
         }
+        // Recreating the id within gcMinAge of its removal is refused [D90, on audit-lifecycle's
+        // branch: before it merges, the create succeeds and this check reports it]. Sent raw, so
+        // the answer is read whatever this build's client knows of the error.
+        const recreated = yield* http
+          .execute(
+            HttpClientRequest.post(`${stack.api}/v1/databases`).pipe(
+              HttpClientRequest.bodyJsonUnsafe({
+                databaseId,
+                keyRange: null,
+                mergeOperator: null,
+                changelogRetentionMs: null,
+                budgetGroup: null,
+              }),
+            ),
+          )
+          .pipe(
+            Effect.flatMap((response) =>
+              Effect.map(response.text, (body) => ({ status: response.status, body })),
+            ),
+            Effect.timeout(REQUEST_TIMEOUT),
+            Effect.result,
+          );
+        ledger.checked("remove.recreate_refused (needs D90)");
+        if (recreated._tag === "Failure") {
+          ledger.failures.push(`remove.recreate: ${describe(recreated.failure)}`);
+        } else if (
+          recreated.success.status !== 409 ||
+          !recreated.success.body.includes("DatabaseRecentlyRemoved")
+        ) {
+          ledger.mismatch(
+            `${databaseId}: recreating it right after its removal answered ${recreated.success.status}, not 409 DatabaseRecentlyRemoved (D90)`,
+          );
+        }
+      }
+    });
+
+    // ---------------------------------------------------------------------------------------------
+    // D106: workloads for the classes of defect today's audits found. Each is checked against a
+    // model and counted in `checks`; each stops with the workload.
+    // ---------------------------------------------------------------------------------------------
+
+    /** A feed row's signature, for the follower. */
+    const feedRow = (row: {
+      readonly key: Uint8Array;
+      readonly seq: number;
+      readonly value:
+        | { readonly _tag: "Value"; readonly bytes: Uint8Array }
+        | { readonly _tag: "Merge"; readonly operand: Uint8Array }
+        | { readonly _tag: "Tombstone" };
+    }) => ({
+      seq: row.seq,
+      signature: rowSignature(
+        stringOf(row.key),
+        row.value._tag,
+        row.value._tag === "Value"
+          ? stringOf(row.value.bytes)
+          : row.value._tag === "Merge"
+            ? stringOf(row.value.operand)
+            : "",
+      ),
+    });
+
+    /**
+     * Reads one page of `databaseId`'s change feed into `follower`, recording what is wrong.
+     * `Expired` and `Disabled` are failures: every soak database keeps its changelog longer than the
+     * soak runs. @returns The number of rows read, or none when the page could not be read.
+     */
+    const followOnce = (databaseId: DatabaseId, follower: FeedFollower) =>
+      Effect.gen(function* () {
+        const page = yield* untilSuccess(
+          ledger,
+          "feed",
+          timed(
+            ledger,
+            "feed",
+            api.databases.changes({
+              params: { databaseId },
+              query: { afterSeq: SeqNum.make(follower.cursor), limit: 500 },
+            }),
+          ),
+        );
+        if (Option.isNone(page)) return Option.none<number>();
+        for (const problem of follower.page({
+          rows: page.value.rows.map(feedRow),
+          nextAfterSeq: page.value.nextAfterSeq,
+        }))
+          ledger.mismatch(`${databaseId} feed: ${problem}`);
+        ledger.checked("feed.page");
+        return Option.some(page.value.rows.length);
+      });
+
+    /** Checks every acknowledged batch at or below the follower's cursor was delivered (once each). */
+    const reportedMissing = new Set<string>();
+    const checkFeed = (databaseId: DatabaseId, follower: FeedFollower, ledgerOf: ChangeLedger) => {
+      for (const problem of follower.missing(ledgerOf)) {
+        const message = `${databaseId} feed: ${problem}`;
+        if (reportedMissing.has(message)) continue;
+        reportedMissing.add(message);
+        ledger.mismatch(message);
+      }
+      ledger.checked("feed.delivered");
+    };
+
+    /** One follower per soak database, for the whole workload (stopped with it). */
+    const followers = models.map(() => new FeedFollower(0));
+    const feedFollower = (model: DatabaseModel, follower: FeedFollower) =>
+      Effect.gen(function* () {
+        let pages = 0;
+        for (;;) {
+          const read = yield* followOnce(model.databaseId, follower);
+          pages += 1;
+          if (pages % 60 === 0) checkFeed(model.databaseId, follower, model.ledger);
+          // Keep up when behind, rest when caught up.
+          if (Option.getOrElse(read, () => 0) < 500) yield* Effect.sleep("2 seconds");
+        }
+      });
+
+    // The documented way to follow a database through a split (D80): a database with a feed is
+    // sealed, checkpointed, and forked into two successors partway through; its follower reads the
+    // sealed source to its end, then each successor from the source's last sequence number.
+    const splitSource = new DatabaseModel(DatabaseId.make(`${prefix}-feedsplit`));
+    const splitLeft = new DatabaseModel(DatabaseId.make(`${prefix}-feedsplit-l`));
+    const splitRight = new DatabaseModel(DatabaseId.make(`${prefix}-feedsplit-r`));
+    const SPLIT_AT = "m";
+    yield* createWith(splitSource.databaseId, { changelog: true });
+    let splitDone = false;
+    let splitFromSeq = 0;
+    const splitFollowers = {
+      source: new FeedFollower(0),
+      left: Option.none<FeedFollower>(),
+      right: Option.none<FeedFollower>(),
+    };
+    const splitWriter = Effect.gen(function* () {
+      let round = 0;
+      const splitAtMs = startedAt + Math.max(2, options.minutes * 0.4) * 60_000;
+      while (yield* running) {
+        if (!splitDone && (yield* Clock.currentTimeMillis) >= splitAtMs) {
+          // Seal, checkpoint, fork both halves, release the caller's checkpoint.
+          const sealed = yield* untilSuccess(
+            ledger,
+            "feedsplit.seal",
+            api.databases.seal({
+              params: { databaseId: splitSource.databaseId },
+              payload: { successors: [splitLeft.databaseId, splitRight.databaseId] },
+            }),
+          );
+          const checkpoint = yield* untilSuccess(
+            ledger,
+            "feedsplit.checkpoint",
+            api.databases.createCheckpoint({
+              params: { databaseId: splitSource.databaseId },
+              payload: { name: Option.some("feed split"), lifetimeMs: Option.none() },
+            }),
+          );
+          if (Option.isNone(sealed) || Option.isNone(checkpoint)) return;
+          for (const [successor, range] of [
+            [splitLeft, { start: new Uint8Array(0), end: Option.some(bytesOf(SPLIT_AT)) }],
+            [splitRight, { start: bytesOf(SPLIT_AT), end: Option.none() }],
+          ] as const) {
+            yield* untilSuccess(
+              ledger,
+              "feedsplit.fork",
+              api.databases.fork({
+                params: { databaseId: splitSource.databaseId },
+                payload: { forkId: successor.databaseId, checkpointId: checkpoint.value.id, range },
+              }),
+            );
+          }
+          yield* untilSuccess(
+            ledger,
+            "feedsplit.deleteCheckpoint",
+            api.databases.deleteCheckpoint({
+              params: { databaseId: splitSource.databaseId, checkpointId: checkpoint.value.id },
+            }),
+          );
+          splitFromSeq = sealed.value.flushedSeq;
+          splitDone = true;
+          ledger.checked("feedsplit.split");
+        }
+        // Five keys a batch, on one side of the split point; after the split, sent to that side.
+        const right = Math.random() < 0.5;
+        const target = !splitDone ? splitSource : right ? splitRight : splitLeft;
+        const changes: Array<SoakChange> = Array.from({ length: 5 }, (_, index) => ({
+          _tag: "Put",
+          key: `${right ? "r" : "a"}${((round * 5 + index) % 400).toString().padStart(4, "0")}`,
+          value: `s${round}-${index}`,
+        }));
+        round += 1;
+        const receipt = yield* untilSuccess(
+          ledger,
+          "feedsplit.write",
+          api.databases
+            .write({
+              params: { databaseId: target.databaseId },
+              payload: {
+                operations: changes.map((change) => ({
+                  _tag: "Put" as const,
+                  key: bytesOf(change.key),
+                  value: bytesOf(change._tag === "Put" ? change.value : ""),
+                  ttlMillis: Option.none(),
+                })),
+              },
+            })
+            .pipe(Effect.tapError(() => Effect.sync(() => target.ledger.maybe(changes)))),
+        );
+        if (Option.isSome(receipt)) target.ledger.ack(receipt.value.seq, changes);
+        yield* Effect.sleep("1 second");
+      }
+    });
+    const splitFollower = Effect.gen(function* () {
+      for (;;) {
+        // The source to its end: an empty page once it is sealed.
+        if (Option.isNone(splitFollowers.left)) {
+          const read = yield* followOnce(splitSource.databaseId, splitFollowers.source);
+          if (splitDone && Option.exists(read, (rows) => rows === 0)) {
+            const status = yield* untilSuccess(
+              ledger,
+              "feedsplit.status",
+              api.databases.status({ params: { databaseId: splitSource.databaseId } }),
+            );
+            if (Option.isSome(status) && status.value.sealed) {
+              // The successors' feeds start at the source's last sequence number.
+              if (status.value.lastSeq !== splitFromSeq)
+                ledger.mismatch(
+                  `${splitSource.databaseId} sealed at ${splitFromSeq}, status says ${status.value.lastSeq}`,
+                );
+              splitFollowers.left = Option.some(new FeedFollower(status.value.lastSeq));
+              splitFollowers.right = Option.some(new FeedFollower(status.value.lastSeq));
+              ledger.checked("feedsplit.source_ended");
+            }
+          }
+        } else {
+          for (const [successor, follower] of [
+            [splitLeft, splitFollowers.left],
+            [splitRight, splitFollowers.right],
+          ] as const) {
+            if (Option.isSome(follower)) yield* followOnce(successor.databaseId, follower.value);
+          }
+        }
+        yield* Effect.sleep("2 seconds");
+      }
+    });
+
+    // Merge operands with TTLs (D81): three Concat keys built from a base and one-character
+    // operands, some expiring after 10 to 40 s, read back at Latest after they expire and after the
+    // database's flushes and compactions.
+    /**
+     * How far the soak's clock and the database's may disagree around an expiry (and a read's own
+     * duration is added). Cloudflare's machines keep NTP time within milliseconds; the laptop
+     * running the soak is usually within a second of it. 5 s covers both, and a read whose time
+     * falls inside the window around an expiry accepts the value either side of it.
+     */
+    const CLOCK_SKEW_MS = 5_000;
+    const mergeDatabase = DatabaseId.make(`${prefix}-merge`);
+    yield* createWith(mergeDatabase, { concat: true });
+    const mergeKeys = ["m0", "m1", "m2"].map((name) => ({ name, model: new MergeKeyModel() }));
+    const mergeWriter = Effect.gen(function* () {
+      let round = 0;
+      while (yield* running) {
+        const target = mergeKeys[round % mergeKeys.length];
+        round += 1;
+        if (target === undefined) continue;
+        // A new base every so often, or when the key's state is unknown or long.
+        const rebase =
+          target.model.unknown || target.model.operands.length >= 24 || round % 20 === 0;
+        const ttlMillis =
+          rebase || Math.random() < 0.5
+            ? Option.none<number>()
+            : Option.some(10_000 + Math.floor(Math.random() * 30_000));
+        const payload = rebase ? `B${round}.` : String.fromCharCode(97 + (round % 26));
+        let failed = false;
+        const receipt = yield* untilSuccess(
+          ledger,
+          "merge.write",
+          api.databases
+            .write({
+              params: { databaseId: mergeDatabase },
+              payload: {
+                operations: [
+                  rebase
+                    ? {
+                        _tag: "Put" as const,
+                        key: bytesOf(target.name),
+                        value: bytesOf(payload),
+                        ttlMillis,
+                      }
+                    : {
+                        _tag: "Merge" as const,
+                        key: bytesOf(target.name),
+                        operand: bytesOf(payload),
+                        ttlMillis,
+                      },
+                ],
+              },
+            })
+            .pipe(Effect.tapError(() => Effect.sync(() => (failed = true)))),
+        );
+        if (Option.isSome(receipt)) {
+          const expireAt = Option.getOrUndefined(
+            Option.map(ttlMillis, (ttl) => receipt.value.createTs + ttl),
+          );
+          // A merge sent twice (a retry after a lost answer) may have applied twice: unknown until
+          // the next base. A base put twice is the same base.
+          if (rebase) target.model.put(receipt.value.seq, payload, expireAt);
+          else if (failed) target.model.unknown = true;
+          else target.model.merge(receipt.value.seq, payload, expireAt);
+        } else target.model.unknown = true;
+        if (round % 2 === 0) yield* readMergeKeys;
+        // Flushes often, so operands meet compaction (four flushes make a compaction).
+        if (round % 10 === 0)
+          yield* untilSuccess(
+            ledger,
+            "merge.flush",
+            api.databases.flush({ params: { databaseId: mergeDatabase } }),
+          );
+        yield* Effect.sleep("1500 millis");
+      }
+    });
+    /** Reads every merge key once (from the writer's fiber: no merge is in flight meanwhile). */
+    const readMergeKeys = Effect.gen(function* () {
+      {
+        for (const target of mergeKeys) {
+          const before = yield* Clock.currentTimeMillis;
+          const got = yield* untilSuccess(
+            ledger,
+            "merge.get",
+            api.databases.get({
+              params: { databaseId: mergeDatabase },
+              payload: {
+                key: bytesOf(target.name),
+                consistency: { _tag: "Latest" },
+                snapshot: Option.none(),
+              },
+            }),
+          );
+          const after = yield* Clock.currentTimeMillis;
+          if (Option.isNone(got)) continue;
+          const acceptable = target.model.acceptable(before, after, CLOCK_SKEW_MS);
+          if (acceptable === undefined) {
+            if (target.model.unknown) ledger.checked("merge.not_judged");
+            else
+              ledger.mismatch(
+                `${mergeDatabase} ${target.name}: cannot decide, too many operands expire near the read`,
+              );
+            continue;
+          }
+          const read = Option.match(got.value.row, {
+            onNone: () => "",
+            onSome: (row) =>
+              row.value._tag === "Value" ? stringOf(row.value.bytes) : `<${row.value._tag}>`,
+          });
+          ledger.checked("merge.get");
+          if (
+            target.model.operands.some(
+              (operand) => operand.expireAt !== undefined && operand.expireAt < before,
+            )
+          )
+            ledger.checked("merge.get_after_expiry");
+          if (!acceptable.has(read))
+            ledger.mismatch(
+              `${mergeDatabase} ${target.name}: read ${JSON.stringify(read.slice(0, 40))}, expected one of ${JSON.stringify([...acceptable].map((value) => value.slice(0, 40)))}`,
+            );
+        }
+      }
+    });
+
+    // Scans with small limits continued by `resumeFrom` at Latest while flushes run (D93): across
+    // one traversal no key repeats or comes out of order, every value is one the model allows, and a
+    // key that held a value throughout is returned.
+    const pager = (model: DatabaseModel) =>
+      Effect.gen(function* () {
+        while (yield* running) {
+          const from = Math.floor(Math.random() * Math.max(1, options.keysPerDatabase - 300));
+          const startKey = keyOf(from);
+          const endKey = keyOf(from + 300);
+          const inRange = [...model.keys.keys()].filter((key) => key >= startKey && key < endKey);
+          const startSeqs = new Map(inRange.map((key) => [key, model.newestSeq(key)]));
+          const traversal = new ScanTraversal();
+          let start: Uint8Array = bytesOf(startKey);
+          let complete = false;
+          for (let page = 0; page < 200; page++) {
+            const read = yield* untilSuccess(
+              ledger,
+              "scan.paged",
+              api.databases.scan({
+                params: { databaseId: model.databaseId },
+                payload: {
+                  range: { start, end: Option.some(bytesOf(endKey)) },
+                  consistency: { _tag: "Latest" },
+                  snapshot: Option.none(),
+                  limit: 7,
+                },
+              }),
+            );
+            if (Option.isNone(read)) break;
+            const keys = read.value.rows.map((row) => stringOf(row.key));
+            for (const problem of traversal.page(keys))
+              ledger.mismatch(`${model.databaseId} paged scan: ${problem}`);
+            for (const row of read.value.rows) {
+              const key = stringOf(row.key);
+              const value =
+                row.value._tag === "Value"
+                  ? Option.some(stringOf(row.value.bytes))
+                  : Option.none<string>();
+              if (!model.accepts(key, startSeqs.get(key) ?? 0, value))
+                ledger.mismatch(
+                  `${model.databaseId} paged scan ${key}: read ${Option.getOrNull(value)?.slice(0, 12)}`,
+                );
+            }
+            if (read.value.rows.length < 7 && Option.isSome(read.value.resumeFrom))
+              ledger.checked("scan.paged_early_end");
+            if (Option.isNone(read.value.resumeFrom)) {
+              complete = true;
+              break;
+            }
+            start = read.value.resumeFrom.value;
+          }
+          if (!complete) {
+            ledger.mismatch(
+              `${model.databaseId} paged scan of ${startKey}.. did not finish in 200 pages`,
+            );
+          } else {
+            // Held a value before the scan and was not written during it (nor in flight).
+            const stable = inRange.filter(
+              (key) =>
+                model.newestSeq(key) === startSeqs.get(key) &&
+                !model.pending.has(key) &&
+                Option.exists(model.current(key), Option.isSome),
+            );
+            for (const problem of traversal.skipped(stable))
+              ledger.mismatch(`${model.databaseId} paged scan: ${problem}`);
+            ledger.checked("scan.paged");
+          }
+          yield* Effect.sleep("20 seconds");
+        }
+      });
+
+    // Bursts of explicit flushes on a database with few rows (what found D78): eight writes, each
+    // flushed at once, every four minutes; ninety seconds later its compactor must not be fenced
+    // and L0 must be below the write limit.
+    const burstDatabase = DatabaseId.make(`${prefix}-burst`);
+    yield* createWith(burstDatabase);
+    const burster = Effect.gen(function* () {
+      let round = 0;
+      while (yield* running) {
+        for (let index = 0; index < 8; index++) {
+          yield* untilSuccess(
+            ledger,
+            "burst.write",
+            api.databases.write({
+              params: { databaseId: burstDatabase },
+              payload: {
+                operations: [
+                  {
+                    _tag: "Put",
+                    key: bytesOf(`b${index}`),
+                    value: bytesOf(`${round}`),
+                    ttlMillis: Option.none(),
+                  },
+                ],
+              },
+            }),
+          );
+          yield* untilSuccess(
+            ledger,
+            "burst.flush",
+            api.databases.flush({ params: { databaseId: burstDatabase } }),
+          );
+        }
+        round += 1;
+        ledger.checked("burst.flushes");
+        yield* pause(90_000);
+        const status = yield* untilSuccess(
+          ledger,
+          "burst.compaction",
+          api.databases.compaction({ params: { databaseId: burstDatabase } }),
+        );
+        if (Option.isSome(status)) {
+          ledger.checked("burst.compactor");
+          if (Option.exists(status.value.compactor, (compactor) => compactor.fenced))
+            ledger.mismatch(`${burstDatabase}: its compactor is fenced after a flush burst (D78)`);
+          if (status.value.l0Ssts >= 16)
+            ledger.mismatch(`${burstDatabase}: ${status.value.l0Ssts} L0 SSTs after a flush burst`);
+        }
+        yield* pause(150_000);
+      }
+    });
+
+    // A database written once and then only read (D76's shape): four flushed batches (one
+    // compaction), then a Latest get every 20 s (which keeps its writer in memory) and a
+    // transaction every 3 minutes, each checked against what was written. D76 needs the
+    // compaction's replaced manifest collected (gcMinAge, 1 h, after the compaction) while the writer
+    // stays up: a soak of more than about 65 minutes reaches it; a shorter one checks the rest.
+    const idleDatabase = DatabaseId.make(`${prefix}-idle`);
+    yield* createWith(idleDatabase);
+    const idleValues = new Map<string, string>();
+    for (let batch = 0; batch < 4; batch++) {
+      const operations = Array.from({ length: 10 }, (_, index) => {
+        const key = `i${(batch * 10 + index).toString().padStart(3, "0")}`;
+        idleValues.set(key, `idle-${batch}-${index}`);
+        return {
+          _tag: "Put" as const,
+          key: bytesOf(key),
+          value: bytesOf(`idle-${batch}-${index}`),
+          ttlMillis: Option.none(),
+        };
+      });
+      yield* untilSuccess(
+        ledger,
+        "idle.write",
+        api.databases.write({ params: { databaseId: idleDatabase }, payload: { operations } }),
+      );
+      yield* untilSuccess(
+        ledger,
+        "idle.flush",
+        api.databases.flush({ params: { databaseId: idleDatabase } }),
+      );
+    }
+    const idleKeys = [...idleValues.keys()];
+    const idleReader = Effect.gen(function* () {
+      let round = 0;
+      while (yield* running) {
+        const key = idleKeys[Math.floor(Math.random() * idleKeys.length)] ?? "i000";
+        const got = yield* untilSuccess(
+          ledger,
+          "idle.get",
+          api.databases.get({
+            params: { databaseId: idleDatabase },
+            payload: {
+              key: bytesOf(key),
+              consistency: { _tag: "Latest" },
+              snapshot: Option.none(),
+            },
+          }),
+        );
+        if (Option.isSome(got)) {
+          ledger.checked("idle.get");
+          const read = Option.flatMap(got.value.row, (row) =>
+            row.value._tag === "Value" ? Option.some(stringOf(row.value.bytes)) : Option.none(),
+          );
+          if (Option.getOrNull(read) !== (idleValues.get(key) ?? null))
+            ledger.mismatch(`${idleDatabase} ${key}: read ${Option.getOrNull(read)}`);
+        }
+        round += 1;
+        if (round % 9 === 0) {
+          const begun = yield* untilSuccess(
+            ledger,
+            "idle.transaction",
+            api.databases.beginTransaction({ params: { databaseId: idleDatabase } }),
+          );
+          if (Option.isSome(begun)) {
+            for (const sample of idleKeys.slice(0, 5)) {
+              const read = yield* untilSuccess(
+                ledger,
+                "idle.transaction",
+                api.databases.transactionGet({
+                  params: { databaseId: idleDatabase },
+                  payload: {
+                    readSeq: begun.value.readSeq,
+                    manifestId: begun.value.manifestId,
+                    key: bytesOf(sample),
+                  },
+                }),
+              );
+              if (Option.isNone(read)) continue;
+              const value = Option.flatMap(read.value.row, (row) =>
+                row.value._tag === "Value" ? Option.some(stringOf(row.value.bytes)) : Option.none(),
+              );
+              if (Option.getOrNull(value) !== (idleValues.get(sample) ?? null))
+                ledger.mismatch(
+                  `${idleDatabase} transaction read of ${sample}: ${Option.getOrNull(value)}`,
+                );
+            }
+            ledger.checked(
+              (yield* Clock.currentTimeMillis) - startedAt > 65 * 60_000
+                ? "idle.transaction_after_gc_age"
+                : "idle.transaction",
+            );
+          }
+        }
+        yield* pause(20_000);
+      }
+    });
+
+    // A fork from a checkpoint early in the soak (D77): the source keeps changing, the fork must
+    // keep the state at the checkpoint. The caller's checkpoint is deleted after the fork; deleting
+    // the fork's hold must be refused [needs audit-lifecycle's hold fix (its STATUS.md, 01:06):
+    // before it, the deletion succeeds and the check reports it].
+    const forkSource = DatabaseId.make(`${prefix}-forksrc`);
+    const forkCopy = DatabaseId.make(`${prefix}-fork`);
+    yield* createWith(forkSource);
+    const forkValues = new Map<string, string>();
+    const forkOperations = Array.from({ length: 200 }, (_, index) => {
+      const key = `f${index.toString().padStart(3, "0")}`;
+      forkValues.set(key, `fork-${index}`);
+      return {
+        _tag: "Put" as const,
+        key: bytesOf(key),
+        value: bytesOf(`fork-${index}`),
+        ttlMillis: Option.none(),
+      };
+    });
+    yield* untilSuccess(
+      ledger,
+      "fork.write",
+      api.databases.write({
+        params: { databaseId: forkSource },
+        payload: { operations: forkOperations },
+      }),
+    );
+    const forkCheckpoint = yield* untilSuccess(
+      ledger,
+      "fork.checkpoint",
+      api.databases.createCheckpoint({
+        params: { databaseId: forkSource },
+        payload: { name: Option.some("soak fork"), lifetimeMs: Option.none() },
+      }),
+    );
+    let forkReady = false;
+    if (Option.isSome(forkCheckpoint)) {
+      const forked = yield* untilSuccess(
+        ledger,
+        "fork.fork",
+        api.databases.fork({
+          params: { databaseId: forkSource },
+          payload: {
+            forkId: forkCopy,
+            checkpointId: forkCheckpoint.value.id,
+            range: { start: new Uint8Array(0), end: Option.none() },
+          },
+        }),
+      );
+      forkReady = Option.isSome(forked);
+      yield* untilSuccess(
+        ledger,
+        "fork.deleteCheckpoint",
+        api.databases.deleteCheckpoint({
+          params: { databaseId: forkSource, checkpointId: forkCheckpoint.value.id },
+        }),
+      );
+      const listed = yield* untilSuccess(
+        ledger,
+        "fork.listCheckpoints",
+        api.databases.listCheckpoints({ params: { databaseId: forkSource } }),
+      );
+      const hold = Option.flatMap(listed, (list) =>
+        Option.fromUndefinedOr(
+          list.checkpoints.find((checkpoint) => Option.contains(checkpoint.holder, forkCopy)),
+        ),
+      );
+      if (Option.isNone(hold)) {
+        ledger.mismatch(`${forkSource}: no hold for fork ${forkCopy} after the fork`);
+      } else {
+        const deleted = yield* Effect.result(
+          api.databases
+            .deleteCheckpoint({ params: { databaseId: forkSource, checkpointId: hold.value.id } })
+            .pipe(Effect.timeout(REQUEST_TIMEOUT)),
+        );
+        ledger.checked("fork.hold_delete_refused (needs audit-lifecycle's hold fix)");
+        if (deleted._tag === "Success")
+          ledger.mismatch(
+            `${forkSource}: deleting fork ${forkCopy}'s hold succeeded; it must be refused (DatabaseHasDependents)`,
+          );
+        else if (tagOf(deleted.failure) !== "DatabaseHasDependentsPublicError")
+          ledger.mismatch(
+            `${forkSource}: deleting the fork's hold failed with ${describe(deleted.failure)}, not DatabaseHasDependents`,
+          );
+      }
+    }
+    /** Reads `keys` from the fork and compares them with the checkpoint's state. */
+    const readFork = (keys: ReadonlyArray<string>, kind: string) =>
+      Effect.forEach(
+        keys,
+        (key) =>
+          Effect.gen(function* () {
+            const got = yield* untilSuccess(
+              ledger,
+              kind,
+              api.databases.get({
+                params: { databaseId: forkCopy },
+                payload: {
+                  key: bytesOf(key),
+                  consistency: { _tag: "Latest" },
+                  snapshot: Option.none(),
+                },
+              }),
+            );
+            if (Option.isNone(got)) return;
+            const read = Option.flatMap(got.value.row, (row) =>
+              row.value._tag === "Value" ? Option.some(stringOf(row.value.bytes)) : Option.none(),
+            );
+            if (Option.getOrNull(read) !== (forkValues.get(key) ?? null))
+              ledger.mismatch(
+                `${forkCopy} ${key}: read ${Option.getOrNull(read)}, the checkpoint held ${forkValues.get(key)}`,
+              );
+          }),
+        { concurrency: 8, discard: true },
+      );
+    const forkKeys = [...forkValues.keys()];
+    const forkWorkload = Effect.gen(function* () {
+      let round = 0;
+      while (yield* running) {
+        // The source moves on: every fork key overwritten, flushed, compacted in time.
+        yield* untilSuccess(
+          ledger,
+          "fork.source_write",
+          api.databases.write({
+            params: { databaseId: forkSource },
+            payload: {
+              operations: forkKeys
+                .slice((round * 20) % 200, ((round * 20) % 200) + 20)
+                .map((key) => ({
+                  _tag: "Put" as const,
+                  key: bytesOf(key),
+                  value: bytesOf(`after-${round}`),
+                  ttlMillis: Option.none(),
+                })),
+            },
+          }),
+        );
+        if (round % 3 === 0)
+          yield* untilSuccess(
+            ledger,
+            "fork.source_flush",
+            api.databases.flush({ params: { databaseId: forkSource } }),
+          );
+        if (forkReady && round % 30 === 0) {
+          yield* readFork(
+            forkKeys.filter((_, index) => index % 10 === round % 10),
+            "fork.get",
+          );
+          ledger.checked("fork.read");
+        }
+        round += 1;
+        yield* pause(10_000);
       }
     });
 
@@ -861,6 +1699,7 @@ export const soak = (options: SoakOptions) =>
             writer(model),
             reader(model),
             scanner(model),
+            pager(model),
             transactor(model),
             snapshotter(model),
           ]),
@@ -868,17 +1707,77 @@ export const soak = (options: SoakOptions) =>
           groupWriter,
           splitter,
           redeployer,
+          splitWriter,
+          mergeWriter,
+          burster,
+          idleReader,
+          forkWorkload,
         ],
         { concurrency: "unbounded", discard: true },
       ),
-      Effect.all([tracePuller, tailWatcher, every("60 seconds", saveReport)], {
-        concurrency: "unbounded",
-        discard: true,
-      }),
+      Effect.all(
+        [
+          tracePuller,
+          tailWatcher,
+          every("60 seconds", saveReport),
+          // The change-feed followers run for the whole workload and stop with it; each then
+          // reads to the end of its feed in the final checks (D106).
+          ...models.map((model, index) => {
+            const follower = followers[index];
+            return follower === undefined ? Effect.void : feedFollower(model, follower);
+          }),
+          splitFollower,
+        ],
+        { concurrency: "unbounded", discard: true },
+      ),
     );
 
     // Final checks: every key at Latest, then (after a flush) at Flushed; counters; the group.
+    /**
+     * Reads `databaseId`'s feed to its end (an empty page, within 200 pages), then checks that every
+     * acknowledged batch was delivered once and every delivered batch was sent (D106).
+     */
+    const finishFeed = (databaseId: DatabaseId, follower: FeedFollower, of: ChangeLedger) =>
+      Effect.gen(function* () {
+        let ended = false;
+        for (let page = 0; page < 200 && !ended; page++) {
+          const read = yield* followOnce(databaseId, follower);
+          if (Option.isNone(read)) break;
+          ended = read.value === 0;
+        }
+        if (!ended) ledger.mismatch(`${databaseId} feed: did not reach its end in 200 pages`);
+        checkFeed(databaseId, follower, of);
+        for (const problem of follower.unaccounted(of))
+          ledger.mismatch(`${databaseId} feed: ${problem}`);
+        ledger.checked("feed.final");
+      });
     const finalChecks = Effect.gen(function* () {
+      for (const [index, model] of models.entries()) {
+        const follower = followers[index];
+        if (follower !== undefined) yield* finishFeed(model.databaseId, follower, model.ledger);
+      }
+      if (!splitDone) {
+        ledger.checked("feedsplit.not_reached");
+        yield* finishFeed(splitSource.databaseId, splitFollowers.source, splitSource.ledger);
+      } else {
+        // The source to its end, then each successor from the source's last sequence number.
+        yield* finishFeed(splitSource.databaseId, splitFollowers.source, splitSource.ledger);
+        for (const [successor, follower] of [
+          [splitLeft, splitFollowers.left],
+          [splitRight, splitFollowers.right],
+        ] as const) {
+          yield* finishFeed(
+            successor.databaseId,
+            Option.getOrElse(follower, () => new FeedFollower(splitFromSeq)),
+            successor.ledger,
+          );
+        }
+        ledger.checked("feedsplit.final");
+      }
+      if (forkReady) {
+        yield* readFork(forkKeys, "final.fork");
+        ledger.checked("final.fork");
+      }
       for (const model of models) {
         for (const consistency of [{ _tag: "Latest" } as const, { _tag: "Flushed" } as const]) {
           if (consistency._tag === "Flushed") {
@@ -922,7 +1821,16 @@ export const soak = (options: SoakOptions) =>
               );
             }
           }
-          for (const key of seen.keys()) {
+          for (const [key, value] of seen) {
+            const aborted = model.maybe.get(key);
+            if (aborted !== undefined) {
+              ledger.checked("final.aborted_key");
+              if (value !== aborted)
+                ledger.mismatch(
+                  `${model.databaseId} ${key} aborted write read ${value.slice(0, 12)}`,
+                );
+              continue;
+            }
             if (key !== COUNTER && !model.keys.has(key))
               ledger.mismatch(`${model.databaseId} ${key} was never written`);
           }

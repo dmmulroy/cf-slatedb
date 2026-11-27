@@ -4107,6 +4107,62 @@ directory's `beginSplit` (audit-do) does not stamp it. The shard map is unchange
 - A further test shows today's code dropping an unknown field, which is why the format rule
   exists.
 
+## D106. The soak exercises the classes of defect the v1 audits found
+
+**Why.** A 132-minute soak, the 13 scenarios, and both gates passed on code that still held every
+defect from D76 to D103. The soak's workload never did what those defects needed: follow the change
+feed, write merge operands with TTLs, continue a scan page by page, flush in bursts, leave a
+database idle, fork from a checkpoint, recreate a removed id, or abort a request.
+
+**What it adds.** `docs/testing.md` ("The soak's workload") lists each workload, the defect class
+it exercises, and its `checks` keys. The models live in `tools/scenario-cli/src/soak-checks.ts`:
+
+- **`ChangeLedger` and `FeedFollower`.**
+  - The ledger records every batch the soak sent to a database: acknowledged by sequence number,
+    or uncertain (a failed attempt that may have committed once).
+  - Each feed page must hold sequence numbers above the cursor, in order, with `nextAfterSeq` at
+    its last row.
+  - Every acknowledged batch at or below the cursor must have arrived whole. A sequence number is
+    assigned inside its commit, so this holds whenever the check runs.
+  - Every batch that arrived must be acknowledged, or match one uncertain attempt. This is judged
+    at the end.
+- **`MergeKeyModel`.**
+  - Each part of a `Concat` value (the base and each operand) expires on its own, from its write
+    receipt's `createTs` plus its TTL.
+  - A read accepts the value either side of an expiry within `CLOCK_SKEW_MS` (5 s) of its
+    interval.
+  - A key whose merge outcome is unknown is not judged until its next base.
+- **`ScanTraversal`.** Across one traversal of pages, keys must strictly increase, and a key that
+  held a value throughout must be returned.
+- **Aborted writes** go to keys no other write touches, written once each. Such a key holds its
+  value or nothing.
+
+**Tolerances, and why each is sound.**
+
+- **Uncertain batches.** A batch the soak never learned the outcome of may appear once at an
+  unknown sequence number, and only as exactly its changes.
+- **Merge reads.** The 5 s window covers the skew between the laptop's clock and Cloudflare's,
+  which keep NTP time. Within it, either answer is correct under D83.
+- **Merge keys sent twice.** A key whose merge may have been applied twice is skipped until its
+  next base.
+- **Paged scans.** A key written, deleted, or in flight during the traversal is not required.
+
+**Checks that wait on unmerged fixes,** marked as such in their check names:
+
+- deleting a fork's hold is refused (audit-lifecycle's hold fix);
+- recreating a removed id is refused (D90).
+
+On a build without them, these checks fail. That is the point.
+
+**Reach.** D76 needs the compaction's replaced manifest collected (`gcMinAge`, one hour) while the
+writer stays up. The idle database's reads every 20 s keep its writer in memory, so a soak of more
+than about 65 minutes reaches it (`idle.transaction_after_gc_age`). A shorter run checks only that
+idle reads and transactions are exact.
+
+**The scenarios** (`repair`, `fork-split`, `changelog`, `remove`) were read against D80, D90, D95,
+and D99. None recreates an id, deletes a hold, reads a feed below a fork point, or reseals with
+other successors, so none changed.
+
 ## D107. An SST's metadata stays a small fraction of its data, whatever its key size
 
 **Found by the read audit.**

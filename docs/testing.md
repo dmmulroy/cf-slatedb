@@ -53,6 +53,29 @@ pull --stage <stage>` (or `tail --stage <stage>`) to bring them into the local t
 ([`operations.md`](operations.md), "Reading a stage's telemetry"). Live Workers export after the response (D5), so pull a few seconds
 after the requests a check asserts on.
 
+## The soak's workload
+
+`scenario-cli soak --stage <stage>` runs a mixed workload for its `--minutes` and checks it against
+a model of what was acknowledged. Besides writes, gets at three consistencies, scans, transactions,
+snapshots, removals, splits, and a redeploy, it runs one workload per class of defect found in the
+v1 audits (D106; the models are in `soak-checks.ts`, tested in `soak-checks.test.ts`):
+
+| Workload                                                                                              | Exercises                                                                        | `checks` keys                                                   |
+| ----------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| A change-feed follower per soak database, for the whole run, read to the end at the finish            | D80, D93b: every acknowledged batch once, in order; a 1,500-row batch every 60th | `feed.page`, `feed.delivered`, `feed.final`, `write.big_batch`  |
+| A database with a feed, split by the documented procedure partway (40% of the run, at least minute 2) | D80: the sealed source to its end, then each successor from its `lastSeq`        | `feedsplit.split`, `feedsplit.source_ended`, `feedsplit.final`  |
+| Three `Concat` keys built from a base and operands, half with 10 to 40 s TTLs, flushed every 15 s     | D81: each operand expires on its own, through compactions                        | `merge.get`, `merge.get_after_expiry`, `merge.not_judged`       |
+| Scans of 300 keys with `limit` 7, continued by `resumeFrom`, at `Latest`                              | D93: no key skipped or repeated across pages                                     | `scan.paged`, `scan.paged_early_end`                            |
+| Eight write-and-flush pairs back to back, every four minutes                                          | D78: the compactor is never fenced, and L0 drains                                | `burst.flushes`, `burst.compactor`                              |
+| A database written once, then read every 20 s, with a transaction every 3 minutes                     | D76, once the run passes about 65 minutes                                        | `idle.get`, `idle.transaction`, `idle.transaction_after_gc_age` |
+| A fork from a checkpoint at the start, read every 5 minutes and at the end                            | D77; a refused deletion of the fork's hold                                       | `fork.read`, `final.fork`, `fork.hold_delete_refused …`         |
+| Recreating each removed id at once                                                                    | D90: refused with `DatabaseRecentlyRemoved`                                      | `remove.recreate_refused …`                                     |
+| One write in 50 and one commit in 20 aborted by the client after 2 to 22 ms                           | D74b, D85: every later check holds                                               | `write.aborted`, `transaction.aborted`, `final.aborted_key`     |
+
+Every soak database keeps its changelog for the run's length plus an hour, so `Expired` is a
+failure. A merge read is judged within `CLOCK_SKEW_MS` (5 s) of each expiry: inside that window
+either answer passes.
+
 ## Faithful local substitutes
 
 - `objectStoreTestLayer` is an in-memory object store with real create-if-absent semantics
