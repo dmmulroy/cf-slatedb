@@ -11,6 +11,9 @@ import {
   ManifestId,
   markRemoved,
   manifestSstHandles,
+  MANIFEST_SIZE_BUDGET_BYTES,
+  MAX_CHECKPOINTS_PER_DATABASE,
+  GC_PINNED_MANIFEST_READ_BUDGET_BYTES,
   prepareGarbageCollection,
   sealManifest,
   SeqNum,
@@ -1779,9 +1782,8 @@ describe("DatabaseLifecycle: an old incarnation's compaction after the id is reu
   });
 });
 
-describe("DatabaseLifecycle: a thousand checkpoints and pinned snapshots (D99)", () => {
-  it("keep commits, cold reads, and a collection inside the manifest budget", async () => {
-    const MANIFEST_BUDGET_BYTES = 4 * 1024 * 1024;
+describe("DatabaseLifecycle: the most checkpoints and pinned snapshots a database may hold (D99, D129)", () => {
+  it("keep commits, cold reads, and a collection inside their budgets, and the collection deletes garbage", async () => {
     const outcome = await run(
       Effect.gen(function* () {
         const lifecycle = yield* DatabaseLifecycle;
@@ -1794,7 +1796,13 @@ describe("DatabaseLifecycle: a thousand checkpoints and pinned snapshots (D99)",
           databaseOptions: DEFAULT_DATABASE_OPTIONS,
         });
         yield* client.put(SOURCE, bytes("a"), bytes("A"));
-        for (let index = 0; index < 1_000; index++) {
+        // Garbage for the collection to delete: an L0 SST a compaction replaces.
+        for (let round = 0; round < 4; round++) {
+          yield* client.put(SOURCE, bytes(`g${round}`), bytes("G"));
+          yield* client.flush(SOURCE);
+        }
+        yield* compactUntilIdle(SOURCE);
+        for (let index = 0; index < MAX_CHECKPOINTS_PER_DATABASE; index++) {
           if (index % 2 === 0) {
             yield* lifecycle.createCheckpoint(SOURCE, {
               name: Option.some(`checkpoint-${index}`.padEnd(256, "x")),
@@ -1832,6 +1840,7 @@ describe("DatabaseLifecycle: a thousand checkpoints and pinned snapshots (D99)",
           pinnedManifests: pinned.size,
           pinnedBytes,
           collected: report.manifestId._tag,
+          deletedSsts: report.deletedSsts,
           read: Option.getOrNull(
             Option.map(
               yield* client.get(SOURCE, bytes("b"), {
@@ -1846,13 +1855,17 @@ describe("DatabaseLifecycle: a thousand checkpoints and pinned snapshots (D99)",
       }),
     );
     require("node:fs").writeFileSync(
-      "/tmp/shale-work/agents/mut-read/checkpoints-1000.json",
+      "/tmp/shale-work/agents/mut-read/checkpoints-max.json",
       JSON.stringify(outcome, null, 2),
     );
     expect(outcome.refused).toBe("CheckpointLimitError");
-    expect(outcome.checkpoints).toBe(1_000);
-    expect(outcome.newestBytes).toBeLessThan(MANIFEST_BUDGET_BYTES);
-    expect(outcome.pinnedManifests).toBeLessThanOrEqual(1_000);
+    expect(outcome.checkpoints).toBe(MAX_CHECKPOINTS_PER_DATABASE);
+    expect(outcome.newestBytes).toBeLessThan(MANIFEST_SIZE_BUDGET_BYTES);
+    expect(outcome.pinnedManifests).toBeLessThanOrEqual(MAX_CHECKPOINTS_PER_DATABASE);
+    // A collection reads every pinned manifest: within its budget, and it completes its SST
+    // deletion (the compaction's replaced L0 SSTs).
+    expect(outcome.pinnedBytes).toBeLessThanOrEqual(GC_PINNED_MANIFEST_READ_BUDGET_BYTES);
+    expect(outcome.deletedSsts).toBeGreaterThan(0);
     expect(outcome.collected).toBe("Some");
     expect(outcome.read).toBe("B");
   }, 300_000);

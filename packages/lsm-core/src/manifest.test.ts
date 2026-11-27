@@ -38,6 +38,8 @@ import {
   MANIFEST_FORMAT_VERSION,
   MAX_CHANGELOG_ENTRIES,
   MAX_CHECKPOINTS_PER_DATABASE,
+  MANIFEST_SIZE_BUDGET_BYTES,
+  GC_PINNED_MANIFEST_READ_BUDGET_BYTES,
   MAX_DROPPED_SST_HISTORY,
   ManifestJson,
   pruneChangelog,
@@ -785,7 +787,20 @@ describe("manifest edits at their edges (mutation sweep, D117)", () => {
 
   it("pins the manifest's documented bounds", () => {
     expect([MAX_DROPPED_SST_HISTORY, MAX_CHECKPOINTS_PER_DATABASE, MAX_CHANGELOG_ENTRIES]).toEqual([
-      32, 1_000, 2_048,
+      32, 128, 2_048,
     ]);
+  });
+
+  it("caps checkpoints so the manifests they pin fit one collection's read budget (D129)", () => {
+    // The most a collection reads of pinned manifests: every caller checkpoint pins its own
+    // manifest, and a manifest is kept within its size budget.
+    expect(MAX_CHECKPOINTS_PER_DATABASE * MANIFEST_SIZE_BUDGET_BYTES).toBeLessThanOrEqual(
+      GC_PINNED_MANIFEST_READ_BUDGET_BYTES,
+    );
+    // About 10 ms to decode each MiB (D99): the budget is at most a tenth of the compactor's
+    // 60 s CPU limit.
+    expect((GC_PINNED_MANIFEST_READ_BUDGET_BYTES / (1024 * 1024)) * 10).toBeLessThanOrEqual(
+      60_000 / 10,
+    );
   });
 });
