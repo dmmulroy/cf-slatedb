@@ -343,7 +343,15 @@ export const makeDbReader = Effect.gen(function* () {
       const loadNamed = (manifestId: ManifestId) =>
         reader.load(databaseId, manifestId).pipe(Effect.catchTags(manifestUnavailable(databaseId)));
       if (Option.isSome(named) && Option.isNone(view.maxLastL0Seq)) {
-        const snapshot = yield* loadNamed(named.value);
+        const loaded = yield* loadNamed(named.value);
+        // A snapshot's sequence number is its manifest's `lastL0Seq`. A manifest under that id that
+        // disagrees is another chain's: the id was reused after a removal (D119).
+        const snapshot = Option.filter(loaded, (manifest) =>
+          Option.match(view.snapshotSeq, {
+            onNone: () => true,
+            onSome: (seq) => manifest.lastL0Seq === seq,
+          }),
+        );
         if (Option.isNone(snapshot)) {
           return yield* new ReaderUnavailableError({
             databaseId,

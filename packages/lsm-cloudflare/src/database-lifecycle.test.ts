@@ -1493,7 +1493,7 @@ describe("DatabaseLifecycle: a manifest CAS in flight during removal", () => {
 });
 
 describe("DatabaseLifecycle: a removal that stopped after marking", () => {
-  it("leaves nothing of the old incarnation to a create gcMinAge later, and sequence numbers start again (D91)", async () => {
+  it("leaves nothing of the old incarnation to a create gcMinAge later, whose sequence numbers continue past the tombstone (D91, D119)", async () => {
     const outcome = await run(
       Effect.gen(function* () {
         const lifecycle = yield* DatabaseLifecycle;
@@ -1537,7 +1537,9 @@ describe("DatabaseLifecycle: a removal that stopped after marking", () => {
     );
     expect(outcome).toEqual({
       tooSoon: "DatabaseRecentlyRemovedError",
-      firstSeq: 1,
+      // The tombstone's lastL0Seq was 1 (the unflushed rows never reached a manifest): the new
+      // chain starts at 2, so its first write is 3.
+      firstSeq: 3,
       a: null,
       u1: null,
       b: "new",
@@ -1658,5 +1660,94 @@ describe("DatabaseLifecycle: a fork's hold", () => {
     );
     expect(outcome.fork).toBe("DatabaseAlreadyExistsError");
     expect(outcome.checkpoints).toHaveLength(1);
+  });
+});
+
+describe("DatabaseLifecycle: an old incarnation's snapshot after the id is reused", () => {
+  it("reads as expired, not as the new database (D119)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const client = yield* DbClient;
+        const options = { keyRange: Option.none(), databaseOptions: DEFAULT_DATABASE_OPTIONS };
+        yield* TestClock.adjust(HOUR);
+        yield* lifecycle.create(SOURCE, options);
+        yield* client.put(SOURCE, bytes("a"), bytes("old"));
+        yield* client.flush(SOURCE);
+        const snapshot = yield* client.snapshot(SOURCE);
+        yield* lifecycle.remove(SOURCE);
+        yield* TestClock.adjust(HOUR + 1);
+        yield* lifecycle.create(SOURCE, options);
+        // The new chain reaches the snapshot's manifest id with other data.
+        for (let round = 0; round < snapshot.manifestId + 2; round++) {
+          yield* client.put(SOURCE, bytes("a"), bytes(`new-${round}`));
+          yield* client.flush(SOURCE);
+        }
+        const read = yield* client
+          .get(SOURCE, bytes("a"), {
+            consistency: { _tag: "Flushed" },
+            snapshot: Option.some(snapshot),
+            refuseSealed: false,
+          })
+          .pipe(
+            Effect.map((value) => Option.getOrElse(Option.map(value, text), () => "none")),
+            Effect.catchTag("ReaderUnavailableError", (error) => Effect.succeed(error.reason)),
+          );
+        return { manifestId: snapshot.manifestId, read };
+      }),
+    );
+    expect(outcome.read).toBe("SnapshotExpired");
+  });
+});
+
+describe("DatabaseLifecycle: an old incarnation's compaction after the id is reused", () => {
+  it("is fenced, not committed into the new chain (D119)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        const lifecycle = yield* DatabaseLifecycle;
+        const client = yield* DbClient;
+        const store = yield* ManifestStore;
+        const reader = yield* ManifestReader;
+        const options = { keyRange: Option.none(), databaseOptions: DEFAULT_DATABASE_OPTIONS };
+        const withRun = Effect.gen(function* () {
+          for (let round = 0; round < 4; round++) {
+            yield* client.put(SOURCE, bytes(`k${round}`), bytes("v"));
+            yield* client.flush(SOURCE);
+          }
+          yield* compactUntilIdle(SOURCE);
+          return yield* reader.loadLatest(SOURCE);
+        });
+        yield* TestClock.adjust(HOUR);
+        yield* lifecycle.create(SOURCE, options);
+        const old = yield* withRun;
+        // A job of the old incarnation over its sorted run, still running when it is removed.
+        const oldRun = old.manifest.sortedRuns[0];
+        if (oldRun === undefined) return yield* Effect.die("the old chain has no sorted run");
+        const oldEpoch = old.manifest.compactorEpoch;
+        yield* lifecycle.remove(SOURCE);
+        yield* TestClock.adjust(HOUR + 1);
+        yield* lifecycle.create(SOURCE, options);
+        const fresh = yield* withRun;
+        const commit = yield* Effect.result(
+          store.update(SOURCE, (manifest) =>
+            commitCompaction(manifest, {
+              compactorEpoch: oldEpoch,
+              jobId: "old-incarnation-job",
+              job: {
+                sources: [{ _tag: "SortedRun", id: oldRun.id }],
+                destination: oldRun.id,
+                isBottom: true,
+              },
+              outputs: oldRun.ssts,
+            }),
+          ),
+        );
+        return {
+          sameRunId: fresh.manifest.sortedRuns.some((run) => run.id === oldRun.id),
+          commit: commit._tag === "Success" ? "committed" : commit.failure._tag,
+        };
+      }),
+    );
+    expect(outcome).toEqual({ sameRunId: true, commit: "CompactorFencedError" });
   });
 });
