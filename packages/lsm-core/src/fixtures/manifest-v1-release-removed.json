@@ -1,0 +1,111 @@
+{
+  "formatVersion": 1,
+  "databaseId": "orders-r",
+  "writerEpoch": 3,
+  "compactorEpoch": 2,
+  "lastL0Seq": 42,
+  "lastL0ClockTick": 1795000000000,
+  "l0": [
+    {
+      "id": "01JD0000000000000000000001",
+      "firstKey": "AQ==",
+      "lastKey": "yA==",
+      "sizeBytes": 4096,
+      "rowCount": 10,
+      "metaOffset": 3996,
+      "metaLength": 100,
+      "owner": null,
+      "view": null
+    }
+  ],
+  "sortedRuns": [
+    {
+      "id": 0,
+      "ssts": [
+        {
+          "id": "01JD0000000000000000000002",
+          "firstKey": "AQ==",
+          "lastKey": "yA==",
+          "sizeBytes": 4096,
+          "rowCount": 10,
+          "metaOffset": 3996,
+          "metaLength": 100,
+          "owner": "orders",
+          "view": {
+            "start": "AQ==",
+            "end": "ZA=="
+          }
+        }
+      ]
+    }
+  ],
+  "checkpoints": [
+    {
+      "id": "01JD0000000000000000000CP1",
+      "manifestId": 7,
+      "createdAt": 1795000000000,
+      "expireAt": 1795003600000,
+      "holder": "orders-b",
+      "name": "before-split"
+    }
+  ],
+  "keyRange": {
+    "start": "AQ==",
+    "end": "ZA=="
+  },
+  "state": {
+    "_tag": "Removed",
+    "removedAt": 1795000500000,
+    "cleared": true
+  },
+  "externalRefs": [
+    {
+      "owner": "orders",
+      "checkpointId": "01JD0000000000000000000CP2"
+    }
+  ],
+  "changelog": [
+    {
+      "sst": {
+        "id": "01JD0000000000000000000003",
+        "firstKey": "AQ==",
+        "lastKey": "yA==",
+        "sizeBytes": 4096,
+        "rowCount": 10,
+        "metaOffset": 3996,
+        "metaLength": 100,
+        "owner": null,
+        "view": null
+      },
+      "firstSeq": 30,
+      "lastSeq": 42,
+      "createdAt": 1795000000000
+    }
+  ],
+  "options": {
+    "mergeOperator": "U64Add",
+    "budgetGroup": "tenant-1",
+    "changelog": {
+      "retentionMs": 86400000
+    }
+  },
+  "gcSstBoundary": 1794990000000,
+  "droppedSsts": [
+    {
+      "sstId": "01JD0000000000000000000009",
+      "owner": null,
+      "from": {
+        "_tag": "L0",
+        "sstId": "01JD0000000000000000000009"
+      },
+      "firstKey": "BQ==",
+      "lastKey": "Bg==",
+      "view": null,
+      "rowCount": 3,
+      "reason": "Corrupted",
+      "droppedAt": 1795000000000
+    }
+  ],
+  "changelogAfterSeq": 29,
+  "recentCompactionJobIds": ["01M8D1PFJZDMYRF1SXCZWT2E2G"]
+}
