@@ -1,5 +1,14 @@
-import { DEFAULT_DATABASE_OPTIONS, MAX_TTL_MILLIS, WriteBatch } from "@shaledb/lsm-core";
-import { Effect, Exit, Option, Schema } from "effect";
+import {
+  DEFAULT_DATABASE_OPTIONS,
+  FULL_KEY_RANGE,
+  MAX_BATCH_BYTES,
+  MAX_BATCH_OPERATIONS,
+  MAX_KEY_BYTES,
+  MAX_TTL_MILLIS,
+  MAX_VALUE_BYTES,
+  WriteBatch,
+} from "@shaledb/lsm-core";
+import { Effect, Exit, Option, Schema, Stream } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 
 import { DatabaseLifecycle } from "./database-lifecycle.ts";
@@ -107,4 +116,55 @@ describe("checkpoint lifetimes at the limits (D88)", () => {
     );
     expect(Exit.isSuccess(checkpoint), String(checkpoint)).toBe(true);
   });
+});
+
+describe("key, value, and batch sizes at the limits (D88)", () => {
+  it("the largest key and value, and the largest batch, are written, flushed, read, and scanned", async () => {
+    const key = new Uint8Array(MAX_KEY_BYTES).fill(7);
+    const value = new Uint8Array(MAX_VALUE_BYTES).fill(9);
+    // The most operations whose keys and values fit the byte limit: 10,000 rows of ~800 bytes.
+    const rowBytes = Math.floor(MAX_BATCH_BYTES / MAX_BATCH_OPERATIONS) - 4;
+    const many = Array.from({ length: MAX_BATCH_OPERATIONS }, (_, index) => ({
+      _tag: "Put" as const,
+      key: Uint8Array.of(1, index >> 8, index & 0xff, 0),
+      value: new Uint8Array(rowBytes).fill(index & 0xff),
+      ttlMillis: Option.none(),
+    }));
+    const outcome = await Effect.gen(function* () {
+      const id = yield* createDatabase("sizes");
+      const writer = yield* WriterClient;
+      const client = yield* DbClient;
+      yield* writer.write(id, {
+        operations: [{ _tag: "Put", key, value, ttlMillis: Option.none() }],
+      });
+      yield* writer.write(id, { operations: many });
+      const tooMany = yield* Effect.exit(
+        writer.write(id, {
+          operations: [
+            ...many,
+            {
+              _tag: "Put",
+              key: Uint8Array.of(2),
+              value: Uint8Array.of(1),
+              ttlMillis: Option.none(),
+            },
+          ],
+        }),
+      );
+      yield* writer.flush(id);
+      const big = yield* client.get(id, key, read("Flushed"));
+      const rows = yield* Stream.runCollect(
+        client.scan(id, FULL_KEY_RANGE, { ...read("Latest"), limit: Option.none() }),
+      );
+      return { big, rows: rows.length, tooMany };
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(dbServicesTestLayer()),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.runPromise,
+    );
+    expect(Option.map(outcome.big, (bytes) => bytes.length)).toEqual(Option.some(MAX_VALUE_BYTES));
+    expect(outcome.rows).toBe(MAX_BATCH_OPERATIONS + 1);
+    expect(Exit.isFailure(outcome.tooMany)).toBe(true);
+  }, 60_000);
 });
