@@ -26,6 +26,11 @@ It never:
 - changes when a request is retryable;
 - weakens what a read sees at a given consistency.
 
+What a read sees at a snapshot, a pinned snapshot, or a transaction's `readSeq` is a set of
+writes. TTLs are judged at each read's own time, so a value at a fixed point may expire between
+two reads (`docs/invariants.md`). That is v1's contract, not a weakening a later release may
+make.
+
 Anything else is a new major version (`/v2`). During a published deprecation window, `/v1` and
 `/v2` are served side by side.
 

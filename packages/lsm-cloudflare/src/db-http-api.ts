@@ -244,7 +244,7 @@ export class DbHttpApiGroup extends HttpApiGroup.make("databases")
       OpenApi.annotations({
         summary: "Write a batch",
         description:
-          "Commits puts, deletes, and merges atomically with one sequence number. The write is durable when the response arrives. Pass the returned `seq` to an `AtLeast` read to read your own write. Each put and merge with `ttlMillis` expires on its own: a read treats an expired value as deleted and skips an expired merge operand, so operands that have not expired still apply (onto nothing, when the value under them has expired). Within one batch, a key's operations become one version: its merges must share one TTL, and the version expires at the earliest TTL among them.",
+          "Commits puts, deletes, and merges atomically with one sequence number. The write is durable when the response arrives. Pass the returned `seq` to an `AtLeast` read to read your own write. Each put and merge with `ttlMillis` expires on its own: a read treats an expired value as deleted and skips an expired merge operand, so operands that have not expired still apply (onto nothing, when the value under them has expired). Within one batch, a key's operations become one version: its merges must share one TTL, and the version expires at the earliest TTL among them. A TTL is judged by each read's clock when it runs, also at a snapshot or in a transaction: a value may expire between two reads of the same snapshot.",
       }),
     ),
   )
@@ -404,7 +404,7 @@ export class DbHttpApiGroup extends HttpApiGroup.make("databases")
       OpenApi.annotations({
         summary: "Read a key in a transaction",
         description:
-          "Reads a key as of the transaction's `readSeq` and `manifestId` (both from `transactions/begin`). Send the keys read to `transactions/commit` as `readKeys`.",
+          "Reads a key as of the transaction's `readSeq` and `manifestId` (both from `transactions/begin`). Send the keys read to `transactions/commit` as `readKeys`. A TTL is judged at each read's time, so a value may expire between two reads at one `readSeq`; an expiry is not a write, and the commit's conflict check does not see it.",
       }),
     ),
   )
@@ -446,7 +446,7 @@ export class DbHttpApiGroup extends HttpApiGroup.make("databases")
       OpenApi.annotations({
         summary: "Read a key",
         description:
-          "Returns the key's visible row: `Latest` sees every acknowledged write, `AtLeast` sees at least the write with that `seq` (from a write receipt), `Flushed` sees flushed data without calling the writer. A `snapshot` from the snapshot operation reads a fixed manifest.",
+          "Returns the key's visible row: `Latest` sees every acknowledged write, `AtLeast` sees at least the write with that `seq` (from a write receipt), `Flushed` sees flushed data without calling the writer. A `snapshot` from the snapshot operation reads a fixed manifest: it fixes which writes are visible, not the time TTLs are judged at, so a value read at a snapshot still expires at its `expireTs`.",
       }),
     ),
   )
@@ -474,7 +474,7 @@ export class DbHttpApiGroup extends HttpApiGroup.make("databases")
       OpenApi.annotations({
         summary: "Take a pinned snapshot",
         description:
-          "Flushes every acknowledged write, then pins the resulting manifest with a checkpoint for lifetimeMs: pass `snapshot` to reads to see exactly that data until `expireAt`. Delete the checkpoint (`checkpointId`) to release it early. Each pinned snapshot is a manifest write; an unpinned snapshot (POST …/snapshots) costs none but is kept only about an hour.",
+          "Flushes every acknowledged write, then pins the resulting manifest with a checkpoint for lifetimeMs: pass `snapshot` to reads to see exactly those writes until `expireAt`. TTLs are still judged at each read's time, so a value in the snapshot may expire between reads. Delete the checkpoint (`checkpointId`) to release it early. Each pinned snapshot is a manifest write; an unpinned snapshot (POST …/snapshots) costs none but is kept only about an hour.",
       }),
     ),
   )
@@ -487,7 +487,7 @@ export class DbHttpApiGroup extends HttpApiGroup.make("databases")
       OpenApi.annotations({
         summary: "Take a snapshot",
         description:
-          "Pins the current flushed manifest without writing anything; pass the snapshot to reads to see exactly that data. It stays readable for GC's minimum age (an hour by default); reads after that may fail with SnapshotExpired. Take a pinned snapshot (POST …/snapshots/pinned) to read for longer.",
+          "Pins the current flushed manifest without writing anything; pass the snapshot to reads to see exactly those writes. TTLs are still judged at each read's time, so a value in the snapshot may expire between reads. It stays readable for GC's minimum age (an hour by default); reads after that may fail with SnapshotExpired. Take a pinned snapshot (POST …/snapshots/pinned) to read for longer.",
       }),
     ),
   )
