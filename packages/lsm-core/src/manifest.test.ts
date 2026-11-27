@@ -30,16 +30,23 @@ import {
   fenceWriter,
   forkManifest,
   holdForSuccessors,
+  markRemovalCleared,
   markRemoved,
   releasableExternalRefs,
   initialManifest,
   Manifest,
   MANIFEST_FORMAT_VERSION,
+  MAX_CHANGELOG_ENTRIES,
+  MAX_CHECKPOINTS_PER_DATABASE,
   MAX_DROPPED_SST_HISTORY,
   ManifestJson,
   pruneChangelog,
+  removalExpiresAt,
   removeCheckpoint,
+  removeExpiredCheckpoints,
+  removeExternalRef,
   replaceManifestFields,
+  sealedSuccessors,
   sealManifest,
   type SstHandle,
   successorHoldsOf,
@@ -641,5 +648,144 @@ describe("changelog coverage (D80)", () => {
         return true;
       },
     );
+  });
+});
+
+describe("manifest edits at their edges (mutation sweep, D117)", () => {
+  const checkpoint = (id: string, expireAt: Option.Option<number>) => ({
+    id: CheckpointId.make(id.padEnd(26, "0")),
+    manifestId: ManifestId.make(1),
+    createdAt: Timestamp.make(0),
+    expireAt: Option.map(expireAt, (ms) => Timestamp.make(ms)),
+    holder: Option.none<DatabaseId>(),
+    name: Option.none<string>(),
+  });
+  const entry = (n: number, firstSeq: number, lastSeq: number) => ({
+    sst: handle(n, 0, 1),
+    firstSeq: SeqNum.make(firstSeq),
+    lastSeq: SeqNum.make(lastSeq),
+    createdAt: Timestamp.make(n),
+  });
+
+  it("derives a pre-D80 manifest's changelogAfterSeq from its oldest kept entry, or lastL0Seq", () => {
+    const legacy = (changelog: ReturnType<typeof entry>[]) =>
+      changelogAfterSeqOf(
+        manifestWith(empty, {
+          changelog,
+          changelogAfterSeq: Option.none(),
+          lastL0Seq: SeqNum.make(40),
+        }),
+      );
+    expect(legacy([])).toBe(40);
+    expect(legacy([entry(1, 12, 20), entry(2, 5, 11), entry(3, 21, 40)])).toBe(4);
+    expect(legacy([entry(1, 0, 3)])).toBe(0);
+    // A new database records it: no change was ever missed.
+    expect(empty.changelogAfterSeq).toEqual(Option.some(0));
+  });
+
+  it("fences the writer by raising its epoch by one, and names a sealed database's successors", () => {
+    expect(Result.getOrThrow(fenceWriter(empty)).writerEpoch).toBe(empty.writerEpoch + 1);
+    const successors = [DatabaseId.make("left"), DatabaseId.make("right")];
+    expect(sealedSuccessors(sealManifest(empty, successors))).toEqual(Option.some(successors));
+    expect(sealedSuccessors(empty)).toEqual(Option.none());
+  });
+
+  it("removes a database once: removal time kept, cleared only after removal, expiry gcMinAge after it", () => {
+    const removed = Result.getOrThrow(markRemoved(empty, Timestamp.make(100)));
+    expect(removed.state).toEqual({ _tag: "Removed", removedAt: Option.some(100), cleared: false });
+    // A second removal keeps the first time; one removed before D91 gets one.
+    expect(Result.getOrThrow(markRemoved(removed, Timestamp.make(500)))).toBe(removed);
+    const legacy = manifestWith(empty, {
+      state: { _tag: "Removed", removedAt: Option.none(), cleared: false },
+    });
+    expect(Result.getOrThrow(markRemoved(legacy, Timestamp.make(500))).state).toEqual({
+      _tag: "Removed",
+      removedAt: Option.some(500),
+      cleared: false,
+    });
+    const cleared = markRemovalCleared(removed);
+    expect(cleared.state).toEqual({ _tag: "Removed", removedAt: Option.some(100), cleared: true });
+    expect(markRemovalCleared(cleared)).toBe(cleared);
+    expect(markRemovalCleared(empty)).toBe(empty);
+    expect(removalExpiresAt(removed, Timestamp.make(900), 1_000)).toEqual(Option.some(1_100));
+    expect(removalExpiresAt(legacy, Timestamp.make(900), 1_000)).toEqual(Option.some(1_900));
+    expect(removalExpiresAt(empty, Timestamp.make(900), 1_000)).toEqual(Option.none());
+  });
+
+  it("expires a checkpoint at its expiry time, never one without an expiry", () => {
+    const withCheckpoints = manifestWith(empty, {
+      checkpoints: [checkpoint("01JDA", Option.some(100)), checkpoint("01JDB", Option.none())],
+    });
+    expect(removeExpiredCheckpoints(withCheckpoints, Timestamp.make(99))).toBe(withCheckpoints);
+    expect(
+      removeExpiredCheckpoints(withCheckpoints, Timestamp.make(100)).checkpoints.map((c) => c.id),
+    ).toEqual([checkpoint("01JDB", Option.none()).id]);
+  });
+
+  it("removes only the external reference that matches both owner and checkpoint", () => {
+    const ref = (owner: string, id: string) => ({
+      owner: DatabaseId.make(owner),
+      checkpointId: CheckpointId.make(id.padEnd(26, "0")),
+    });
+    const refs = [ref("a", "01JDA"), ref("a", "01JDB"), ref("b", "01JDA")];
+    const fork = manifestWith(empty, { externalRefs: refs });
+    expect(removeExternalRef(fork, ref("a", "01JDA")).externalRefs).toEqual(refs.slice(1));
+    expect(removeExternalRef(fork, ref("b", "01JDB"))).toBe(fork);
+  });
+
+  it("leaves out of a fork every sorted run its range keeps nothing of", () => {
+    const source = manifestWith(empty, {
+      sortedRuns: [
+        { id: SortedRunId.make(1), ssts: [handle(1, 1, 2)] },
+        { id: SortedRunId.make(0), ssts: [handle(2, 10, 20)] },
+      ],
+    });
+    const fork = forkManifest(source, {
+      databaseId: DatabaseId.make("fork"),
+      checkpointId: CheckpointId.make("01JDCP".padEnd(26, "0")),
+      range: { start: Uint8Array.of(10), end: Option.none() },
+    });
+    expect(fork.sortedRuns.map((run) => run.id)).toEqual([0]);
+  });
+
+  it("recognizes a retried commit written before D103 by its outputs, and drops an SST once", () => {
+    let manifest = empty;
+    for (const n of [1, 2, 3]) manifest = Result.getOrThrow(flush(manifest, n));
+    const commit = {
+      compactorEpoch: manifest.compactorEpoch,
+      jobId: "legacy",
+      job: {
+        sources: [ulid(1), ulid(2)].map((sstId) => ({ _tag: "L0" as const, sstId })),
+        destination: SortedRunId.make(0),
+        isBottom: true,
+      },
+      outputs: [handle(11, 1, 3)],
+    };
+    // No job ids recorded, as before D103: the outputs in place and the inputs gone say it applied.
+    const compacted = manifestWith(Result.getOrThrow(commitCompaction(manifest, commit)), {
+      recentCompactionJobIds: [],
+    });
+    expect(Result.getOrThrow(commitCompaction(compacted, commit))).toBe(compacted);
+    const at = Timestamp.make(5);
+    const dropped = Result.getOrThrow(
+      dropSstFromManifest(compacted, { sstId: ulid(3), reason: "Forced", droppedAt: at }),
+    );
+    expect(
+      Result.getOrThrow(
+        dropSstFromManifest(dropped, { sstId: ulid(3), reason: "Forced", droppedAt: at }),
+      ),
+    ).toBe(dropped);
+    const unknown = dropSstFromManifest(dropped, {
+      sstId: ulid(99),
+      reason: "Forced",
+      droppedAt: at,
+    });
+    expect(Result.isFailure(unknown) && unknown.failure._tag).toBe("SstNotInManifestError");
+  });
+
+  it("pins the manifest's documented bounds", () => {
+    expect([MAX_DROPPED_SST_HISTORY, MAX_CHECKPOINTS_PER_DATABASE, MAX_CHANGELOG_ENTRIES]).toEqual([
+      32, 1_000, 2_048,
+    ]);
   });
 });

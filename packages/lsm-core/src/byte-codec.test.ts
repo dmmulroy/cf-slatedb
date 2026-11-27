@@ -94,3 +94,26 @@ describe("fixed-width integers", () => {
     );
   });
 });
+
+describe("ByteReader at the end of its bytes (mutation sweep, D117)", () => {
+  it("reads each fixed-width integer that ends exactly at the end, and refuses one byte short", () => {
+    const bytes = new ByteWriter().u8(1).u16(2).u32(3).u64(4).toBytes();
+    const reader = new ByteReader(bytes);
+    expect([reader.u8(), reader.u16(), reader.u32(), reader.u64()]).toEqual([1, 2, 3, 4]);
+    for (const [width, read] of [
+      [2, (r: ByteReader) => r.u16()],
+      [4, (r: ByteReader) => r.u32()],
+      [8, (r: ByteReader) => r.u64()],
+    ] as const) {
+      expect(read(new ByteReader(new Uint8Array(width)))).toBe(0);
+      expect(() => read(new ByteReader(new Uint8Array(width - 1)))).toThrow(ByteReadOutOfBounds);
+    }
+  });
+
+  it("refuses a varint longer than 8 bytes, which no safe integer needs", () => {
+    const eight = Uint8Array.of(0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01);
+    expect(new ByteReader(eight).varint()).toBe(2 ** 49);
+    const nine = Uint8Array.of(0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01);
+    expect(() => new ByteReader(nine).varint()).toThrow(ByteReadOutOfBounds);
+  });
+});
