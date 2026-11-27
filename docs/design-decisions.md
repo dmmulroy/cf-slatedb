@@ -3861,6 +3861,17 @@ size.
   - `block-source.test.ts`: the hedged source's `uncached` reads the bucket at once.
   - Two mutations caught.
 
+**Also: a read fetches at most eight SSTs' metadata at once.**
+
+- **Before.** D67 fetched every candidate SST's metadata at once: a get reads one SST per level (up
+  to 16 L0 SSTs and as many runs), and a scan reads every overlapping SST. Metadata is up to 1/32
+  of an SST (D107), 2 MiB for a 64 MiB SST, so a cold read could hold 64 MiB of bodies and their
+  decoded form at once.
+- **Now.** `METADATA_READS_AT_ONCE` (8). An invocation has only six connections waiting for headers
+  at a time, so this costs no latency.
+- **Test** (`db-reader-limits.test.ts`): over 20 L0 SSTs holding one key, a get and a scan keep at
+  most 8 metadata reads in flight; with the fetches unbounded, the get keeps 20.
+
 **Not covered.** The transaction scan (`DbClient.scanAt`, `transactions/scan`) passes no budget.
 Its pages are bounded by `limit` rows, not by what they examine, and its `resumeFrom`-less contract
 needs a decision of its own (`CROSS:` to the API owner).

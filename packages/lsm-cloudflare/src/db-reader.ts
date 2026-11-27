@@ -247,6 +247,15 @@ export interface IDbReader {
 /** The contextual database reader. */
 export class DbReader extends Context.Service<DbReader, IDbReader>()("@shaledb/DbReader") {}
 
+/**
+ * How many SSTs' metadata one read fetches at once (read audit). A get may read up to one SST per
+ * level, 16 L0 SSTs and as many runs, and a scan every overlapping SST. Metadata is up to 1/32 of
+ * an SST (D107), 2 MiB for 64 MiB, so unbounded fetches held up to 64 MiB of bodies plus their
+ * decoded form at once in a 128 MB isolate. An invocation has six connections waiting for headers
+ * at a time anyway, so eight costs no latency.
+ */
+export const METADATA_READS_AT_ONCE = 8;
+
 /** Every SST a manifest references, grouped by level, newest level first: each L0 SST, then each run. */
 const levels = (manifest: Manifest): ReadonlyArray<ReadonlyArray<SstHandle>> => [
   ...manifest.l0.map((handle) => [handle]),
@@ -499,7 +508,7 @@ export const makeDbReader = Effect.gen(function* () {
         yield* Effect.forEach(
           candidates,
           (handle) => blocks.meta(sstHandleOwner(handle, databaseId), handle, budgetGroup),
-          { concurrency: "unbounded", discard: true },
+          { concurrency: METADATA_READS_AT_ONCE, discard: true },
         ).pipe(Effect.catchTags(blockFailures(databaseId, pointRead)));
       }
       for (const handle of candidates) {
@@ -610,7 +619,7 @@ export const makeDbReader = Effect.gen(function* () {
           yield* Effect.forEach(
             overlapping,
             (handle) => blocks.meta(sstHandleOwner(handle, databaseId), handle, budgetGroup),
-            { concurrency: "unbounded", discard: true },
+            { concurrency: METADATA_READS_AT_ONCE, discard: true },
           ).pipe(Effect.catchTags(blockFailures(databaseId, scanRead)));
         }
         const ssts = overlapping.map((handle) =>
