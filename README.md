@@ -83,17 +83,17 @@ It is not a fit for:
 
 <!-- STEP4 readme-baseline: begin -->
 
-The same workload against shaledb and against one table in a plain Durable Object, on `preview-3` (production settings, 100% trace sampling), from the same client, one target after the other, each on a new database or object. Median of 0 of 3 runs, commit `d89beba` (provisional: not the release commit); not available: `p3-baseline-1` (still running), `p3-baseline-2` (no output), `p3-baseline-3` (no output).
+The same workload against shaledb and against one table in a plain Durable Object, on `preview-3` (production settings, 100% trace sampling), from the same client, one target after the other, each on a new database or object. Median of 1 of 3 runs, commit `d89beba` (provisional: not the release commit); not available: `p3-baseline-2` (still running), `p3-baseline-3` (no output).
 
 | Target                      | Rows/s acknowledged | Write p50 / p99 (ms) | Reads/s | Read p50 / p99 (ms) | Cost per million rows written |
 | --------------------------- | ------------------- | -------------------- | ------- | ------------------- | ----------------------------- |
-| shaledb, reads at `Latest`  | —                   | — / —                | —       | — / —               | —                             |
-| shaledb, reads at `Flushed` | —                   | — / —                | —       | — / —               | —                             |
-| plain Durable Object SQLite | —                   | — / —                | —       | — / —               | —                             |
+| shaledb, reads at `Latest`  | 6,064               | 110 / 538            | 62.6    | 104 / 712           | $3.02                         |
+| shaledb, reads at `Flushed` | 6,000               | 120 / 345            | 133.1   | 37 / 212            | $3.03                         |
+| plain Durable Object SQLite | 8,236               | 83 / 351             | 93.2    | 79 / 322            | $1.01                         |
 
-- **Write p50:** — ms (`Latest` run), — ms (`Flushed` run), — ms (plain table).
-- **Read p50:** — ms at `Latest`, — ms at `Flushed`, — ms from the plain table.
-- **Durable Object invocations at `Flushed`:** —, against — write batches: reads at `Flushed` reach no Durable Object when the two are equal.
+- **Write p50:** 110 ms (`Latest` run), 120 ms (`Flushed` run), 83 ms (plain table).
+- **Read p50:** 104 ms at `Latest`, 37 ms at `Flushed`, 79 ms from the plain table.
+- **Durable Object invocations at `Flushed`:** 1,826 in the tail records, against 1,842 write batches: no more than the writes, so no read reached a Durable Object. Tail records may be dropped, so the count is a lower bound.
 - **SQLite rows written per row:** 3 for shaledb's memtable, 1 for the plain table.
 
 Each target's runs, the stage-side counts, and the price arithmetic are in [`docs/measurements.md`](docs/measurements.md), "Step 4".
