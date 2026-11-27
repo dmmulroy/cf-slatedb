@@ -157,6 +157,20 @@ a flush commits from its own view with one create and no `ManifestReader.loadLat
 
 ## Maintenance notes
 
+- D110–D114 drift check (formal2), against the integration head. Each step still maps to one
+  awaited effect:
+  - **D90.** `create` of a removed id clears the old chain's objects, GC's manifest boundary, and
+    the `LATEST` hint, then writes manifest 1, so the boundary moves back across incarnations. The
+    model has one incarnation. A committer from the old chain that lands later cannot commit,
+    because recreation waits `gcMinAge` and the old writer and compactor state is destroyed:
+    - a compaction's update reloads the new chain, and its inputs are not there
+      (`CompactionInputsChangedError`);
+    - no writer of the old incarnation remains.
+
+    `Lifecycle.tla` checks that a recreated database serves nothing of the old incarnation.
+  - **D110.** `CompactorObject.tla` models the compactor's own Durable Object state, which this
+    model abstracts as one fence-in per compactor.
+
 - D103: `commitCompaction` records the job's id (`recentCompactionJobIds`, the last 16) and
   treats a commit of a recorded id as already applied, returning the manifest unchanged, whatever
   the job's outputs. Before, only a job with outputs could be recognized. The model has no retried
@@ -224,7 +238,7 @@ a flush commits from its own view with one create and no `ManifestReader.loadLat
 
 ## Keeping it in step with the code
 
-Sync commit: the D91 commit (`fix(lifecycle)`: the Removed manifest stays as the chain's tombstone); before it the D78 commit (the model was last
+Sync commit: the D110–D114 drift check (formal2); before it, the D91 commit (`fix(lifecycle)`: the Removed manifest stays as the chain's tombstone); before it the D78 commit (the model was last
 confirmed to describe the code at this commit). When a covered file changed after it, diff it, update the model so each step still maps
 to one awaited effect in the code, rerun, and show the affected invariant still fails on a broken
 variant. Move the sync commit forward only after confirming the model describes the code at the
