@@ -2770,3 +2770,92 @@ snapshot scan, and a transaction read. Three mutations fail it.
 
 These hold by reading the code (`resolveVisibleRow`, `retainKeyVersions`, `DbWriter.commitBatch`,
 the executor's `prepare`). No code changed for them.
+
+## D88. The public surface under hostile and careless callers: TTL bound, truthful answers to retries
+
+An audit of every request field's largest accepted value and of every retried call (audit round 2).
+
+**A TTL could make a database permanently unflushable.** `WriteOperation.ttlMillis` accepted any
+positive integer. The writer stores expiry as `createTs + ttl` in the memtable's SQLite row.
+
+- For a TTL near 2^53 the sum is past 2^53 - 1. SQLite cannot return it as a JavaScript number
+  ("Value is too large to be represented as a JavaScript number").
+- The write was acknowledged. From then on every flush of the database failed, and so did a
+  `Latest` read of the key, each with the retryable `StorageUnavailable`.
+- Retrying never helps, so unflushed bytes grow until `WriteStalled`.
+
+`createCheckpoint` with a `lifetimeMs` near 2^53 died the same way (`expireAt` fails the `Timestamp`
+schema): `InternalFailure` (500) on a path any caller can take.
+
+- **Rule.** A TTL and a checkpoint lifetime are at most `MAX_TTL_MILLIS` = 100 years
+  (3,153,600,000,000 ms), from 1 (`TtlMillisSchema`, lsm-core). A larger value is `InvalidRequest`
+  (400) at the schema, before anything is stored.
+- **Why it is allowed.** This tightens a limit within `/v1`, which `api-compatibility.md`
+  otherwise forbids. Every value it now refuses was already broken: the TTL ones made the database
+  unusable and the lifetime ones failed with 500. The OpenAPI document states the maximum.
+- **Changelog retention** at 2^53 - 1 was checked and works (no sum is stored).
+- **Test:** `db-http-limits.test.ts`. The largest accepted TTL is written, read at `Latest`, and
+  flushed, and the database stays writable. Values past the bound are refused. The largest
+  checkpoint lifetime makes a checkpoint. Mutations caught: the bound removed, the bound at 2^53
+  (the defect itself), and the lifetime unbounded.
+
+**Answers to retries.** What each call returns when it is retried after its first attempt got no
+answer (`db-http-retries.test.ts`):
+
+| Call                          | Second attempt                                                  | Change                                                                        |
+| ----------------------------- | --------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| write (puts, deletes)         | a second write, new `seq`; same final value                     | none                                                                          |
+| write (merges)                | applied twice                                                   | the unreachable-writer message now says so                                    |
+| flush, seal (same successors) | succeed again (idempotent)                                      | none                                                                          |
+| fork                          | idempotent retry (`database-lifecycle.test.ts`, not rerun here) | none                                                                          |
+| create                        | `DatabaseAlreadyExists` (409)                                   | message: a completed first attempt answers this way, the database is ready    |
+| commit                        | `TransactionConflict` (`WriteConflict`, 409)                    | message: the first attempt may have committed, read its keys before rerunning |
+| remove                        | `DatabaseNotFound` (404) "Create it first"                      | message: never created or already removed, nothing to remove                  |
+| drop SST                      | not checked in this audit                                       | none                                                                          |
+
+A `StorageUnavailable` answer for a write or commit whose writer could not be reached
+(`WriterUnreachable`) said "Retry the same request". The write may have committed, so the
+message now says that retrying is safe for puts and deletes, and that a batch with merges may
+apply twice. Codes, statuses, and `retryable` are unchanged. Three mutations, one per message,
+are each caught.
+
+**Sizes checked and cleared** (`db-http-limits.test.ts`):
+
+- a 16 KiB key with a 1 MiB value;
+- a batch of 10,000 operations totalling 8 MiB, and 10,001 operations refused;
+- an empty key;
+- a reversed range, and an empty range.
+
+**Not fixed here (reported to their owners):**
+
+- **Seal with other successors.** Sealing an already-sealed database with different successors
+  succeeds and keeps the first ones.
+- **`Concat` merges.** Their results are unbounded: 1 MiB per operand, any number of operands,
+  resolved in the API isolate.
+- **Request bodies.** No limit applies below Cloudflare's own (100 MB on Free and Pro), and the
+  API isolate decodes a body whole.
+
+## D89. A shard router refreshes a map older than a second before a read that never asks the writer
+
+A router learns that its cached map is stale only from a routing error: a sealed, out-of-range,
+or removed database. `Latest` reads set `refuseSealed`, and the writer's answer reports the seal
+(D57). `Flushed` and `AtLeast` reads read a manifest and never ask the writer, so a sealed shard
+does not fail them.
+
+A router whose map predated a split therefore served the sealed shard's data at `Flushed`
+indefinitely, `get` and `scan` both, after the successor had newer flushed data. It stayed stale
+for as long as its isolate cached the map: unbounded, against a lag of about a second for
+`Flushed`. The sharded HTTP API reads `Latest` only, so the defect was reached through the
+`ShardRouter` API.
+
+- **Rule.** Before a `Flushed` or `AtLeast` read without a snapshot, the router refreshes a map
+  older than `SHARD_MAP_MAX_AGE_FOR_UNPROBED_READS_MS` (1 s). The cost is one directory read per
+  group per second per isolate, only while such reads run. Reads at a snapshot read a fixed
+  database and are not rerouted.
+- **Test:** `shard-router-staleness.test.ts`. Two routers cache the one-shard map; the shard is
+  split, and key 1 is overwritten in its successor and flushed. After the age bound, a `Flushed`
+  get and a `Flushed` scan through the stale routers return the new value. Mutations caught: no
+  refresh, a scan without the refresh, and an age bound never reached.
+- **Not changed.** `DbClient` could refuse a sealed database at `Flushed` from the manifest's
+  sealed state, which would make the router exact rather than bounded. That is
+  `db-client.ts`'s owner's call.

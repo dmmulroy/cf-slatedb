@@ -168,3 +168,37 @@ describe("key, value, and batch sizes at the limits (D88)", () => {
     expect(Exit.isFailure(outcome.tooMany)).toBe(true);
   }, 60_000);
 });
+
+describe("empty keys and reversed ranges (D88)", () => {
+  it("an empty key is written and read; a reversed or empty range scans nothing", async () => {
+    const outcome = await Effect.gen(function* () {
+      const id = yield* createDatabase("edges");
+      const writer = yield* WriterClient;
+      const client = yield* DbClient;
+      yield* writer.write(id, {
+        operations: [
+          { _tag: "Put", key: new Uint8Array(0), value: bytes(1), ttlMillis: Option.none() },
+          { _tag: "Put", key: bytes(5), value: bytes(2), ttlMillis: Option.none() },
+        ],
+      });
+      const empty = yield* client.get(id, new Uint8Array(0), read("Latest"));
+      const scanOf = (start: number, end: number) =>
+        Stream.runCollect(
+          client.scan(
+            id,
+            { start: bytes(start), end: Option.some(bytes(end)) },
+            { ...read("Latest"), limit: Option.none() },
+          ),
+        ).pipe(Effect.map((rows) => rows.length));
+      return { empty, reversed: yield* scanOf(9, 1), same: yield* scanOf(5, 5) };
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(dbServicesTestLayer()),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.runPromise,
+    );
+    expect(outcome.empty).toEqual(Option.some(bytes(1)));
+    expect(outcome.reversed).toBe(0);
+    expect(outcome.same).toBe(0);
+  });
+});

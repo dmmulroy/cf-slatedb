@@ -46,6 +46,12 @@ and are not part of it:
   defects (D79). Its declared errors (`DatabaseNotFoundError`, `GarbageCollectorUnavailableError`)
   are `{ _tag, databaseId, message }`, with messages of its own and never storage detail.
 
+## Limits tightened to stop a defect
+
+- `ttlMillis` and a checkpoint's `lifetimeMs` are at most 100 years (D88). A larger value had been
+  accepted, but a larger TTL then made every flush of the database fail, and a larger lifetime
+  failed with `InternalFailure`. No working request is refused.
+
 ## Examples from v1's history
 
 These shipped inside `/v1` because they are additive:
