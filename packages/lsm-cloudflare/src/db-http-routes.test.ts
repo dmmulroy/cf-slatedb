@@ -577,27 +577,29 @@ describe("the public database API's routes (D130)", () => {
       Effect.gen(function* () {
         const databaseId = DatabaseId.make("compacted");
         yield* created(client, databaseId);
-        for (const key of ["a", "b"]) {
+        for (const key of ["a", "b", "c"]) {
           yield* put(client, databaseId, key, key);
           yield* client.databases.flush({ params: { databaseId } });
         }
-        // A compaction behind the writer's back: both L0 SSTs become one sorted run (oldest key
-        // first), then one of them is dropped. The writer still holds its own manifest.
+        // A compaction behind the writer's back: the two older L0 SSTs become one sorted run (oldest
+        // key first), and the newest is dropped. The writer still holds its own manifest.
         const store = yield* ManifestStore;
         const before = yield* (yield* ManifestReader).loadLatest(databaseId);
-        const [newer, older] = before.manifest.l0;
-        if (newer === undefined || older === undefined) return yield* Effect.die("two L0 SSTs");
+        const [newest, middle, oldest] = before.manifest.l0;
+        if (newest === undefined || middle === undefined || oldest === undefined) {
+          return yield* Effect.die("three L0 SSTs");
+        }
         yield* store.update(databaseId, (manifest) =>
           Result.succeed(
             replaceManifestFields(manifest, {
-              l0: [],
-              sortedRuns: [{ id: SortedRunId.make(0), ssts: [older, newer] }],
+              l0: [newest],
+              sortedRuns: [{ id: SortedRunId.make(0), ssts: [oldest, middle] }],
             }),
           ),
         );
         yield* store.update(databaseId, (manifest) =>
           dropSstFromManifest(manifest, {
-            sstId: older.id,
+            sstId: newest.id,
             reason: "Forced",
             droppedAt: Timestamp.make(0),
           }),
@@ -611,16 +613,15 @@ describe("the public database API's routes (D130)", () => {
             sortedRun.ssts,
             sortedRun.sizeBytes,
           ]),
-          remaining: newer.sizeBytes,
+          runBytes: oldest.sizeBytes + middle.sizeBytes,
           dropped: compaction.droppedSsts.map((dropped) => dropped.sstId),
-          older: older.id,
+          newest: newest.id,
         };
       }),
     );
     expect([observed.l0Count, observed.l0Ssts]).toEqual([0, 0]);
-    expect(observed.sortedRuns).toEqual([[1, observed.remaining]]);
-    expect(observed.remaining).toBeGreaterThan(0);
-    expect(observed.dropped).toEqual([observed.older]);
+    expect(observed.sortedRuns).toEqual([[2, observed.runBytes]]);
+    expect(observed.dropped).toEqual([observed.newest]);
   });
 
   it("drops an SST only when confirm repeats its id, forcing only when asked, and reports every corrupted SST", async () => {
