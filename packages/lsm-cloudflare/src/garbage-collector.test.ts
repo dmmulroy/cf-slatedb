@@ -36,6 +36,7 @@ import {
 import { decodeStoredManifest, ManifestReader } from "./manifest-reader.ts";
 import { ManifestStore } from "./manifest-store.ts";
 import {
+  changelogKey,
   compactedPrefix,
   databasePrefix,
   manifestKey,
@@ -527,18 +528,27 @@ describe("GarbageCollector", () => {
           const id = SstId.make(`0000000000${String(index).padStart(16, "0")}`);
           yield* objects.put(sstKey(DB, id), Uint8Array.of(1));
         }
+        // And a changelog SST a failed flush exported but never committed.
+        const changelogOrphan = changelogKey(
+          DB,
+          SeqNum.make(7),
+          SstId.make("0000000000ZZZZZZZZZZZZZZZZ"),
+        );
+        yield* objects.put(changelogOrphan, Uint8Array.of(1));
         yield* TestClock.adjust(MIN_AGE + 1);
         const report = yield* (yield* GarbageCollector).collect(DB, Option.none());
         const latest = (yield* (yield* ManifestReader).loadLatest(DB)).manifest;
         return {
           deleted: report.deletedSsts,
+          changelogOrphanStored: Option.isSome(yield* objects.get(changelogOrphan)),
           left: (yield* storedKeys(compactedPrefix(DB))).length,
           referenced: manifestSstHandles(latest).length,
           rows: yield* readAll,
         };
       }),
     );
-    expect(outcome.deleted).toBe(2_500);
+    expect(outcome.deleted).toBe(2_501);
+    expect(outcome.changelogOrphanStored).toBe(false);
     expect(outcome.left).toBe(outcome.referenced);
     expect(outcome.rows).toEqual([1]);
   });
