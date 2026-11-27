@@ -16,6 +16,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { DbClient, dbClientTestLayer, makeDbClient, type ReadOptions } from "./db-client.ts";
 import {
   DbReader,
+  ReaderUnavailableError,
   type DbReaderServices,
   SCAN_READ_AHEAD_BLOCKS,
   scanFirstReadAheadBlocks,
@@ -589,6 +590,47 @@ describe("DbClient against a Map oracle", () => {
       Result.isFailure(outcome.overtakenEachTime) && [
         outcome.overtakenEachTime.failure._tag,
         "reason" in outcome.overtakenEachTime.failure && outcome.overtakenEachTime.failure.reason,
+      ],
+    ).toEqual(["ReaderUnavailableError", "StorageUnavailable"]);
+  });
+
+  it("a Latest scan whose snapshot is overtaken on every attempt gives up after three, retryably (D70, D130)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createDatabase;
+        yield* (yield* DbClient).put(DB, keyBytes(1), Uint8Array.of(1));
+        const reader = yield* DbReader;
+        let attempts = 0;
+        const overtaken = yield* makeDbClient.pipe(
+          Effect.provideService(
+            DbReader,
+            DbReader.of({
+              ...reader,
+              scan: (databaseId) => {
+                attempts += 1;
+                return Stream.fail(
+                  new ReaderUnavailableError({
+                    databaseId,
+                    reason: "SnapshotExpired",
+                    message: "flushed past the read's snapshot",
+                  }),
+                );
+              },
+            }),
+          ),
+        );
+        const scanned = yield* Stream.runCollect(
+          overtaken.scan(DB, FULL_KEY_RANGE, { ...latest, limit: Option.none() }),
+        ).pipe(Effect.result);
+        return { attempts, scanned };
+      }),
+    );
+    // The message promises "each of 3 attempts" (LATEST_READ_ATTEMPTS).
+    expect(outcome.attempts).toBe(3);
+    expect(
+      Result.isFailure(outcome.scanned) && [
+        outcome.scanned.failure._tag,
+        "reason" in outcome.scanned.failure && outcome.scanned.failure.reason,
       ],
     ).toEqual(["ReaderUnavailableError", "StorageUnavailable"]);
   });
