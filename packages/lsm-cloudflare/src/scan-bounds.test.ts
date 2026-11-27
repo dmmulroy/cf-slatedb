@@ -682,4 +682,3 @@ describe("a scan whose writer rows span pages, with flushed keys after them (D13
     for (const read of outcome) expect(read).toEqual({ count: 1201, distinct: 1201, last: 2000 });
   });
 });
-
