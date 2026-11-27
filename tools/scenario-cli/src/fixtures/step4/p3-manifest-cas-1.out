@@ -1,0 +1,54 @@
+{
+  "databaseId": "ms-cas-mwydx86r",
+  "flushes": 30,
+  "rowsPerFlush": 10,
+  "manifestUpdateMs": {
+    "count": 41,
+    "p50": 610,
+    "p90": 1581,
+    "p99": 1964,
+    "max": 1964
+  },
+  "manifestUpdateFromOwnViewMs": {
+    "count": 30,
+    "p50": 576,
+    "p90": 937,
+    "p99": 1361,
+    "max": 1361
+  },
+  "manifestUpdateLoadedMs": {
+    "count": 11,
+    "p50": 1566,
+    "p90": 1712,
+    "p99": 1964,
+    "max": 1964
+  },
+  "casAttempts": {
+    "count": 41,
+    "p50": 1,
+    "p90": 2,
+    "p99": 2,
+    "max": 2
+  },
+  "loadLatestMs": {
+    "count": 59,
+    "p50": 227,
+    "p90": 332,
+    "p99": 500,
+    "max": 500
+  },
+  "writerFlushMs": {
+    "count": 30,
+    "p50": 1093,
+    "p90": 1422,
+    "p99": 1849,
+    "max": 1849
+  },
+  "flushClientMs": {
+    "count": 30,
+    "p50": 1164,
+    "p90": 1541,
+    "p99": 1922,
+    "max": 1922
+  }
+}

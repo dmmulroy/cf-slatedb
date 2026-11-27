@@ -1,0 +1,51 @@
+{
+  "databaseId": "ms-compact-mwydezww",
+  "megabytesPerFlush": 60,
+  "compacted": true,
+  "compactedAfterSeconds": 139.403,
+  "flushCpuMsPerFlush": 4655.75,
+  "writeCpuMsTotal": 19936,
+  "flushCpuMs": {
+    "count": 8,
+    "p50": 942,
+    "p90": 4710,
+    "p99": 4710,
+    "max": 4710
+  },
+  "flushWallMs": {
+    "count": 8,
+    "p50": 15783,
+    "p90": 17461,
+    "p99": 17461,
+    "max": 17461
+  },
+  "compactorCpuMsByEventKind": {
+    "fetch": {
+      "count": 18,
+      "p50": 5,
+      "p90": 41,
+      "p99": 56,
+      "max": 56
+    },
+    "alarm": {
+      "count": 9,
+      "p50": 12,
+      "p90": 28,
+      "p99": 28,
+      "max": 28
+    },
+    "rpc": {
+      "count": 1,
+      "p50": 8834,
+      "p90": 8834,
+      "p99": 8834,
+      "max": 8834
+    }
+  },
+  "compactorOutcomes": [
+    "ok"
+  ],
+  "writerOutcomes": [
+    "ok"
+  ]
+}

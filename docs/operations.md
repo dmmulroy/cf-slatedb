@@ -203,22 +203,27 @@ creating a new installation and forking or copying databases into it.
 
 ## Capacity
 
-Measured on preview stages with production settings ([`measurements.md`](measurements.md)):
+<!-- STEP4 capacity: begin -->
 
-| What                            | Measured                                                           |
-| ------------------------------- | ------------------------------------------------------------------ |
-| One writer, 1,000-row batches   | ~15,000 rows/s; p50 latency ~1 s                                   |
-| One writer, 100-row batches     | ~6,500 rows/s; p50 latency ~105 ms                                 |
-| Unflushed data per writer       | 256 MiB (`maxUnflushedBytes`); then `WriteStalled` until a flush   |
-| L0 SSTs before writes stall     | 16 (`l0MaxSsts`)                                                   |
-| Manifest commit (one CAS)       | p50 ~357 ms beside the bucket; ~550 ms from Europe; ~1 s from APAC |
-| Small flush                     | p50 ~709 ms                                                        |
-| 60 MiB flush                    | ~4 s CPU per flush (D73), ~14 s wall                               |
-| Compaction step (64 MiB output) | ~10 s CPU (max ~18 s)                                              |
-| Split (seal and fork)           | writes pause ~3 s                                                  |
-| Transactions held open          | at least 60 s (`transactionRetentionMs`) across flushes            |
-| Concurrent compactions          | 200 at once completed in 16 s                                      |
-| GC sweep                        | 50 databases per run, ~160 ms CPU                                  |
+On `preview-3` (production settings, 100% trace sampling; `measurements.md`, "Step 4"). The Basis column says what each figure rests on.
+
+| What                          | Measured                                                                        | Basis                                    |
+| ----------------------------- | ------------------------------------------------------------------------------- | ---------------------------------------- |
+| One writer, 1,000-row batches | 22,359 rows/s at 16 clients; p50 latency 596 ms                                 | commit `d89beba`, provisional            |
+| One writer, 100-row batches   | 4,394 rows/s at 8 clients; p50 latency 146 ms                                   | commit `d89beba`, provisional            |
+| Unflushed data per writer     | 256 MiB (`maxUnflushedBytes`); then `WriteStalled` until a flush                | setting                                  |
+| L0 SSTs before writes stall   | 16 (`l0MaxSsts`)                                                                | setting                                  |
+| Manifest commit (one CAS)     | p50 610 and 627 ms                                                              | commit `d89beba`, provisional            |
+| Manifest commit by region     | ~285 ms create-if-absent beside the bucket; ~550 ms from Europe; ~1 s from APAC | commit `774ed7b` (D56), R2's own latency |
+| Small flush                   | p50 1,093 and 1,118 ms                                                          | commit `d89beba`, provisional            |
+| 60 MiB flush                  | 4.7 and 3.2 s CPU; wall p50 15.8 and 11.1 s                                     | commit `d89beba`, provisional            |
+| Compaction step               | 8.8 and 11.6 s CPU                                                              | commit `d89beba`, provisional            |
+| Split (seal and fork)         | writes pause 3.8 s (median longest gap of 6 runs), 0 failed                     | commit `d89beba`, provisional            |
+| Transactions held open        | at least 60 s (`transactionRetentionMs`) across flushes                         | setting; measured at `5f2850b` (D58)     |
+| Concurrent compactions        | 200 at once completed in 16 s                                                   | commit `308defd` (D61)                   |
+| GC sweep                      | 50 databases per run, ~160 ms CPU                                               | commit `e06f3eb` (D60)                   |
+
+<!-- STEP4 capacity: end -->
 
 Throughput per database is one writer's. A workload that needs more uses more databases, for
 example with range sharding.

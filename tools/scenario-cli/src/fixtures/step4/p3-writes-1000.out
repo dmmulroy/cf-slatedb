@@ -1,0 +1,42 @@
+{
+  "databaseId": "ms-writes-mwycpli7",
+  "load": {
+    "batchRows": 1000,
+    "valueBytes": 100,
+    "concurrency": 16,
+    "seconds": 30
+  },
+  "elapsedSeconds": 30.949,
+  "acknowledgedRows": 692000,
+  "rowsPerSecond": 22359.36540760606,
+  "requestsPerSecond": 22.35936540760606,
+  "megabytesPerSecond": 2.5588263024451514,
+  "latencyMs": {
+    "count": 692,
+    "p50": 596,
+    "p90": 1187,
+    "p99": 2465,
+    "max": 2695
+  },
+  "failures": {},
+  "after": {
+    "l0Count": 0,
+    "unflushedBytes": 104492000
+  },
+  "writerCpuMsPerBatch": {
+    "count": 692,
+    "p50": 23,
+    "p90": 43,
+    "p99": 319,
+    "max": 942
+  },
+  "apiCpuMsPerBatch": {
+    "count": 692,
+    "p50": 23,
+    "p90": 69,
+    "p99": 134,
+    "max": 191
+  },
+  "writerCpuSeconds": 21.617,
+  "writerBusyFraction": 0.6984716792141911
+}

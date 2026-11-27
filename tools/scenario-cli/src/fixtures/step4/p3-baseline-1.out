@@ -1,0 +1,120 @@
+{
+  "load": {
+    "batchRows": 100,
+    "valueBytes": 100,
+    "writers": 8,
+    "readers": 8,
+    "seconds": 30
+  },
+  "preloadedRows": 2000,
+  "targets": [
+    {
+      "target": "shaledb, reads at Latest",
+      "name": "ms-base-mwy843wd",
+      "seconds": 30.044,
+      "acknowledgedRowsPerSecond": 6134,
+      "writeBatchesPerSecond": 61.3,
+      "readsPerSecond": 60.3,
+      "writeLatencyMs": {
+        "count": 1843,
+        "p50": 114,
+        "p90": 162,
+        "p99": 425,
+        "max": 696
+      },
+      "readLatencyMs": {
+        "count": 1811,
+        "p50": 114,
+        "p90": 175,
+        "p99": 592,
+        "max": 784
+      },
+      "failures": {},
+      "workerInvocations": {
+        "count": 3654,
+        "cpuMs": 60526
+      },
+      "durableObjectInvocations": {
+        "count": 3654,
+        "cpuMs": 12089
+      },
+      "r2Requests": {
+        "classA": 5,
+        "classB": 609
+      },
+      "tracesWithBlockFetches": 868
+    },
+    {
+      "target": "shaledb, reads at Flushed",
+      "name": "ms-base-mwy84uvl",
+      "seconds": 30.206,
+      "acknowledgedRowsPerSecond": 8329,
+      "writeBatchesPerSecond": 83.3,
+      "readsPerSecond": 115.9,
+      "writeLatencyMs": {
+        "count": 2516,
+        "p50": 87,
+        "p90": 124,
+        "p99": 269,
+        "max": 514
+      },
+      "readLatencyMs": {
+        "count": 3501,
+        "p50": 57,
+        "p90": 114,
+        "p99": 203,
+        "max": 830
+      },
+      "failures": {},
+      "workerInvocations": {
+        "count": 6017,
+        "cpuMs": 67588
+      },
+      "durableObjectInvocations": {
+        "count": 2516,
+        "cpuMs": 11708
+      },
+      "r2Requests": {
+        "classA": 10,
+        "classB": 6774
+      },
+      "tracesWithBlockFetches": 1494
+    },
+    {
+      "target": "plain Durable Object SQLite",
+      "name": "ms-base-mwy85kpq",
+      "seconds": 30.147,
+      "acknowledgedRowsPerSecond": 8193,
+      "writeBatchesPerSecond": 81.9,
+      "readsPerSecond": 89.1,
+      "writeLatencyMs": {
+        "count": 2470,
+        "p50": 82,
+        "p90": 132,
+        "p99": 359,
+        "max": 560
+      },
+      "readLatencyMs": {
+        "count": 2686,
+        "p50": 77,
+        "p90": 120,
+        "p99": 429,
+        "max": 704
+      },
+      "failures": {},
+      "workerInvocations": {
+        "count": 5157,
+        "cpuMs": 41016
+      },
+      "durableObjectInvocations": {
+        "count": 5157,
+        "cpuMs": 11986
+      },
+      "r2Requests": {
+        "classA": 0,
+        "classB": 0
+      },
+      "tracesWithBlockFetches": 0
+    }
+  ]
+}

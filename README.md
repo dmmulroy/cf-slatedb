@@ -37,27 +37,22 @@ SST's first and last key (D99). Larger data is split into several databases with
 Every limit a caller can meet is listed in [`docs/api-compatibility.md`](docs/api-compatibility.md),
 "Limits of v1".
 
-One database's write rate is bounded by its writer, which commits one batch at a time. The highest
-rates measured on one writer (`preview-1`, production settings, 16-byte keys and 100-byte values,
-a laptop client on a US residential connection, so latencies include an internet round trip):
+One database's write rate is bounded by its writer, which commits one batch at a time. Every
+measured number in this README names the commit it was measured on; none is yet on the release
+commit ([`docs/release-v1.md`](docs/release-v1.md) §3). The rates measured on one writer:
 
-Every measured number in this README says what it rests on. The rule is in
-[`docs/release-v1.md`](docs/release-v1.md) §3, and none is measured on the release commit yet. The
-rates below were measured at `308defd` (workstream 6, D61). The writer's code has changed since
-(`git diff 308defd..c149afb -- db-writer.ts mem-table.ts`). The release-commit runs will replace
-them.
+<!-- STEP4 readme-writes: begin -->
 
-<!-- STEP4-NUMBERS: begin -->
+Measured on `preview-3`, production settings, 100% trace sampling, commit `d89beba` (provisional: not the release commit); 16-byte keys and 100-byte values, from a laptop on a US residential connection, so latencies include an internet round trip:
 
-| Batch rows | Batches in flight | Rows/s acknowledged | Client latency p50 / p90 / p99 (ms) |
-| ---------: | ----------------: | ------------------: | ----------------------------------- |
-|        100 |                 8 |               6,547 | 105 / 136 / 427                     |
-|      1,000 |                16 |              15,257 | 961 / 1,706 / 2,400                 |
+| Batch rows | Batches in flight | Rows/s acknowledged | Client latency p50 / p90 / p99 (ms) | Writer busy |
+| ---------- | ----------------- | ------------------- | ----------------------------------- | ----------- |
+| 100        | 8                 | 4,394               | 146 / 273 / 539                     | 0.52        |
+| 1,000      | 16                | 22,359              | 596 / 1,187 / 2,465                 | 0.7         |
 
-The writer was busy about half the time at both loads, so these are the rates measured, not a
-proven ceiling ([`docs/measurements.md`](docs/measurements.md), "Writer throughput and limits").
+Writer busy below 1 means these are the rates measured, not a proven ceiling ([`docs/measurements.md`](docs/measurements.md), "Step 4").
 
-<!-- STEP4-NUMBERS: end -->
+<!-- STEP4 readme-writes: end -->
 
 Reads cost the writer differently by consistency:
 
@@ -84,52 +79,26 @@ It is not a fit for:
 - anything [`docs/measurements.md`](docs/measurements.md) does not cover (its "Not measured" list
   names what is open).
 
-<!-- BASELINE: begin -->
-
 ### Compared with a plain Durable Object SQLite table
 
-The same workload against shaledb and against one table in a plain Durable Object, on the same
-stage (`preview-3`, production settings), from the same client, one target after the other, each
-on a new database or object: 8 writers each sending 100-row batches (16-byte keys, 100-byte
-values) and 8 readers each doing point reads of preloaded keys, for 30 seconds.
+<!-- STEP4 readme-baseline: begin -->
 
-> **Provisional.** One run, 2026-11-27, at commit `ed4e787`, while a local test run loaded the
-> client during the plain-table part. The writer and reader code has changed since
-> (`git diff ed4e787..c149afb -- db-writer.ts mem-table.ts db-client.ts db-reader.ts`). The
-> memtable's insert and delete statements, which set the rows-written counts, have not changed; it
-> gained three `SELECT` statements. The release checklist repeats it three times on the release
-> commit ([`docs/release-v1.md`](docs/release-v1.md)); this table is replaced by those runs.
+The same workload against shaledb and against one table in a plain Durable Object, on `preview-3` (production settings, 100% trace sampling), from the same client, one target after the other, each on a new database or object. Median of 1 of 3 runs, commit `d89beba` (provisional: not the release commit); not available: `p3-baseline-2` (still running), `p3-baseline-3` (no output).
 
-| Target                      | Rows/s acknowledged | Write p50 / p90 / p99 (ms) | Reads/s | Read p50 / p90 / p99 (ms) |
-| --------------------------- | ------------------: | -------------------------- | ------: | ------------------------- |
-| shaledb, reads at `Latest`  |               6,134 | 114 / 162 / 425            |    60.3 | 114 / 175 / 592           |
-| shaledb, reads at `Flushed` |               8,329 | 87 / 124 / 269             |   115.9 | 57 / 114 / 203            |
-| plain Durable Object SQLite |               8,193 | 82 / 132 / 359             |    89.1 | 77 / 120 / 429            |
+| Target                      | Rows/s acknowledged | Write p50 / p99 (ms) | Reads/s | Read p50 / p99 (ms) | Cost per million rows written |
+| --------------------------- | ------------------- | -------------------- | ------- | ------------------- | ----------------------------- |
+| shaledb, reads at `Latest`  | 6,064               | 110 / 538            | 62.6    | 104 / 712           | $3.02                         |
+| shaledb, reads at `Flushed` | 6,000               | 120 / 345            | 133.1   | 37 / 212            | $3.03                         |
+| plain Durable Object SQLite | 8,236               | 83 / 351             | 93.2    | 79 / 322            | $1.01                         |
 
-Each writer and reader waits for its answer before sending the next request, so the rates follow
-the latencies: they are what 8 clients over the internet got, not a capacity. What the stage did
-for each run, from its tail records and spans:
+- **Write p50:** 110 ms (`Latest` run), 120 ms (`Flushed` run), 83 ms (plain table).
+- **Read p50:** 104 ms at `Latest`, 37 ms at `Flushed`, 79 ms from the plain table.
+- **Durable Object invocations at `Flushed`:** 1,826 in the tail records, against 1,842 write batches: no more than the writes, so no read reached a Durable Object. Tail records may be dropped, so the count is a lower bound.
+- **SQLite rows written per row:** 3 for shaledb's memtable, 1 for the plain table.
 
-| Target                      | Worker CPU per request | Durable Object requests per read | Durable Object CPU per request | SQLite rows written per row | R2 class A / class B requests |
-| --------------------------- | ---------------------: | -------------------------------: | -----------------------------: | --------------------------: | ----------------------------- |
-| shaledb, reads at `Latest`  |                16.6 ms |                                1 |                         3.3 ms |                           3 | 5 / 609                       |
-| shaledb, reads at `Flushed` |                11.2 ms |                                0 |                         4.7 ms |                           3 | 10 / 6,774                    |
-| plain Durable Object SQLite |                 8.0 ms |                                1 |                         2.3 ms |                           1 | 0 / 0                         |
+Each target's runs, the stage-side counts, and the price arithmetic are in [`docs/measurements.md`](docs/measurements.md), "Step 4".
 
-**What was measured.**
-
-- **Writes cost the caller the same.** Write latency is within run-to-run noise of the plain
-  table's; nearly all of it is the client's round trip.
-- **A `Latest` read is slower than a plain read** (p50 114 ms against 77 ms): it asks the writer
-  and then reads SSTs.
-- **A `Flushed` read is faster and never touches a Durable Object** (p50 57 ms against 77 ms; the
-  only Durable Object requests in that run were the writes).
-- **shaledb's writes cost three times a plain table's in SQLite charges.** Its memtable bills two
-  rows written per row (the table and its index) and one more when the flushed row is deleted;
-  a plain table bills one (measured on `preview-3` by the row-cost probe). At Cloudflare's
-  published overage prices, fetched 2026-11-26 and ignoring included allowances, that is $3.02
-  against $1.01 per million rows written with this read mix; SQLite row writes are $3.00 and
-  $1.00 of it.
+<!-- STEP4 readme-baseline: end -->
 
 **What that buys, and how far each claim is measured.**
 
@@ -149,8 +118,6 @@ If one Durable Object's table holds the data and its writer can serve every read
 table is simpler and cheaper to write to. The numbers, the commands, and the price arithmetic
 are in [`docs/measurements.md`](docs/measurements.md), "Baseline: a plain Durable Object SQLite
 table".
-
-<!-- BASELINE: end -->
 
 ## Quick start (local)
 

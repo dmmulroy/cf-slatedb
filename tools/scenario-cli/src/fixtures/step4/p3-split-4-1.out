@@ -1,0 +1,33 @@
+{
+  "group": "ms-split-mwycrc10",
+  "load": {
+    "writers": 4,
+    "secondsBefore": 10,
+    "secondsAfter": 10
+  },
+  "elapsedSeconds": 154.107,
+  "splitClientMs": 2682,
+  "splitSpanMs": [
+    2635
+  ],
+  "sealSpanMs": [
+    1622
+  ],
+  "putsBeforeSplitMs": {
+    "count": 409,
+    "p50": 70,
+    "p90": 84,
+    "p99": 483,
+    "max": 1720
+  },
+  "putsDuringSplitMs": {
+    "count": 9,
+    "p50": 353,
+    "p90": 4776,
+    "p99": 4776,
+    "max": 4776
+  },
+  "failedPuts": 0,
+  "totalPuts": 835,
+  "longestAckGapDuringSplitMs": 3841
+}
