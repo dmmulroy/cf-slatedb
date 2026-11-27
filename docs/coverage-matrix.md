@@ -32,7 +32,8 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   compactor fences in again on wake and alarm; D94: a job unseen for `compactionLeaseMs` is
   finished), `compaction-executor.test.ts`
   (oracle property across flushes and compactions, key-ordered outputs, bottom deletes, inputs
-  changed, fenced; D97: a step whose rows are all dropped ends after a bounded input and
+  changed, fenced; D103: a commit records its job id, so an all-dropped job's retried commit ends
+  `Committed`, and a missing Workflow instance or an unknown status finishes the job; D97: a step whose rows are all dropped ends after a bounded input and
   writes nothing; D96: a job running longer than `gcMinAge` keeps its outputs through a
   collection and commits, older garbage still goes, a discarded job's outputs go later, and the
   compactor passes the oldest running job's start, taken before its launch; D86: the `prepare` step result of the largest planned merge fits Workflows'

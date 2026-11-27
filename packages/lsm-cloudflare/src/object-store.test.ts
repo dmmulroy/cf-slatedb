@@ -11,8 +11,12 @@ import {
   objectKindOfKey,
   sstKey,
 } from "./object-keys.ts";
+import * as Cloudflare from "@alchemy.run/cloudflare";
+
+import { LsmBucketClient } from "./lsm-bucket.ts";
 import {
   ObjectStore,
+  objectStoreLayerWithoutDependencies,
   objectStoreTestLayer,
   objectStoreWithTransitCorruptionTestLayer,
   PART_INTEGRITY_ATTEMPTS,
@@ -210,5 +214,89 @@ describe("objectKindOfKey", () => {
     expect(objectKindOfKey(sstKey(db, SstId.make("01JD0000000000000000000001")))).toBe("Sst");
     expect(objectKindOfKey(`db/${db}/changelog/00000000000000000009-x.sst`)).toBe("Changelog");
     expect(objectKindOfKey("probe/r2/run/1")).toBe("Other");
+  });
+});
+
+describe("ObjectStore.delete against R2's limits (Workflow audit)", () => {
+  /**
+   * The R2 store over a bucket that holds `keys`, refuses a delete of more than 1,000 keys (R2's
+   * limit), and fails every delete while `failing` is set after it has deleted `deletesBeforeFailing`
+   * calls' keys. Every other bucket operation is out of scope here and dies.
+   */
+  const deleteAgainstR2Limits = (keys: ReadonlyArray<string>, deletesBeforeFailing: number) => {
+    const stored = new Set(keys);
+    const calls: Array<number> = [];
+    let failing = true;
+    const outOfScope = () => Effect.die(new Error("not used by this test"));
+    const bucket = LsmBucketClient.of({
+      raw: outOfScope(),
+      head: outOfScope,
+      get: outOfScope,
+      list: outOfScope,
+      put: outOfScope,
+      createMultipartUpload: outOfScope,
+      resumeMultipartUpload: outOfScope,
+      delete: (input) =>
+        Effect.suspend(() => {
+          const batch = typeof input === "string" ? [input] : input;
+          calls.push(batch.length);
+          if (batch.length > 1000) {
+            return Effect.fail(
+              new Cloudflare.R2.R2Error({
+                message: "too many keys",
+                cause: new Error("delete accepts at most 1000 keys"),
+              }),
+            );
+          }
+          if (failing && calls.length > deletesBeforeFailing) {
+            return Effect.fail(
+              new Cloudflare.R2.R2Error({ message: "unavailable", cause: new Error("503") }),
+            );
+          }
+          for (const key of batch) stored.delete(key);
+          return Effect.void;
+        }),
+    });
+    const withStore = <A, E>(
+      use: (store: ObjectStore["Service"]) => Effect.Effect<A, E, RuntimeContext>,
+    ) =>
+      Effect.gen(function* () {
+        const store = yield* ObjectStore;
+        return yield* use(store);
+      }).pipe(
+        Effect.provide(objectStoreLayerWithoutDependencies),
+        Effect.provideService(LsmBucketClient, bucket),
+        Effect.provide(lsmTestRuntimeContextLayer),
+      );
+    return {
+      stored,
+      calls,
+      heal: () => {
+        failing = false;
+      },
+      withStore,
+    };
+  };
+
+  const keys = Array.from({ length: 2_500 }, (_, index) => `db/orders/compacted/${index}.sst`);
+
+  it("deletes every key in calls of at most 1,000", async () => {
+    const bucket = deleteAgainstR2Limits(keys, Number.POSITIVE_INFINITY);
+    await Effect.runPromise(bucket.withStore((store) => store.delete(keys)));
+    expect(bucket.stored.size).toBe(0);
+    expect(bucket.calls).toEqual([1000, 1000, 500]);
+  });
+
+  it("fails typed when a call fails partway, and a later delete of the same keys finishes", async () => {
+    const bucket = deleteAgainstR2Limits(keys, 1);
+    const failed = await Effect.runPromise(
+      bucket.withStore((store) => Effect.flip(store.delete(keys))),
+    );
+    expect(failed._tag).toBe("ObjectStoreUnavailableError");
+    // The first call's keys are gone; the rest are still stored.
+    expect(bucket.stored.size).toBe(1_500);
+    bucket.heal();
+    await Effect.runPromise(bucket.withStore((store) => store.delete(keys)));
+    expect(bucket.stored.size).toBe(0);
   });
 });

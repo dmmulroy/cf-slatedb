@@ -28,6 +28,7 @@ import { ObjectStore } from "./object-store.ts";
 import { sstStoreLayerWithoutDependencies } from "./sst-store.ts";
 
 const DB = DatabaseId.make("orders");
+let jobCounter = 0;
 const key = (n: number) => Uint8Array.of(0x6b, n);
 /** A row's value bytes, or none for a delete or an unresolved merge operand. */
 const valueBytes = (row: Row): Option.Option<Uint8Array> =>
@@ -80,7 +81,7 @@ const runJob = (job: CompactionJob, compactorEpoch: CompactorEpoch) =>
       outputs.push(...Option.toArray(step.output));
       start = step.resumeFrom;
     } while (Option.isSome(start));
-    return yield* executor.commit(prepared, outputs);
+    return yield* executor.commit(prepared, outputs, `job-${++jobCounter}`);
   });
 
 /** Compacts L0 (and the sorted run) when there is anything to compact. */

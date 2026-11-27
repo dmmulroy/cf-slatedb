@@ -23,6 +23,7 @@ import {
 
 const DB = DatabaseId.make("orders");
 let nextHandle = 0;
+let nextJobId = 0;
 const handle = (sizeBytes: number): SstHandle => ({
   id: SstId.make(`01JD${String(++nextHandle).padStart(22, "0")}`),
   firstKey: Uint8Array.of(0),
@@ -59,6 +60,7 @@ const withLsm = (l0: ReadonlyArray<SstHandle>, sortedRuns: ReadonlyArray<SortedR
     gcSstBoundary: Timestamp.make(0),
     droppedSsts: [],
     changelogAfterSeq: Option.none(),
+    recentCompactionJobIds: [],
   });
 
 const smallInt = (minimum: number, maximum: number) =>
@@ -252,6 +254,7 @@ describe("planCompactions", () => {
         current = Result.getOrThrow(
           commitCompaction(current, {
             compactorEpoch: current.compactorEpoch,
+            jobId: `job-${++nextJobId}`,
             job,
             outputs: [output],
           }),
@@ -284,6 +287,7 @@ describe("planCompactions", () => {
             current = Result.getOrThrow(
               commitCompaction(current, {
                 compactorEpoch: current.compactorEpoch,
+                jobId: `job-${++nextJobId}`,
                 job,
                 outputs: [output],
               }),

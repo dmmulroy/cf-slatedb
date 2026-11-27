@@ -258,7 +258,12 @@ describe("manifest edits", () => {
       destination: SortedRunId.make(0),
       isBottom: true,
     };
-    const commit = { compactorEpoch: manifest.compactorEpoch, job, outputs: [handle(10, 1, 4)] };
+    const commit = {
+      compactorEpoch: manifest.compactorEpoch,
+      jobId: "job-1",
+      job,
+      outputs: [handle(10, 1, 4)],
+    };
     const compacted = Result.getOrThrow(commitCompaction(manifest, commit));
     expect(compacted.l0.map((sst) => sst.id)).toEqual([ulid(5), ulid(4)]);
     expect(compacted.sortedRuns.map((run) => [run.id, run.ssts.map((sst) => sst.id)])).toEqual([
@@ -266,10 +271,55 @@ describe("manifest edits", () => {
     ]);
     expect(Result.getOrThrow(commitCompaction(compacted, commit))).toBe(compacted);
 
-    const changed = commitCompaction(compacted, { ...commit, outputs: [handle(11, 1, 4)] });
+    // Another job over the same inputs, which this one already replaced.
+    const changed = commitCompaction(compacted, {
+      ...commit,
+      jobId: "job-2",
+      outputs: [handle(11, 1, 4)],
+    });
     expect(Result.isFailure(changed) && changed.failure._tag).toBe("CompactionInputsChangedError");
     const fenced = commitCompaction(fenceCompactor(manifest), commit);
     expect(Result.isFailure(fenced) && fenced.failure._tag).toBe("CompactorFencedError");
+  });
+
+  it("recognizes a retried commit of a job with no outputs by its recorded id, across later edits, for the last 16 jobs (D103)", () => {
+    let manifest = empty;
+    for (const n of [1, 2, 3]) manifest = Result.getOrThrow(flush(manifest, n));
+    const job: CompactionJob = {
+      sources: [ulid(1), ulid(2)].map((sstId) => ({ _tag: "L0" as const, sstId })),
+      destination: SortedRunId.make(0),
+      isBottom: true,
+    };
+    // Every row was dropped: the commit removes the inputs and adds nothing.
+    const commit = { compactorEpoch: manifest.compactorEpoch, jobId: "dropped", job, outputs: [] };
+    const compacted = Result.getOrThrow(commitCompaction(manifest, commit));
+    expect(compacted.l0.map((sst) => sst.id)).toEqual([ulid(3)]);
+    // A flush in between keeps the record; the retry then changes nothing.
+    const flushedAfter = Result.getOrThrow(flush(compacted, 4));
+    expect(Result.getOrThrow(commitCompaction(flushedAfter, commit))).toBe(flushedAfter);
+    // Another job over the same inputs is still refused.
+    const other = commitCompaction(flushedAfter, { ...commit, jobId: "other" });
+    expect(Result.isFailure(other) && other.failure._tag).toBe("CompactionInputsChangedError");
+    // A commit keeps only the newest 16 ids.
+    const full = replaceManifestFields(flushedAfter, {
+      recentCompactionJobIds: Array.from({ length: 16 }, (_, index) => `earlier-${index}`),
+    });
+    const next = Result.getOrThrow(
+      commitCompaction(full, {
+        ...commit,
+        jobId: "next",
+        job: { ...job, sources: [{ _tag: "L0", sstId: ulid(3) }] },
+      }),
+    );
+    expect(next.recentCompactionJobIds).toHaveLength(16);
+    expect(next.recentCompactionJobIds.at(-1)).toBe("next");
+    expect(next.recentCompactionJobIds.includes("earlier-0")).toBe(false);
+    // A manifest written before D103 has no such key and decodes with none recorded.
+    const encoded: Record<string, unknown> = JSON.parse(Schema.encodeSync(ManifestJson)(compacted));
+    delete encoded["recentCompactionJobIds"];
+    expect(Schema.decodeSync(ManifestJson)(JSON.stringify(encoded)).recentCompactionJobIds).toEqual(
+      [],
+    );
   });
 
   it("rejects new SSTs created before GC's boundary, which only moves forward", () => {
@@ -307,7 +357,12 @@ describe("manifest edits", () => {
       isBottom: true,
     };
     const compaction = (output: SstHandle) =>
-      commitCompaction(flushed, { compactorEpoch: flushed.compactorEpoch, job, outputs: [output] });
+      commitCompaction(flushed, {
+        compactorEpoch: flushed.compactorEpoch,
+        jobId: "job-1",
+        job,
+        outputs: [output],
+      });
     const staleOutput = compaction(at(1_000, 3));
     expect(Result.isFailure(staleOutput) && staleOutput.failure._tag).toBe(
       "SstBelowGcBoundaryError",

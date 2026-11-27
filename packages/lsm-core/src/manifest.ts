@@ -237,7 +237,20 @@ export class Manifest extends Schema.Class<Manifest>("Manifest")({
   gcSstBoundary: Timestamp,
   droppedSsts: Schema.Array(DroppedSst).pipe(Schema.withDecodingDefaultKey(Effect.succeed([]))),
   changelogAfterSeq: Schema.OptionFromOptionalKey(SeqNum),
+  /**
+   * The ids of the most recent compaction jobs this manifest's history committed, newest last, at
+   * most {@link RECENT_COMPACTION_JOBS}: a commit step retried after its result was lost finds its
+   * own job here, whatever its outputs (D103). Absent in manifests written before D103, and dropped
+   * by older code that rewrites one: a retry then is not recognized and its job reports
+   * `Discarded`, as before, which loses nothing.
+   */
+  recentCompactionJobIds: Schema.Array(Schema.String).pipe(
+    Schema.withDecodingDefaultKey(Effect.succeed([])),
+  ),
 }) {}
+
+/** How many committed compaction job ids a manifest keeps (D103). */
+export const RECENT_COMPACTION_JOBS = 16;
 
 /**
  * The sequence number after which the manifest's changelog holds every change, up to `lastL0Seq`
@@ -297,6 +310,7 @@ export const initialManifest = (
     gcSstBoundary: Timestamp.make(0),
     droppedSsts: [],
     changelogAfterSeq: Option.some(SeqNum.make(0)),
+    recentCompactionJobIds: [],
   });
 
 /** Every SST handle the manifest references: L0 newest first, then each sorted run. */
@@ -490,6 +504,7 @@ export const replaceManifestFields = (manifest: Manifest, fields: Partial<Manife
     gcSstBoundary: fields.gcSstBoundary ?? manifest.gcSstBoundary,
     droppedSsts: fields.droppedSsts ?? manifest.droppedSsts,
     changelogAfterSeq: fields.changelogAfterSeq ?? manifest.changelogAfterSeq,
+    recentCompactionJobIds: fields.recentCompactionJobIds ?? manifest.recentCompactionJobIds,
   });
 
 // ---------------------------------------------------------------------------------------------
@@ -592,6 +607,8 @@ export type CompactionJob = typeof CompactionJob.Type;
 /** A finished compaction to commit. */
 export interface CompactionCommit {
   readonly compactorEpoch: CompactorEpoch;
+  /** The job's id (its Workflow instance id), recorded so a retried commit finds itself (D103). */
+  readonly jobId: string;
   readonly job: CompactionJob;
   /** Output SSTs in key order; may be empty when every row was dropped. */
   readonly outputs: ReadonlyArray<SstHandle>;
@@ -620,12 +637,15 @@ export const commitCompaction = (
     commit.job.sources.flatMap((source) => (source._tag === "SortedRun" ? [source.id] : [])),
   );
   const destination = manifest.sortedRuns.find((run) => run.id === commit.job.destination);
+  // A retried commit of a job this history committed (its step result was lost): the job's id is
+  // recorded, whatever its outputs (D103); before D103 only a job with outputs could be recognized.
   const alreadyApplied =
-    commit.outputs.length > 0 &&
-    destination !== undefined &&
-    destination.ssts.length === commit.outputs.length &&
-    destination.ssts.every((sst, index) => sst.id === commit.outputs[index]?.id) &&
-    !manifest.l0.some((sst) => l0Inputs.has(sst.id));
+    manifest.recentCompactionJobIds.includes(commit.jobId) ||
+    (commit.outputs.length > 0 &&
+      destination !== undefined &&
+      destination.ssts.length === commit.outputs.length &&
+      destination.ssts.every((sst, index) => sst.id === commit.outputs[index]?.id) &&
+      !manifest.l0.some((sst) => l0Inputs.has(sst.id)));
   if (alreadyApplied) return Result.succeed(manifest);
   if (manifest.compactorEpoch !== commit.compactorEpoch) {
     return Result.fail(
@@ -663,6 +683,9 @@ export const commitCompaction = (
     replaceManifestFields(manifest, {
       l0: manifest.l0.filter((sst) => !l0Inputs.has(sst.id)),
       sortedRuns,
+      recentCompactionJobIds: [...manifest.recentCompactionJobIds, commit.jobId].slice(
+        -RECENT_COMPACTION_JOBS,
+      ),
     }),
   );
 };
@@ -978,6 +1001,7 @@ export const forkManifest = (
     droppedSsts: [],
     // Changes up to the fork point belong to the source's feed (D80).
     changelogAfterSeq: Option.some(checkpointManifest.lastL0Seq),
+    recentCompactionJobIds: [],
   });
 };
 

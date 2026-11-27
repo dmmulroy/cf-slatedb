@@ -43,7 +43,7 @@ import {
   manifestPrefix,
   sstKey,
 } from "./object-keys.ts";
-import { ObjectStore, objectStoreTestLayer } from "./object-store.ts";
+import { ObjectStore, ObjectStoreUnavailableError, objectStoreTestLayer } from "./object-store.ts";
 import { SstStore, sstStoreLayerWithoutDependencies } from "./sst-store.ts";
 
 const DB = DatabaseId.make("orders");
@@ -352,7 +352,7 @@ describe("GarbageCollector", () => {
         const during = yield* gc.collect(DB, Option.some(startedAt));
         const storedDuring = new Set(yield* storedKeys(compactedPrefix(DB)));
         const commit = yield* Effect.result(
-          executor.commit(prepared, Option.toArray(first.output)),
+          executor.commit(prepared, Option.toArray(first.output), "long-job"),
         );
         // A second job over the same kind of inputs is discarded after writing an output: once it
         // is no longer running, its output is collected gcMinAge after it was written.
@@ -515,6 +515,128 @@ describe("GarbageCollector", () => {
     expect(outcome.leftOver).toEqual([]);
     expect(outcome.referencedStored).toBe(true);
     expect(outcome.rows).toEqual([1, 2, 3, 4]);
+  });
+
+  it("a job that drops every row and whose commit step runs twice ends Committed once, its sources gone (D103)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* create;
+        const client = yield* DbClient;
+        for (const key of [1, 2, 3, 4]) {
+          yield* client.put(DB, Uint8Array.of(key), Uint8Array.of(key));
+          yield* client.flush(DB);
+        }
+        for (const key of [1, 2, 3, 4]) {
+          yield* client.delete(DB, Uint8Array.of(key));
+          yield* client.flush(DB);
+        }
+        const { manifest } = yield* (yield* ManifestReader).loadLatest(DB);
+        const job: CompactionJob = {
+          sources: manifest.l0.map((sst) => ({ _tag: "L0" as const, sstId: sst.id })),
+          destination: SortedRunId.make(0),
+          isBottom: true,
+        };
+        // The commit step's first result is lost after it committed: it runs again.
+        let commits = 0;
+        const commitTwice: CompactionStepRunner = (name, _schema, step) =>
+          name === "commit"
+            ? Effect.andThen(step, step).pipe(Effect.tap(() => Effect.sync(() => (commits += 2))))
+            : step;
+        const outcome = yield* runCompactionJob(
+          { databaseId: DB, compactorEpoch: manifest.compactorEpoch, jobId: "all-dropped", job },
+          commitTwice,
+        );
+        const latest = (yield* (yield* ManifestReader).loadLatest(DB)).manifest;
+        return {
+          outcome: outcome._tag,
+          commits,
+          l0: latest.l0.length,
+          runs: latest.sortedRuns.length,
+          recorded: latest.recentCompactionJobIds.filter((id) => id === "all-dropped").length,
+          rows: yield* readAll,
+        };
+      }),
+    );
+    expect(outcome).toEqual({
+      outcome: "Committed",
+      commits: 2,
+      l0: 0,
+      runs: 0,
+      recorded: 1,
+      rows: [],
+    });
+  });
+
+  it("a collection cut off partway through its deletes fails typed, and the next run deletes the rest (Workflow audit)", async () => {
+    // The bucket fails the second delete call once: the first 1,000 keys of a batch went.
+    let deleteCalls = 0;
+    const cutOffStore = Layer.effect(
+      ObjectStore,
+      Effect.gen(function* () {
+        const store = yield* ObjectStore;
+        return ObjectStore.of({
+          ...store,
+          delete: (keys) =>
+            Effect.gen(function* () {
+              for (let start = 0; start < keys.length; start += 1000) {
+                deleteCalls++;
+                if (deleteCalls === 2) {
+                  return yield* new ObjectStoreUnavailableError({
+                    operation: "delete",
+                    key: keys[start] ?? "",
+                    message: "Test: the bucket failed this delete.",
+                  });
+                }
+                yield* store.delete(keys.slice(start, start + 1000));
+              }
+            }),
+        });
+      }),
+    ).pipe(Layer.provide(objectStoreTestLayer));
+    const outcome = await Effect.gen(function* () {
+      yield* create;
+      yield* writeAndFlush([1]);
+      const objects = yield* ObjectStore;
+      for (let index = 0; index < 2_500; index++) {
+        const id = SstId.make(`0000000000${String(index).padStart(16, "0")}`);
+        yield* objects.put(sstKey(DB, id), Uint8Array.of(1));
+      }
+      yield* TestClock.adjust(MIN_AGE + 1);
+      const gc = yield* GarbageCollector;
+      const first = yield* Effect.flip(gc.collect(DB, Option.none()));
+      const leftAfterFirst = (yield* objects.list(compactedPrefix(DB), Option.none())).objects
+        .length;
+      const second = yield* gc.collect(DB, Option.none());
+      const latest = (yield* (yield* ManifestReader).loadLatest(DB)).manifest;
+      return {
+        first: first._tag,
+        leftAfterFirst,
+        secondDeleted: second.deletedSsts,
+        left: (yield* storedKeys(compactedPrefix(DB))).length,
+        referenced: manifestSstHandles(latest).length,
+        rows: yield* readAll,
+      };
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.effect(CompactionExecutor, makeCompactionExecutor),
+          Layer.effect(GarbageCollector, makeGarbageCollector),
+        ).pipe(
+          Layer.provideMerge(sstStoreLayerWithoutDependencies),
+          Layer.provideMerge(dbClientTestLayer({ blockSize: 64, gcMinAge: MIN_AGE }, cutOffStore)),
+        ),
+      ),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.provide(TestClock.layer()),
+      Effect.runPromise,
+    );
+    expect(outcome.first).toBe("GarbageCollectorUnavailableError");
+    // The listing's first page shows what is left: the first 1,000 orphans are gone.
+    expect(outcome.leftAfterFirst).toBe(1000);
+    expect(outcome.secondDeleted).toBe(1_500);
+    expect(outcome.left).toBe(outcome.referenced);
+    expect(outcome.rows).toEqual([1]);
   });
 
   it("collects thousands of orphans across listing pages in one run (Workflow audit)", async () => {

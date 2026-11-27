@@ -159,10 +159,15 @@ export interface ICompactionExecutor {
     prepared: PreparedCompaction,
     startKey: Option.Option<Uint8Array>,
   ) => Effect.Effect<CompactionOutputStep, CompactionError, RuntimeContext>;
-  /** Commits the outputs: replaces exactly the job's inputs with the destination sorted run. */
+  /**
+   * Commits the outputs: replaces exactly the job's inputs with the destination sorted run, and
+   * records `jobId`, so a retry of this commit after its result was lost succeeds without changing
+   * anything, even for a job that wrote no output (D103).
+   */
   readonly commit: (
     prepared: PreparedCompaction,
     outputs: ReadonlyArray<SstHandle>,
+    jobId: string,
   ) => Effect.Effect<VersionedManifest, CompactionError, RuntimeContext>;
 }
 
@@ -408,16 +413,19 @@ export const makeCompactionExecutor = Effect.gen(function* () {
   const commit = Effect.fn("CompactionExecutor.commit")(function* (
     prepared: PreparedCompaction,
     outputs: ReadonlyArray<SstHandle>,
+    jobId: string,
   ) {
     const { databaseId } = prepared;
     yield* Effect.annotateCurrentSpan({
       "database.id": databaseId,
       "compaction.outputs": outputs.length,
+      "compaction.job_id": jobId,
     });
     const committed = yield* manifests
       .update(databaseId, (manifest) =>
         commitCompaction(manifest, {
           compactorEpoch: prepared.compactorEpoch,
+          jobId,
           job: prepared.job,
           outputs,
         }),

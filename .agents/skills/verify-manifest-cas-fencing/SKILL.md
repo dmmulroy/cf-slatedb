@@ -144,6 +144,13 @@ a flush commits from its own view with one create and no `ManifestReader.loadLat
 
 ## Maintenance notes
 
+- D103: `commitCompaction` records the job's id (`recentCompactionJobIds`, the last 16) and
+  treats a commit of a recorded id as already applied, returning the manifest unchanged, whatever
+  the job's outputs. Before, only a job with outputs could be recognized. The model has no retried
+  commit after success: `JobCommitCreate` runs once per job. The already-applied path writes
+  nothing, so widening it cannot break `AckedDataVisible`, `NoDoubleReference`, or the fencing
+  invariants. No model step changed; not rerun.
+
 - D78: `Compactor.ensureState` is single-flight (`startLock`), and a fenced compactor fences in
   again on its next start (wake, requested collection, SST drop, or alarm). Every compactor state
   write is a read-modify-write (`updateState`). The fence-in is still one `ManifestStore.update`

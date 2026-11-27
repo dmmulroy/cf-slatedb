@@ -1,15 +1,15 @@
 import { ManifestId } from "@shaledb/lsm-core";
-import { Option, Schema } from "effect";
+import { Cause, Option, Schema } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 
 import { CompactionJobOutcome } from "./compaction-job.ts";
-import { compactionJobProgressOf } from "./compaction-workflow.ts";
+import { compactionJobProgressOf, isWorkflowInstanceNotFound } from "./compaction-workflow.ts";
 
 const encode = Schema.encodeSync(CompactionJobOutcome);
 
 describe("compactionJobProgressOf", () => {
   it("is running while the instance can still commit, and finished with its outcome otherwise", () => {
-    for (const status of ["queued", "running", "paused", "waiting", "waitingForPause", "unknown"]) {
+    for (const status of ["queued", "running", "paused", "waiting", "waitingForPause"]) {
       expect(compactionJobProgressOf(status, undefined)).toEqual({ _tag: "Running" });
     }
     const committed = { _tag: "Committed" as const, manifestId: ManifestId.make(7) };
@@ -30,5 +30,26 @@ describe("compactionJobProgressOf", () => {
       _tag: "Finished",
       outcome: Option.none(),
     });
+  });
+});
+
+describe("isWorkflowInstanceNotFound", () => {
+  it("recognizes Workflows' missing-instance error however Alchemy wraps it, and nothing else", () => {
+    const notFound = new Error("instance.not_found");
+    expect(isWorkflowInstanceNotFound(Cause.die(notFound))).toBe(true);
+    expect(isWorkflowInstanceNotFound(Cause.die(new Cause.UnknownError(notFound)))).toBe(true);
+    expect(isWorkflowInstanceNotFound(Cause.fail(new Cause.UnknownError(notFound)))).toBe(true);
+    // A transient failure keeps the job running until the next poll.
+    expect(isWorkflowInstanceNotFound(Cause.die(new Error("network connection lost")))).toBe(false);
+    expect(isWorkflowInstanceNotFound(Cause.fail("instance.not_found"))).toBe(false);
+  });
+
+  it("does not count a status this code does not know as running", () => {
+    for (const status of ["unknown", "someFutureStatus"]) {
+      expect(compactionJobProgressOf(status, undefined)).toEqual({
+        _tag: "Finished",
+        outcome: Option.none(),
+      });
+    }
   });
 });
