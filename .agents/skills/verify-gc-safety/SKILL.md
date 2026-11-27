@@ -29,9 +29,24 @@ node tools/formal-verification/src/verify.ts gc-safety   # about 45 seconds
 vp run verify                                            # every formal check
 ```
 
-Expected: seven `✓` lines. The code as written passes both configs; `noBoundaryCheck`,
+Expected: eight `✓` lines. The code as written passes the three configs; `noBoundaryCheck`,
 `ownUploadAge`, and `dropDeletesObject` fail `ReadableManifestsComplete`; `ignorePins` fails
 `PinnedManifestsComplete`; `earlyForkRelease` (`GcSafetyFork.cfg`) fails `ForkReadsComplete`.
+`GcSafetyTwoCollectors.cfg` runs two collections at once (D83) and has no broken variant: see
+"Two collections" below.
+
+## Deeper search
+
+Not part of `verify.ts`. Run it after a change to `GarbageCollector.collect`, alone, for up to 20
+minutes:
+
+```sh
+nice -n 15 java -XX:+UseParallelGC -cp .tlc/downloads/tla2tools.jar tlc2.TLC -workers 2 \
+  -config GcSafetyTwoCollectorsDeep.cfg GcSafety.tla   # from tools/formal-verification/specs
+```
+
+`GcSafetyTwoCollectorsDeep.cfg` has two collections with the clock to 3 and at most four
+manifests. It does not finish in 20 minutes niced with two workers.
 
 ## Read a result
 
@@ -97,7 +112,17 @@ moment ago counted as old and its SSTs could be deleted under a reader. `ownUplo
   fork's holds down the chain…", and `manifest.test.ts`), and removal of the source, which deletes
   every object but is refused while the hold exists (`markRemoved`; covered by
   `database-lifecycle.test.ts`).
-- One GC run at a time; its steps interleave with every other action. Manifest CAS is atomic here
+- **Two collections (D116, D83's deferred model).** `Collectors` names the collections that may
+  run at once; GC's variables are indexed by collection, and `mBound` is GC's manifest boundary.
+  A collection loads its retained manifests at `GcDeleteSsts`: one another collection deleted is
+  at or below `mBound` and is skipped; one above it fails the run, which deletes nothing (D83's
+  guard). `GcSafetyTwoCollectors.cfg`: 1 SST, clock 0–2, at most 4 manifests, collections
+  symmetric; 11,888,970 states, 152 s niced with two workers. It passes: two collections at once
+  break no safety property, so the compactor's `collectionLock` saves duplicate work and is not a
+  safety lock. No variant fails here that does not fail with one collection. The guard's
+  above-boundary branch matters only for a manifest deleted by something other than a collection,
+  which this model has none of: it protects against an out-of-band delete.
+- In `GcSafety.cfg` one collection runs; its steps interleave with every other action. Manifest CAS is atomic here
   (`verify-manifest-cas-fencing` checks it); stale manifest creates over collected ids are refused by
   `gc/manifest.boundary`, which `ManifestCasFencingGc.cfg` model-checks (`CommitOnce`, broken variant
   `noBoundaryReread`) together with optimistic commits from a committer's own view and `loadLatest`
@@ -110,6 +135,10 @@ moment ago counted as old and its SSTs could be deleted under a reader. `ownUplo
   modeled (as in SlateDB RFC 0029).
 
 ## Maintenance notes
+
+- D116: `Collectors`, `mBound`, and D83's guard on loading a retained manifest;
+  `GcSafetyTwoCollectors.cfg` (gate) and `GcSafetyTwoCollectorsDeep.cfg` (deeper search). One
+  collection's configs are unchanged in meaning; their state counts grow only by `mBound`.
 
 - D110–D114 drift check (formal2), against the integration head. Each action still maps to its
   function. Changes since the last note:
@@ -198,7 +227,7 @@ moment ago counted as old and its SSTs could be deleted under a reader. `ownUplo
 
 ## Keeping it in step with the code
 
-Sync commit: the D110–D114 drift check (formal2); before it, the D77 commit (`fix(lsm-cloudflare): a fork releases its hold only when no manifest GC keeps names another database's SST`); before it the D70–D74 commit. When a covered function changes after it, update the model
+Sync commit: the D116 commit; before it, the D110–D114 drift check (formal2); before it, the D77 commit (`fix(lsm-cloudflare): a fork releases its hold only when no manifest GC keeps names another database's SST`); before it the D70–D74 commit. When a covered function changes after it, update the model
 so each action is still one awaited effect in the code, rerun, and show each invariant still fails on
 a broken variant before moving the sync commit. For drift that skipped this skill, use
 `.agents/skills/maintain-formal-verification-skill/SKILL.md`.

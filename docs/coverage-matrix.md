@@ -798,3 +798,9 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   writer's named candidates (start-path scheduling, start-failure reasons, D95 successors,
   `initLock`, `flushLock`) tested. Tests: `db-transaction-ranges.test.ts` (scanned ranges),
   `db-writer-start.test.ts`, `mem-table.test.ts`, `compactor.test.ts`.
+- **The models interleave inside the locks (D116)**: done. Each lock in `compactor.ts` and the
+  sharding directory is a broken variant with a gated unit test, except `collectionLock`, which no
+  safety property needs (`GcSafetyTwoCollectors.cfg`). New properties: `DroppedStaysDropped`,
+  `RunningStaysRecorded`, `PublishedIsSealed`, `NewIncarnationIntact`. Two defects found and
+  fixed: `deleteCheckpoint` during `forkRange` (`database-lifecycle.test.ts`), and a job launched
+  before it was recorded (`compactor.test.ts`). Deeper search configs, unregistered, in each skill.

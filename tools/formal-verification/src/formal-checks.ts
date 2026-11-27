@@ -161,6 +161,13 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
         expect: "ReadableManifestsComplete",
         timeLimitSeconds: 60,
       },
+      // D116: two collections at once (D83); no variant fails here that passes with one.
+      {
+        config: "GcSafetyTwoCollectors.cfg",
+        broken: "none",
+        expect: "pass",
+        timeLimitSeconds: 300,
+      },
       { config: "GcSafetyFork.cfg", broken: "none", expect: "pass", timeLimitSeconds: 120 },
       {
         config: "GcSafetyFork.cfg",
