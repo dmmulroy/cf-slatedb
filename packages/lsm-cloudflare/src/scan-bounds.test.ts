@@ -646,3 +646,40 @@ describe("a Latest scan of a sealed database (D130)", () => {
     expect(outcome).toEqual({ refused: "DatabaseSealedError", read: 1 });
   });
 });
+
+describe("a scan whose writer rows span pages, with flushed keys after them (D130)", () => {
+  it("reads every key once: each segment ends where the next begins", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createDatabase;
+        const db = yield* DbClient;
+        // Key 2000 flushed; keys 0..1199 unflushed: two writer pages, cut between two keys.
+        yield* db.write(DB, {
+          operations: [{ _tag: "Put", key: key(2000), value: u64(1), ttlMillis: Option.none() }],
+        });
+        yield* db.flush(DB);
+        for (let start = 0; start < 1200; start += 600) {
+          yield* db.write(DB, {
+            operations: Array.from({ length: 600 }, (_, offset) => ({
+              _tag: "Put" as const,
+              key: key(start + offset),
+              value: u64(1),
+              ttlMillis: Option.none(),
+            })),
+          });
+        }
+        const latest = yield* Stream.runCollect(
+          db.scan(DB, FULL_KEY_RANGE, { ...latestOptions(10), limit: Option.none() }),
+        );
+        const { readSeq, manifestId } = yield* db.beginTransaction(DB);
+        const transaction = yield* db.scanAt(DB, FULL_KEY_RANGE, readSeq, 5000, manifestId);
+        return [latest, transaction].map((rows) => {
+          const keys = rows.map((row) => ((row.key[1] ?? 0) << 8) | (row.key[2] ?? 0));
+          return { count: keys.length, distinct: new Set(keys).size, last: keys.at(-1) };
+        });
+      }),
+    );
+    for (const read of outcome) expect(read).toEqual({ count: 1201, distinct: 1201, last: 2000 });
+  });
+});
+
