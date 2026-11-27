@@ -1,8 +1,9 @@
-import { Cause, Context, Effect, Layer, Option, Schema, Stream } from "effect";
+import { ByteSize, Cause, Context, Effect, Layer, Schema } from "effect";
 import {
   HttpEffect,
+  HttpIncomingMessage,
   HttpRouter,
-  type HttpServerError,
+  HttpServerError,
   HttpServerRequest,
   HttpServerResponse,
 } from "effect/http";
@@ -48,31 +49,6 @@ const noStore = { "cache-control": "no-store" };
  */
 export const MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024;
 
-/** The bytes of `stream`, or `None` as soon as they pass `limit` (the rest is never read). */
-const readAtMost = (stream: Stream.Stream<Uint8Array, unknown>, limit: number) =>
-  Effect.gen(function* () {
-    const chunks: Array<Uint8Array> = [];
-    let total = 0;
-    const within = yield* stream.pipe(
-      Stream.takeUntil((chunk) => {
-        total += chunk.length;
-        chunks.push(chunk);
-        return total > limit;
-      }),
-      Stream.runDrain,
-      Effect.as(true),
-      Effect.catch(() => Effect.succeed(false)),
-    );
-    if (!within || total > limit) return Option.none<Uint8Array>();
-    const body = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-      body.set(chunk, offset);
-      offset += chunk.length;
-    }
-    return Option.some(body);
-  });
-
 /** The part of a request each kind of request decoding failure is about. */
 const REQUEST_PART_BY_SCHEMA_ERROR_KIND = {
   Params: "path parameters",
@@ -105,6 +81,19 @@ const malformedRequestPart = (cause: Cause.Cause<unknown>) => {
   }
   return undefined;
 };
+
+/**
+ * Whether the request died because its body passed the bound while the API builder read it: the
+ * builder raises a body it cannot read as a defect holding the server's `RequestParseError`.
+ */
+const bodyTooLarge = (cause: Cause.Cause<unknown>) =>
+  cause.reasons.some(
+    (reason) =>
+      Cause.isDieReason(reason) &&
+      HttpServerError.isHttpServerError(reason.defect) &&
+      reason.defect.reason._tag === "RequestParseError" &&
+      reason.defect.reason.reason === "BodyTooLarge",
+  );
 
 /**
  * Where a public API's caller checks a request it got wrong, named at the end of the middleware's
@@ -168,33 +157,21 @@ export const publicHttpRequestMiddlewareLayer = (reference: PublicHttpApiReferen
             ),
             { status: 400, headers: noStore },
           );
-        // The body is read here, at most MAX_REQUEST_BODY_BYTES of it, whether or not the request
-        // declares its length (a chunked body has none); the router reads the buffered copy (D100).
+        // A declared length over the bound is refused before anything is read. A body with no
+        // declared length (chunked) is bounded where it is read: the router reads it once, through
+        // `HttpIncomingMessage.MaxBodySize`, and stops at the bound (D100). The body is never read
+        // here: a second read of a request body fails in the Workers runtime.
         const tooLarge = () =>
           invalidRequest(
             `The request to ${request.method} ${pathname} has a body larger than ${MAX_REQUEST_BODY_BYTES} bytes (16 MiB), the most any request may send. Send a smaller batch, or fewer keys and ranges.`,
           );
         const declared = Number(request.headers["content-length"] ?? "0");
         if (Number.isFinite(declared) && declared > MAX_REQUEST_BODY_BYTES) return tooLarge();
-        const hasBody = request.method !== "GET" && request.method !== "HEAD";
-        const served = hasBody
-          ? yield* Effect.gen(function* () {
-              const body = yield* readAtMost(request.stream, MAX_REQUEST_BODY_BYTES);
-              if (Option.isNone(body)) return Option.none<HttpServerRequest.HttpServerRequest>();
-              return Option.some(
-                HttpServerRequest.fromWeb(
-                  new Request(new URL(request.originalUrl, "http://api.internal"), {
-                    method: request.method,
-                    headers: request.headers,
-                    body: body.value,
-                  }),
-                ),
-              );
-            })
-          : Option.some(request);
-        if (Option.isNone(served)) return tooLarge();
         return yield* httpEffect.pipe(
-          Effect.provideService(HttpServerRequest.HttpServerRequest, served.value),
+          Effect.provideService(
+            HttpIncomingMessage.MaxBodySize,
+            ByteSize.bytes(MAX_REQUEST_BODY_BYTES),
+          ),
           // The API builder answers a content type no endpoint accepts itself, in plain text.
           Effect.map((response) =>
             response.status === 415
@@ -222,6 +199,7 @@ export const publicHttpRequestMiddlewareLayer = (reference: PublicHttpApiReferen
                   ),
                 );
               case "RequestParseError":
+                if (error.reason.reason === "BodyTooLarge") return Effect.succeed(tooLarge());
                 return Effect.succeed(
                   invalidRequest(
                     `The request to ${request.method} ${pathname} could not be read because its path, query, or body is malformed. Fix the request and send it again.`,
@@ -233,6 +211,7 @@ export const publicHttpRequestMiddlewareLayer = (reference: PublicHttpApiReferen
             }
           }),
           Effect.catchCauseIf(Cause.hasDies, (cause) => {
+            if (bodyTooLarge(cause)) return Effect.succeed(tooLarge());
             const malformed = malformedRequestPart(cause);
             return malformed === undefined
               ? internalFailure("shaledb API request failed on a defect", Cause.pretty(cause))

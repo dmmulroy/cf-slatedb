@@ -3795,6 +3795,15 @@ with them. `collapseWriteBatch` still checks a batch for callers inside the Work
 - **Mutations caught:** `readKeys` unbounded, the checkpoint name unbounded, `budgetGroup` any
   string, a sharded value unbounded, no declared-length refusal, and an unbounded chunked read.
 
+**Corrected at integration: the body is bounded where it is read, not buffered first.** The first
+form read the body in the middleware and handed the router a copy. It passed its unit tests and
+failed every `POST` in workerd (`writer.workerd.ts`): the router read the original request, whose
+body was already used. The middleware now refuses a declared `content-length` over the bound and
+provides Effect's `HttpIncomingMessage.MaxBodySize`, so the router's one read of the body stops
+at 16 MiB and fails with `RequestParseError` (`BodyTooLarge`), which the middleware answers as
+`InvalidRequest`. Nothing reads a body twice. The agents' harness could not show this: only the
+workerd tests run the Workers runtime's request, which is why they are part of `vp run ready`.
+
 ## D101. A request that waits out an abandoned split finishes it
 
 A split has four steps: record it, seal the shard, fork both halves, publish
