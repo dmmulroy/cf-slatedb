@@ -117,4 +117,23 @@ describe("ShaledbStackConfig", () => {
     expect(eu.jurisdiction).toEqual(Option.some("eu"));
     expect(lsmWorkerSettingsBindings(eu)["SHALEDB_JURISDICTION"]).toBe("eu");
   });
+
+  it("binds each setting within a Worker variable's 5 KB, with the largest values settings allow (D92)", async () => {
+    // Workers: a variable or secret is at most 5 KB (developers.cloudflare.com/workers/platform/limits,
+    // 2026-11-25). The engine settings are one JSON variable; its numbers grow with their values.
+    const largest = Object.fromEntries(
+      Object.entries(DEFAULT_LSM_SETTINGS).map(([name, value]) => [
+        name,
+        Number.isInteger(value) ? Number.MAX_SAFE_INTEGER : 0.123456789012345,
+      ]),
+    );
+    // The settings' JSON is plain numbers, so its longest form is every field at its longest number.
+    expect(new TextEncoder().encode(JSON.stringify(largest)).length).toBeLessThanOrEqual(5_000);
+    const bindings = lsmWorkerSettingsBindings(
+      shaledbWorkerSettingsOf(await resolve("production", {})),
+    );
+    for (const [name, value] of Object.entries(bindings)) {
+      expect([name, new TextEncoder().encode(value).length <= 5_000]).toEqual([name, true]);
+    }
+  });
 });

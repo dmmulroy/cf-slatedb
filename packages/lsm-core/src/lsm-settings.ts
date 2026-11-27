@@ -1,5 +1,7 @@
 import { Schema } from "effect";
 
+import { MAX_BATCH_BYTES } from "./write-batch.ts";
+
 const PositiveInt = Schema.Int.check(Schema.isGreaterThan(0));
 const PositiveNumber = Schema.Number.check(Schema.isGreaterThan(0));
 
@@ -34,6 +36,23 @@ const LsmSettingsFields = Schema.Struct({
 /** Every setting, each valid on its own. */
 type LsmSettingsFields = typeof LsmSettingsFields.Type;
 
+/**
+ * Cloudflare platform limits the settings are checked against (D92). Each is the documented value
+ * on the date given; a limit that changes is changed here.
+ */
+export const LSM_PLATFORM_LIMITS = {
+  /** R2: most parts in one multipart upload (developers.cloudflare.com/r2/platform/limits, 2026-10-30). */
+  r2MaxUploadParts: 10_000,
+  /** R2: largest single upload or multipart part, 5 GiB less 5 MiB (same page). */
+  r2MaxPartBytes: 5 * 1024 ** 3 - 5 * 1024 ** 2,
+  /** Workers: memory per isolate, 128 MB (developers.cloudflare.com/workers/platform/limits, 2026-11-25). */
+  isolateMemoryBytes: 128_000_000,
+  /** Durable Objects: SQLite storage per object on Workers Paid, 10 GB (developers.cloudflare.com/durable-objects/platform/limits, 2026-11-13). */
+  durableObjectStorageBytes: 10_000_000_000,
+  /** Workflows: concurrent instances per account on Workers Paid (developers.cloudflare.com/workflows/reference/limits, 2026-11-10). */
+  workflowConcurrentInstances: 50_000,
+} as const;
+
 /** One rule between settings: the fields it relates, and what must hold between them. */
 interface LsmSettingsCombinationRule {
   /** The field the issue is reported at. */
@@ -53,6 +72,11 @@ interface LsmSettingsCombinationRule {
  *   until `maxL0Age` flushes.
  * - A compaction's budget lease must outlive the compactor's poll interval, which renews it.
  * - Flushed rows kept for transactions must not outlive the manifests those transactions read.
+ * - Platform limits ({@link LSM_PLATFORM_LIMITS}, D92): the largest flush and every compaction
+ *   output fit in R2's parts; a part fits in one R2 upload; the L1 caches fit in an isolate; a
+ *   writer's SQLite (unflushed rows, at most one batch over the limit, the newest flush kept for
+ *   transactions, and the retained rows) fits in a Durable Object; the compaction budget fits the
+ *   account's concurrent Workflow instances.
  */
 const LSM_SETTINGS_COMBINATION_RULES: ReadonlyArray<LsmSettingsCombinationRule> = [
   {
@@ -72,6 +96,38 @@ const LSM_SETTINGS_COMBINATION_RULES: ReadonlyArray<LsmSettingsCombinationRule> 
       settings.transactionRetentionMs === 0 || settings.transactionRetentionMs < settings.gcMinAge,
     message:
       "transactionRetentionMs must be shorter than gcMinAge: a transaction reads the manifest it began at, which GC keeps only for gcMinAge",
+  },
+  {
+    field: "multipartPartSize",
+    holds: (settings) =>
+      Math.max(settings.maxUnflushedBytes, settings.compactionOutputSstSize) <=
+      LSM_PLATFORM_LIMITS.r2MaxUploadParts * settings.multipartPartSize,
+    message: `multipartPartSize is too small: the largest flush (maxUnflushedBytes) and each compaction output (compactionOutputSstSize) must fit in ${LSM_PLATFORM_LIMITS.r2MaxUploadParts} parts, R2's limit for one multipart upload`,
+  },
+  {
+    field: "multipartPartSize",
+    holds: (settings) => settings.multipartPartSize <= LSM_PLATFORM_LIMITS.r2MaxPartBytes,
+    message: `multipartPartSize must be at most ${LSM_PLATFORM_LIMITS.r2MaxPartBytes} bytes (5 GiB less 5 MiB), R2's largest part`,
+  },
+  {
+    field: "l1DataCacheBytes",
+    holds: (settings) =>
+      settings.l1DataCacheBytes + settings.l1MetaCacheBytes <
+      LSM_PLATFORM_LIMITS.isolateMemoryBytes,
+    message: `l1DataCacheBytes and l1MetaCacheBytes together must be below ${LSM_PLATFORM_LIMITS.isolateMemoryBytes} bytes, the memory of one isolate, which holds both caches and every request it serves`,
+  },
+  {
+    field: "maxRetainedBytes",
+    holds: (settings) =>
+      settings.maxRetainedBytes + 2 * settings.maxUnflushedBytes + MAX_BATCH_BYTES <=
+      LSM_PLATFORM_LIMITS.durableObjectStorageBytes,
+    message: `maxRetainedBytes plus twice maxUnflushedBytes plus one batch must fit in ${LSM_PLATFORM_LIMITS.durableObjectStorageBytes} bytes, a Durable Object's storage: the writer's SQLite holds the unflushed rows (up to one batch over the limit), the newest flush (up to maxUnflushedBytes after a stall), and the rows retained for transactions`,
+  },
+  {
+    field: "compactionBudgetCapacity",
+    holds: (settings) =>
+      settings.compactionBudgetCapacity <= LSM_PLATFORM_LIMITS.workflowConcurrentInstances,
+    message: `compactionBudgetCapacity must be at most ${LSM_PLATFORM_LIMITS.workflowConcurrentInstances}, the concurrent Workflow instances an account may run`,
   },
   {
     field: "compactionLeaseMs",
