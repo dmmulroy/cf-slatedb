@@ -65,6 +65,23 @@ export class CompactionWorkflow extends Cloudflare.Workflow<CompactionWorkflow>(
 
 const decodeOutcome = Schema.decodeUnknownOption(CompactionJobOutcome);
 
+/**
+ * A compaction job's progress from its Workflow instance's status: running while the instance can
+ * still commit; otherwise finished, with the outcome a completed instance returned (none for an
+ * errored or terminated one, or an output this version cannot read).
+ */
+export const compactionJobProgressOf = (
+  status: string,
+  /** The instance's output: a completed run's encoded outcome, read from Workflows (untyped). */
+  output: unknown,
+): CompactionJobProgress => {
+  if (RUNNING_STATUSES.has(status)) return { _tag: "Running" };
+  return {
+    _tag: "Finished",
+    outcome: status === "complete" ? decodeOutcome(output) : Option.none(),
+  };
+};
+
 /** Workflow statuses after which a job can still commit. */
 const RUNNING_STATUSES: ReadonlySet<string> = new Set([
   "queued",
@@ -110,17 +127,7 @@ export const compactionLauncherLayer = Layer.effect(
           "compaction.job_id": jobId,
           "workflow.status": status.status,
         });
-        if (RUNNING_STATUSES.has(status.status)) {
-          const running: CompactionJobProgress = { _tag: "Running" };
-          return running;
-        }
-        // A completed run returns its encoded outcome; an errored or terminated one has none.
-        const outcome =
-          status.status === "complete"
-            ? decodeOutcome(status.output)
-            : Option.none<CompactionJobOutcome>();
-        const finished: CompactionJobProgress = { _tag: "Finished", outcome };
-        return finished;
+        return compactionJobProgressOf(status.status, status.output);
       }),
     });
   }),
