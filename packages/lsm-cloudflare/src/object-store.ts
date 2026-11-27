@@ -171,11 +171,82 @@ export class ObjectStore extends Context.Service<ObjectStore, IObjectStore>()(
   "@shaledb/ObjectStore",
 ) {}
 
-/** Retry for transient R2 failures: three retries, exponential from 50 ms with jitter. */
+/**
+ * Retry for R2 writes and deletes: three retries, exponential from 50 ms with jitter. A
+ * conditional write (`putIfAbsent`, `putIfVersion`) whose response was lost may find its own
+ * write on the retry; that class has its own rules (D85, D113) where the result is read, and is
+ * not changed by D134's read retry.
+ */
 const r2RetrySchedule = {
   schedule: Schedule.exponential("50 millis").pipe(Schedule.jittered),
   times: 3,
 };
+
+/**
+ * R2 error codes that mean "try again" (https://developers.cloudflare.com/r2/api/error-codes/,
+ * "Service errors"): 10001 InternalError ("We encountered an internal error. Please try again."),
+ * 10043 ServiceUnavailable, 10054 ClientDisconnect, 10058 TooManyRequests. The Workers binding
+ * throws an `Error` whose message ends with the code in parentheses; Alchemy's `R2Error` keeps that
+ * message. Every other code is a fact about the request (10039 InvalidRange, 10031
+ * PreconditionFailed, 10020 InvalidObjectName, the authorization codes) and is not retried. A
+ * missing object is not an error: `get` and `head` return null.
+ */
+const TRANSIENT_R2_ERROR_CODES: ReadonlySet<number> = new Set([10001, 10043, 10054, 10058]);
+
+/** The R2 error code at the end of a binding error's message, if it has one. */
+const r2ErrorCode = (message: string): Option.Option<number> => {
+  const match = /\((\d{5,6})\)\s*$/.exec(message);
+  return match?.[1] === undefined ? Option.none() : Option.some(Number(match[1]));
+};
+
+/**
+ * Whether an R2 failure is worth retrying (D134): a transient R2 code, or no code at all, which is
+ * the binding failing between the Worker and R2 ("Network connection lost.").
+ */
+export const isTransientR2Error = (error: { readonly message: string }): boolean =>
+  Option.match(r2ErrorCode(error.message), {
+    onNone: () => true,
+    onSome: (code) => TRANSIENT_R2_ERROR_CODES.has(code),
+  });
+
+/**
+ * Retries after the first attempt of an idempotent read (D134). A ranged block read costs about
+ * 20 ms and a read request's p99 is about 350 ms on `preview-3` (`docs/measurements.md`), so two
+ * retries 25 and 50 ms apart (jittered) add at most about 150 ms to a read that would otherwise
+ * fail; one transient failure in 10,000 reads then fails a read about once in 10^12.
+ */
+export const R2_READ_RETRIES = 2;
+
+/**
+ * Runs an idempotent R2 read (`get`, `getRange`, `head`, `list`, and the body it returns), retrying
+ * a transient failure ({@link isTransientR2Error}) up to {@link R2_READ_RETRIES} times, inside the
+ * caller's span. A read that needed a retry marks the span `object.read_retried` with the number of
+ * retries, whether it then succeeded or not, for the health report (D134). Interruption is not a
+ * failure and is never retried.
+ */
+export const retryTransientRead = <A, E extends { readonly message: string }, R>(
+  read: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> =>
+  Effect.suspend(() => {
+    let attempts = 0;
+    return Effect.suspend(() => {
+      attempts++;
+      return read;
+    }).pipe(
+      Effect.retry({
+        schedule: Schedule.exponential("25 millis").pipe(Schedule.jittered),
+        times: R2_READ_RETRIES,
+        while: isTransientR2Error,
+      }),
+      Effect.ensuring(
+        Effect.suspend(() =>
+          attempts > 1
+            ? Effect.annotateCurrentSpan({ "object.read_retried": attempts - 1 })
+            : Effect.void,
+        ),
+      ),
+    );
+  });
 
 /**
  * Re-chunks a byte stream into parts of exactly `partSize` bytes, except a shorter final part. Each
@@ -336,11 +407,13 @@ export const makeObjectStore = Effect.gen(function* () {
   return ObjectStore.of({
     get: Effect.fn("ObjectStore.get")(function* (key: string) {
       yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
-      const object = yield* bucket
-        .get(key)
-        .pipe(Effect.retry(r2RetrySchedule), Effect.mapError(unavailable("get", key)));
-      if (object === null) return Option.none<Uint8Array>();
-      return Option.some(yield* object.bytes().pipe(Effect.mapError(unavailable("get", key))));
+      return yield* retryTransientRead(
+        Effect.gen(function* () {
+          const object = yield* bucket.get(key);
+          if (object === null) return Option.none<Uint8Array>();
+          return Option.some(yield* object.bytes());
+        }),
+      ).pipe(Effect.mapError(unavailable("get", key)));
     }),
     getRange: Effect.fn("ObjectStore.getRange")(function* (key: string, range: ByteRange) {
       yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
@@ -348,20 +421,26 @@ export const makeObjectStore = Effect.gen(function* () {
         "object.offset": range.offset,
         "object.length": range.length,
       });
-      const object = yield* bucket
-        .get(key, { range: { offset: range.offset, length: range.length } })
-        .pipe(Effect.retry(r2RetrySchedule), Effect.mapError(unavailable("getRange", key)));
-      if (object === null) return Option.none<Uint8Array>();
-      return Option.some(yield* object.bytes().pipe(Effect.mapError(unavailable("getRange", key))));
+      return yield* retryTransientRead(
+        Effect.gen(function* () {
+          const object = yield* bucket.get(key, {
+            range: { offset: range.offset, length: range.length },
+          });
+          if (object === null) return Option.none<Uint8Array>();
+          return Option.some(yield* object.bytes());
+        }),
+      ).pipe(Effect.mapError(unavailable("getRange", key)));
     }),
     getVersioned: Effect.fn("ObjectStore.getVersioned")(function* (key: string) {
       yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
-      const object = yield* bucket
-        .get(key)
-        .pipe(Effect.retry(r2RetrySchedule), Effect.mapError(unavailable("get", key)));
-      if (object === null) return Option.none<VersionedObject>();
-      const bytes = yield* object.bytes().pipe(Effect.mapError(unavailable("get", key)));
-      return Option.some({ bytes, version: object.httpEtag });
+      return yield* retryTransientRead(
+        Effect.gen(function* () {
+          const object = yield* bucket.get(key);
+          if (object === null) return Option.none<VersionedObject>();
+          const bytes = yield* object.bytes();
+          return Option.some({ bytes, version: object.httpEtag });
+        }),
+      ).pipe(Effect.mapError(unavailable("get", key)));
     }),
     putIfVersion: Effect.fn("ObjectStore.putIfVersion")(function* (
       key: string,
@@ -379,9 +458,9 @@ export const makeObjectStore = Effect.gen(function* () {
     }),
     head: Effect.fn("ObjectStore.head")(function* (key: string) {
       yield* Effect.annotateCurrentSpan({ "object.kind": objectKindOfKey(key) });
-      const object = yield* bucket
-        .head(key)
-        .pipe(Effect.retry(r2RetrySchedule), Effect.mapError(unavailable("head", key)));
+      const object = yield* retryTransientRead(bucket.head(key)).pipe(
+        Effect.mapError(unavailable("head", key)),
+      );
       return object === null ? Option.none() : Option.some(info(object));
     }),
     putIfAbsent: Effect.fn("ObjectStore.putIfAbsent")(function* (key: string, body: Uint8Array) {
@@ -475,9 +554,13 @@ export const makeObjectStore = Effect.gen(function* () {
         );
       }).pipe(Effect.withSpan("ObjectStore.putMultipart")),
     list: Effect.fn("ObjectStore.list")(function* (prefix: string, cursor: Option.Option<string>) {
-      const page = yield* bucket
-        .list({ prefix, limit: 1000, ...(Option.isSome(cursor) ? { cursor: cursor.value } : {}) })
-        .pipe(Effect.retry(r2RetrySchedule), Effect.mapError(unavailable("list", prefix)));
+      const page = yield* retryTransientRead(
+        bucket.list({
+          prefix,
+          limit: 1000,
+          ...(Option.isSome(cursor) ? { cursor: cursor.value } : {}),
+        }),
+      ).pipe(Effect.mapError(unavailable("list", prefix)));
       return {
         objects: page.objects.map(info),
         cursor: page.truncated ? Option.some(page.cursor) : Option.none(),
@@ -492,14 +575,14 @@ export const makeObjectStore = Effect.gen(function* () {
       // Every key under `<p>/` sorts before `<p>0` ("/" is 0x2F, "0" is 0x30), so starting after it
       // skips the whole earlier prefix and nothing that follows it.
       const startAfter = Option.map(after, (previous) => `${previous.slice(0, -1)}0`);
-      const page = yield* bucket
-        .list({
+      const page = yield* retryTransientRead(
+        bucket.list({
           prefix,
           delimiter: "/",
           limit: pageLimit,
           ...(Option.isSome(startAfter) ? { startAfter: startAfter.value } : {}),
-        })
-        .pipe(Effect.retry(r2RetrySchedule), Effect.mapError(unavailable("list", prefix)));
+        }),
+      ).pipe(Effect.mapError(unavailable("list", prefix)));
       const prefixes = page.delimitedPrefixes;
       return {
         prefixes,
