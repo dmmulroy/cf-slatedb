@@ -8,7 +8,7 @@ import {
   planCompactions,
   type SstHandle,
 } from "@shaledb/lsm-core";
-import { Effect, Layer, Option, type Scope, Stream } from "effect";
+import { Effect, Exit, Layer, Option, type Scope, Stream } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -314,5 +314,120 @@ describe("one key overwritten many times (D125)", () => {
       expect(seen.pages).toBeLessThanOrEqual(2);
       expect(seen.rows).toBeLessThanOrEqual(1000 + 1);
     }
+  }, 120_000);
+});
+
+const putAll = (count: number, value: number) =>
+  Effect.flatMap(DbClient, (db) =>
+    db.write(DB, {
+      operations: Array.from({ length: count }, (_, index) => ({
+        _tag: "Put" as const,
+        key: key(index),
+        value: Uint8Array.of(value),
+        ttlMillis: Option.none(),
+      })),
+    }),
+  );
+
+describe("one transaction scan in several pages (D125)", () => {
+  it("pages separated by an overwrite, a flush, and a compaction all read the readSeq state", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createDatabase;
+        yield* putAll(100, 1);
+        const db = yield* DbClient;
+        const { readSeq, manifestId } = yield* db.beginTransaction(DB);
+        const first = yield* db.scanAtPage(DB, FULL_KEY_RANGE, readSeq, 10, manifestId);
+        // Every key overwritten, flushed, and compacted between the two pages.
+        yield* putAll(100, 2);
+        yield* db.flush(DB);
+        yield* compact;
+        const resumeFrom = Option.getOrThrow(first.resumeFrom);
+        const second = yield* db.scanAtPage(
+          DB,
+          { start: resumeFrom, end: Option.none() },
+          readSeq,
+          10,
+          manifestId,
+        );
+        const values = (rows: ReadonlyArray<{ readonly value: { readonly _tag: string } }>) =>
+          rows.map((row) =>
+            row.value._tag === "Value" &&
+            "bytes" in row.value &&
+            row.value.bytes instanceof Uint8Array
+              ? row.value.bytes[0]
+              : -1,
+          );
+        return {
+          first: values(first.rows),
+          second: values(second.rows),
+          secondStart: (second.rows[0]?.key ?? new Uint8Array(0))[2],
+        };
+      }),
+    );
+    expect(outcome.first).toEqual(Array(10).fill(1));
+    expect(outcome.second).toEqual(Array(10).fill(1));
+    expect(outcome.secondStart).toBe(10);
+  }, 120_000);
+
+  /** Begins, scans one page of `[0, 100)` (ending at key 10), lets another writer insert key 50, and commits. */
+  const phantom = (readRange: "whole range" | "page only") =>
+    run(
+      Effect.gen(function* () {
+        yield* createDatabase;
+        yield* Effect.flatMap(DbClient, (db) =>
+          db.write(DB, {
+            operations: Array.from({ length: 50 }, (_, index) => ({
+              _tag: "Put" as const,
+              key: key(index),
+              value: Uint8Array.of(1),
+              ttlMillis: Option.none(),
+            })),
+          }),
+        );
+        const db = yield* DbClient;
+        const whole = { start: key(0), end: Option.some(key(100)) };
+        const { readSeq, manifestId } = yield* db.beginTransaction(DB);
+        const page = yield* db.scanAtPage(DB, whole, readSeq, 10, manifestId);
+        // A phantom: beyond the page's end, inside the range scanned.
+        yield* db.write(DB, {
+          operations: [
+            { _tag: "Put", key: key(70), value: Uint8Array.of(9), ttlMillis: Option.none() },
+          ],
+        });
+        const named =
+          readRange === "whole range"
+            ? whole
+            : { start: key(0), end: Option.some(Option.getOrThrow(page.resumeFrom)) };
+        const committed = yield* Effect.exit(
+          db.commitTransaction(DB, {
+            readSeq,
+            isolation: "SerializableSnapshot",
+            batch: {
+              operations: [
+                {
+                  _tag: "Put",
+                  key: key(200),
+                  value: Uint8Array.of(page.rows.length),
+                  ttlMillis: Option.none(),
+                },
+              ],
+            },
+            readKeys: [],
+            readRanges: [named],
+          }),
+        );
+        return Exit.isSuccess(committed)
+          ? "committed"
+          : String(Option.getOrUndefined(Exit.findErrorOption(committed))?._tag);
+      }),
+    );
+
+  it("a phantom beyond an early page's end but inside the scanned range fails the commit when readRanges names the whole range", async () => {
+    expect(await phantom("whole range")).toBe("TransactionConflictError");
+  }, 120_000);
+
+  it("naming only the part a page returned misses that phantom: the commit succeeds (what the docs warn of)", async () => {
+    expect(await phantom("page only")).toBe("committed");
   }, 120_000);
 });
