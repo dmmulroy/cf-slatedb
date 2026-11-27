@@ -159,7 +159,12 @@ cd "$(mktemp -d)" && cp <repo>/tools/formal-verification/specs/WriterObject.tla 
 - `WriterObjectSimulate.cfg`: 6 requests, 4 sequence numbers, 2 evictions, 2 interruptions,
   2 R2 failures, no symmetry; simulation only.
 
-Results are recorded in `/tmp/shale-work/agents/formal/STATUS.md` and the maintenance notes.
+Results (2026-11-26, the D131 model, one worker, niced):
+
+- `WriterObjectSearch.cfg`, breadth-first for 30 minutes: no violation; 34,464,583 distinct
+  states to depth 72, 1,195,912 still queued (not complete).
+- `WriterObjectSimulate.cfg`, `-simulate -depth 200` for 30 minutes: no violation; 227,199,679
+  states checked.
 
 ## Maintenance notes
 
