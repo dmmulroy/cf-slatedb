@@ -5173,3 +5173,35 @@ limit. That is D98's limit, not this one's; it is left to D98's owner.
     `MAX_BATCH_BYTES`, which equals `MAX_MEMTABLE_PAGE_BYTES`, counted the same way, so a
     first batch alone never passes the bound. No consumer stalls.
   - **The row limit with `>`.** `DbClient.changes` cuts again at the limit.
+
+## D130. Mutation sweep of the database API's routes, the scan paths, and the shard router
+
+- **Files:** `db-http-handlers.ts` (all of it, with hand mutants per route), the scan functions of
+  `db-client.ts` and `db-reader.ts` (D125's), `shard-router.ts`, and the sharded handlers.
+  Generator `/tmp/shale-work/scripts/mutants.py`; lists, logs, and triage in
+  `/tmp/shale-work/agents/mut-http/`.
+- **The routes were untested in-process.** 59 of 70 handler mutants survived the first pass,
+  including the scan page's `+ 1` probe row: without it every full page answers a null
+  `resumeFrom` and the scan silently ends. Only the workerd test reached most routes.
+  - `db-http-routes.test.ts` now reaches every route through the real router and a generated
+    client. It checks each route's own `operation`, the create fields, paging, the transaction
+    reads at their begin manifest, seal without holds, the newest manifest on status and
+    compaction, and dropSst's `confirm` and `force`.
+  - After it, 3 of 70 survive, all equivalent.
+- **The in-process harness cannot serve a writer route on first use from inside an API request**
+  (open). `writerClientTestLayer` builds a database's writer router on its first call. Built inside
+  an in-process API request, that router first collides with the API's own router, then fails to
+  decode payloads and queries. The API answers 503, where workerd answers correctly. The route
+  tests warm each database's writer with one direct call.
+- **Scan paths:** tests for the segment ends (a settled key, and a writer-page cut, both before
+  flushed keys), the sealed refusal, three overtaken attempts, and a key settled below a page of
+  operands. Equivalent: the reader filters memtable rows by the segment, exact duplicates merge
+  away, and `scanWithBudget`'s retry is dead, since a Flushed view is never SnapshotExpired.
+- **Open:**
+  - **A risk.** Nothing tests `scanAtSegments` taking the highest `retainedFromSeq` across a
+    segment's writer pages (`Math.min` survives).
+  - **Shard router.** Two test gaps: the routing-error classification, and the map refresh for
+    unprobed reads. One risk: a Flushed read at a snapshot that refreshes the map could be
+    rerouted.
+  - **Not run in the time box:** 37 of the 115 scan mutants and 73 of the 102 shard-router and
+    sharded-handler mutants. The runner resumes.
