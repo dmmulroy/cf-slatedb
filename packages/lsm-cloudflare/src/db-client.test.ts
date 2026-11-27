@@ -13,9 +13,9 @@ import { Arbitrary, Bytes, Effect, Option, Result, Schema, Stream, Tracer } from
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
-import { DbClient, dbClientTestLayer, makeDbClient } from "./db-client.ts";
+import { DbClient, dbClientTestLayer, makeDbClient, type ReadOptions } from "./db-client.ts";
 import {
-  type DbReader,
+  DbReader,
   type DbReaderServices,
   SCAN_READ_AHEAD_BLOCKS,
   scanFirstReadAheadBlocks,
@@ -298,6 +298,74 @@ describe("DbClient against a Map oracle", () => {
       "ReaderUnavailableError",
     );
     expect(outcome.retried).toEqual(Result.succeed(Option.none()));
+  });
+
+  it("a read that loses an SST partway says what to do next: retry, resume a scan after its last row, or take a new snapshot (D83)", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createDatabase;
+        const client = yield* DbClient;
+        for (let key = 1; key <= 40; key++) {
+          yield* client.put(DB, keyBytes(key), Uint8Array.of(key));
+        }
+        yield* client.flush(DB);
+        const snapshot = yield* client.snapshot(DB);
+        const begin = yield* client.beginTransaction(DB);
+        // Warm the cached manifest, then delete its only SST, as GC does once nothing may hold it.
+        const latest: ReadOptions = {
+          consistency: { _tag: "Latest" },
+          snapshot: Option.none(),
+          refuseSealed: false,
+        };
+        yield* client.get(DB, keyBytes(1), latest);
+        const { manifest } = yield* (yield* ManifestReader).loadLatest(DB);
+        yield* (yield* ObjectStore).delete(manifest.l0.map((sst) => sstKey(DB, sst.id)));
+        const message = <A, E extends { readonly message: string }, R>(
+          effect: Effect.Effect<A, E, R>,
+        ) => Effect.map(Effect.flip(effect), (error) => error.message);
+        const scan = (options: ReadOptions) =>
+          Stream.runCollect(
+            client.scan(
+              DB,
+              { start: new Uint8Array(0), end: Option.none() },
+              { ...options, limit: Option.none() },
+            ),
+          );
+        return {
+          get: yield* message(client.get(DB, keyBytes(40), latest)),
+          scan: yield* message(scan(latest)),
+          snapshotGet: yield* message(
+            client.get(DB, keyBytes(40), { ...latest, snapshot: Option.some(snapshot) }),
+          ),
+          snapshotScan: yield* message(scan({ ...latest, snapshot: Option.some(snapshot) })),
+          // As a transaction's read sees it once the writer no longer keeps the rows.
+          transactionGet: yield* message(
+            (yield* DbReader).getRow(DB, keyBytes(40), {
+              minLastL0Seq: begin.readSeq,
+              snapshotSeq: Option.some(begin.readSeq),
+              memtable: [],
+              manifestId: begin.manifestId,
+              maxLastL0Seq: Option.some(begin.readSeq),
+              freshness: "Recent",
+              manifestHint: Option.none(),
+            }),
+          ),
+        };
+      }),
+    );
+    const resume = "A scan resumes from the key after the last row it returned";
+    const retry = "Retry the read: it reads the newest manifest.";
+    const newSnapshot = "take a new snapshot (pinned, to read for longer) and read again.";
+    expect(outcome.get).toContain(retry);
+    expect(outcome.get).not.toContain(resume);
+    expect(outcome.scan).toContain(retry);
+    expect(outcome.scan).toContain(resume);
+    expect(outcome.snapshotGet).toContain(newSnapshot);
+    expect(outcome.snapshotGet).not.toContain(resume);
+    expect(outcome.snapshotScan).toContain(newSnapshot);
+    expect(outcome.snapshotScan).toContain(resume);
+    // A transaction read names its begin manifest but is not a snapshot: a retry reads on.
+    expect(outcome.transactionGet).toContain(retry);
   });
 
   it("sizes a scan's first read-ahead from its limit and the SST's rows per block (D72)", () => {
