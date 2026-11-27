@@ -728,3 +728,35 @@ describe("GC's manifest boundary under a concurrent advance (mutation sweep)", (
     });
   }
 });
+
+describe("loadLatest's listing fallback (mutation sweep)", () => {
+  it("lists to the newest manifest, not to a pinned one below GC's boundary", async () => {
+    const newest = await run(
+      Effect.gen(function* () {
+        yield* initialize;
+        const store = yield* ManifestStore;
+        const objects = yield* ObjectStore;
+        for (const n of [1, 2, 3, 4, 5, 6])
+          yield* store.update(DB, flushEdit(n, WriterEpoch.make(0)));
+        // GC kept manifest 2 (a checkpoint pins it), deleted 1, 3, and 4, and the hint names an id
+        // that was never written: the reader must list.
+        yield* Effect.sleep("20 millis");
+        yield* store.advanceManifestBoundary(DB, ManifestId.make(4));
+        yield* objects.delete([1, 3, 4].map((id) => manifestKey(DB, ManifestId.make(id))));
+        yield* objects.put(latestManifestKey(DB), new TextEncoder().encode("9"));
+        return (yield* (yield* ManifestReader).loadLatest(DB)).id;
+      }),
+    );
+    expect(newest).toBe(7);
+  });
+
+  it("answers a database with only a stale hint left as not found", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* (yield* ObjectStore).put(latestManifestKey(DB), new TextEncoder().encode("3"));
+        return (yield* Effect.flip((yield* ManifestReader).loadLatest(DB)))._tag;
+      }),
+    );
+    expect(outcome).toBe("DatabaseNotFoundError");
+  });
+});
