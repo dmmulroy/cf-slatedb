@@ -9,6 +9,7 @@ import {
   initialManifest,
   type WriteBatch,
 } from "@shaledb/lsm-core";
+import type { RuntimeContext } from "alchemy/RuntimeContext";
 import { Context, Effect, Layer, Option, Result } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
@@ -193,5 +194,96 @@ describe("DbWriter seal of a sealed database, same count of successors (D95, D12
       Effect.runPromise,
     );
     expect(outcome).toEqual(["DatabaseSealedError", "DatabaseSealedError", "sealed"]);
+  });
+});
+
+describe("DbWriter locks (D127)", () => {
+  const started = <A, E>(
+    body: Effect.Effect<A, E, DbWriter | ManifestStore | ManifestReader | RuntimeContext>,
+  ) =>
+    Effect.gen(function* () {
+      yield* (yield* ManifestStore).initialize(
+        initialManifest(DB, { keyRange: Option.none(), databaseOptions: DEFAULT_DATABASE_OPTIONS }),
+      );
+      return yield* body;
+    }).pipe(
+      Effect.provide(dbWriterTestLayer()),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.provide(TestClock.layer()),
+      Effect.runPromise,
+    );
+
+  it("concurrent first requests fence in once (initLock), so the writer's flushes still commit", async () => {
+    const outcome = await Effect.gen(function* () {
+      yield* (yield* ManifestStore).initialize(
+        initialManifest(DB, { keyRange: Option.none(), databaseOptions: DEFAULT_DATABASE_OPTIONS }),
+      );
+      const store = yield* ManifestStore;
+      const shared = yield* Effect.context<ManifestStore | ManifestReader | ObjectStore>();
+      // R2 answers after other fibers ran: a second request may reach the start meanwhile.
+      const slowStore = ManifestStore.of({
+        ...store,
+        update: (databaseId, edit) =>
+          Effect.flatMap(
+            Effect.forEach(Array.from({ length: 20 }), () => Effect.yieldNow, { discard: true }),
+            () => store.update(databaseId, edit),
+          ),
+      });
+      const context = yield* Layer.build(
+        dbWriterLayerWithoutDependencies.pipe(
+          Layer.provide(sstStoreLayerWithoutDependencies),
+          Layer.provide(memTableLayerWithoutDependencies),
+          Layer.provide([
+            durableObjectAlarmTestLayer,
+            compactionTriggerTestLayer,
+            backgroundWorkTestLayer,
+            lsmConfigurationTestLayer(),
+          ]),
+          Layer.provide(Layer.succeedContext(shared.pipe(Context.add(ManifestStore, slowStore)))),
+        ),
+      );
+      const writer = Context.get(context, DbWriter);
+      // Status reads and probes start the writer under no lock but the start's own.
+      yield* Effect.all(
+        [
+          writer.status(DB),
+          writer.probe(DB, new TextEncoder().encode("a")),
+          writer.status(DB),
+          writer.probe(DB, new TextEncoder().encode("b")),
+        ],
+        { concurrency: "unbounded" },
+      );
+      for (const key of ["a", "b", "c", "d"]) yield* writer.write(DB, put(key, key));
+      const flushed = yield* Effect.result(writer.flush(DB));
+      const manifest = (yield* (yield* ManifestReader).loadLatest(DB)).manifest;
+      return {
+        flushed: flushed._tag,
+        writerEpoch: manifest.writerEpoch,
+        lastL0Seq: manifest.lastL0Seq,
+      };
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(Layer.merge(manifestStoreTestLayer, writerSqlStorageTestLayer)),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.provide(TestClock.layer()),
+      Effect.runPromise,
+    );
+    // Without the lock each request fences in: the epoch passes 1, and one start's phase is stale.
+    expect(outcome).toEqual({ flushed: "Success", writerEpoch: 1, lastL0Seq: 4 });
+  });
+
+  it("concurrent flushes write the unflushed rows once (flushLock)", async () => {
+    const outcome = await started(
+      Effect.gen(function* () {
+        const writer = yield* DbWriter;
+        for (const key of ["a", "b", "c"]) yield* writer.write(DB, put(key, key));
+        yield* Effect.all([writer.flush(DB), writer.flush(DB), writer.flush(DB)], {
+          concurrency: "unbounded",
+        });
+        const manifest = (yield* (yield* ManifestReader).loadLatest(DB)).manifest;
+        return { l0: manifest.l0.length, lastL0Seq: manifest.lastL0Seq };
+      }),
+    );
+    expect(outcome).toEqual({ l0: 1, lastL0Seq: 3 });
   });
 });
