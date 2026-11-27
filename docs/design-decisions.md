@@ -2770,3 +2770,72 @@ snapshot scan, and a transaction read. Three mutations fail it.
 
 These hold by reading the code (`resolveVisibleRow`, `retainKeyVersions`, `DbWriter.commitBatch`,
 the executor's `prepare`). No code changed for them.
+
+## D84. A transaction's conflict check re-reads the horizon after its queries
+
+**Found by the Durable Object audit.** `DbWriter.commitTransaction` checked that
+`retained_from_seq <= readSeq`, then queried `MemTable.writtenAfter`. These were separate SQLite
+statements, outside any SQLite transaction and outside the flush lock. A flush's trim takes no
+commit lock. If a flush's R2 response arrived while the commit's fiber yielded between the two,
+the trim deleted flushed rows above `readSeq`. The conflict query then found nothing, and a
+`Snapshot` commit over a newer write of the same key was accepted: a lost update.
+
+**The rule.** After the conflict queries, the check reads `retained_from_seq` again. If it passed
+`readSeq`, the commit fails with `SnapshotTooOld`, as it would had the trim come first. Trims only
+raise the horizon, so a horizon still at or below `readSeq` proves every row the queries looked
+for was present. That makes the code match `Transactions.tla`'s atomic `Commit` step.
+
+**Rejected.** Running the check in `MemTable.consistently` would be atomic in production
+(`transactionSync`), but no test can show it, because the test storage's transaction can be
+interleaved.
+
+**Test** (`db-writer.test.ts`). A hook runs a flush right before the conflict query. Before the
+fix the commit was accepted over the write at seq 2; now it is refused with `SnapshotTooOld`. Two
+mutations are caught: the re-read removed, and the re-read testing `flushed_seq`.
+
+## D85. A seal that does not return forgets the writer's phase; an alarm for a database that is gone stops
+
+**A seal whose commit the writer never saw.** `DbWriter.seal` set the writer's in-memory phase to
+sealed only after its manifest commit returned. If the seal's caller hung up after the
+create-if-absent landed, or the boundary read after it failed, the seal ended with:
+
+- the manifest sealed, with the writer epoch raised by one;
+- the writer still believing it was open.
+
+The next write was then acknowledged into SQLite. It could never flush, because the seal's epoch
+fences its writer, and it was in no successor of a split.
+
+**The rule.** If the seal ends without returning (failure or interruption), it sets the phase to
+uninitialized while it still holds the commit lock. The next request then starts the writer again
+from the manifest:
+
+- a sealed manifest starts a sealed writer, without fencing;
+- an open one fences in with a new epoch and stays writable.
+
+A writer evicted at that point restarts the same way. Forgetting the phase after a successful
+seal too would be harmless, because the manifest it reloads is sealed. That is the one mutation
+the tests cannot catch.
+
+**Tests** (`db-writer.test.ts`). A store wrapper holds the seal's commit, then the seal's fiber is
+interrupted:
+
+- interrupted after the commit landed: the next write is refused with `DatabaseSealedError`;
+- the writer evicted after the commit landed: the restarted writer is sealed;
+- interrupted before the commit: the database stays open, and the next write is acknowledged and
+  flushed.
+
+**An alarm for a database that is gone.**
+
+- **The problem.** `runAlarm` rescheduled itself one second out after every failure except
+  fencing. A writer whose database was removed before its state was deleted (a removal
+  interrupted before `writers.destroy`) failed every firing with `DatabaseNotFoundError`, and woke
+  its object every second, forever.
+- **The fix.** `DatabaseNotFoundError` now ends the alarm. Nothing the writer holds can be flushed,
+  and a removal retry deletes the state.
+- **Test** (`db-writer.test.ts`). A writer restarted after its manifest was marked removed sets no
+  alarm on three firings.
+
+**Mutations.** All caught except the harmless one named above.
+
+**Models.** `seal-split` and `transactions` were rerun: pass, and every broken variant fails. No
+step changed; the skills record why.

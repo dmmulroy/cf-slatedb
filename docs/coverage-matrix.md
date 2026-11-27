@@ -258,7 +258,9 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `/v1/databases/:id/transactions/{begin,get,scan,commit}`. Tests: `db-transaction.test.ts`
   (serializability-in-commit-order property for `SerializableSnapshot` and no-lost-update property
   for `Snapshot` over interleavings with direct writes and flushes; write skew; own writes;
-  `SnapshotTooOld`; each shown failing on its mutation), `writer.workerd.ts` (write skew refused
+  `SnapshotTooOld`; each shown failing on its mutation), `db-writer.test.ts` (D84: a trim between
+  the horizon check and the conflict query cannot hide a write; D85: a seal interrupted after or
+  before its commit, and a writer evicted after it), `writer.workerd.ts` (write skew refused
   through the public API). Formal: `Transactions` (check 6).
 
 ## §9 Effect audit and private gaps
