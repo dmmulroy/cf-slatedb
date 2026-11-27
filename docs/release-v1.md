@@ -643,10 +643,6 @@ them.
 - **D108, one scan page could read a whole range of deleted versions,** past the API Worker's CPU
   on every request. A page now examines at most 16 MiB (`SCAN_PAGE_EXAMINED_BYTES`) and ends early
   with `resumeFrom`. Found by the read audit.
-- **D123, span events bypassed the trace policy.** A log line's object parts and annotations were
-  exported unfiltered; no call site put a key there, but nothing stopped one. Events now pass the
-  same allowlist as attributes (this audit).
-
 - **D109, the writer Durable Object at await granularity.** `WriterObject.tla` (PlusCal): two
   requests and the alarm, a label at every await, eviction and interruption anywhere. D74b, D84,
   D85, D102, and D74's loop are each a broken variant that fails a named property. It found D115.
@@ -696,6 +692,10 @@ them.
   partial). Test gaps closed: the commit lock against a seal, the stored row kinds, the start
   failures, concurrent first requests, concurrent flushes, the trim's bounds, and a restarted
   writer scheduling its flush. No wrong behavior found.
+- **D123, span events bypassed the trace policy.** A log line's object parts and annotations were
+  exported unfiltered; no call site put a key there, but nothing stopped one. Events now pass the
+  same allowlist as attributes (this audit).
+
 - **D125, every scan surface is bounded** (the second review, above).
 - **D128, the mutation sweep of the request edge and sharding.** 165 mutants. It found one defect,
   by reading the code beside a survivor: a read of a corrupted SST answered `InternalFailure`,
