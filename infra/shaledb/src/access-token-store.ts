@@ -159,13 +159,25 @@ export const ensureAccessTokens = (stage: string) =>
 export const missingAccessTokens = (stage: string) =>
   Effect.gen(function* () {
     const storeId = yield* tokenStore;
-    const missing: Array<ShaledbAccessTokenSlot> = [];
+    const present = new Set<string>();
     for (const slot of SHALEDB_ACCESS_TOKEN_SLOTS) {
-      const existing = yield* secretIdByName(storeId, accessTokenSecretName(stage, slot));
-      if (Option.isNone(existing)) missing.push(slot);
+      const name = accessTokenSecretName(stage, slot);
+      if (Option.isSome(yield* secretIdByName(storeId, name))) present.add(name);
     }
-    return missing;
+    return missingAccessTokenSlots(stage, present);
   });
+
+/**
+ * The slots of `stage` whose secret is not among `present` (secret names that exist in the store):
+ * the decision `tokens check` and the production deploy make (D64, D104). Only this stage's exact
+ * names count, so another stage's secret, or a name that merely contains this one, never satisfies
+ * a slot.
+ */
+export const missingAccessTokenSlots = (
+  stage: string,
+  present: ReadonlySet<string>,
+): ReadonlyArray<ShaledbAccessTokenSlot> =>
+  SHALEDB_ACCESS_TOKEN_SLOTS.filter((slot) => !present.has(accessTokenSecretName(stage, slot)));
 
 /**
  * Replaces the token in one slot with a new random one (D64). The other slot's token stays valid,
