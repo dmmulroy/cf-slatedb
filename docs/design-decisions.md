@@ -5437,6 +5437,81 @@ commit's check. It still fails without `scheduleFlush`'s lock (mutation caught).
 `alarmBeforeMark`, and `schedulerIgnoresCommit` fail it. `WriterObjectSeal.cfg` passes with
 4,949,012 states.
 
+## D132. The soak's span reads keep up with the soak and read only their window
+
+**What failed.** The 130-minute soak on `preview-1` at `d89beba` (10% sampling) passed every data
+check and failed its gate on `health report: not finished within 20 min`
+(`/tmp/shale-work/final/soak-p1.report.json`). The 12-minute run at 100% sampling failed the same
+way (`/tmp/shale-work/release2/NOTES.md`).
+
+**Why, measured locally on the soak's own store** (reads of a local directory, no live request):
+
+- **The grep, not only the pull.** The measurement store `.traces/measure/preview-1` is shared by
+  every soak and measurement of the stage. It held 134,795 trace files in one directory, 1.1 GB.
+  `measureHealth` runs ten `trace-cli grep`s, and each read every file before `spansSince` dropped
+  the spans outside its window. One took 207 s, and 163 s when the files were cached (`nice -n 15`).
+  Ten of them come to about 30 minutes, past the 20-minute budget whatever the pull does.
+- **A cut-off pull stored exports twice.** The pull saved its cursor after each page of up to 500
+  exports. A watcher pull cut off at its 5-minute budget mid-page had appended those exports, and
+  the next pull stored them again.
+- **The health pull could skip spans.** In the soak, the health report pulled its window before the
+  final full pull. With the watcher behind by more than 15 minutes, the pull's start (the later of
+  the cursor and now minus 15 minutes) moved the cursor past the gap, and the error check never read
+  it.
+
+**The rules.**
+
+- **`trace-cli grep --since <ms>`** keeps only spans that started at or after the time. It reads no
+  trace file last written before the time less 10 minutes (`STORE_CLOCK_MARGIN_MS`, for the skew
+  between the span's clock and this machine's). This is sound because a span is written to its
+  trace file when it is pulled, after it started: a file last written earlier holds no span of the
+  window. `spansSince` passes it, so every soak and measurement grep reads only its window.
+  - **Measured:** on the same store, a 15-minute window took 15 s instead of about 160 s. It
+    found the same 60 `DbWriter.flush` spans as the full grep filtered by time.
+- **A pull saves its cursor after every export it stores,** so a pull cut off anywhere resumes
+  after the last export stored and stores none twice.
+- **The soak's span pulls** (`SpanPuller`, `soak-telemetry.ts`):
+  - **Pacing:** every 30 s while the workload runs, each within 5 minutes.
+  - **One at a time:** one lock covers the watcher and the final catch-up.
+  - **Catch-up first:** after the workload, the span catch-up runs before the health report. The
+    health report then reads the store as it is (`measureHealth(15, { pull: false })`) and cannot
+    move the cursor.
+  - **Visible progress:** the report shows `spansPulledThrough` (from the store's cursor),
+    `spanPullLagAtWorkloadEndSeconds`, and `spanPulls` (finished, cut off, failed). A watcher pull
+    cut off is an event, not a failure; the final budget still bounds the catch-up.
+- **`measure health` on its own** (`docs/operations.md`, production included) pulls only its window
+  (`--since-minutes`). It already did so on a first run against a collector holding 14 days of
+  spans. Its greps now read only that window's files too.
+
+**Why a pull is slow: what the code says, not yet measured.**
+
+- **Already done in the code:**
+  - The collector reads a page's exports 50 at a time (`trace-collector-worker.ts`), one list and
+    up to 500 gets.
+  - The client asks for the next page while it stores the current one (`preview-trace-pull.ts`).
+- **Derived from that:** 500 gets of tens of milliseconds at even 6 at a time take about 6 s of a
+  page. The observed rate is about 30 s of 100%-sampled exports per 2 minutes of pulling, or about
+  10 exports a second at the 40 a second this stage stores at 100% (the collector's comment). That
+  is about 50 s a page. So most of a page's time is the transfer of its base64 bodies or the client
+  decoding and appending each export, not the Worker's reads.
+- **Not changed:** the collector. Which of the two dominates needs one timed page on a live stage:
+  the request alone, against the pull's own time for it. The orchestrator can measure it.
+
+**What this does not fix.** At 100% sampling a pull still moves about a quarter of real time, so a
+12-minute run exports about 48 minutes of pulling. The watcher keeps the backlog moving, but the
+catch-up then needs more than a 10-minute budget. Release soaks run at 10%: 130 minutes export
+about 52 minutes of pulling, which the watcher does during the workload.
+
+**Tests.**
+
+- `soak-telemetry.test.ts`: a pull that cannot keep up is cut off at its budget, keeps how far it
+  got, and the next resumes; two pulls at once run one after the other; a failed pull and the lag;
+  a workload ending mid-pull releases the lock.
+- `preview-trace-pull.test.ts`: a pull killed mid-page stores each export once on resuming.
+- `trace-store.test.ts`: `listTraceIdsWrittenSince` lists only files written since the time.
+- **Mutations: 5 of 5 caught.** The lock removed, a cut-off counted as finished, the cursor not
+  read back, the cursor saved per page only, and the mtime filter removed.
+
 ## D133. Paged scans are model-checked: Latest segments, budget-limited pages, and transaction pages with the phantom rule
 
 **Why.** D93's and D125's paging rules were checked by oracle property tests on the code

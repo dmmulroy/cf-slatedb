@@ -76,6 +76,16 @@ Every soak database keeps its changelog for the run's length plus an hour, so `E
 failure. A merge read is judged within `CLOCK_SKEW_MS` (5 s) of each expiry: inside that window
 either answer passes.
 
+**Its telemetry keeps up with it (D132).** While the workload runs, the soak pulls the stage's
+spans every 30 seconds, one pull at a time, each within 5 minutes; a pull cut off resumes after the
+last export it stored. After the workload it catches the pull up, then reads the health report and
+the error spans from that store; each `grep` reads only the trace files written during its window
+(`trace-cli grep --since`). The report shows `spansPulledThrough`, `spanPullLagAtWorkloadEndSeconds`,
+and `spanPulls` (finished, cut off, failed) while it runs, so a collector too slow for the stage is
+visible before the telemetry budget ends. Tests: `soak-telemetry.test.ts` (fake pulls: one that
+cannot keep up, two at once, a failure, a workload ending mid-pull), `preview-trace-pull.test.ts`
+(a pull cut off mid-page stores nothing twice), `trace-store.test.ts`.
+
 ## Faithful local substitutes
 
 - `objectStoreTestLayer` is an in-memory object store with real create-if-absent semantics

@@ -1553,14 +1553,23 @@ export const measureSampling = (requests: number) =>
  * Spans are sampled in production (P4), so span counts there are a sample; tail records of
  * invocations that did not end `ok` are not (D71).
  *
+ * On a first run against a collector holding weeks of spans, it downloads only the last `minutes`
+ * (`trace-cli pull --since-minutes`), and its greps read only the trace files written since then
+ * (`grep --since`, D132). With `pull: false` it reads the measurement store as it is.
+ *
  * @returns The report with an `issues` list (empty when healthy), or `MeasurementError` when tail
  *   records cannot be read.
  */
-export const measureHealth = (minutes: number) =>
+export const measureHealth = (
+  minutes: number,
+  options: { readonly pull: boolean } = { pull: true },
+) =>
   Effect.gen(function* () {
     const sinceMs = (yield* Clock.currentTimeMillis) - minutes * 60_000;
     const records = yield* readInvocationRecords(sinceMs);
-    const store = yield* pullMeasurementSpans(minutes);
+    // Its own pull fetches only its window (`--since-minutes`), whatever the store holds. A soak,
+    // which has pulled its spans already, reads the store as it is (D132).
+    const store = options.pull ? yield* pullMeasurementSpans(minutes) : yield* measurementStorePath;
     const workers = new Map<string, Array<InvocationRecord>>();
     for (const record of records) {
       const worker = Option.getOrElse(record.scriptName, () => "unknown");
