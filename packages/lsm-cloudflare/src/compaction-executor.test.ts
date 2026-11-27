@@ -30,6 +30,9 @@ import { ManifestStore } from "./manifest-store.ts";
 import { sstStoreLayerWithoutDependencies } from "./sst-store.ts";
 
 const DB = DatabaseId.make("orders");
+let jobCounter = 0;
+/** A fresh job id, as each Workflow instance has its own. */
+const nextJobId = () => `job-${++jobCounter}`;
 const hex = (bytes: Uint8Array) =>
   Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 
@@ -79,7 +82,7 @@ const runJob = (job: CompactionJob, compactorEpoch: CompactorEpoch) =>
       outputs.push(...Option.toArray(step.output));
       start = step.resumeFrom;
     } while (Option.isSome(start));
-    return { committed: yield* executor.commit(prepared, outputs), outputs };
+    return { committed: yield* executor.commit(prepared, outputs, nextJobId()), outputs };
   });
 
 /** Whether every sorted run's SSTs are in key order and do not overlap. */
@@ -155,7 +158,7 @@ describe("CompactionExecutor", () => {
             start = step.resumeFrom;
             steps++;
           }
-          const committed = yield* executor.commit(prepared, outputs);
+          const committed = yield* executor.commit(prepared, outputs, nextJobId());
           const rows = yield* Stream.runCollect(
             client.scan(DB, FULL_KEY_RANGE, {
               consistency: { _tag: "Latest" },
@@ -425,7 +428,7 @@ describe("CompactionExecutor", () => {
           const prepared = yield* executor.prepare(DB, manifest.compactorEpoch, job);
           // Another compaction of the same inputs commits first.
           yield* runJob(job, manifest.compactorEpoch);
-          const replaced = yield* Effect.flip(executor.commit(prepared, []));
+          const replaced = yield* Effect.flip(executor.commit(prepared, [], nextJobId()));
           // A step of the prepared job that runs after that resolves inputs no manifest holds.
           const outputAfter = yield* Effect.flip(executor.writeOutput(prepared, Option.none()));
           const replanned = yield* Effect.flip(executor.prepare(DB, manifest.compactorEpoch, job));

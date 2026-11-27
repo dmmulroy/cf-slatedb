@@ -177,7 +177,7 @@ export const runCompactionJob = <Requires>(
       "commit",
       discardable(Committed),
       discardOnTags(
-        Effect.map(executor.commit(prepared.value, outputs), (manifest) => ({
+        Effect.map(executor.commit(prepared.value, outputs, params.jobId), (manifest) => ({
           manifestId: manifest.id,
         })),
       ),
