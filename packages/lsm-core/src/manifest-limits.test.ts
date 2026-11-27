@@ -116,6 +116,7 @@ describe("changelog entries one manifest keeps (D99)", () => {
       commitL0Flush(full, {
         writerEpoch: full.writerEpoch,
         sst: handle(next),
+        afterSeq: full.lastL0Seq,
         lastSeq: SeqNum.make(next * 10 + 10),
         clockTick: Timestamp.make(next),
         changelog: Option.some(entry(next)),
@@ -137,6 +138,7 @@ describe("changelog entries one manifest keeps (D99)", () => {
       commitL0Flush(below, {
         writerEpoch: below.writerEpoch,
         sst: handle(9_999),
+        afterSeq: below.lastL0Seq,
         lastSeq: SeqNum.make(1),
         clockTick: Timestamp.make(1),
         changelog: Option.some(entry(MAX_CHANGELOG_ENTRIES)),

@@ -734,7 +734,7 @@ export const makeDbReader = Effect.gen(function* () {
     }
     const entries = [...manifest.changelog]
       .filter((entry) => entry.lastSeq > afterSeq)
-      .sort((left, right) => left.firstSeq - right.firstSeq);
+      .sort((left, right) => left.firstSeq - right.firstSeq || left.lastSeq - right.lastSeq);
     // Changelog SSTs are read sequentially and once per consumer: straight from R2, not cached.
     const unavailable = (key: string) => (error: { readonly message: string }) =>
       new ReaderUnavailableError({
@@ -762,6 +762,10 @@ export const makeDbReader = Effect.gen(function* () {
     let batchStart = 0;
     let bytesBeforeBatch = 0;
     let cut = false;
+    // Every change at or below it was read from an earlier entry. An entry holds every change in
+    // its range, so a later entry overlapping it repeats them: a manifest written before D113 can
+    // hold one (a flush re-exported after a commit whose response was lost). Skipped, not repeated.
+    let coveredUpTo = afterSeq;
     entries: for (const entry of entries) {
       const key = changelogKey(databaseId, entry.lastSeq, entry.sst.id);
       const meta = yield* Effect.fromResult(
@@ -778,7 +782,7 @@ export const makeDbReader = Effect.gen(function* () {
           }),
         );
         for (const row of block.rows()) {
-          if (row.seq <= afterSeq || row.seq > upToSeq) continue;
+          if (row.seq <= coveredUpTo || row.seq > upToSeq) continue;
           if (!Option.contains(lastSeq, row.seq)) {
             if (rows.length >= limit) {
               cut = true;
@@ -805,6 +809,7 @@ export const makeDbReader = Effect.gen(function* () {
           rows.push(row);
         }
       }
+      if (entry.lastSeq > coveredUpTo) coveredUpTo = entry.lastSeq;
     }
     yield* Effect.annotateCurrentSpan({
       "changelog.rows": rows.length,

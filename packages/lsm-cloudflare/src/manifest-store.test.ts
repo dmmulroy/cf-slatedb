@@ -48,6 +48,7 @@ const flushEdit =
     commitL0Flush(manifest, {
       writerEpoch,
       sst: handle(n),
+      afterSeq: manifest.lastL0Seq,
       lastSeq: SeqNum.make(n),
       clockTick: Timestamp.make(n),
       changelog: Option.none(),

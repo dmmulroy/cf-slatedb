@@ -785,6 +785,7 @@ describe("GarbageCollector", () => {
             commitL0Flush(manifest, {
               writerEpoch: manifest.writerEpoch,
               sst: orphan.handle,
+              afterSeq: manifest.lastL0Seq,
               lastSeq: SeqNum.make(99),
               clockTick: Timestamp.make(0),
               changelog: Option.none(),

@@ -7,6 +7,7 @@ import {
   forkManifest,
   initialManifest,
   pruneChangelog,
+  replaceManifestFields,
   SeqNum,
   Timestamp,
 } from "@shaledb/lsm-core";
@@ -463,5 +464,35 @@ describe("change feed pages of flushed changes (D93)", () => {
       [2, 2],
       [3, 3],
     ]);
+  });
+});
+
+describe("change feed over a changelog entry an earlier one overlaps (D113)", () => {
+  // A manifest written before D113 can hold two entries for the same changes: a flush exported
+  // them again after a commit whose response was lost. The feed delivers each change once.
+  it("delivers each change once when a later entry repeats an earlier one", async () => {
+    const outcome = await Effect.runPromise(
+      provide(
+        Effect.gen(function* () {
+          yield* create(true);
+          const client = yield* DbClient;
+          yield* client.put(DB, Uint8Array.of(1), Uint8Array.of(1));
+          yield* client.flush(DB);
+          // The repeat: a second entry holding seq 1 again, as the code before D113 wrote.
+          yield* (yield* ManifestStore).update(DB, (manifest) =>
+            Result.succeed(
+              replaceManifestFields(manifest, {
+                changelog: [...manifest.changelog, ...manifest.changelog],
+              }),
+            ),
+          );
+          yield* client.put(DB, Uint8Array.of(2), Uint8Array.of(2));
+          yield* client.flush(DB);
+          const page = yield* client.changes(DB, SeqNum.make(0), 10);
+          return page.rows.map((row) => row.seq);
+        }),
+      ),
+    );
+    expect(outcome).toEqual([1, 2]);
   });
 });

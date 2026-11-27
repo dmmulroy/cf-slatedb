@@ -442,4 +442,41 @@ export const FORMAL_CHECKS: ReadonlyArray<FormalCheck> = [
       },
     ],
   },
+  {
+    name: "change-feed",
+    spec: "ChangeFeed.tla",
+    runs: [
+      { config: "ChangeFeed.cfg", broken: "none", expect: "pass", timeLimitSeconds: 60 },
+      {
+        config: "ChangeFeed.cfg",
+        broken: "lostResponseReexport",
+        expect: "NoOverlappingEntries",
+        timeLimitSeconds: 60,
+      },
+      {
+        config: "ChangeFeed.cfg",
+        broken: "noExpiredCheck",
+        expect: "ExactlyOnce",
+        timeLimitSeconds: 60,
+      },
+      {
+        config: "ChangeFeed.cfg",
+        broken: "appendAfterCut",
+        expect: "ExactlyOnce",
+        timeLimitSeconds: 60,
+      },
+      {
+        config: "ChangeFeedOldData.cfg",
+        broken: "beforeD113",
+        expect: "ExactlyOnce",
+        timeLimitSeconds: 60,
+      },
+      {
+        config: "ChangeFeedOldData.cfg",
+        broken: "lostResponseReexport",
+        expect: "pass",
+        timeLimitSeconds: 60,
+      },
+    ],
+  },
 ];

@@ -4463,28 +4463,85 @@ agent's `Lifecycle` and `CompactorObject` work (D110, D114).
 The safety run has 24,118 states. An exploration at larger bounds (228,918 states) found nothing.
 
 ## D113. The change feed can repeat changes after a flush commit whose response was lost
+## D113. A flush is exact about where it starts; the change feed reads each change once
 
-**Found** while placing the labels of a change-feed model, and shown by a failing test before
-any model was written:
+**Found** while placing the labels of the change-feed model. A failing test showed it before any
+model was written.
 
-- **The test.** `db-writer.test.ts`, "DbWriter changelog after a flush commit whose response was
-  lost (D113)". The manifest holds the entries `(1, 1)` and `(1, 2)`.
+**The defect.**
+
 - **Where the commit lands without an answer.** A flush's manifest create lands, and then
   `attemptCreate` fails reading GC's boundary, or the `putIfAbsent` response is lost. The flush
   fails, so `markFlushed` never runs.
-- **The second export.** The next flush exports its changelog from the old `flushed_seq` again
-  (`exportChangelog(meta.flushedSeq, cut)`). `commitL0Flush` appends a second entry.
-- **The repeat.** `DbReader.changelogRows` reads every entry above `afterSeq` in `firstSeq`
-  order and keeps every row in range. A consumer gets sequence number 1 twice: the "same batch"
-  check keeps the repeat inside one batch.
+- **The second export.** The next flush read `flushed_seq` from SQLite, still the old one, and
+  exported its changelog from it again (`exportChangelog(meta.flushedSeq, cut)`).
+  `commitL0Flush` appended a second entry holding the same changes, and a second L0 SST with the
+  same rows. The merge removes duplicate rows in L0; the feed does not.
+- **What a consumer saw.** `DbReader.changelogRows` read every entry above `afterSeq` in
+  `firstSeq` order and kept every row in range. With entries `(1, 1)` and `(1, 2)` a consumer got
+  1, 1, 2: a change twice, and the sequence going back. Nothing was skipped. The "same batch"
+  check kept the repeat inside one batch.
 
-L0 is not affected: the merge removes the duplicate rows.
+**The rules.**
 
-**Not fixed here.** Two places could fix it; the owners of `db-reader.ts` and `db-writer.ts`
-decide which:
+- **A flush says where its rows start.** `L0Flush.afterSeq` is the `flushed_seq` the flush read
+  its rows above. `commitL0Flush` refuses a flush whose `afterSeq` is below the manifest's
+  `lastL0Seq` with `FlushedSeqStaleError`. The check comes after the epoch and sealed checks and
+  after the "already applied" check, so a retried commit is still recognized. The error is
+  internal: the writer handles it, and no caller sees it.
+- **The writer records the manifest's flushed state and flushes again.** It runs
+  `markFlushed(lastL0Seq, the refusing manifest's id)`, as `startWriter` does, then flushes again
+  from it, still under the flush lock. No row is exported or uploaded twice, and none is
+  skipped: the rows up to `lastL0Seq` are in the landed manifest. Nothing else commits a flush
+  under the lock, so a second attempt is not stale again; a second refusal fails the flush.
+- **The refused attempt's SSTs** (the L0 SST and the changelog SST) are orphans. No manifest
+  names them, and GC collects them after `gcMinAge`, like any upload whose commit was refused
+  (`GcSafety`'s `Discard`).
+- **The feed reads each change once.** `changelogRows` skips rows at or below the highest
+  `lastSeq` of the entries it has already read. An entry holds every change in its range, so
+  those rows are repeats. This makes manifests written before this decision read correctly; an
+  entry entirely covered by an earlier one gives no rows. Entries are ordered by `firstSeq`, then
+  `lastSeq`.
 
-- the feed never returns a sequence number at or below one it already returned;
-- the export starts at the newest `lastL0Seq` the commit finds.
+**The other committers in `db-writer.ts`, in the same lost-response window.**
+
+| Committer                                   | Lands, response lost | Outcome                                                                                                                                                                      |
+| ------------------------------------------- | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A flush with a seal (`flushThen(sealEdit)`) | sealed and flushed   | `onExit` forgets the phase (D85, D115); the restart sees the seal and flushes nothing. A stale refusal comes before `sealEdit` runs, so the second attempt carries the seal. |
+| The seal's own commit                       | sealed               | the same                                                                                                                                                                     |
+| `startWriter`'s fence-in                    | epoch raised         | the next start fences again: one more epoch, nothing else                                                                                                                    |
+| A transaction's commit, a write             | no manifest commit   | —                                                                                                                                                                            |
+| The stalled-write reload                    | an identity edit     | no write                                                                                                                                                                     |
+
+**Tests.**
+
+- `db-writer.test.ts`, "DbWriter changelog after a flush commit whose response was lost
+  (D113)". Its checks: the entries are `(1, 1)` and `(2, 2)`; a flush with nothing new records
+  the landed manifest's id; `flushed_seq` is 2; L0 holds each row. On the code before, the
+  entries are `(1, 1)` and `(1, 2)`.
+- `change-feed.test.ts`, "change feed over a changelog entry an earlier one overlaps (D113)". A
+  manifest holds a repeated entry, and the feed returns 1, 2. On the code before it returns 1,
+  1, 2.
+- `manifest.test.ts`, "commitL0Flush's start (D113)".
+
+**Mutations: 6 of 6 caught.**
+
+- the stale check removed;
+- the manifest's state not recorded;
+- no second attempt;
+- the refusing manifest's id ignored;
+- the reader's high-water mark never advanced;
+- the reader skipping by `afterSeq` only.
+
+**Model.** `ChangeFeed.tla` (`change-feed`, skill `verify-change-feed`). A consumer follows the
+feed against flushes whose commit may land and lose its response, restarts, and prunes.
+
+- `ChangeFeed.cfg`: the code passes `ExactlyOnce`, `NoOverlappingEntries`, and
+  `FlushedInManifest`. `lostResponseReexport` (no stale refusal) fails `NoOverlappingEntries`.
+  `noExpiredCheck` (before D80) and `appendAfterCut` (before D93) fail `ExactlyOnce`.
+- `ChangeFeedOldData.cfg` drops `NoOverlappingEntries`: overlapping entries are allowed, as in
+  old manifests. `beforeD113` (no stale refusal and no reader skip) fails `ExactlyOnce`.
+  `lostResponseReexport` passes: the reader alone reads old data once.
 
 ## D114. The lifecycle is modeled across three databases
 

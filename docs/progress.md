@@ -401,6 +401,13 @@ hand-off is below.
 
 ## Remaining-work log
 
+- **D113 fix (formal audit, 2026-11-26).** A flush commit that landed with its response lost made
+  the next flush export the same changes again, and the feed delivered them twice. `commitL0Flush`
+  now takes `afterSeq` and refuses a stale start (`FlushedSeqStaleError`); the writer records the
+  manifest's state and flushes again; `changelogRows` reads each change once, which also makes
+  older manifests safe. New model `ChangeFeed.tla` (6 runs). Tests in `db-writer.test.ts`,
+  `change-feed.test.ts`, `manifest.test.ts`; mutations 6 of 6. Gates below.
+
 - **D111, D113 (formal audit, 2026-11-26).** Liveness: `TransactionsLive.cfg` (`EveryTxnCommits`;
   `beforeD76` fails) and `NoAckedWriteLostLive.cfg` (`EventuallyFlushed`; `noWake` fails), with
   `WriterObject`'s two. `verify.ts no-acked-write-lost` exit 0 (7 runs); `transactions`: 6 of 7

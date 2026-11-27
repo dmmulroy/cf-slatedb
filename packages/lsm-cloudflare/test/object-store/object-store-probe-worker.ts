@@ -88,6 +88,7 @@ export const objectStoreProbeWorkerLayer = ObjectStoreProbeWorker.make(
                 commitL0Flush(manifest, {
                   writerEpoch: WriterEpoch.make(0),
                   sst: handle(n),
+                  afterSeq: manifest.lastL0Seq,
                   lastSeq: SeqNum.make(n),
                   clockTick: Timestamp.make(n),
                   changelog: Option.none(),

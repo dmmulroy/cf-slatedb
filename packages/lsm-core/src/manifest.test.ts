@@ -80,10 +80,46 @@ const flush = (manifest: Manifest, n: number, writerEpoch = manifest.writerEpoch
   commitL0Flush(manifest, {
     writerEpoch,
     sst: handle(n, n, n + 1),
+    afterSeq: manifest.lastL0Seq,
     lastSeq: SeqNum.make(n * 10),
     clockTick: Timestamp.make(n),
     changelog: Option.none(),
   });
+
+describe("commitL0Flush's start (D113)", () => {
+  it("refuses a flush whose rows start below the manifest's lastL0Seq, and accepts one at it", () => {
+    const once = Result.getOrThrow(flush(empty, 1));
+    // The same writer flushes again from the flushed_seq it had before the first commit.
+    const again = commitL0Flush(once, {
+      writerEpoch: once.writerEpoch,
+      sst: handle(2, 2, 3),
+      afterSeq: empty.lastL0Seq,
+      lastSeq: SeqNum.make(20),
+      clockTick: Timestamp.make(2),
+      changelog: Option.none(),
+    });
+    expect(Result.isFailure(again) && again.failure._tag).toBe("FlushedSeqStaleError");
+    expect(
+      Result.isFailure(again) && again.failure._tag === "FlushedSeqStaleError"
+        ? again.failure.lastL0Seq
+        : undefined,
+    ).toBe(10);
+    // A retry of the commit that landed is still recognized as applied.
+    expect(
+      Result.getOrThrow(
+        commitL0Flush(once, {
+          writerEpoch: once.writerEpoch,
+          sst: handle(1, 1, 2),
+          afterSeq: empty.lastL0Seq,
+          lastSeq: SeqNum.make(10),
+          clockTick: Timestamp.make(1),
+          changelog: Option.none(),
+        }),
+      ),
+    ).toBe(once);
+    expect(Result.isSuccess(flush(once, 2))).toBe(true);
+  });
+});
 
 describe("Manifest JSON", () => {
   it("round-trips a manifest with every v1 field", () => {
@@ -353,6 +389,7 @@ describe("manifest edits", () => {
       commitL0Flush(bounded, {
         writerEpoch: bounded.writerEpoch,
         sst,
+        afterSeq: bounded.lastL0Seq,
         lastSeq: SeqNum.make(1),
         clockTick: Timestamp.make(1),
         changelog: Option.none(),
@@ -564,6 +601,7 @@ describe("changelog coverage (D80)", () => {
       commitL0Flush(manifest, {
         writerEpoch: manifest.writerEpoch,
         sst: handle(n, n, n + 1),
+        afterSeq: manifest.lastL0Seq,
         lastSeq: SeqNum.make(rows.cut),
         clockTick: Timestamp.make(n),
         changelog: Option.some({
@@ -626,6 +664,7 @@ describe("changelog coverage (D80)", () => {
                   commitL0Flush(manifest, {
                     writerEpoch: manifest.writerEpoch,
                     sst: handle(n + 1, 0, 1),
+                    afterSeq: manifest.lastL0Seq,
                     lastSeq: SeqNum.make(nextCut),
                     clockTick: Timestamp.make(n + 1),
                     changelog: Option.none(),

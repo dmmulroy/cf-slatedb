@@ -403,6 +403,22 @@ export class SstBelowGcBoundaryError extends Schema.TaggedError<SstBelowGcBounda
   },
 ) {}
 
+/**
+ * A flush started after a sequence number the manifest is already past: an earlier flush of this
+ * writer committed and the writer never recorded it (the commit's response was lost, D113). The
+ * writer records the manifest's `lastL0Seq` as flushed and flushes again from there. Internal: the
+ * writer handles it and no caller sees it.
+ */
+export class FlushedSeqStaleError extends Schema.TaggedError<FlushedSeqStaleError>()(
+  "FlushedSeqStaleError",
+  {
+    databaseId: DatabaseId,
+    afterSeq: SeqNum,
+    lastL0Seq: SeqNum,
+    message: Schema.String,
+  },
+) {}
+
 /** The creation time GC compares with its boundary: the time in the SST's ULID. */
 export const sstCreatedAt = (sstId: SstId): Timestamp => Timestamp.make(ulidTimeMillis(sstId));
 
@@ -568,6 +584,11 @@ export const fenceCompactor = (manifest: Manifest): Manifest =>
 export interface L0Flush {
   readonly writerEpoch: WriterEpoch;
   readonly sst: SstHandle;
+  /**
+   * The writer's `flushed_seq` when the flush read its rows: they are the rows above it. A
+   * manifest whose `lastL0Seq` is past it already holds some of them (D113).
+   */
+  readonly afterSeq: SeqNum;
   /** Newest sequence number in the flushed SST (the flush cut). */
   readonly lastSeq: SeqNum;
   /** Newest clock tick of the flushed rows. */
@@ -581,19 +602,33 @@ export interface L0Flush {
  *
  * @returns The new manifest; the same manifest when this SST is already in L0 (a retried commit
  *   that had succeeded); `WriterFencedError` when another writer took over;
- *   `DatabaseSealedError` when the database was sealed; or `SstBelowGcBoundaryError` when the SST
- *   (or changelog SST) predates GC's boundary.
+ *   `DatabaseSealedError` when the database was sealed; `FlushedSeqStaleError` when the manifest's
+ *   `lastL0Seq` is past `afterSeq` (an earlier flush committed unrecorded: these rows would be in
+ *   L0 and the changelog twice, D113); or `SstBelowGcBoundaryError` when the SST (or changelog
+ *   SST) predates GC's boundary.
  */
 export const commitL0Flush = (
   manifest: Manifest,
   flush: L0Flush,
-): Result.Result<Manifest, WriterFencedError | DatabaseSealedError | SstBelowGcBoundaryError> => {
+): Result.Result<
+  Manifest,
+  WriterFencedError | DatabaseSealedError | FlushedSeqStaleError | SstBelowGcBoundaryError
+> => {
   if (manifest.l0.some((sst) => sst.id === flush.sst.id)) return Result.succeed(manifest);
   // Sealing and removal both increment writerEpoch, so a writer from before either is fenced here.
   if (manifest.writerEpoch !== flush.writerEpoch)
     return Result.fail(writerFenced(manifest, flush.writerEpoch));
   if (manifest.state._tag === "Sealed")
     return Result.fail(databaseSealed(manifest, manifest.state.successors));
+  if (manifest.lastL0Seq > flush.afterSeq)
+    return Result.fail(
+      new FlushedSeqStaleError({
+        databaseId: manifest.databaseId,
+        afterSeq: flush.afterSeq,
+        lastL0Seq: manifest.lastL0Seq,
+        message: `A flush of database ${manifest.databaseId} read the rows after sequence number ${flush.afterSeq}, but its manifest already holds the rows up to ${manifest.lastL0Seq}: the writer's flushed_seq is stale. Record the manifest's flushed state and flush again from it.`,
+      }),
+    );
   const stale = belowGcBoundary(manifest, [
     flush.sst.id,
     ...Option.toArray(flush.changelog).map((entry) => entry.sst.id),

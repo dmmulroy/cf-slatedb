@@ -1682,11 +1682,11 @@ describe("DbWriter flush fenced by its own writer's restart (D115)", () => {
 
 describe("DbWriter changelog after a flush commit whose response was lost (D113)", () => {
   // A flush's manifest commit lands and its response is lost (the read of GC's boundary after
-  // the create fails), so flushed_seq is not recorded. The next flush exports its changelog from
-  // the old flushed_seq again: two entries then hold the same changes, and the feed, which reads
-  // every entry above afterSeq in turn, delivers them twice.
-  // `it.fails` until the owners fix D113: it then fails, and becomes `it`.
-  it.fails("no two changelog entries hold the same sequence number", async () => {
+  // the create fails), so flushed_seq is not recorded. Before D113 the next flush exported its
+  // changelog from the old flushed_seq again: two entries held the same changes, and the feed,
+  // which reads every entry above afterSeq in turn, delivered them twice. Now its commit is
+  // refused as stale, the writer records the manifest's flushed state, and flushes again from it.
+  it("no two changelog entries hold the same sequence number", async () => {
     const entries = await Effect.gen(function* () {
       yield* createDatabase({ changelog: true });
       const store = yield* ManifestStore;
@@ -1725,9 +1725,25 @@ describe("DbWriter changelog after a flush commit whose response was lost (D113)
       yield* writer.write(DB, put("a", "1"));
       yield* Ref.set(armed, true);
       yield* Effect.result(writer.flush(DB));
+      // Nothing new: the flush finds its flushed_seq stale, records the landed manifest, and has
+      // nothing left to write. A reader whose cache is behind loads that manifest (D67).
+      yield* writer.flush(DB);
+      const landed = yield* (yield* ManifestReader).loadLatest(DB);
+      const recorded = yield* writer.status(DB);
+      expect({ flushedSeq: recorded.flushedSeq, manifest: recorded.flushedManifestId }).toEqual({
+        flushedSeq: 1,
+        manifest: Option.some(landed.id),
+      });
       yield* writer.write(DB, put("b", "2"));
       yield* writer.flush(DB);
       const latest = yield* (yield* ManifestReader).loadLatest(DB);
+      const status = yield* writer.status(DB);
+      // Every acknowledged row is in L0 once, and the writer recorded all of it as flushed.
+      expect({ flushedSeq: status.flushedSeq, unflushedRows: status.unflushedRows }).toEqual({
+        flushedSeq: 2,
+        unflushedRows: 0,
+      });
+      expect(Object.fromEntries((yield* durableValues).values)).toEqual({ a: "1", b: "2" });
       return latest.manifest.changelog.map((entry) => [entry.firstSeq, entry.lastSeq]);
     }).pipe(
       Effect.scoped,
@@ -1736,6 +1752,10 @@ describe("DbWriter changelog after a flush commit whose response was lost (D113)
       Effect.provide(TestClock.layer()),
       Effect.runPromise,
     );
+    expect(entries).toEqual([
+      [1, 1],
+      [2, 2],
+    ]);
     for (const [index, [, last]] of entries.entries()) {
       const next = entries[index + 1];
       if (next !== undefined) expect(next[0]).toBeGreaterThan(last ?? 0);
