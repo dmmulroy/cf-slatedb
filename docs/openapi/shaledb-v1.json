@@ -3,7 +3,7 @@
   "info": {
     "title": "shaledb",
     "version": "1.0.0",
-    "description": "A SlateDB-style LSM key-value store on R2 and Durable Objects. Keys and values are base64 in JSON. Every response carries `x-request-id`; error bodies repeat it as `requestId`."
+    "description": "A SlateDB-style LSM key-value store on R2 and Durable Objects. Keys and values are base64 in JSON. Every response carries `x-request-id`; error bodies repeat it as `requestId`. A request body is at most 16 MiB (16,777,216 bytes, whether or not it declares its length); a larger one is refused with `InvalidRequest` before it is read further. Every string, byte, and array field states its bound."
   },
   "paths": {
     "/v1/databases": {
@@ -21,7 +21,8 @@
                   "type": "object",
                   "properties": {
                     "databaseId": {
-                      "type": "string"
+                      "type": "string",
+                      "maxLength": 63
                     },
                     "manifestId": {
                       "type": "integer",
@@ -304,6 +305,7 @@
                 "properties": {
                   "databaseId": {
                     "type": "string",
+                    "maxLength": 63,
                     "examples": ["orders-eu"]
                   },
                   "keyRange": {
@@ -406,6 +408,7 @@
             "in": "path",
             "schema": {
               "type": "string",
+              "maxLength": 63,
               "examples": ["orders-eu"]
             },
             "required": true
@@ -746,8 +749,8 @@
                               "anyOf": [
                                 {
                                   "type": "integer",
-                                  "maximum": 9007199254740991,
-                                  "exclusiveMinimum": 0
+                                  "minimum": 1,
+                                  "maximum": 3153600000000
                                 },
                                 {
                                   "type": "null"
@@ -795,8 +798,8 @@
                               "anyOf": [
                                 {
                                   "type": "integer",
-                                  "maximum": 9007199254740991,
-                                  "exclusiveMinimum": 0
+                                  "minimum": 1,
+                                  "maximum": 3153600000000
                                 },
                                 {
                                   "type": "null"
@@ -808,7 +811,8 @@
                           "additionalProperties": false
                         }
                       ]
-                    }
+                    },
+                    "maxItems": 10000
                   }
                 },
                 "required": ["operations"],
@@ -846,6 +850,7 @@
             "in": "path",
             "schema": {
               "type": "string",
+              "maxLength": 63,
               "examples": ["orders-eu"]
             },
             "required": true
@@ -1131,6 +1136,7 @@
             "in": "path",
             "schema": {
               "type": "string",
+              "maxLength": 63,
               "examples": ["orders-eu"]
             },
             "required": true
@@ -1146,7 +1152,8 @@
                   "type": "object",
                   "properties": {
                     "databaseId": {
-                      "type": "string"
+                      "type": "string",
+                      "maxLength": 63
                     },
                     "writerEpoch": {
                       "type": "integer",
@@ -1502,6 +1509,7 @@
             "in": "path",
             "schema": {
               "type": "string",
+              "maxLength": 63,
               "examples": ["orders-eu"]
             },
             "required": true
@@ -1569,7 +1577,8 @@
                               "maximum": 9007199254740991
                             },
                             "databaseId": {
-                              "type": "string"
+                              "type": "string",
+                              "maxLength": 63
                             },
                             "compactorEpoch": {
                               "type": "integer",
@@ -1786,7 +1795,8 @@
                           "owner": {
                             "anyOf": [
                               {
-                                "type": "string"
+                                "type": "string",
+                                "maxLength": 63
                               },
                               {
                                 "type": "null"
@@ -2184,6 +2194,7 @@
             "in": "path",
             "schema": {
               "type": "string",
+              "maxLength": 63,
               "examples": ["orders-eu"]
             },
             "required": true
@@ -2223,7 +2234,8 @@
                         "owner": {
                           "anyOf": [
                             {
-                              "type": "string"
+                              "type": "string",
+                              "maxLength": 63
                             },
                             {
                               "type": "null"
@@ -2624,7 +2636,8 @@
                 "type": "object",
                 "properties": {
                   "confirm": {
-                    "type": "string"
+                    "type": "string",
+                    "maxLength": 64
                   },
                   "force": {
                     "type": "boolean"
@@ -2654,6 +2667,7 @@
             "in": "path",
             "schema": {
               "type": "string",
+              "maxLength": 63,
               "examples": ["orders-eu"]
             },
             "required": true
@@ -2697,7 +2711,8 @@
                     "holder": {
                       "anyOf": [
                         {
-                          "type": "string"
+                          "type": "string",
+                          "maxLength": 63
                         },
                         {
                           "type": "null"
@@ -2994,8 +3009,8 @@
                     "anyOf": [
                       {
                         "type": "integer",
-                        "maximum": 9007199254740991,
-                        "exclusiveMinimum": 0
+                        "minimum": 1,
+                        "maximum": 3153600000000
                       },
                       {
                         "type": "null"
@@ -3026,6 +3041,7 @@
             "in": "path",
             "schema": {
               "type": "string",
+              "maxLength": 63,
               "examples": ["orders-eu"]
             },
             "required": true
@@ -3074,7 +3090,8 @@
                           "holder": {
                             "anyOf": [
                               {
-                                "type": "string"
+                                "type": "string",
+                                "maxLength": 63
                               },
                               {
                                 "type": "null"
@@ -3371,6 +3388,7 @@
             "in": "path",
             "schema": {
               "type": "string",
+              "maxLength": 63,
               "examples": ["orders-eu"]
             },
             "required": true
@@ -3645,6 +3663,7 @@
             "in": "path",
             "schema": {
               "type": "string",
+              "maxLength": 63,
               "examples": ["orders-eu"]
             },
             "required": true
@@ -3927,8 +3946,10 @@
                   "successors": {
                     "type": "array",
                     "items": {
-                      "type": "string"
-                    }
+                      "type": "string",
+                      "maxLength": 63
+                    },
+                    "maxItems": 16
                   }
                 },
                 "required": ["successors"],
@@ -3955,6 +3976,7 @@
             "in": "path",
             "schema": {
               "type": "string",
+              "maxLength": 63,
               "examples": ["orders-eu"]
             },
             "required": true
@@ -3970,7 +3992,8 @@
                   "type": "object",
                   "properties": {
                     "databaseId": {
-                      "type": "string"
+                      "type": "string",
+                      "maxLength": 63
                     },
                     "manifestId": {
                       "type": "integer",
@@ -4239,7 +4262,8 @@
                 "type": "object",
                 "properties": {
                   "forkId": {
-                    "type": "string"
+                    "type": "string",
+                    "maxLength": 63
                   },
                   "checkpointId": {
                     "type": "string",
@@ -4299,6 +4323,7 @@
             "in": "path",
             "schema": {
               "type": "string",
+              "maxLength": 63,
               "examples": ["orders-eu"]
             },
             "required": true
@@ -4563,6 +4588,7 @@
             "in": "path",
             "schema": {
               "type": "string",
+              "maxLength": 63,
               "examples": ["orders-eu"]
             },
             "required": true
@@ -4854,6 +4880,7 @@
             "in": "path",
             "schema": {
               "type": "string",
+              "maxLength": 63,
               "examples": ["orders-eu"]
             },
             "required": true
@@ -5274,6 +5301,7 @@
             "in": "path",
             "schema": {
               "type": "string",
+              "maxLength": 63,
               "examples": ["orders-eu"]
             },
             "required": true
@@ -5720,6 +5748,7 @@
             "in": "path",
             "schema": {
               "type": "string",
+              "maxLength": 63,
               "examples": ["orders-eu"]
             },
             "required": true
@@ -6056,8 +6085,8 @@
                                   "anyOf": [
                                     {
                                       "type": "integer",
-                                      "maximum": 9007199254740991,
-                                      "exclusiveMinimum": 0
+                                      "minimum": 1,
+                                      "maximum": 3153600000000
                                     },
                                     {
                                       "type": "null"
@@ -6105,8 +6134,8 @@
                                   "anyOf": [
                                     {
                                       "type": "integer",
-                                      "maximum": 9007199254740991,
-                                      "exclusiveMinimum": 0
+                                      "minimum": 1,
+                                      "maximum": 3153600000000
                                     },
                                     {
                                       "type": "null"
@@ -6118,7 +6147,8 @@
                               "additionalProperties": false
                             }
                           ]
-                        }
+                        },
+                        "maxItems": 10000
                       }
                     },
                     "required": ["operations"],
@@ -6130,7 +6160,8 @@
                       "type": "string",
                       "format": "byte",
                       "contentEncoding": "base64"
-                    }
+                    },
+                    "maxItems": 10000
                   },
                   "readRanges": {
                     "type": "array",
@@ -6157,7 +6188,8 @@
                       },
                       "required": ["start", "end"],
                       "additionalProperties": false
-                    }
+                    },
+                    "maxItems": 1000
                   }
                 },
                 "required": ["readSeq", "isolation", "batch", "readKeys", "readRanges"],
@@ -6197,6 +6229,7 @@
             "in": "path",
             "schema": {
               "type": "string",
+              "maxLength": 63,
               "examples": ["orders-eu"]
             },
             "required": true
@@ -6628,7 +6661,8 @@
                         "type": "object",
                         "properties": {
                           "databaseId": {
-                            "type": "string"
+                            "type": "string",
+                            "maxLength": 63
                           },
                           "manifestId": {
                             "type": "integer",
@@ -6678,6 +6712,7 @@
             "in": "path",
             "schema": {
               "type": "string",
+              "maxLength": 63,
               "examples": ["orders-eu"]
             },
             "required": true
@@ -7139,7 +7174,8 @@
                         "type": "object",
                         "properties": {
                           "databaseId": {
-                            "type": "string"
+                            "type": "string",
+                            "maxLength": 63
                           },
                           "manifestId": {
                             "type": "integer",
@@ -7198,6 +7234,7 @@
             "in": "path",
             "schema": {
               "type": "string",
+              "maxLength": 63,
               "examples": ["orders-eu"]
             },
             "required": true
@@ -7537,6 +7574,7 @@
             "in": "path",
             "schema": {
               "type": "string",
+              "maxLength": 63,
               "examples": ["orders-eu"]
             },
             "required": true
@@ -7832,6 +7870,7 @@
             "in": "path",
             "schema": {
               "type": "string",
+              "maxLength": 63,
               "examples": ["orders-eu"]
             },
             "required": true
@@ -8295,7 +8334,8 @@
             "type": "object",
             "properties": {
               "databaseId": {
-                "type": "string"
+                "type": "string",
+                "maxLength": 63
               }
             },
             "required": ["databaseId"],
@@ -8349,7 +8389,8 @@
             "type": "object",
             "properties": {
               "databaseId": {
-                "type": "string"
+                "type": "string",
+                "maxLength": 63
               }
             },
             "required": ["databaseId"],
@@ -8403,7 +8444,8 @@
             "type": "object",
             "properties": {
               "databaseId": {
-                "type": "string"
+                "type": "string",
+                "maxLength": 63
               },
               "reason": {
                 "type": "string"
@@ -8465,7 +8507,8 @@
             "type": "object",
             "properties": {
               "databaseId": {
-                "type": "string"
+                "type": "string",
+                "maxLength": 63
               },
               "checkpoints": {
                 "type": "integer",
@@ -8529,7 +8572,8 @@
             "type": "object",
             "properties": {
               "databaseId": {
-                "type": "string"
+                "type": "string",
+                "maxLength": 63
               },
               "sstId": {
                 "type": "string",
@@ -8591,7 +8635,8 @@
             "type": "object",
             "properties": {
               "databaseId": {
-                "type": "string"
+                "type": "string",
+                "maxLength": 63
               },
               "reason": {
                 "type": "string",
@@ -8649,7 +8694,8 @@
             "type": "object",
             "properties": {
               "databaseId": {
-                "type": "string"
+                "type": "string",
+                "maxLength": 63
               }
             },
             "required": ["databaseId"],
@@ -8703,7 +8749,8 @@
             "type": "object",
             "properties": {
               "databaseId": {
-                "type": "string"
+                "type": "string",
+                "maxLength": 63
               },
               "reason": {
                 "type": "string",
@@ -8871,12 +8918,14 @@
             "type": "object",
             "properties": {
               "databaseId": {
-                "type": "string"
+                "type": "string",
+                "maxLength": 63
               },
               "dependents": {
                 "type": "array",
                 "items": {
-                  "type": "string"
+                  "type": "string",
+                  "maxLength": 63
                 }
               }
             },
@@ -8931,12 +8980,14 @@
             "type": "object",
             "properties": {
               "databaseId": {
-                "type": "string"
+                "type": "string",
+                "maxLength": 63
               },
               "successors": {
                 "type": "array",
                 "items": {
-                  "type": "string"
+                  "type": "string",
+                  "maxLength": 63
                 }
               }
             },
@@ -8991,7 +9042,8 @@
             "type": "object",
             "properties": {
               "databaseId": {
-                "type": "string"
+                "type": "string",
+                "maxLength": 63
               },
               "operationIndex": {
                 "type": "integer",
@@ -9050,7 +9102,8 @@
             "type": "object",
             "properties": {
               "databaseId": {
-                "type": "string"
+                "type": "string",
+                "maxLength": 63
               }
             },
             "required": ["databaseId"],
@@ -9104,7 +9157,8 @@
             "type": "object",
             "properties": {
               "databaseId": {
-                "type": "string"
+                "type": "string",
+                "maxLength": 63
               },
               "sstId": {
                 "type": "string",
@@ -9162,7 +9216,8 @@
             "type": "object",
             "properties": {
               "databaseId": {
-                "type": "string"
+                "type": "string",
+                "maxLength": 63
               },
               "checkpointId": {
                 "type": "string",

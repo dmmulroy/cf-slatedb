@@ -47,6 +47,8 @@ export interface HealthSpans {
   readonly collections: ReadonlyArray<HealthSpan>;
   /** `MaintenanceSweep.sweepPage` spans with an error status. */
   readonly failedSweeps: ReadonlyArray<HealthSpan>;
+  /** `ShardSplit.resumePending` spans: a split a waiting request had to finish (D101). */
+  readonly resumedSplits: ReadonlyArray<HealthSpan>;
   /** Every span with an error status. */
   readonly errors: ReadonlyArray<HealthSpan>;
 }
@@ -231,6 +233,18 @@ export const summarizeHealth = (
       ({ database, unread, retained }) =>
         `database ${database}'s collection deferred SST deletion: it retains ${retained} manifests and left ${unread} unread, so its garbage SSTs stay until it commits fewer manifests per gcMinAge (D98)`,
     ),
+    ...(spans.resumedSplits.length > 0
+      ? [
+          `${spans.resumedSplits.length} abandoned shard splits were finished by a waiting request (${[
+            ...new Set(
+              spans.resumedSplits.map((span) => {
+                const id = span.attributes["shard.resumed_split"];
+                return typeof id === "string" ? id : "unknown";
+              }),
+            ),
+          ].join(", ")}): see docs/operations.md, "Shard splits"`,
+        ]
+      : []),
   ];
   return {
     healthy: issues.length === 0,

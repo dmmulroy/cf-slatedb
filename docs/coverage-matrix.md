@@ -656,3 +656,17 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   `DatabaseLifecycle` for any Worker in the Stack (cross-script `WriterServer` and `CompactorServer`,
   `BlockServer`, bucket), and in memory for consumers' tests. `makeWriterClientOver` builds the writer
   client over any `WriterServer` namespace.
+- **Request limits and retries (D88)** — done. `MAX_TTL_MILLIS` / `TtlMillisSchema` (lsm-core
+  `write-batch.ts`) on `ttlMillis` and checkpoint `lifetimeMs`; retry messages in
+  `db-public-error-translation.ts`. Tests: `db-http-limits.test.ts` (TTL and lifetime bounds,
+  largest key, value, and batch, empty key, reversed range), `db-http-retries.test.ts`.
+- **Stale shard maps on reads that never ask the writer (D89)** — done.
+  `SHARD_MAP_MAX_AGE_FOR_UNPROBED_READS_MS` in `shard-router.ts`. Test:
+  `shard-router-staleness.test.ts`.
+- **Bounded requests (D100)** — done. `MAX_REQUEST_BODY_BYTES` and the bounded read in
+  `db-http-request.ts`; the `Request*` schemas in lsm-core; `request-schema-bounds.ts`. Tests:
+  `db-http-request.test.ts`, `request-schema-bounds.test.ts`, `db-http-boundary.property.test.ts`,
+  `shard-router-worker.test.ts`, `block-server.test.ts`.
+- **Abandoned splits finished by a waiting request (D101)** — done. `ShardSplit.resumePending`,
+  `withAbandonedSplitFinished`. Tests: `shard-split-faults.test.ts` (each step killed, concurrent
+  splits, a two-generation stale router), `health-report.test.ts`.

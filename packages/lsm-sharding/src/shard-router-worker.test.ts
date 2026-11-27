@@ -5,6 +5,7 @@ import {
   lsmTestRuntimeContextLayer,
   ReaderUnavailableError,
   serveLsmTestRequest,
+  unboundedRequestFields,
   WriterUnavailableError,
 } from "@shaledb/lsm-cloudflare";
 import { Effect, Layer, Option, Stream } from "effect";
@@ -14,7 +15,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { ShardDirectory, shardDirectoryTestLayer } from "./shard-directory.ts";
 import { ShardGroup } from "./shard-map.ts";
 import { ShardRouter, shardRouterLayerWithoutDependencies } from "./shard-router.ts";
-import { shardedHttpRouterLayer } from "./shard-router-worker.ts";
+import { ShardedHttpApi, shardedHttpRouterLayer } from "./shard-router-worker.ts";
 import { shardSplitLayerWithoutDependencies } from "./shard-split.ts";
 
 const GROUP = ShardGroup.make("orders");
@@ -207,5 +208,11 @@ describe("the sharded API's answers to requests it refuses (D79)", () => {
       requestId: map?.requestId,
       retryable: false,
     });
+  });
+});
+
+describe("every sharded request field is bounded (D100)", () => {
+  it("has no unbounded string, bytes, array, or record", () => {
+    expect(unboundedRequestFields(ShardedHttpApi)).toEqual([]);
   });
 });

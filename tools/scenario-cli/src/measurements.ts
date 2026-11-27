@@ -1533,6 +1533,7 @@ export const measureHealth = (minutes: number) =>
       failedCollections: yield* named("GarbageCollector.collect", "--error"),
       collections: yield* named("GarbageCollector.collect"),
       failedSweeps: yield* named("MaintenanceSweep.sweepPage", "--error"),
+      resumedSplits: yield* named("ShardSplit.resumePending"),
       errors: yield* spansSince(store, sinceMs, ["--error"]),
     });
     return { minutes, ...report, invocations };

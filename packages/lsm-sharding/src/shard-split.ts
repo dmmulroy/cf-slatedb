@@ -37,6 +37,17 @@ export interface IShardSplit {
     databaseId: DatabaseId,
     atKey: Uint8Array,
   ) => Effect.Effect<ShardMap, ShardSplitError, DatabaseLifecycleServices>;
+  /**
+   * Finishes the group's pending split, if one is recorded, from the directory's record alone
+   * (D101): the same `split` with the recorded shard and key, so every step is resumed or found
+   * done. Called when a routed request has waited the router's full routing wait for a split that
+   * never published, so an abandoned split does not leave its range unwritable.
+   *
+   * @returns The published map, `None` when no split is pending, or the split's failure.
+   */
+  readonly resumePending: (
+    group: ShardGroup,
+  ) => Effect.Effect<Option.Option<ShardMap>, ShardSplitError, DatabaseLifecycleServices>;
 }
 
 /** The contextual shard split. */
@@ -103,8 +114,48 @@ export const makeShardSplit = Effect.gen(function* () {
     return published;
   });
 
-  return ShardSplit.of({ split });
+  const resumePending = Effect.fn("ShardSplit.resumePending")(function* (group: ShardGroup) {
+    const map = yield* directory.map(group);
+    if (Option.isNone(map.pendingSplit)) return Option.none<ShardMap>();
+    const pending = map.pendingSplit.value;
+    // An operator looks for this span: a split that had to be finished by a later request.
+    yield* Effect.annotateCurrentSpan({
+      "shard.group": group,
+      "shard.resumed_split": pending.databaseId,
+    });
+    return Option.some(yield* split(group, pending.databaseId, pending.atKey));
+  });
+
+  return ShardSplit.of({ split, resumePending });
 });
 
 /** Provides the split, leaving the database lifecycle and shard directory visible. */
 export const shardSplitLayerWithoutDependencies = Layer.effect(ShardSplit, makeShardSplit);
+
+/** Failures a router reports once its routing wait for a split's new map has run out. */
+const isRoutingFailure = (error: { readonly _tag: string }) =>
+  error._tag === "DatabaseSealedError" ||
+  error._tag === "KeyOutOfRangeError" ||
+  error._tag === "DatabaseNotFoundError";
+
+/**
+ * Runs a routed request; when it fails because the router waited its full routing wait (30 s) for
+ * a split that never published, finishes that split (`resumePending`, D101) and runs the request
+ * once more. A split normally publishes within seconds, so one still pending then was abandoned;
+ * finishing it from two requests at once is safe (each step is idempotent).
+ */
+export const withAbandonedSplitFinished = <A, E extends { readonly _tag: string }, R>(
+  splitter: IShardSplit,
+  group: ShardGroup,
+  request: () => Effect.Effect<A, E, R>,
+) =>
+  request().pipe(
+    Effect.catchIf(isRoutingFailure, (error) =>
+      Effect.gen(function* () {
+        const resumed = yield* splitter
+          .resumePending(group)
+          .pipe(Effect.orElseSucceed(() => Option.none<ShardMap>()));
+        return Option.isSome(resumed) ? yield* request() : yield* Effect.fail(error);
+      }),
+    ),
+  );

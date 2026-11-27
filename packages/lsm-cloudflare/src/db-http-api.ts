@@ -3,18 +3,20 @@ import {
   CheckpointId,
   DatabaseId,
   DroppedSst,
-  KeyRange,
   ManifestId,
   MergeOperatorName,
   ReadConsistency,
+  RequestKeyBytes,
+  RequestKeyRange,
+  RequestTransactionCommit,
+  RequestWriteBatch,
   RowSchema,
   SeqNum,
   SortedRunId,
-  TransactionCommit,
-  WriteBatch,
   WriteReceipt,
   SstId,
   Timestamp,
+  TtlMillisSchema,
 } from "@shaledb/lsm-core";
 import { Schema } from "effect";
 import { HttpApi, HttpApiEndpoint, HttpApiGroup, HttpApiSchema, OpenApi } from "effect/http-api";
@@ -29,17 +31,14 @@ const DatabaseParams = Schema.Struct({
   databaseId: DatabaseId.annotate({ examples: [DatabaseId.make("orders-eu")] }),
 });
 
-/** Schema for creating a database. */
 /** Longest changelog retention a database may ask for: 30 days, like a pinned snapshot (D99). */
 export const MAX_CHANGELOG_RETENTION_MS = 30 * 24 * 3_600_000;
 
-/** Longest checkpoint name: names are kept in the manifest, which every commit rewrites (D99). */
-export const MAX_CHECKPOINT_NAME_LENGTH = 256;
-
+/** Schema for creating a database. */
 export const CreateDatabaseRequest = Schema.Struct({
   databaseId: DatabaseId.annotate({ examples: [DatabaseId.make("orders-eu")] }),
   /** Keys the database accepts; writes outside fail with `KeyOutOfRange`. Null: every key. */
-  keyRange: Schema.OptionFromNullOr(KeyRange),
+  keyRange: Schema.OptionFromNullOr(RequestKeyRange),
   /** Built-in merge operator for merge operands; null: merges are stored but cannot be read. */
   mergeOperator: Schema.OptionFromNullOr(MergeOperatorName),
   /**
@@ -49,8 +48,12 @@ export const CreateDatabaseRequest = Schema.Struct({
   changelogRetentionMs: Schema.OptionFromNullOr(
     Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: MAX_CHANGELOG_RETENTION_MS })),
   ),
-  /** Group for fair compaction and cache budgets, at most 63 characters; null: the database id. */
-  budgetGroup: Schema.OptionFromNullOr(Schema.String.check(Schema.isMaxLength(63))),
+  /**
+   * Group for fair compaction and cache budgets; null: the database id. A name like a database id
+   * (D100): groups, like ids, are trusted names inside one installation, and the access token is
+   * the only tenant boundary.
+   */
+  budgetGroup: Schema.OptionFromNullOr(DatabaseId),
 });
 
 /** Schema for a created database. */
@@ -59,11 +62,28 @@ export const CreateDatabaseResponse = Schema.Struct({
   manifestId: Schema.Int,
 });
 
+/** Schema for a snapshot a read names (as `snapshot` returns it), with its id bounded (D100). */
+export const RequestSnapshot = Schema.Struct({
+  // The same type as `DbSnapshot`'s, so a snapshot's answer is sent back as is.
+  databaseId: Schema.String.check(Schema.isMaxLength(63)),
+  manifestId: ManifestId,
+  snapshotSeq: SeqNum,
+});
+
+/**
+ * Longest checkpoint name, in characters: a label, not data. Names are kept in the manifest, which
+ * every commit rewrites (D99, D100).
+ */
+export const MAX_CHECKPOINT_NAME_LENGTH = 256;
+
+/** Most successors a seal may name (D100): a split names two. */
+export const MAX_SEAL_SUCCESSORS = 16;
+
 /** Schema for a point read: the key, how fresh the read must be, and an optional snapshot. */
 export const GetRequest = Schema.Struct({
-  key: Schema.Uint8ArrayFromBase64,
+  key: RequestKeyBytes,
   consistency: ReadConsistency,
-  snapshot: Schema.OptionFromNullOr(DbSnapshot),
+  snapshot: Schema.OptionFromNullOr(RequestSnapshot),
 });
 
 /** Schema for a point read's result: the visible row (value, `seq`, timestamps), or null. */
@@ -102,7 +122,7 @@ export const CompactionStatusResponse = Schema.Struct({
 /** Schema for an SST drop request (D62). */
 export const DropSstRequest = Schema.Struct({
   /** Must repeat the SST id in the path: dropping loses the SST's rows. */
-  confirm: Schema.String,
+  confirm: Schema.String.check(Schema.isMaxLength(64)),
   /** Drop the SST even though no compaction reported it corrupted. */
   force: Schema.optionalKey(Schema.Boolean),
 });
@@ -115,7 +135,8 @@ export const CreateCheckpointRequest = Schema.Struct({
   name: Schema.OptionFromNullOr(
     Schema.String.check(Schema.isMaxLength(MAX_CHECKPOINT_NAME_LENGTH)),
   ),
-  lifetimeMs: Schema.OptionFromNullOr(Schema.Int.check(Schema.isGreaterThan(0))),
+  /** At most 100 years (`MAX_TTL_MILLIS`, D88). */
+  lifetimeMs: Schema.OptionFromNullOr(TtlMillisSchema),
 });
 
 /** Schema for a pinned snapshot request: how long it stays readable, at most 30 days. */
@@ -124,13 +145,15 @@ export const PinSnapshotRequest = Schema.Struct({
 });
 
 /** Schema for a seal request: the databases that replace the sealed one. */
-export const SealDatabaseRequest = Schema.Struct({ successors: Schema.Array(DatabaseId) });
+export const SealDatabaseRequest = Schema.Struct({
+  successors: Schema.Array(DatabaseId).check(Schema.isMaxLength(MAX_SEAL_SUCCESSORS)),
+});
 
 /** Schema for a fork request: the new database, the source checkpoint, and the key range. */
 export const ForkDatabaseRequest = Schema.Struct({
   forkId: DatabaseId,
   checkpointId: CheckpointId,
-  range: KeyRange,
+  range: RequestKeyRange,
 });
 
 /**
@@ -151,14 +174,14 @@ export const TransactionBeginResponse = Schema.Struct({
 export const TransactionGetRequest = Schema.Struct({
   readSeq: SeqNum,
   manifestId: Schema.OptionFromOptionalKey(ManifestId),
-  key: Schema.Uint8ArrayFromBase64,
+  key: RequestKeyBytes,
 });
 
 /** Schema for a transaction's scan: a range at the transaction's read sequence number (see get). */
 export const TransactionScanRequest = Schema.Struct({
   readSeq: SeqNum,
   manifestId: Schema.OptionFromOptionalKey(ManifestId),
-  range: KeyRange,
+  range: RequestKeyRange,
   limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 1000 })),
 });
 
@@ -181,9 +204,9 @@ export const MAX_SCAN_PAGE_ROWS = 1000;
 
 /** Schema for a scan: a key range, how fresh, a page size, and an optional snapshot. */
 export const ScanRequest = Schema.Struct({
-  range: KeyRange,
+  range: RequestKeyRange,
   consistency: ReadConsistency,
-  snapshot: Schema.OptionFromNullOr(DbSnapshot),
+  snapshot: Schema.OptionFromNullOr(RequestSnapshot),
   limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: MAX_SCAN_PAGE_ROWS })),
 });
 
@@ -214,7 +237,7 @@ export class DbHttpApiGroup extends HttpApiGroup.make("databases")
   .add(
     HttpApiEndpoint.post("write", "/databases/:databaseId/batches", {
       params: DatabaseParams,
-      payload: WriteBatch,
+      payload: RequestWriteBatch,
       success: WriteReceipt,
       error: DB_PUBLIC_ERRORS,
     }).annotateMerge(
@@ -402,7 +425,7 @@ export class DbHttpApiGroup extends HttpApiGroup.make("databases")
   .add(
     HttpApiEndpoint.post("commitTransaction", "/databases/:databaseId/transactions/commit", {
       params: DatabaseParams,
-      payload: TransactionCommit,
+      payload: RequestTransactionCommit,
       success: WriteReceipt,
       error: DB_PUBLIC_ERRORS,
     }).annotateMerge(
@@ -492,6 +515,6 @@ export class DbHttpApi extends HttpApi.make("DbHttpApi")
       title: "shaledb",
       version: "1.0.0",
       description:
-        "A SlateDB-style LSM key-value store on R2 and Durable Objects. Keys and values are base64 in JSON. Every response carries `x-request-id`; error bodies repeat it as `requestId`.",
+        "A SlateDB-style LSM key-value store on R2 and Durable Objects. Keys and values are base64 in JSON. Every response carries `x-request-id`; error bodies repeat it as `requestId`. A request body is at most 16 MiB (16,777,216 bytes, whether or not it declares its length); a larger one is refused with `InvalidRequest` before it is read further. Every string, byte, and array field states its bound.",
     }),
   ) {}

@@ -106,22 +106,61 @@ const isRoutingError = (error: { readonly _tag: string }) =>
  */
 const ROUTING_WAIT_MS = 30_000;
 
+/**
+ * Oldest a cached map may be when a `Flushed` or `AtLeast` read uses it (D89). Those reads never
+ * ask the writer, so a sealed shard does not fail them and a stale map would serve the sealed
+ * shard's data for as long as the isolate lives. Refreshing a map older than this bounds that
+ * staleness to about the lag a `Flushed` read already has.
+ */
+export const SHARD_MAP_MAX_AGE_FOR_UNPROBED_READS_MS = 1_000;
+
 /** Constructs the router over the contextual database client and shard directory. */
 export const makeShardRouter = Effect.gen(function* () {
   const client = yield* DbClient;
   const directory = yield* ShardDirectory;
   const maps = yield* Ref.make(new Map<ShardGroup, ShardMap>());
+  /** When each group's cached map was read from the directory (or learned from a wait). */
+  const readAt = yield* Ref.make(new Map<ShardGroup, number>());
+  const remember = (group: ShardGroup, map: ShardMap) =>
+    Effect.gen(function* () {
+      const now = yield* Clock.currentTimeMillis;
+      yield* Ref.update(maps, (current) => new Map(current).set(group, map));
+      yield* Ref.update(readAt, (current) => new Map(current).set(group, now));
+    });
 
   const refresh = Effect.fn("ShardRouter.refresh")(function* (group: ShardGroup) {
     const map = yield* directory.map(group);
-    yield* Ref.update(maps, (current) => new Map(current).set(group, map));
-    yield* Effect.annotateCurrentSpan({ "shard.group": group, "shard.version": map.version });
+    yield* remember(group, map);
+    yield* Effect.annotateCurrentSpan({
+      "shard.group": group,
+      "shard.version": map.version,
+      // A split still pending shows here (D101); `measure health` reports one that a request had
+      // to finish (`ShardSplit.resumePending`).
+      ...(Option.isSome(map.pendingSplit)
+        ? { "shard.pending_split": map.pendingSplit.value.databaseId }
+        : {}),
+    });
     return map;
   });
   const mapFor = (group: ShardGroup) =>
     Effect.flatMap(Ref.get(maps), (current) => {
       const cached = current.get(group);
       return cached === undefined ? refresh(group) : Effect.succeed(cached);
+    });
+
+  /**
+   * The map a read with `options` uses: the cached one, refreshed first when the read never asks
+   * the writer (`Flushed`, `AtLeast`) and the map is older than
+   * {@link SHARD_MAP_MAX_AGE_FOR_UNPROBED_READS_MS}. A read at a snapshot is not rerouted.
+   */
+  const refreshForUnprobedRead = (group: ShardGroup, options: ReadOptions) =>
+    Effect.gen(function* () {
+      if (Option.isSome(options.snapshot) || options.consistency._tag === "Latest") return;
+      const at = (yield* Ref.get(readAt)).get(group);
+      const now = yield* Clock.currentTimeMillis;
+      if (at === undefined || now - at > SHARD_MAP_MAX_AGE_FOR_UNPROBED_READS_MS) {
+        yield* refresh(group);
+      }
     });
 
   /** The database holding `key` in `map`; a map covers every key, so a miss is a broken map. */
@@ -151,7 +190,7 @@ export const makeShardRouter = Effect.gen(function* () {
         const remaining = deadline - (yield* Clock.currentTimeMillis);
         if (!isRoutingError(error) || remaining <= 0) return yield* Effect.fail(error);
         const waited = yield* directory.awaitMap(group, map.version, remaining);
-        yield* Ref.update(maps, (current) => new Map(current).set(group, waited.map));
+        yield* remember(group, waited.map);
         yield* Effect.annotateCurrentSpan({ "shard.wait_outcome": waited.outcome });
         if (waited.outcome !== "Newer") return yield* Effect.fail(error);
       }
@@ -227,6 +266,7 @@ export const makeShardRouter = Effect.gen(function* () {
     key: Uint8Array,
     options: ReadOptions,
   ) {
+    yield* refreshForUnprobedRead(group, options);
     return yield* routed(group, key, (databaseId) => client.get(databaseId, key, options));
   });
 
@@ -258,7 +298,7 @@ export const makeShardRouter = Effect.gen(function* () {
                   const remaining = deadline - (yield* Clock.currentTimeMillis);
                   if (remaining <= 0) return Stream.fail(error);
                   const waited = yield* directory.awaitMap(group, map.version, remaining);
-                  yield* Ref.update(maps, (current) => new Map(current).set(group, waited.map));
+                  yield* remember(group, waited.map);
                   return waited.outcome === "Newer"
                     ? scanFrom(group, range, options, deadline)
                     : Stream.fail(error);
@@ -282,13 +322,16 @@ export const makeShardRouter = Effect.gen(function* () {
 
   const scan = (group: ShardGroup, range: KeyRange, options: ScanReadOptions) =>
     Stream.unwrap(
-      Effect.map(Clock.currentTimeMillis, (now) => {
-        const all = scanFrom(group, range, options, now + ROUTING_WAIT_MS);
-        return Option.match(options.limit, {
-          onNone: () => all,
-          onSome: (limit) => Stream.take(all, limit),
-        });
-      }),
+      Effect.map(
+        Effect.andThen(refreshForUnprobedRead(group, options), Clock.currentTimeMillis),
+        (now) => {
+          const all = scanFrom(group, range, options, now + ROUTING_WAIT_MS);
+          return Option.match(options.limit, {
+            onNone: () => all,
+            onSome: (limit) => Stream.take(all, limit),
+          });
+        },
+      ),
     ).pipe(Stream.withSpan("ShardRouter.scan", { attributes: { "shard.group": group } }));
 
   return ShardRouter.of({

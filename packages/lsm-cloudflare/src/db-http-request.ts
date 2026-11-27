@@ -1,4 +1,4 @@
-import { Cause, Context, Effect, Layer, Schema } from "effect";
+import { Cause, Context, Effect, Layer, Option, Schema, Stream } from "effect";
 import {
   HttpEffect,
   HttpRouter,
@@ -39,6 +39,39 @@ const encodeRouteNotFound = Schema.encodeSync(RouteNotFoundPublicError);
 const encodeInternalFailure = Schema.encodeSync(InternalFailurePublicError);
 
 const noStore = { "cache-control": "no-store" };
+
+/**
+ * Largest request body any public API reads, in bytes: 16 MiB (D100). The largest legitimate body
+ * is a write batch at its limits (10,000 operations, 8 MiB of keys and values): about 11.4 MiB as
+ * base64 JSON. A larger body is refused before it is held, so no request can make the API isolate
+ * (128 MB, shared by every database it serves) hold an unbounded body.
+ */
+export const MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024;
+
+/** The bytes of `stream`, or `None` as soon as they pass `limit` (the rest is never read). */
+const readAtMost = (stream: Stream.Stream<Uint8Array, unknown>, limit: number) =>
+  Effect.gen(function* () {
+    const chunks: Array<Uint8Array> = [];
+    let total = 0;
+    const within = yield* stream.pipe(
+      Stream.takeUntil((chunk) => {
+        total += chunk.length;
+        chunks.push(chunk);
+        return total > limit;
+      }),
+      Stream.runDrain,
+      Effect.as(true),
+      Effect.catch(() => Effect.succeed(false)),
+    );
+    if (!within || total > limit) return Option.none<Uint8Array>();
+    const body = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      body.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return Option.some(body);
+  });
 
 /** The part of a request each kind of request decoding failure is about. */
 const REQUEST_PART_BY_SCHEMA_ERROR_KIND = {
@@ -135,7 +168,33 @@ export const publicHttpRequestMiddlewareLayer = (reference: PublicHttpApiReferen
             ),
             { status: 400, headers: noStore },
           );
+        // The body is read here, at most MAX_REQUEST_BODY_BYTES of it, whether or not the request
+        // declares its length (a chunked body has none); the router reads the buffered copy (D100).
+        const tooLarge = () =>
+          invalidRequest(
+            `The request to ${request.method} ${pathname} has a body larger than ${MAX_REQUEST_BODY_BYTES} bytes (16 MiB), the most any request may send. Send a smaller batch, or fewer keys and ranges.`,
+          );
+        const declared = Number(request.headers["content-length"] ?? "0");
+        if (Number.isFinite(declared) && declared > MAX_REQUEST_BODY_BYTES) return tooLarge();
+        const hasBody = request.method !== "GET" && request.method !== "HEAD";
+        const served = hasBody
+          ? yield* Effect.gen(function* () {
+              const body = yield* readAtMost(request.stream, MAX_REQUEST_BODY_BYTES);
+              if (Option.isNone(body)) return Option.none<HttpServerRequest.HttpServerRequest>();
+              return Option.some(
+                HttpServerRequest.fromWeb(
+                  new Request(new URL(request.originalUrl, "http://api.internal"), {
+                    method: request.method,
+                    headers: request.headers,
+                    body: body.value,
+                  }),
+                ),
+              );
+            })
+          : Option.some(request);
+        if (Option.isNone(served)) return tooLarge();
         return yield* httpEffect.pipe(
+          Effect.provideService(HttpServerRequest.HttpServerRequest, served.value),
           // The API builder answers a content type no endpoint accepts itself, in plain text.
           Effect.map((response) =>
             response.status === 415

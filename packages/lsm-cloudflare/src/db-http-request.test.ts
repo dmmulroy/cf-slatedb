@@ -2,7 +2,10 @@ import { Effect } from "effect";
 import { HttpRouter } from "effect/http";
 import { describe, expect, it } from "vite-plus/test";
 
+import { MAX_BATCH_BYTES, MAX_BATCH_OPERATIONS, MAX_TTL_MILLIS } from "@shaledb/lsm-core";
+
 import { dbHttpRouterLayer } from "./db-http-handlers.ts";
+import { MAX_REQUEST_BODY_BYTES } from "./db-http-request.ts";
 import { dbServicesTestLayer } from "./db-services.ts";
 import { lsmTestRuntimeContextLayer, serveLsmTestRequest } from "./lsm-test-runtime.ts";
 
@@ -77,5 +80,81 @@ describe("the database API's answers to requests it refuses", () => {
       expect(answer.status, path).toBe(404);
       expect(answer.body, path).toMatchObject(envelope(answer, "RouteNotFound", method, path));
     }
+  });
+});
+
+describe("request bodies are bounded (D100)", () => {
+  const path = "/v1/databases/orders/batches";
+  const send = (init: RequestInit) =>
+    Effect.gen(function* () {
+      const app = yield* HttpRouter.toHttpEffect(dbHttpRouterLayer);
+      const web = yield* serveLsmTestRequest(app, new Request(`http://api.internal${path}`, init));
+      return { status: web.status, body: web.text === "" ? "" : JSON.parse(web.text) };
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(dbServicesTestLayer()),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.runPromise,
+    );
+
+  /** A chunked body of `chunks` chunks of 1 MiB, counting how many the server pulled. */
+  const chunked = (chunks: number) => {
+    const pulled = { count: 0 };
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (pulled.count >= chunks) return controller.close();
+        pulled.count += 1;
+        controller.enqueue(new Uint8Array(1024 * 1024).fill(0x20));
+      },
+    });
+    return { stream, pulled };
+  };
+
+  it("refuses a declared length over 16 MiB before reading the body", async () => {
+    const { stream, pulled } = chunked(64);
+    const answer = await send({
+      method: "POST",
+      body: stream,
+      headers: {
+        "content-type": "application/json",
+        "content-length": String(MAX_REQUEST_BODY_BYTES + 1),
+      },
+      // @ts-expect-error: Node's fetch needs this for a stream body; workerd ignores it.
+      duplex: "half",
+    });
+    expect(answer.status).toBe(400);
+    expect(answer.body).toMatchObject({ code: "InvalidRequest" });
+    expect(JSON.stringify(answer.body)).toContain("16 MiB");
+    expect(pulled.count).toBeLessThanOrEqual(1);
+  });
+
+  it("refuses a chunked body once it passes 16 MiB, without reading the rest", async () => {
+    const { stream, pulled } = chunked(64);
+    const answer = await send({
+      method: "POST",
+      body: stream,
+      headers: { "content-type": "application/json" },
+      // @ts-expect-error: Node's fetch needs this for a stream body; workerd ignores it.
+      duplex: "half",
+    });
+    expect(answer.status).toBe(400);
+    expect(JSON.stringify(answer.body)).toContain("16 MiB");
+    // 17 chunks pass 16 MiB; a few more may be buffered by the stream, never all 64.
+    expect(pulled.count).toBeLessThan(24);
+  });
+
+  it("fits the largest legitimate write batch with room to spare", () => {
+    const rowBytes = Math.floor(MAX_BATCH_BYTES / MAX_BATCH_OPERATIONS);
+    const batch = {
+      operations: Array.from({ length: MAX_BATCH_OPERATIONS }, (_, index) => ({
+        _tag: "Merge",
+        key: Buffer.from(new Uint8Array(16).fill(index & 0xff)).toString("base64"),
+        operand: Buffer.from(new Uint8Array(rowBytes - 16)).toString("base64"),
+        ttlMillis: MAX_TTL_MILLIS,
+      })),
+    };
+    const size = new TextEncoder().encode(JSON.stringify(batch)).length;
+    expect(size).toBeGreaterThan(11 * 1024 * 1024);
+    expect(size).toBeLessThan(MAX_REQUEST_BODY_BYTES * 0.75);
   });
 });

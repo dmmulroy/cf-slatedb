@@ -5,7 +5,7 @@ import {
   ManifestId,
   SstId,
 } from "@shaledb/lsm-core";
-import { Effect, Layer, Option } from "effect";
+import { Effect, Exit, Layer, Option } from "effect";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -95,5 +95,39 @@ describe("BlockServer", () => {
     expect(outcome.pastEnd.status).toBe(404);
     expect(outcome.missing.status).toBe(404);
     expect(outcome.purge.status).toBe(200);
+  });
+});
+
+describe("BlockServer paths a crafted request might try (D100)", () => {
+  it("refuses ids and ranges that are not a database id, a ULID, and digits, so no key outside db/<id>/ is formed", async () => {
+    const answers = await Effect.gen(function* () {
+      const objects = yield* ObjectStore;
+      yield* objects.put("secret/elsewhere", Uint8Array.of(1, 2, 3));
+      yield* objects.put(sstKey(DB, SST), Uint8Array.of(9, 9, 9, 9));
+      const statuses: Record<string, number> = {};
+      for (const path of [
+        `/v1/databases/..%2Fsecret/ssts/${SST}/blocks/0-3`,
+        `/v1/databases/${DB}/ssts/..%2F..%2Fsecret%2Felsewhere/blocks/0-3`,
+        `/v1/databases/${DB}/ssts/${SST}/blocks/-1-3`,
+        `/v1/databases/${DB}/ssts/${SST}/blocks/0-3%2F..`,
+        `/v1/databases/ORDERS/ssts/${SST}/blocks/0-3`,
+        `/v1/databases/${DB}/manifests/..%2F..%2Fsecret`,
+      ]) {
+        // A refused request dies with the schema error; the Workers runtime answers it 400 (D79).
+        const exit = yield* Effect.exit(call("GET", path));
+        statuses[path] = Exit.isSuccess(exit)
+          ? exit.value.status
+          : String(exit).includes("HttpApiSchemaError")
+            ? 400
+            : 500;
+      }
+      return statuses;
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(manifestStoreTestLayer),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.runPromise,
+    );
+    for (const [path, status] of Object.entries(answers)) expect(status, path).toBe(400);
   });
 });

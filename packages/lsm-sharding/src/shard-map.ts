@@ -2,9 +2,10 @@ import { DatabaseId, FULL_KEY_RANGE, KeyRange, keyRangeContains } from "@shaledb
 import { Bytes, Option, Result, Schema } from "effect";
 
 /** Schema for a shard group's name: one directory, one range map. */
-export const ShardGroup = Schema.String.check(Schema.isPattern(/^[a-z0-9][a-z0-9._-]{0,62}$/)).pipe(
-  Schema.brand("ShardGroup"),
-);
+export const ShardGroup = Schema.String.check(
+  Schema.isPattern(/^[a-z0-9][a-z0-9._-]{0,62}$/),
+  Schema.isMaxLength(63),
+).pipe(Schema.brand("ShardGroup"));
 
 /** A shard group's name. */
 export type ShardGroup = typeof ShardGroup.Type;
