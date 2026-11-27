@@ -411,6 +411,7 @@ describe("sharded scans resume a scan overtaken after it returned rows (D93)", (
                           reason: "StorageUnavailable",
                           message: "overtaken by a flush after returning rows",
                           resumeFrom: key(3),
+                          pageEnd: "OvertakenByFlush",
                         }),
                       );
                     }),

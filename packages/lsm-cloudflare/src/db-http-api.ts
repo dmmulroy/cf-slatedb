@@ -185,6 +185,16 @@ export const TransactionScanRequest = Schema.Struct({
   limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 1000 })),
 });
 
+/**
+ * Schema for one page of a transaction's scan (D125): rows at the transaction's `readSeq`, and
+ * `resumeFrom`, where the next page starts (null: the range is exhausted). A page may hold fewer
+ * rows than its limit, or none, and still have a `resumeFrom`: it examined its share.
+ */
+export const TransactionScanResponse = Schema.Struct({
+  rows: Schema.Array(RowSchema),
+  resumeFrom: Schema.OptionFromNullOr(Schema.Uint8ArrayFromBase64),
+});
+
 /** Schema for one page of the change feed (see `ChangeFeedPage`). */
 export const ChangeFeedResponse = Schema.Struct({
   rows: Schema.Array(RowSchema),
@@ -412,13 +422,13 @@ export class DbHttpApiGroup extends HttpApiGroup.make("databases")
     HttpApiEndpoint.post("transactionScan", "/databases/:databaseId/transactions/scan", {
       params: DatabaseParams,
       payload: TransactionScanRequest,
-      success: Schema.Struct({ rows: Schema.Array(RowSchema) }),
+      success: TransactionScanResponse,
       error: DB_PUBLIC_ERRORS,
     }).annotateMerge(
       OpenApi.annotations({
         summary: "Scan a range in a transaction",
         description:
-          "Scans a key range as of the transaction's `readSeq` and `manifestId` (both from `transactions/begin`), at most `limit` rows. Send the range to `transactions/commit` as one of `readRanges`.",
+          "Scans a key range as of the transaction's `readSeq` and `manifestId` (both from `transactions/begin`): at most `limit` rows, and `resumeFrom`, where the next page starts (null when the range is exhausted). A page may hold fewer rows than `limit`, or none, and still have a `resumeFrom`: it examined its share of work. Continue with the same `readSeq` and `manifestId` and `range.start` set to `resumeFrom`; every page reads the same snapshot. Send `transactions/commit` the whole range scanned as one of `readRanges`, not each page's part.",
       }),
     ),
   )

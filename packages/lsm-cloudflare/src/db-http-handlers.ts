@@ -160,17 +160,14 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
       )
       .handle("transactionScan", ({ params, payload }) =>
         client
-          .scanAt(
+          .scanAtPage(
             params.databaseId,
             payload.range,
             payload.readSeq,
             payload.limit,
             payload.manifestId,
           )
-          .pipe(
-            Effect.map((rows) => ({ rows })),
-            publicFailures("transaction"),
-          ),
+          .pipe(publicFailures("transaction")),
       )
       .handle("commitTransaction", ({ params, payload }) =>
         client.commitTransaction(params.databaseId, payload).pipe(publicFailures("transaction")),

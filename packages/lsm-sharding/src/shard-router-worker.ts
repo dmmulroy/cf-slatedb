@@ -5,6 +5,7 @@ import {
   RequestKeyBytes,
   RequestKeyRange,
   RequestValueBytes,
+  type Row,
   SeqNum,
 } from "@shaledb/lsm-core";
 import {
@@ -28,7 +29,7 @@ import {
 import type { HttpEffect } from "alchemy/Http";
 import { makeExecutionMemo } from "alchemy/Runtime/ExecutionMemo";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
-import { Effect, Layer, Option, Schema, Stream } from "effect";
+import { Cause, Effect, Layer, Option, Schema, Stream } from "effect";
 import { HttpRouter } from "effect/http";
 import {
   HttpApi,
@@ -147,7 +148,12 @@ export class ShardedHttpApiGroup extends HttpApiGroup.make("groups")
         range: RequestKeyRange,
         limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 1000 })),
       }),
-      success: Schema.Struct({ rows: Schema.Array(Pair) }),
+      // `resumeFrom`: where the next page starts, or null when the range is exhausted. A page may
+      // hold fewer rows than its limit, or none, and still have one: its budget was spent (D125).
+      success: Schema.Struct({
+        rows: Schema.Array(Pair),
+        resumeFrom: Schema.OptionFromNullOr(Schema.Uint8ArrayFromBase64),
+      }),
       error: SHARDED_ERRORS,
     }),
   )
@@ -267,19 +273,45 @@ const shardedHttpHandlersLayer = HttpApiBuilder.group(ShardedHttpApi, "groups", 
       .handle("scan", ({ params, payload }) =>
         shardedFailures(
           finishingAbandonedSplit(params.group, () =>
-            Stream.runCollect(
-              router.scan(params.group, payload.range, {
-                consistency: { _tag: "Latest" },
-                snapshot: Option.none(),
-                refuseSealed: true,
-                limit: Option.some(payload.limit),
-              }),
-            ),
+            Effect.gen(function* () {
+              const rows: Array<Row> = [];
+              // One extra row tells whether another page follows; a page whose budget is spent
+              // ends early with the key to continue from (D125), as the database API's does.
+              const scanned = yield* Effect.exit(
+                Stream.runForEach(
+                  router.scan(params.group, payload.range, {
+                    consistency: { _tag: "Latest" },
+                    snapshot: Option.none(),
+                    refuseSealed: true,
+                    limit: Option.some(payload.limit + 1),
+                  }),
+                  (row) => Effect.sync(() => void rows.push(row)),
+                ),
+              );
+              if (scanned._tag === "Failure") {
+                const failure = Cause.findErrorOption(scanned.cause);
+                if (
+                  Option.isSome(failure) &&
+                  failure.value._tag === "ReaderUnavailableError" &&
+                  failure.value.resumeFrom !== undefined &&
+                  rows.length <= payload.limit
+                ) {
+                  return { rows, resumeFrom: Option.some(failure.value.resumeFrom) };
+                }
+                return yield* Effect.failCause(scanned.cause);
+              }
+              const next = rows[payload.limit];
+              return {
+                rows: rows.slice(0, payload.limit),
+                resumeFrom: next === undefined ? Option.none() : Option.some(next.key),
+              };
+            }),
           ).pipe(
-            Effect.map((rows) => ({
+            Effect.map(({ rows, resumeFrom }) => ({
               rows: rows.flatMap((row) =>
                 row.value._tag === "Value" ? [{ key: row.key, value: row.value.bytes }] : [],
               ),
+              resumeFrom,
             })),
           ),
         ),

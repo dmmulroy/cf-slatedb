@@ -105,6 +105,11 @@ export class ReaderUnavailableError extends Data.TaggedError("ReaderUnavailableE
    * Every row before it was returned, and none at or after it (D93).
    */
   readonly resumeFrom?: Uint8Array;
+  /**
+   * Why a scan with `resumeFrom` ended: its page's budget was spent (D108, D125), so the page ends
+   * there; or a flush overtook it after it returned rows (D93), so the rest needs a new snapshot.
+   */
+  readonly pageEnd?: "BudgetSpent" | "OvertakenByFlush";
 }> {}
 
 /**
@@ -175,6 +180,19 @@ export class ScanBudget {
  * block reads, 2,048 with every one hedged, of an invocation's 10,000 subrequests.
  */
 export const SCAN_PAGE_EXAMINED_BYTES = 16 * 1024 * 1024;
+
+/**
+ * The examined-bytes budget a scan page gets (D108, D125): `maxBytes` for a new page's budget, and
+ * `shared`, a budget already spent in part, which a routed page passes to each shard it scans so
+ * the whole page stays within one budget. The default is {@link SCAN_PAGE_EXAMINED_BYTES} and no
+ * shared budget; tests set a few hundred bytes.
+ */
+export const ScanPageBudget = Context.Reference<{
+  readonly maxBytes: number;
+  readonly shared: Option.Option<ScanBudget>;
+}>("@shaledb/ScanPageBudget", {
+  defaultValue: () => ({ maxBytes: SCAN_PAGE_EXAMINED_BYTES, shared: Option.none() }),
+});
 
 /**
  * Reads SSTs in the caller's isolate: finds the manifest a view needs, skips SSTs by key range and
@@ -639,6 +657,7 @@ export const makeDbReader = Effect.gen(function* () {
                     reason: "StorageUnavailable",
                     message: `A scan of database ${databaseId} examined ${budget.examinedBytes} bytes of versions, its page's share, before reaching its limit (deleted or expired rows return nothing). Resume the scan from resumeFrom (the next range start); every row before it was returned.`,
                     resumeFrom: versions[0].key,
+                    pageEnd: "BudgetSpent",
                   }),
                 );
               }
