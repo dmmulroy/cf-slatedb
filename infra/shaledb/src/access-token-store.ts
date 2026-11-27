@@ -19,9 +19,11 @@ import { SHALEDB_CLOUDFLARE_ACCOUNT_ID } from "./shaledb-stage.ts";
  *   `tokens ensure <stage>`).
  * - `CloudflareUnavailable`: the Secrets Store API failed or refused the request. Retry; check
  *   that the Alchemy profile's credentials can edit Secrets Store secrets.
+ * - `SecretNotActive`: a token was written (and shown) but its secret did not turn active within
+ *   the wait, so Workers cannot bind it yet (D121). Wait, then deploy.
  */
 export class AccessTokenStoreError extends Data.TaggedError("AccessTokenStoreError")<{
-  readonly reason: "StoreNotFound" | "CloudflareUnavailable";
+  readonly reason: "StoreNotFound" | "CloudflareUnavailable" | "SecretNotActive";
   readonly message: string;
 }> {}
 
@@ -31,6 +33,8 @@ export interface WrittenAccessToken {
   readonly slot: ShaledbAccessTokenSlot;
   readonly secretName: string;
   readonly token: Redacted.Redacted<string>;
+  /** Whether the secret turned active within the wait; a deploy cannot bind it before (D121). */
+  readonly active: boolean;
 }
 
 /** A new 256-bit token as 64 hex digits, like the state-held preview tokens. */
@@ -81,16 +85,31 @@ const secretIdByName = (storeId: string, name: string) =>
       Effect.mapError(unavailable(`look up secret ${name}`)),
     );
 
-/** Waits (bounded) until a written secret is active: Workers cannot bind a pending one. */
-const awaitActive = (storeId: string, secretId: string) =>
-  secretsStore.getStoreSecret({ accountId: SHALEDB_CLOUDFLARE_ACCOUNT_ID, storeId, secretId }).pipe(
-    Effect.map((secret) => secret.status),
+/** How often, and how many times, a written secret's status is read before giving up on it. */
+export const SECRET_ACTIVE_POLL = { spacing: "500 millis", reads: 20 } as const;
+
+/**
+ * Whether a written secret turned `active` (D121): its status is read up to
+ * {@link SECRET_ACTIVE_POLL}'s reads, `spacing` apart (about 10 s). Workers cannot bind a pending
+ * secret, so a deploy right after a write that never turned active fails to bind it. A failed read
+ * counts as not yet active.
+ */
+export const awaitSecretActive = <E, R>(readStatus: Effect.Effect<string, E, R>) =>
+  readStatus.pipe(
+    Effect.orElseSucceed(() => "unreadable"),
     Effect.repeat({
-      schedule: Schedule.spaced("500 millis"),
+      schedule: Schedule.spaced(SECRET_ACTIVE_POLL.spacing),
       until: (status) => status === "active",
-      times: 20,
+      times: SECRET_ACTIVE_POLL.reads - 1,
     }),
-    Effect.ignore,
+    Effect.map((status) => status === "active"),
+  );
+
+const awaitActive = (storeId: string, secretId: string) =>
+  awaitSecretActive(
+    secretsStore
+      .getStoreSecret({ accountId: SHALEDB_CLOUDFLARE_ACCOUNT_ID, storeId, secretId })
+      .pipe(Effect.map((secret) => String(secret.status))),
   );
 
 /** Writes a new token into `slot`, creating its secret when missing. */
@@ -128,8 +147,8 @@ const writeSlot = (storeId: string, stage: string, slot: ShaledbAccessTokenSlot)
             Effect.mapError(unavailable(`create secret ${secretName}`)),
           ),
     });
-    yield* awaitActive(storeId, secretId);
-    return { stage, slot, secretName, token } satisfies WrittenAccessToken;
+    const active = yield* awaitActive(storeId, secretId);
+    return { stage, slot, secretName, token, active } satisfies WrittenAccessToken;
   });
 
 /**
@@ -188,3 +207,22 @@ export const missingAccessTokenSlots = (
  */
 export const rotateAccessToken = (stage: string, slot: ShaledbAccessTokenSlot) =>
   Effect.flatMap(tokenStore, (storeId) => writeSlot(storeId, stage, slot));
+
+/**
+ * The failure to report after showing `written` tokens, when any secret did not turn active
+ * (D121): the tokens are shown first, since they cannot be read again, and the command still exits
+ * non-zero, so a script does not deploy against a secret Workers cannot bind yet.
+ */
+export const inactiveSecretsFailure = (
+  written: ReadonlyArray<WrittenAccessToken>,
+): Option.Option<AccessTokenStoreError> => {
+  const pending = written.filter((token) => !token.active).map((token) => token.secretName);
+  return pending.length === 0
+    ? Option.none()
+    : Option.some(
+        new AccessTokenStoreError({
+          reason: "SecretNotActive",
+          message: `${pending.join(", ")} ${pending.length === 1 ? "was" : "were"} written (the token is shown above; store it now) but did not become active within 10 s, so Workers cannot bind ${pending.length === 1 ? "it" : "them"} yet. Wait a minute, then deploy; do not write the token again.`,
+        }),
+      );
+};

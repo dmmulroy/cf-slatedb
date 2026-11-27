@@ -15,7 +15,7 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
 import * as Auth from "alchemy/Auth";
-import { Console, Effect, Layer, Redacted } from "effect";
+import { Console, Effect, Layer, Option, Redacted } from "effect";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import { FetchHttpClient } from "effect/http";
 import { Argument, Command } from "effect/cli";
@@ -23,6 +23,7 @@ import { Argument, Command } from "effect/cli";
 import {
   AccessTokenStoreError,
   ensureAccessTokens,
+  inactiveSecretsFailure,
   missingAccessTokens,
   rotateAccessToken,
   type WrittenAccessToken,
@@ -48,6 +49,8 @@ const ensure = Command.make("ensure", { stage: stageArgument }, ({ stage }) =>
       `${stage}: created ${created.length} access token(s). Store them now; they are not shown again.`,
     );
     yield* Effect.forEach(created, show, { discard: true });
+    const inactive = inactiveSecretsFailure(created);
+    if (Option.isSome(inactive)) return yield* inactive.value;
   }),
 ).pipe(Command.withDescription("Create the stage's missing access-token secrets"));
 
@@ -77,6 +80,8 @@ const rotate = Command.make(
         `${stage}: rotated slot ${slot}. Workers accept the new token within 30 s and stop accepting the old one. Store it now; it is not shown again.`,
       );
       yield* show(written);
+      const inactive = inactiveSecretsFailure([written]);
+      if (Option.isSome(inactive)) return yield* inactive.value;
     }),
 ).pipe(Command.withDescription("Replace one slot's access token with a new one"));
 
