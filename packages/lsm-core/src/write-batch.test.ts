@@ -151,6 +151,30 @@ describe("collapseWriteBatch at its limits (mutation sweep, D117)", () => {
         : collapsed.failure._tag;
   };
 
+  it("names the operation a merge refusal is about", () => {
+    const key = Uint8Array.of(5);
+    const merge = (operand: number, ttl: Option.Option<number>): WriteOperation => ({
+      _tag: "Merge",
+      key,
+      operand: Uint8Array.of(operand),
+      ttlMillis: ttl,
+    });
+    const other = put(Uint8Array.of(9), Uint8Array.of(1));
+    // The second merge is the one whose TTL differs; without an operator, the first merge.
+    expect(
+      reasonAndIndex({ operations: [other, merge(1, Option.some(10)), merge(2, Option.some(20))] }),
+    ).toBe("MergeTtlMismatch@2");
+    const withoutOperator = collapseWriteBatch(
+      { operations: [other, merge(1, Option.none()), merge(2, Option.none())] },
+      { ...context, mergeOperator: Option.none() },
+    );
+    expect(
+      Result.isFailure(withoutOperator) &&
+        withoutOperator.failure._tag === "WriteBatchInvalidError" &&
+        Option.getOrNull(withoutOperator.failure.operationIndex),
+    ).toBe(1);
+  });
+
   it("pins the documented limits: 16 KiB keys, 1 MiB values, 10,000 operations, 8 MiB per batch", () => {
     // Public limits (the OpenAPI contract and docs/api-compatibility.md name them).
     expect([MAX_KEY_BYTES, MAX_VALUE_BYTES, MAX_BATCH_OPERATIONS, MAX_BATCH_BYTES]).toEqual([

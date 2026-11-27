@@ -3,6 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   hasSstCollectionCandidates,
+  nextCollectionTime,
   planManifestCollection,
   planSstCollection,
   retainedReferencesOf,
@@ -189,5 +190,81 @@ describe("prepareGarbageCollection", () => {
     // SST 3 was created at 300 ms: not before a 300 ms cutoff, but before 301 ms.
     expect(hasSstCollectionCandidates(latest, stored([1, 2, 3]), Timestamp.make(300))).toBe(false);
     expect(hasSstCollectionCandidates(latest, stored([1, 2, 3]), Timestamp.make(301))).toBe(true);
+  });
+});
+
+describe("the collection plan at its edges (mutation sweep, D117)", () => {
+  it("deletes a manifest superseded exactly gcMinAge ago, and keeps one superseded a moment later", () => {
+    const plan = (now: number) =>
+      planManifestCollection({
+        latestId: ManifestId.make(3),
+        latest: empty,
+        stored: [1, 2, 3].map((id) => ({
+          id: ManifestId.make(id),
+          uploadedAt: Timestamp.make(id * 1000),
+        })),
+        now: Timestamp.make(now),
+        minAge: 1000,
+      }).deletable;
+    // Manifest 1 was superseded at 2000, manifest 2 at 3000.
+    expect(plan(3000)).toEqual([1]);
+    expect(plan(2999)).toEqual([]);
+  });
+
+  it("notes when a retained manifest reads another database's SST, and not otherwise", () => {
+    expect(retainedReferencesOf([manifestWith([1, 2])]).readsAnotherDatabase).toBe(false);
+    expect(
+      retainedReferencesOf([manifestWith([1]), manifestWith([2], [3])]).readsAnotherDatabase,
+    ).toBe(true);
+    const references = retainedReferencesOf([manifestWith([1], [3])]);
+    // A source's SST is not this database's to keep or delete.
+    expect([...references.live]).toEqual([sstId(1)]);
+  });
+
+  it("schedules the next collection when something kept becomes collectable, and never otherwise", () => {
+    const next = (input: {
+      readonly stored: ReadonlyArray<number>;
+      readonly retainedIds: ReadonlyArray<number>;
+      readonly latest?: Manifest;
+      readonly boundary: number;
+    }) =>
+      Option.getOrNull(
+        nextCollectionTime({
+          latestId: ManifestId.make(9),
+          latest: input.latest ?? manifestWith([1]),
+          retainedIds: input.retainedIds.map((id) => ManifestId.make(id)),
+          live: retainedReferencesOf([manifestWith([1])]).live,
+          stored: stored(input.stored),
+          boundary: Timestamp.make(input.boundary),
+          now: Timestamp.make(10_000),
+          minAge: 1_000,
+        }),
+      );
+    // Nothing young: an idle database schedules nothing.
+    expect(next({ stored: [1], retainedIds: [9], boundary: 500 })).toBeNull();
+    // An unreferenced SST created at or after the boundary is young: collectable gcMinAge later.
+    expect(next({ stored: [1, 5], retainedIds: [9], boundary: 500 })).toBe(11_000);
+    // One before the boundary was collectable this time already.
+    expect(next({ stored: [1, 4], retainedIds: [9], boundary: 500 })).toBeNull();
+    // A superseded, unpinned manifest kept for its age.
+    expect(next({ stored: [1], retainedIds: [8, 9], boundary: 500 })).toBe(11_000);
+    // A checkpoint that expires sooner than gcMinAge decides; one already expired, now.
+    const withCheckpoint = (expireAt: number) =>
+      Result.getOrThrow(
+        addCheckpoint(manifestWith([1]), {
+          id: CheckpointId.make("01JD00000000000000000000CP"),
+          manifestId: ManifestId.make(9),
+          createdAt: Timestamp.make(0),
+          expireAt: Option.some(Timestamp.make(expireAt)),
+          holder: Option.none(),
+          name: Option.none(),
+        }),
+      );
+    expect(
+      next({ stored: [1, 5], retainedIds: [9], boundary: 500, latest: withCheckpoint(10_400) }),
+    ).toBe(10_400);
+    expect(
+      next({ stored: [1], retainedIds: [9], boundary: 500, latest: withCheckpoint(9_000) }),
+    ).toBe(10_000);
   });
 });
