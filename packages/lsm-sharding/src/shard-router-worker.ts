@@ -189,7 +189,14 @@ const RETRYABLE = new Set([
  * name storage paths or carry a storage error's text (D79).
  */
 const classify = (error: DbInternalError, requestId: string) => {
-  const { message } = toPublicError("routeRequest", requestId)(error);
+  // A corrupted SST names no database, and the router does not say which shard it read (D128):
+  // the message names the SST, as the database API's StoredDataInvalid does.
+  const { message } =
+    error._tag === "SstCorruptedError"
+      ? {
+          message: `Stored data of this group failed validation: SST ${error.sstId} is corrupted (${error.section}). Retrying will not help. Contact the operator with request id ${requestId}; the corruption runbook restores or drops the SST.`,
+        }
+      : toPublicError("routeRequest", requestId)(error);
   return RETRYABLE.has(error._tag)
     ? new ShardedRequestUnavailableError({ reason: error._tag, message })
     : new ShardedRequestRefusedError({ reason: error._tag, message });

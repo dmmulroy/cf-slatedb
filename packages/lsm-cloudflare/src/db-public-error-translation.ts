@@ -1,4 +1,5 @@
 import type {
+  DatabaseId,
   CheckpointLimitError,
   TransactionConflictError,
   DatabaseHasDependentsError,
@@ -82,7 +83,12 @@ export type DbInternalError =
  * type error until it is classified here.
  */
 export const toPublicError =
-  (operation: DbApiOperation, requestId: string) =>
+  (
+    operation: DbApiOperation,
+    requestId: string,
+    /** The database the request names: a corrupted SST's error carries none of its own (D128). */
+    databaseId: Option.Option<DatabaseId> = Option.none(),
+  ) =>
   (error: DbInternalError): DbPublicError => {
     switch (error._tag) {
       case "DatabaseNotFoundError":
@@ -322,6 +328,26 @@ export const toPublicError =
         }
       // falls through: the inner switch is exhaustive
       case "SstCorruptedError":
+        // A read met an SST whose bytes fail their checksum in the bucket too (D53, D108): the
+        // corruption runbook's StoredDataInvalid, naming the database and the SST.
+        if (Option.isSome(databaseId)) {
+          return new StoredDataInvalidPublicError({
+            code: "StoredDataInvalid",
+            operation,
+            message: `Database ${databaseId.value}'s stored data failed validation: SST ${error.sstId} is corrupted (${error.section}). Retrying will not help. Contact the operator with request id ${requestId}; the corruption runbook restores or drops the SST.`,
+            details: { databaseId: databaseId.value },
+            requestId,
+            retryable: false,
+          });
+        }
+        return new InternalFailurePublicError({
+          code: "InternalFailure",
+          operation,
+          message: `The request could not be completed because of an internal error. Contact the operator with request id ${requestId}.`,
+          details: {},
+          requestId,
+          retryable: false,
+        });
       case "DatabaseIdMismatchError":
         return new InternalFailurePublicError({
           code: "InternalFailure",
