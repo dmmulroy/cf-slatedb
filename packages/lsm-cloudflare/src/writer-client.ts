@@ -338,6 +338,34 @@ export const writerClientTestLayer = Layer.effect(
     >();
     const runtime = yield* RuntimeContext;
     const scope = yield* Effect.scope;
+    /**
+     * Runs `effect` with only the services a Durable Object's own invocation has: this layer's
+     * dependencies and the runtime. Nothing of the calling fiber's context reaches a writer call,
+     * nor the writer router a database's first call builds (D120). An in-process public API request
+     * that was a database's first writer call used to lend that build its context:
+     *
+     * - its layer memo map, from which `HttpRouter.toHttpEffect` took the API's own `HttpRouter`
+     *   ("Method POST already declared for route ...");
+     * - its request services, which the router captures for its handlers and `HttpApiBuilder`'s
+     *   middleware provides to each request, so a writer route decoded the API request's query
+     *   ("Missing key").
+     */
+    const ownContext = Context.add(shared, RuntimeContext, runtime);
+    const isolated = <
+      A,
+      E,
+      R extends
+        | ManifestStore
+        | ManifestReader
+        | ObjectStore
+        | LsmConfiguration
+        | CompactionTrigger
+        | RuntimeContext,
+    >(
+      effect: Effect.Effect<A, E, R>,
+    ): Effect.Effect<A, E> =>
+      // Replaced, not merged: `provideContext` would keep the caller's services underneath.
+      Effect.updateContext(effect, (): Context.Context<R> => ownContext);
     const routers = yield* Cache.make({
       capacity: Number.POSITIVE_INFINITY,
       lookup: (_databaseId: DatabaseId) =>
@@ -372,7 +400,11 @@ export const writerClientTestLayer = Layer.effect(
                   Effect.provideService(HttpServerRequest.HttpServerRequest, request),
                   Effect.scoped,
                 ),
-              ).pipe(Effect.provideService(RuntimeContext, runtime)),
+              ).pipe(
+                Effect.provideService(RuntimeContext, runtime),
+                // The router's first build runs here too: `Cache.get` looks it up in this fiber.
+                isolated,
+              ),
           }),
         }),
     });

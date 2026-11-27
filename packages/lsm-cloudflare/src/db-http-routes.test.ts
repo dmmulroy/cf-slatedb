@@ -37,7 +37,6 @@ import { ManifestReader } from "./manifest-reader.ts";
 import { ManifestStore } from "./manifest-store.ts";
 import { manifestKey } from "./object-keys.ts";
 import { ObjectStore } from "./object-store.ts";
-import { WriterClient } from "./writer-client.ts";
 
 /**
  * Every route of the public database API calls its service with the request's fields, reports its
@@ -46,10 +45,8 @@ import { WriterClient } from "./writer-client.ts";
  *
  * **Details**
  *
- * The in-process writers (`writerClientTestLayer`) are built on a database's first writer call.
- * A database whose first writer call comes from inside an in-process API request gets a writer
- * router that cannot decode its payloads (D130, open): each database here is warmed by one
- * direct writer call before its first request. Workerd does not have this limit.
+ * The in-process writers (`writerClientTestLayer`) start cold, on a database's first writer call,
+ * as a Durable Object does, and in their own context (D120).
  */
 const run = <A, E>(
   body: (client: DbApiClient) => Effect.Effect<A, E, TestServices>,
@@ -108,7 +105,7 @@ type DbApiClient = HttpApiClient.ForApi<typeof DbHttpApi>;
 const bytes = (text: string) => new TextEncoder().encode(text);
 const text = (value: Uint8Array) => new TextDecoder().decode(value);
 
-/** Creates `databaseId` through the API and warms its in-process writer (see the module note). */
+/** Creates `databaseId` through the API; its writer starts on the first request that needs it. */
 const created = (
   client: DbApiClient,
   databaseId: DatabaseId,
@@ -129,7 +126,6 @@ const created = (
         changelogRetentionMs: Option.fromNullishOr(options.changelogRetentionMs),
       },
     });
-    yield* (yield* WriterClient).status(databaseId);
     return answer;
   });
 
