@@ -104,7 +104,9 @@ from `DbHttpApi`, with examples of every request and response. It covers:
 
 - **Databases:** create, status, remove.
 - **Writes:** batches of puts, deletes, and merges, with an optional TTL each. `flush` makes
-  everything acknowledged durable in R2.
+  everything acknowledged durable in R2. A TTL is judged by the reader's clock: a value expires
+  within clock skew of its expiry time, readers on different machines may disagree for up to that
+  skew, and a value compaction has removed does not return (D83).
 - **Reads:** `get` and `scan` at `Latest` (sees every acknowledged write), `AtLeast` a sequence
   number, or `Flushed`; at a snapshot; pinned snapshots that outlive GC.
 - **Transactions:** `Snapshot` or `SerializableSnapshot` isolation, with conflicts detected at

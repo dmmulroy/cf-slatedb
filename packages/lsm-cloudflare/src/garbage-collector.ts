@@ -216,14 +216,32 @@ export const makeGarbageCollector = Effect.gen(function* () {
       minAge: settings.gcMinAge,
     });
     const retained: Array<Manifest> = [committed.manifest];
-    let everyRetainedLoaded = true;
+    const missing: Array<ManifestId> = [];
     for (const id of plan.retained) {
       if (id === committed.id) continue;
       const manifest = yield* reader
         .load(databaseId, id)
         .pipe(Effect.catchTags({ ManifestReadError: unavailable(databaseId) }));
-      if (Option.isNone(manifest)) everyRetainedLoaded = false;
+      if (Option.isNone(manifest)) missing.push(id);
       retained.push(...Option.toArray(manifest));
+    }
+    const everyRetainedLoaded = missing.length === 0;
+    // A retained manifest listed a moment ago and gone now. Another collection deletes manifests
+    // only after moving `gc/manifest.boundary` past them, so one at or below the boundary was
+    // collected by a run that judged it deletable later than this one, and every SST it alone
+    // names is one that run deletes too (D83). One above the boundary was deleted by something
+    // else (only a removal of the database may): delete nothing rather than act without it.
+    if (!everyRetainedLoaded) {
+      const boundary = yield* reader
+        .loadManifestBoundary(databaseId)
+        .pipe(Effect.catchTags({ ManifestReadError: unavailable(databaseId) }));
+      const unexplained = missing.filter((id) => id > boundary.id);
+      if (unexplained.length > 0) {
+        return yield* new GarbageCollectorUnavailableError({
+          databaseId,
+          message: `Garbage collection of database ${databaseId} found manifest ${unexplained.join(", ")} missing above GC's manifest boundary (${boundary.id}), where only removing the database deletes manifests, so it deleted nothing. The next run lists the manifests again and collects without it: if the database is not being removed, find what deleted the manifest first.`,
+        });
+      }
     }
     // A fork releases its hold on its source once no manifest kept here names another database's
     // SST (D77). Each step is an idempotent CAS: first the owner's checkpoint, then the reference,

@@ -113,6 +113,17 @@ export class ChangelogUnavailableError extends Schema.TaggedError<ChangelogUnava
   },
 ) {}
 
+/** Which read lost its blocks: a point read or a scan, and whether it reads a snapshot. */
+interface BlockReadContext {
+  readonly kind: "Get" | "Scan";
+  /** A snapshot by manifest id (no upper bound): its manifest is read exactly. */
+  readonly snapshot: boolean;
+}
+
+/** Whether `view` reads a snapshot: a named manifest with no upper bound (see `manifestFor`). */
+const readsSnapshot = (view: ReadView): boolean =>
+  Option.isSome(view.manifestId) && Option.isNone(view.maxLastL0Seq);
+
 /** Every failure a read can report. */
 export type DbReadError =
   | DatabaseNotFoundError
@@ -338,28 +349,42 @@ export const makeDbReader = Effect.gen(function* () {
       });
     });
 
-  const blockFailures = (databaseId: DatabaseId) => ({
-    // The cached manifest named an SST that is gone, so it must not serve the retry (D67).
-    SstMissingError: (error: { readonly message: string }) =>
-      Effect.andThen(
-        manifests.forget(databaseId),
+  /**
+   * What a read that lost blocks partway should do next (docs/errors.md: a way forward), by its
+   * kind: a scan may already have returned rows, so it resumes after the last one; a snapshot's
+   * SSTs go only when GC collects the snapshot, so a retry of it fails as `SnapshotExpired`.
+   */
+  const blockFailures = (databaseId: DatabaseId, read: BlockReadContext) => {
+    const resume =
+      read.kind === "Scan"
+        ? " A scan resumes from the key after the last row it returned (from its start when it returned none)."
+        : "";
+    const missingGuidance = read.snapshot
+      ? `The snapshot's manifest is being collected: take a new snapshot (pinned, to read for longer) and read again.${resume}`
+      : `Retry the read: it reads the newest manifest.${resume}`;
+    return {
+      // The cached manifest named an SST that is gone, so it must not serve the retry (D67).
+      SstMissingError: (error: { readonly message: string }) =>
+        Effect.andThen(
+          manifests.forget(databaseId),
+          Effect.fail(
+            new ReaderUnavailableError({
+              databaseId,
+              reason: "StorageUnavailable",
+              message: `An SST of database ${databaseId} was missing (the manifest changed during the read): ${error.message} ${missingGuidance}`,
+            }),
+          ),
+        ),
+      BlockSourceUnavailableError: (error: { readonly message: string }) =>
         Effect.fail(
           new ReaderUnavailableError({
             databaseId,
             reason: "StorageUnavailable",
-            message: `An SST of database ${databaseId} was missing (the manifest changed during the read): ${error.message} Retry the read.`,
+            message: `Database ${databaseId}'s blocks could not be read: ${error.message} Retry the read.${resume}`,
           }),
         ),
-      ),
-    BlockSourceUnavailableError: (error: { readonly message: string }) =>
-      Effect.fail(
-        new ReaderUnavailableError({
-          databaseId,
-          reason: "StorageUnavailable",
-          message: `Database ${databaseId}'s blocks could not be read: ${error.message}`,
-        }),
-      ),
-  });
+    };
+  };
 
   /** Every version of `key` in one SST at or below `snapshotSeq`, newest first. */
   const sstVersions = (
@@ -409,6 +434,7 @@ export const makeDbReader = Effect.gen(function* () {
     const settled = (rows: ReadonlyArray<Row>) => rows.some((row) => row.value._tag !== "Merge");
     const { manifest } = yield* manifestFor(databaseId, view);
     const snapshotSeq = Option.getOrElse(view.snapshotSeq, () => manifest.lastL0Seq);
+    const pointRead: BlockReadContext = { kind: "Get", snapshot: readsSnapshot(view) };
     let sstsRead = 0;
     if (!settled(versions)) {
       // The one SST per level that may hold the key, newest level first.
@@ -430,12 +456,12 @@ export const makeDbReader = Effect.gen(function* () {
           candidates,
           (handle) => blocks.meta(sstHandleOwner(handle, databaseId), handle, budgetGroup),
           { concurrency: "unbounded", discard: true },
-        ).pipe(Effect.catchTags(blockFailures(databaseId)));
+        ).pipe(Effect.catchTags(blockFailures(databaseId, pointRead)));
       }
       for (const handle of candidates) {
         sstsRead++;
         const found = yield* sstVersions(databaseId, handle, key, snapshotSeq, budgetGroup).pipe(
-          Effect.catchTags(blockFailures(databaseId)),
+          Effect.catchTags(blockFailures(databaseId, pointRead)),
         );
         versions.push(...found);
         if (settled(found)) break;
@@ -460,6 +486,7 @@ export const makeDbReader = Effect.gen(function* () {
     snapshotSeq: SeqNum,
     budgetGroup: string,
     limit: Option.Option<number>,
+    read: BlockReadContext,
   ) =>
     Stream.unwrap(
       Effect.gen(function* () {
@@ -505,9 +532,9 @@ export const makeDbReader = Effect.gen(function* () {
     ).pipe(
       Stream.catchTags({
         SstMissingError: (error) =>
-          Stream.fromEffect(blockFailures(databaseId).SstMissingError(error)),
+          Stream.fromEffect(blockFailures(databaseId, read).SstMissingError(error)),
         BlockSourceUnavailableError: (error) =>
-          Stream.fromEffect(blockFailures(databaseId).BlockSourceUnavailableError(error)),
+          Stream.fromEffect(blockFailures(databaseId, read).BlockSourceUnavailableError(error)),
       }),
     );
 
@@ -516,6 +543,7 @@ export const makeDbReader = Effect.gen(function* () {
       Effect.gen(function* () {
         const { manifest } = yield* manifestFor(databaseId, view);
         const snapshotSeq = Option.getOrElse(view.snapshotSeq, () => manifest.lastL0Seq);
+        const scanRead: BlockReadContext = { kind: "Scan", snapshot: readsSnapshot(view) };
         const now = Timestamp.make(yield* Clock.currentTimeMillis);
         const mergeOperator = Option.map(
           manifest.options.mergeOperator,
@@ -539,10 +567,10 @@ export const makeDbReader = Effect.gen(function* () {
             overlapping,
             (handle) => blocks.meta(sstHandleOwner(handle, databaseId), handle, budgetGroup),
             { concurrency: "unbounded", discard: true },
-          ).pipe(Effect.catchTags(blockFailures(databaseId)));
+          ).pipe(Effect.catchTags(blockFailures(databaseId, scanRead)));
         }
         const ssts = overlapping.map((handle) =>
-          sstRows(databaseId, handle, range, snapshotSeq, budgetGroup, options.limit),
+          sstRows(databaseId, handle, range, snapshotSeq, budgetGroup, options.limit, scanRead),
         );
         const visible = groupRowsByKey(mergeRowStreams([memtable, ...ssts])).pipe(
           Stream.mapEffect((versions) =>

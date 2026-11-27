@@ -7,6 +7,7 @@ import {
   DEFAULT_DATABASE_OPTIONS,
   fenceWriter,
   initialManifest,
+  ManifestId,
   manifestSstHandles,
   replaceManifestFields,
   SeqNum,
@@ -14,7 +15,7 @@ import {
   SstId,
   Timestamp,
 } from "@shaledb/lsm-core";
-import { Effect, Layer, Option, Ref, Stream } from "effect";
+import { Deferred, Effect, Fiber, Layer, Option, Ref, Stream } from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -31,10 +32,16 @@ import {
   maintenanceSweepLayerWithoutDependencies,
   MAX_UNCOLLECTED_MANIFESTS,
 } from "./maintenance-sweep.ts";
-import { ManifestReader } from "./manifest-reader.ts";
+import { decodeStoredManifest, ManifestReader } from "./manifest-reader.ts";
 import { ManifestStore } from "./manifest-store.ts";
-import { compactedPrefix, databasePrefix, manifestPrefix, sstKey } from "./object-keys.ts";
-import { ObjectStore } from "./object-store.ts";
+import {
+  compactedPrefix,
+  databasePrefix,
+  manifestKey,
+  manifestPrefix,
+  sstKey,
+} from "./object-keys.ts";
+import { ObjectStore, objectStoreTestLayer } from "./object-store.ts";
 import { SstStore, sstStoreLayerWithoutDependencies } from "./sst-store.ts";
 
 const DB = DatabaseId.make("orders");
@@ -121,7 +128,198 @@ const readAll = Effect.gen(function* () {
   return rows.map((row) => row.key[0]);
 });
 
+/**
+ * Two collections of one database, interleaved (D83). Collection X starts first and stops at
+ * `gate`: the load of the manifest the compaction superseded (after X listed the manifests and
+ * planned), or its first delete (after it loaded every retained manifest). Collection Y then runs
+ * whole, `laterBy` ms later, and X resumes. Or, with `deleteSupersededWhileStopped`, nothing
+ * collects meanwhile and the superseded manifest is deleted directly, as no collection would.
+ *
+ * @returns Each run's report or failure, the SST keys each deleted, and the SST keys named by
+ *   the manifests each loaded (its retained manifests, and the manifests its search for the
+ *   newest read).
+ */
+const interleavedCollections = (options: {
+  readonly gate: "superseded manifest load" | "first delete";
+  readonly laterBy: number;
+  readonly deleteSupersededWhileStopped: boolean;
+}) => {
+  const phase: { current: "X" | "Y" } = { current: "X" };
+  const deleted = { X: new Set<string>(), Y: new Set<string>() };
+  const named = { X: new Set<string>(), Y: new Set<string>() };
+  // Whether each run has listed the manifests: the loads after that are its retained manifests.
+  const listed = { X: false, Y: false };
+  const reached = Deferred.makeUnsafe<void>();
+  const release = Deferred.makeUnsafe<void>();
+  let gateKey = Option.none<string>();
+  let gateOpen = true;
+  const stop = (matches: boolean) =>
+    matches && gateOpen && phase.current === "X"
+      ? Effect.sync(() => {
+          gateOpen = false;
+        }).pipe(
+          Effect.andThen(Deferred.succeed(reached, undefined)),
+          Effect.andThen(Deferred.await(release)),
+        )
+      : Effect.void;
+  const gatedStore = Layer.effect(
+    ObjectStore,
+    Effect.gen(function* () {
+      const store = yield* ObjectStore;
+      return ObjectStore.of({
+        ...store,
+        get: (key) =>
+          Effect.gen(function* () {
+            yield* stop(
+              options.gate === "superseded manifest load" &&
+                listed.X &&
+                Option.contains(gateKey, key),
+            );
+            const body = yield* store.get(key);
+            if (
+              listed[phase.current] &&
+              Option.isSome(body) &&
+              key.startsWith(manifestPrefix(DB)) &&
+              !key.endsWith("LATEST")
+            ) {
+              const id = Number(key.slice(manifestPrefix(DB).length));
+              const manifest = yield* Effect.orDie(
+                decodeStoredManifest(DB, Option.getOrThrow(decodeId(id)), body.value),
+              );
+              for (const sst of manifestSstHandles(manifest))
+                named[phase.current].add(sstKey(DB, sst.id));
+            }
+            return body;
+          }),
+        list: (prefix, cursor) =>
+          Effect.sync(() => {
+            if (prefix === manifestPrefix(DB)) listed[phase.current] = true;
+          }).pipe(Effect.andThen(store.list(prefix, cursor))),
+        delete: (keys) =>
+          Effect.gen(function* () {
+            yield* stop(options.gate === "first delete");
+            for (const key of keys) deleted[phase.current].add(key);
+            return yield* store.delete(keys);
+          }),
+      });
+    }),
+  ).pipe(Layer.provide(objectStoreTestLayer));
+  return Effect.gen(function* () {
+    yield* create;
+    // L0 SSTs at 0; at 5 s a compaction replaces them and supersedes the last flush's manifest.
+    yield* writeAndFlush([1, 2, 3, 4]);
+    yield* TestClock.adjust(5_000);
+    const superseded = (yield* (yield* ManifestReader).loadLatest(DB)).id;
+    yield* compactL0;
+    gateKey = Option.some(manifestKey(DB, superseded));
+    // X at 14 s: the superseded manifest is younger than gcMinAge (10 s) after its replacement,
+    // so X retains it; the L0 SSTs it names are older than X's boundary (4 s).
+    yield* TestClock.adjust(9_000);
+    const gc = yield* GarbageCollector;
+    const x = yield* Effect.forkChild(Effect.result(gc.collect(DB)));
+    yield* Deferred.await(reached);
+    phase.current = "Y";
+    yield* TestClock.adjust(options.laterBy);
+    const y = options.deleteSupersededWhileStopped
+      ? Option.none()
+      : Option.some(yield* gc.collect(DB));
+    if (options.deleteSupersededWhileStopped) {
+      yield* (yield* ObjectStore).delete([manifestKey(DB, superseded)]);
+      deleted.Y.clear();
+    }
+    phase.current = "X";
+    yield* Deferred.succeed(release, undefined);
+    const xOutcome = yield* Fiber.join(x);
+    // Every manifest still stored names only SSTs that are still stored.
+    const stored = new Set(yield* storedKeys(compactedPrefix(DB)));
+    const manifests = (yield* storedKeys(manifestPrefix(DB))).filter(
+      (key) => !key.endsWith("LATEST"),
+    );
+    const dangling: Array<string> = [];
+    for (const key of manifests) {
+      const body = yield* (yield* ObjectStore).get(key);
+      if (Option.isNone(body)) continue;
+      const id = Option.getOrThrow(decodeId(Number(key.slice(manifestPrefix(DB).length))));
+      const manifest = yield* Effect.orDie(decodeStoredManifest(DB, id, body.value));
+      for (const sst of manifestSstHandles(manifest)) {
+        if (!stored.has(sstKey(DB, sst.id))) dangling.push(sst.id);
+      }
+    }
+    const overlap = (left: Set<string>, right: Set<string>) =>
+      [...left].filter((key) => right.has(key));
+    return {
+      x: xOutcome,
+      y,
+      supersededStored: manifests.includes(manifestKey(DB, superseded)),
+      deletedByX: deleted.X.size,
+      deletedByY: deleted.Y.size,
+      xDeletedWhatYNamed: overlap(deleted.X, named.Y).filter((key) => key.endsWith(".sst")),
+      yDeletedWhatXNamed: overlap(deleted.Y, named.X).filter((key) => key.endsWith(".sst")),
+      dangling,
+      rows: yield* readAll,
+    };
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(
+      Layer.mergeAll(
+        Layer.effect(CompactionExecutor, makeCompactionExecutor),
+        Layer.effect(GarbageCollector, makeGarbageCollector),
+      ).pipe(
+        Layer.provideMerge(sstStoreLayerWithoutDependencies),
+        Layer.provideMerge(dbClientTestLayer({ blockSize: 64, gcMinAge: MIN_AGE }, gatedStore)),
+      ),
+    ),
+    Effect.provide(lsmTestRuntimeContextLayer),
+    Effect.provide(TestClock.layer()),
+    Effect.runPromise,
+  );
+};
+
+const decodeId = (id: number) =>
+  Number.isSafeInteger(id) && id > 0 ? Option.some(ManifestId.make(id)) : Option.none<ManifestId>();
+
 describe("GarbageCollector", () => {
+  it("two collections interleaved at the listing: the later deletes the superseded manifest, the earlier collects without it (D83)", async () => {
+    const outcome = await interleavedCollections({
+      gate: "superseded manifest load",
+      laterBy: 2_000,
+      deleteSupersededWhileStopped: false,
+    });
+    expect(outcome.x._tag).toBe("Success");
+    expect(outcome.supersededStored).toBe(false);
+    expect(outcome.deletedByY).toBeGreaterThan(0);
+    expect(outcome.xDeletedWhatYNamed).toEqual([]);
+    expect(outcome.yDeletedWhatXNamed).toEqual([]);
+    expect(outcome.dangling).toEqual([]);
+    expect(outcome.rows).toEqual([1, 2, 3, 4]);
+  });
+
+  it("two collections interleaved at the deletes delete nothing the other's retained manifests name (D83)", async () => {
+    const outcome = await interleavedCollections({
+      gate: "first delete",
+      laterBy: 0,
+      deleteSupersededWhileStopped: false,
+    });
+    expect(outcome.x._tag).toBe("Success");
+    expect(outcome.deletedByY).toBeGreaterThan(0);
+    expect(outcome.xDeletedWhatYNamed).toEqual([]);
+    expect(outcome.yDeletedWhatXNamed).toEqual([]);
+    expect(outcome.dangling).toEqual([]);
+    expect(outcome.rows).toEqual([1, 2, 3, 4]);
+  });
+
+  it("a retained manifest deleted above GC's boundary, not by a collection, stops the collection before it deletes anything (D83)", async () => {
+    const outcome = await interleavedCollections({
+      gate: "superseded manifest load",
+      laterBy: 0,
+      deleteSupersededWhileStopped: true,
+    });
+    expect(outcome.x._tag === "Failure" && outcome.x.failure._tag).toBe(
+      "GarbageCollectorUnavailableError",
+    );
+    expect(outcome.deletedByX).toBe(0);
+  });
+
   it("keeps young manifests and their SSTs, then collects them once older than gcMinAge", async () => {
     const outcome = await run(
       Effect.gen(function* () {

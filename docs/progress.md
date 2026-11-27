@@ -318,6 +318,19 @@ hand-off is below.
   - The four new tests failed before the fix; seven mutations are each caught.
   - A fork's feed starts at its fork point. The split procedure is in D80 and the OpenAPI text.
 
+- **Review, round 4 (D83, branch `proto/review`).**
+  - **Transactions model.** A transaction read may use any manifest the reader's cache holds
+    (36.9M states, 167 s).
+  - **Two test gaps closed.** A transaction read the reader cannot yet serve is retryable, not
+    too old. A transaction begun before a seal cannot commit after it.
+  - **Two concurrent collections** are argued in D60. A collection that cannot load a retained
+    manifest above GC's boundary deletes nothing. Gated tests cover both.
+  - **Read failures** now say how to retry, resume a scan, or take a new snapshot.
+  - **TTL bounds under clock skew** are in D83 and the README.
+  - **Verified.** `vp check` exit 0. `vp test run` in `packages/lsm-cloudflare` exit 0 (149
+    tests). `verify.ts transactions` and `verify.ts gc-safety` exit 0. Each new test fails under
+    a named mutation (`/tmp/shale-work/agents/review/REPORT-4.md`).
+
 ## Remaining-work log
 
 - **Set up (new session).** Node 24.22, `vp` 1.8, pnpm 12.14; `repos/slatedb` and `.tlc/` present;

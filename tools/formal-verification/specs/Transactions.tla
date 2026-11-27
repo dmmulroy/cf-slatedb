@@ -14,11 +14,15 @@
 (*    that made flushed_seq durable (its lastL0Seq = flushed_seq), read    *)
 (*    together. getAt/scanAt: the writer's rows above retained_from_seq    *)
 (*    at or below readSeq (probeAt) merged with a manifest M such that     *)
-(*    retained_from_seq <= M.lastL0Seq <= readSeq: the begin manifest when *)
-(*    it is stored and between those bounds, otherwise the newest manifest *)
-(*    when that is (db-reader.ts manifestFor, D76); with neither, the read *)
-(*    is refused (SnapshotTooOld). GC may delete the begin manifest at any *)
-(*    time: a compaction replaces a flush's manifest while the writer      *)
+(*    retained_from_seq <= M.lastL0Seq <= readSeq: the newest manifest    *)
+(*    the reader holds when it is between those bounds, otherwise the      *)
+(*    begin manifest when that is stored and between them (db-reader.ts   *)
+(*    manifestFor, D76); with neither, the read is refused                 *)
+(*    (SnapshotTooOld). "The newest the reader holds" is its cached one,   *)
+(*    which may be any manifest committed so far: older than the begin     *)
+(*    manifest, between it and the newest, or a flush's manifest committed *)
+(*    before flushed_seq recorded it. GC may delete the begin manifest at  *)
+(*    any time: a compaction replaces a flush's manifest while the writer  *)
 (*    still names it.                                                      *)
 (*  - db-writer.ts commitTransaction: under the commit lock, abort if      *)
 (*    retained_from_seq > readSeq (SnapshotTooOld); abort if a written     *)
@@ -100,18 +104,24 @@ Fits(t, m) ==
   /\ (m <= readSeq[t] \/ Broken = "noReadUpperBound")
 
 \* getAt: the writer's rows in (retained, readSeq] (probeAt), else the newest version at or below
-\* the manifest's lastL0Seq. The manifest is the begin manifest or the newest one (the begin
-\* manifest may have been deleted by GC, so either may be the one the reader finds); a manifest
-\* that does not fit ends the read as too old.
+\* the manifest's lastL0Seq. The reader uses the manifest it holds when that fits, and otherwise
+\* the begin manifest when that fits. The one it holds is its cached manifest, which may be any
+\* manifest committed so far: older than the begin manifest, between it and the newest, or a
+\* flush's manifest committed before flushed_seq recorded it (so any lastL0Seq up to seq). The
+\* read is refused as too old only when the begin manifest does not fit either (GC may also have
+\* deleted it; refusing is always safe, so the model allows it whenever the begin manifest does
+\* not fit).
 Read(t, k) ==
   /\ state[t] = "active" /\ k \notin writes[t]
-  /\ \E m \in {pinned[t], flushed} :
-       IF ~Fits(t, m)
-         THEN /\ state' = [state EXCEPT ![t] = "aborted"] /\ UNCHANGED reads
-         ELSE LET kept == {v \in versions[k] : v.seq > retained /\ v.seq <= readSeq[t]}
-                  value == IF kept # {} THEN Newest(kept).value ELSE ValueAt(k, m)
-              IN /\ reads' = [reads EXCEPT ![t] = @ \cup {<<k, value>>}]
-                 /\ UNCHANGED state
+  /\ \/ \E m \in 0 .. seq :
+          /\ Fits(t, m)
+          /\ LET kept == {v \in versions[k] : v.seq > retained /\ v.seq <= readSeq[t]}
+                 value == IF kept # {} THEN Newest(kept).value ELSE ValueAt(k, m)
+             IN reads' = [reads EXCEPT ![t] = @ \cup {<<k, value>>}]
+          /\ UNCHANGED state
+     \/ /\ ~Fits(t, pinned[t])
+        /\ state' = [state EXCEPT ![t] = "aborted"]
+        /\ UNCHANGED reads
   /\ UNCHANGED <<seq, flushed, retained, versions, readSeq, pinned, writes, okAtCommit>>
 
 Write(t, k) ==

@@ -36,7 +36,7 @@ step:
 | Action | Code |
 | --- | --- |
 | `Begin(t)` | `DbClient.beginTransaction`: `readSeq` = the writer's `last_seq` (`WriterClient.status`) |
-| `Read(t, k)` | `DbClient.getAt`/`scanAt`: the writer's rows in `(retained_from_seq, readSeq]` (`probeAt`), merged by `DbReader.manifestFor` with the newest manifest when `retained_from_seq <= lastL0Seq <= readSeq`, else the begin manifest when it is stored and between those bounds, else `SnapshotTooOld` (D76) |
+| `Read(t, k)` | `DbClient.getAt`/`scanAt`: the writer's rows in `(retained_from_seq, readSeq]` (`probeAt`), merged by `DbReader.manifestFor` with the manifest the reader holds (its cached one: any committed manifest, so any `lastL0Seq` up to `seq`) when `retained_from_seq <= lastL0Seq <= readSeq` (`Fits`), else the begin manifest when it is stored and fits, else `SnapshotTooOld`. The model reads with any fitting `m \in 0 .. seq` and aborts whenever the begin manifest does not fit (D76, D83) |
 | `Write(t, k)` | `DbTransaction.put` (buffered in the client) |
 | `Commit(t)` | `DbWriter.commitTransaction` under `commitLock`: `flushed_seq > readSeq` aborts; `MemTable.writtenAfter(written keys, and for SerializableSnapshot read keys and ranges)` aborts; else `commitBatch` |
 | `DirectWrite(k)` | `DbWriter.write` (a plain put) |
@@ -84,6 +84,16 @@ deletes rows. `writer.workerd.ts` refuses write skew through the public API.
   the pinned manifest's horizon check); each fails `Serializable`.
 
 ## Maintenance notes
+
+- D83 (review of D76): `Read` chose only between the begin manifest and `flushed`, but the
+  reader's "newest" is its cached manifest, which may be older than the begin manifest, between
+  it and the newest, or a flush's manifest committed before `flushed_seq` recorded it. `Read` now
+  reads with any `m \in 0 .. seq` that `Fits`, and aborts only when the begin manifest does not
+  fit (the code refuses only when neither the held manifest nor the begin manifest fits; refusing
+  more often is safe, so the model over-approximates the refusals). The header comment now says
+  the held manifest is tried first, as the code does. 36.9M states, 167 s niced on a loaded
+  machine (an earlier draft that aborted whenever any chosen `m` did not fit timed out at 420 s);
+  the time limit stays 420 s. All four broken variants still fail.
 
 - D76: a transaction's read no longer requires its begin manifest. `DbReader.manifestFor` uses
   the newest manifest when it is between the read's bounds
