@@ -13,6 +13,7 @@ import {
   type DbClientReadError,
   type DbReaderServices,
   type DbWriteError,
+  type ReaderUnavailableError,
   type ReadOptions,
   type ScanReadOptions,
 } from "@shaledb/lsm-cloudflare";
@@ -292,6 +293,26 @@ export const makeShardRouter = Effect.gen(function* () {
         const head = client
           .scan(first.databaseId, part.value, { ...options, limit: Option.none() })
           .pipe(
+            // A scan overtaken by a flush after it returned rows (D93): the rest of this shard's
+            // part from the key it names, within the same deadline; the shards after it follow
+            // below. Every row before it was returned.
+            Stream.catchIf(
+              (error): error is ReaderUnavailableError & { readonly resumeFrom: Uint8Array } =>
+                error._tag === "ReaderUnavailableError" && error.resumeFrom !== undefined,
+              (error) =>
+                Stream.unwrap(
+                  Effect.map(Clock.currentTimeMillis, (now) =>
+                    now >= deadline
+                      ? Stream.fail(error)
+                      : scanFrom(
+                          group,
+                          { start: error.resumeFrom, end: part.value.end },
+                          options,
+                          deadline,
+                        ),
+                  ),
+                ),
+            ),
             Stream.catchIf(isRoutingError, (error) =>
               Stream.unwrap(
                 Effect.gen(function* () {

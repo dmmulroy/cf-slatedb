@@ -24,6 +24,7 @@ const span = (
 const none: HealthSpans = {
   refusedWrites: [],
   flushes: [],
+  failedFlushes: [],
   polls: [],
   uploads: [],
   failedCollections: [],
@@ -210,6 +211,22 @@ describe("summarizeHealth (D82)", () => {
         /^/,
         "1 ",
       ),
+    ]);
+  });
+});
+
+describe("summarizeHealth: a writer that cannot flush (D102)", () => {
+  it("reports failed flushes per database as an issue", () => {
+    const failed = (database: string) =>
+      span("DbWriter.flush", { "database.id": database }, { exception: "WriterUnavailableError" });
+    const report = summarizeHealth([], {
+      ...none,
+      failedFlushes: [failed("orders"), failed("orders"), failed("users")],
+    });
+    expect(report.healthy).toBe(false);
+    expect(report.issues).toEqual([
+      "2 flushes failed on database orders: its acknowledged writes are not reaching R2",
+      "1 flushes failed on database users: its acknowledged writes are not reaching R2",
     ]);
   });
 });

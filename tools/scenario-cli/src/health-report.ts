@@ -37,6 +37,12 @@ export interface HealthSpans {
   readonly refusedWrites: ReadonlyArray<HealthSpan>;
   /** `DbWriter.flush` spans. */
   readonly flushes: ReadonlyArray<HealthSpan>;
+  /**
+   * `DbWriter.flush` spans with an error status. A writer that cannot flush retries from its alarm
+   * with a backoff of at most `maxL0Age` (D102), so a failing writer shows here at least once a
+   * minute.
+   */
+  readonly failedFlushes: ReadonlyArray<HealthSpan>;
   /** `Compactor.poll` spans. */
   readonly polls: ReadonlyArray<HealthSpan>;
   /** `ObjectStore.putMultipart` spans. */
@@ -223,6 +229,10 @@ export const summarizeHealth = (
     ...(flushMs.count > 0 && flushMs.p99 > thresholds.flushP99Ms
       ? [`flush p99 is ${flushMs.p99} ms, above ${thresholds.flushP99Ms} ms`]
       : []),
+    ...Object.entries(tally(spans.failedFlushes.map((span) => databaseOf(span)))).map(
+      ([database, failures]) =>
+        `${failures} flushes failed on database ${database}: its acknowledged writes are not reaching R2`,
+    ),
     ...(spans.failedCollections.length > 0
       ? [`${spans.failedCollections.length} collections failed`]
       : []),

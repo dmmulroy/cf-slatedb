@@ -42,7 +42,7 @@ import type { DbReaderServices } from "./db-reader.ts";
 import { DurableObjectAlarm, durableObjectAlarmTestLayer } from "./durable-object-alarm.ts";
 import { LsmConfiguration } from "./lsm-configuration.ts";
 import { lsmTestRuntimeContextLayer } from "./lsm-test-runtime.ts";
-import { ManifestReader } from "./manifest-reader.ts";
+import { ManifestReader, ManifestReadError } from "./manifest-reader.ts";
 import { ManifestStore } from "./manifest-store.ts";
 import { sstKey } from "./object-keys.ts";
 import { ObjectStore } from "./object-store.ts";
@@ -1001,5 +1001,88 @@ describe("Compactor jobs it can no longer see (D94)", () => {
       }),
     );
     expect(outcome).toBe(true);
+  });
+});
+
+describe("Compactor alarm retries (D102)", () => {
+  it("a poll that keeps failing is retried from 1 s, doubling to its ceiling, and a success resets it", async () => {
+    const outcome = await run(
+      Effect.gen(function* () {
+        yield* createWithL0(ORDERS, 4);
+        const reader = yield* ManifestReader;
+        const flags = { down: false };
+        const failingReader = ManifestReader.of({
+          ...reader,
+          loadLatest: (databaseId) =>
+            flags.down
+              ? Effect.fail(
+                  new ManifestReadError({
+                    databaseId,
+                    manifestId: Option.none(),
+                    reason: "StorageUnavailable",
+                    message: "R2 is unavailable",
+                  }),
+                )
+              : reader.loadLatest(databaseId),
+        });
+        const shared = yield* Effect.context<
+          | ManifestStore
+          | CompactionLauncher
+          | CompactionBudget
+          | LsmConfiguration
+          | GarbageCollector
+        >();
+        const built = yield* Layer.build(
+          compactorLayerWithoutDependencies.pipe(
+            Layer.provideMerge(
+              Layer.mergeAll(compactorStateCellTestLayer, durableObjectAlarmTestLayer),
+            ),
+            Layer.provide(
+              Layer.succeedContext(shared.pipe(Context.add(ManifestReader, failingReader))),
+            ),
+          ),
+        );
+        const compactor = Context.get(built, Compactor);
+        const alarm = Context.get(built, DurableObjectAlarm);
+        const fireAtScheduled = Effect.gen(function* () {
+          const at = Option.getOrThrow(yield* alarm.scheduled);
+          const now = yield* Clock.currentTimeMillis;
+          if (at > now) yield* TestClock.adjust(at - now);
+          yield* alarm.cancel;
+          const exit = yield* Effect.exit(compactor.runAlarm);
+          return {
+            threw: exit._tag === "Failure",
+            delay: Option.map(yield* alarm.scheduled, (time) => time - at),
+          };
+        });
+        yield* compactor.wake(ORDERS);
+        flags.down = true;
+        const delays: Array<number | undefined> = [];
+        for (let firing = 0; firing < 11; firing++) {
+          const fired = yield* fireAtScheduled;
+          if (fired.threw) return "threw";
+          delays.push(Option.getOrUndefined(fired.delay));
+        }
+        flags.down = false;
+        yield* fireAtScheduled;
+        const status = Option.getOrThrow(yield* compactor.status(ORDERS));
+        flags.down = true;
+        const afterReset = yield* fireAtScheduled;
+        return {
+          delays,
+          compacting: status.running.length,
+          afterReset: Option.getOrUndefined(afterReset.delay),
+        };
+      }),
+    );
+    // Ceiling: min(gcInterval 300 s, compactionLeaseMs / 2 = 450 s), so leases are renewed in time.
+    expect(outcome).toEqual({
+      delays: [
+        1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000, 256_000, 300_000, 300_000,
+      ],
+      // Recovered: the poll started the compaction it could not plan while the manifest was down.
+      compacting: 1,
+      afterReset: 1_000,
+    });
   });
 });

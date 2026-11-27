@@ -3158,11 +3158,16 @@ which dropped the rest of a batch the page had cut. Both now page by whole batch
 - **Mutations:** 6 of 7 caught. The missed one keeps the last key's partial versions in a segment.
   It is equivalent, because the segment's range ends before that key.
 
-**Not done here, proposed to their owners:**
+**Follow-ups (in D102's round):**
 
-- the public scan page, bounded by bytes with an early `resumeFrom`, which the contract's "up to
-  `limit` rows" allows;
-- the feed's flushed part (`DbReader.changelogRows`), bounded at a batch boundary.
+- **The public scan.** A scan that fails with `resumeFrom` after returning rows now ends its page
+  early with those rows and `resumeFrom`; before, it failed the whole page.
+- **`ShardRouter.scan`.** It resumes the shard's part from `resumeFrom` within its deadline, then
+  goes on to the following shards.
+- **The feed's flushed part** (`DbReader.changelogRows`). It is bounded the same way, at a batch
+  boundary. A page cut there ends the page; appending the unflushed rows after it would skip the
+  flushed changes between them.
+- **Still open:** the public scan page's own byte bound belongs to D100 (`audit-api`).
 
 ## D94. A compaction job unseen for compactionLeaseMs is finished
 
@@ -3613,6 +3618,66 @@ wait, the handler finishes the group's pending split from the directory's record
 
 **Mutations caught:** the waiting request not resuming, `resumePending` ignoring the record, and
 a second split allowed while one is pending.
+
+## D102. One alarm retry rule for the writer and the compactor; the writer's view and its alarm are set by one party at a time
+
+**The retry rule** (`DurableObjectAlarm.retryAfterFailure`, `clearFailures`):
+
+- **Delay.** A failed alarm run sets the alarm again after 1 s (`ALARM_RETRY_BASE_MILLIS`). Each
+  further consecutive failure doubles the wait, up to a ceiling.
+- **The count** is stored with the alarm, so it outlives an eviction, and a run that succeeds
+  clears it.
+- **Never thrown.** Both handlers catch every cause, defects included. Cloudflare retries a
+  handler that throws up to 6 times from 2 s, then stops for good
+  (developers.cloudflare.com/durable-objects/api/alarms, 2026-11-18). Never throwing means those
+  retries never stack on this rule, and an outage longer than six retries cannot silence an
+  alarm.
+
+| Handler   | Failure                                                            | Before                                             | Now                                                                                                     |
+| --------- | ------------------------------------------------------------------ | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| Writer    | `writer_meta` unreadable at the start                              | no alarm: unflushed rows waited for the next write | retried, backing off                                                                                    |
+| Writer    | R2 unavailable (start or flush), stored manifest invalid, a defect | every 1 s, forever                                 | from 1 s, doubling to `maxL0Age` (60 s, the longest a row waits for its flush)                          |
+| Writer    | fenced                                                             | stops                                              | stops: a newer epoch serves the database                                                                |
+| Writer    | database removed (D85)                                             | stops                                              | stops                                                                                                   |
+| Compactor | manifest unreadable in a poll                                      | every `compactorPollInterval` (5 s), forever       | from 1 s, doubling to min(`gcInterval`, `compactionLeaseMs` / 2) = 300 s, so leases are renewed in time |
+| Compactor | fence-in unreachable                                               | every 5 s                                          | the same backoff                                                                                        |
+| Compactor | GC storage unavailable                                             | after `gcInterval`                                 | unchanged                                                                                               |
+| Compactor | a defect                                                           | thrown: the runtime's 6 retries, then nothing      | caught, with the backoff                                                                                |
+
+**A writer that cannot flush still shows.** Its flush spans end in error at least once per
+`maxL0Age`. `measure health` now reports failed `DbWriter.flush` spans per database as an issue
+(`failedFlushes`); before, they showed only in the top error spans.
+
+**The stalled-write reload.** A write that finds L0 at its limit reloads the manifest. It used to
+set the writer's view to that manifest unconditionally. A flush that committed while the reload
+loaded was overwritten by the older manifest (status `l0Count` 2 where L0 held 3), and so was a
+fence-out.
+
+- **What it cost.** No write was lost: the next flush's `updateFrom` conflicts and reloads. The
+  cost was one extra round trip and a stale `l0Count`.
+- **The fix.** The reload is installed only over a `Ready` view holding an older manifest.
+
+**One flush scheduler at a time.** Two writes' schedulers could both read the alarm before either
+set it, and the one holding older counters, with the later time, could set it last.
+
+- **What it cost.** A row still waited at most `maxL0Age`: a scheduler's counters are never newer
+  than the oldest unflushed row. But a flush due now, by size, waited up to 60 s more.
+- **The fix.** `scheduleFlush` runs under its own lock, the innermost one, with only the counters
+  and the alarm inside.
+
+**Tests.**
+
+| File                    | Test                                                              | On the code before            |
+| ----------------------- | ----------------------------------------------------------------- | ----------------------------- |
+| `db-writer.test.ts`     | a failing flush backs off 1, 2, 4, … 60 s and resets on success   | 1 s every time                |
+| `db-writer.test.ts`     | an unreadable `writer_meta` and a defect both set the alarm again | no alarm                      |
+| `compactor.test.ts`     | a failing poll backs off 1 … 300 s and resets                     | 5 s every time                |
+| `db-writer.test.ts`     | the reload's older manifest is not installed over the flush's     | `l0Count` 2                   |
+| `db-writer.test.ts`     | the gated two-scheduler race                                      | alarm 60 s, where now was due |
+| `health-report.test.ts` | failed flushes are an issue                                       | —                             |
+
+**Mutations:** 8 of 9 caught. The missed one removes the writer handler's outer `catchCause`,
+which nothing reaches: every effect in the handler is already inside an `Effect.exit`.
 
 ## D103. A compaction's commit records its job; a missing Workflow instance is finished; what a large compaction needs
 

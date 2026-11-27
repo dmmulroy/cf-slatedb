@@ -1528,6 +1528,7 @@ export const measureHealth = (minutes: number) =>
     const report = summarizeHealth(limitHits, {
       refusedWrites: yield* named("DbWriter.write", "--error"),
       flushes: yield* named("DbWriter.flush"),
+      failedFlushes: yield* named("DbWriter.flush", "--error"),
       polls: yield* named("Compactor.poll"),
       uploads: yield* named("ObjectStore.putMultipart"),
       failedCollections: yield* named("GarbageCollector.collect", "--error"),

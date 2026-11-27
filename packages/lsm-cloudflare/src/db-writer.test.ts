@@ -9,7 +9,18 @@ import {
   type WriteBatch,
 } from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
-import { Context, Deferred, Effect, Fiber, Layer, Option, Ref, Result, Tracer } from "effect";
+import {
+  Clock,
+  Context,
+  Deferred,
+  Effect,
+  Fiber,
+  Layer,
+  Option,
+  Ref,
+  Result,
+  Tracer,
+} from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -31,7 +42,7 @@ import {
   memTableLayerWithoutDependencies,
 } from "./mem-table.ts";
 import { ManifestReader } from "./manifest-reader.ts";
-import { ManifestStore, manifestStoreTestLayer } from "./manifest-store.ts";
+import { ManifestStore, manifestStoreTestLayer, ManifestWriteError } from "./manifest-store.ts";
 import { ObjectStore } from "./object-store.ts";
 import { sstStoreLayerWithoutDependencies } from "./sst-store.ts";
 import {
@@ -1106,5 +1117,308 @@ describe("DbWriter seal of a sealed database (D95)", () => {
       successors: ["orders-a", "orders-b"],
       holders: ["orders-a", "orders-b"],
     });
+  });
+});
+
+describe("DbWriter alarm retries (D102)", () => {
+  /**
+   * A writer whose `writer_meta` reads fail while `metaFails`, and whose flush commits fail while
+   * `r2Down`, with the alarm and storage it keeps across firings.
+   */
+  const failingWriter = Effect.gen(function* () {
+    yield* createDatabase();
+    const store = yield* ManifestStore;
+    const shared = yield* Effect.context<ManifestStore | ManifestReader | ObjectStore>();
+    const flags = { metaFails: false, r2Down: false, defect: false };
+    const failingStore = ManifestStore.of({
+      ...store,
+      updateFrom: (view, edit) =>
+        flags.r2Down
+          ? Effect.fail(
+              new ManifestWriteError({
+                databaseId: DB,
+                reason: "StorageUnavailable",
+                message: "R2 is unavailable",
+              }),
+            )
+          : store.updateFrom(view, edit),
+    });
+    const failingMemTable = Layer.effect(
+      MemTable,
+      Effect.map(MemTable, (memTable) =>
+        MemTable.of({
+          ...memTable,
+          meta: Effect.suspend(() =>
+            flags.defect
+              ? Effect.die(new Error("a bug"))
+              : flags.metaFails
+                ? Effect.fail(
+                    new MemTableError({
+                      operation: "meta",
+                      reason: "StorageUnavailable",
+                      message: "SQLite failed",
+                    }),
+                  )
+                : memTable.meta,
+          ),
+        }),
+      ),
+    ).pipe(
+      Layer.provide(
+        memTableLayerWithoutDependencies.pipe(Layer.provide(writerSqlStorageTestLayer)),
+      ),
+    );
+    const context = yield* Layer.build(
+      Layer.provideMerge(
+        dbWriterLayerWithoutDependencies.pipe(Layer.provide(sstStoreLayerWithoutDependencies)),
+        Layer.mergeAll(
+          failingMemTable,
+          durableObjectAlarmTestLayer,
+          compactionTriggerTestLayer,
+          backgroundWorkTestLayer,
+          lsmConfigurationTestLayer(),
+        ),
+      ).pipe(
+        Layer.provide(Layer.succeedContext(shared.pipe(Context.add(ManifestStore, failingStore)))),
+      ),
+    );
+    const writer = Context.get(context, DbWriter);
+    const alarm = Context.get(context, DurableObjectAlarm);
+    /** Fires the alarm at its scheduled time, as the runtime does; the delay it then set. */
+    const fireAtScheduled = Effect.gen(function* () {
+      const at = Option.getOrThrow(yield* alarm.scheduled);
+      const now = yield* Clock.currentTimeMillis;
+      if (at > now) yield* TestClock.adjust(at - now);
+      yield* alarm.cancel;
+      const exit = yield* Effect.exit(writer.runAlarm);
+      const next = yield* alarm.scheduled;
+      return {
+        threw: exit._tag === "Failure",
+        delay: Option.map(next, (time) => time - at),
+      };
+    });
+    return { writer, alarm, flags, fireAtScheduled };
+  });
+
+  const runFailing = <A, E>(
+    body: (
+      writer: Effect.Success<typeof failingWriter>,
+    ) => Effect.Effect<A, E, ManifestStore | ManifestReader | ObjectStore | RuntimeContext>,
+  ) =>
+    Effect.flatMap(failingWriter, body).pipe(
+      Effect.scoped,
+      Effect.provide(manifestStoreTestLayer),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.provide(TestClock.layer()),
+      Effect.runPromise,
+    );
+
+  it("a flush that keeps failing is retried from 1 s, doubling to maxL0Age, and the first success resets it", async () => {
+    const outcome = await runFailing(({ writer, flags, fireAtScheduled }) =>
+      Effect.gen(function* () {
+        yield* writer.write(DB, put("a", "1"));
+        flags.r2Down = true;
+        const failing: Array<number | undefined> = [];
+        for (let firing = 0; firing < 9; firing++) {
+          const fired = yield* fireAtScheduled;
+          if (fired.threw) return "threw";
+          failing.push(Option.getOrUndefined(fired.delay));
+        }
+        flags.r2Down = false;
+        const recovered = yield* fireAtScheduled;
+        const flushed = (yield* writer.status(DB)).flushedSeq;
+        // The next failure starts again from 1 s.
+        yield* writer.write(DB, put("b", "2"));
+        flags.r2Down = true;
+        yield* fireAtScheduled;
+        const afterReset = yield* fireAtScheduled;
+        return {
+          failing,
+          recovered: Option.getOrUndefined(recovered.delay),
+          flushed,
+          afterReset: Option.getOrUndefined(afterReset.delay),
+        };
+      }),
+    );
+    // The first failure waits 1 s (the alarm had been due at maxL0Age); the waits then double.
+    expect(outcome).toEqual({
+      failing: [1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 60_000, 60_000, 60_000],
+      // Recovered: the flush ran; no row waits, so no alarm.
+      recovered: undefined,
+      flushed: 1,
+      afterReset: 2_000,
+    });
+  });
+
+  it("an unreadable writer_meta at the alarm's start sets the alarm again, and a defect never escapes", async () => {
+    const outcome = await runFailing(({ writer, flags, fireAtScheduled }) =>
+      Effect.gen(function* () {
+        yield* writer.write(DB, put("a", "1"));
+        flags.metaFails = true;
+        const unreadable = [yield* fireAtScheduled, yield* fireAtScheduled];
+        flags.metaFails = false;
+        flags.defect = true;
+        const defect = yield* fireAtScheduled;
+        flags.defect = false;
+        const recovered = yield* fireAtScheduled;
+        return {
+          unreadable: unreadable.map((fired) => [fired.threw, Option.getOrUndefined(fired.delay)]),
+          defect: [defect.threw, Option.getOrUndefined(defect.delay)],
+          flushed: (yield* writer.status(DB)).flushedSeq,
+          recovered: Option.getOrUndefined(recovered.delay),
+        };
+      }),
+    );
+    expect(outcome).toEqual({
+      unreadable: [
+        [false, 1_000],
+        [false, 2_000],
+      ],
+      defect: [false, 4_000],
+      flushed: 1,
+      recovered: undefined,
+    });
+  });
+});
+
+describe("DbWriter's view after the stalled-write reload (D102)", () => {
+  it("a reload that loaded before a flush committed never puts the older manifest over the flush's", async () => {
+    const outcome = await Effect.gen(function* () {
+      yield* createDatabase();
+      const store = yield* ManifestStore;
+      const shared = yield* Effect.context<ManifestStore | ManifestReader | ObjectStore>();
+      // Hooks run, once each, before a flush's commit and after the reload's load.
+      const beforeFlushCommit: Array<Effect.Effect<void>> = [];
+      const afterReloadLoad: Array<Effect.Effect<void>> = [];
+      const hookedStore = ManifestStore.of({
+        ...store,
+        updateFrom: (view, edit) =>
+          Effect.andThen(
+            Effect.suspend(() => beforeFlushCommit.shift() ?? Effect.void),
+            store.updateFrom(view, edit),
+          ),
+        update: (databaseId, edit) =>
+          Effect.tap(store.update(databaseId, edit), () =>
+            Effect.suspend(() => afterReloadLoad.shift() ?? Effect.void),
+          ),
+      });
+      const context = yield* Layer.build(
+        dbWriterLayerWithoutDependencies.pipe(
+          Layer.provide(sstStoreLayerWithoutDependencies),
+          Layer.provide(
+            memTableLayerWithoutDependencies.pipe(Layer.provide(writerSqlStorageTestLayer)),
+          ),
+          Layer.provide([
+            durableObjectAlarmTestLayer,
+            compactionTriggerTestLayer,
+            backgroundWorkTestLayer,
+            lsmConfigurationTestLayer({ l0MaxSsts: 2 }),
+          ]),
+          Layer.provide(Layer.succeedContext(shared.pipe(Context.add(ManifestStore, hookedStore)))),
+        ),
+      );
+      const writer = Context.get(context, DbWriter);
+      const runtime = yield* Effect.context<RuntimeContext>();
+      const quietly = <A, E>(effect: Effect.Effect<A, E, RuntimeContext>) =>
+        effect.pipe(Effect.asVoid, Effect.orDie, Effect.provide(runtime));
+      yield* writer.write(DB, put("a", "1"));
+      yield* writer.flush(DB);
+      yield* writer.write(DB, put("b", "2"));
+      // The second flush leaves L0 at its limit; a write lands while it uploads, so it stays
+      // unflushed.
+      beforeFlushCommit.push(quietly(writer.write(DB, put("c", "3"))));
+      yield* writer.flush(DB);
+      // The next write reloads (L0 at its limit); right after its load a third flush commits.
+      afterReloadLoad.push(quietly(writer.flush(DB)));
+      const stalled = yield* Effect.flip(writer.write(DB, put("d", "4")));
+      const latest = yield* (yield* ManifestReader).loadLatest(DB);
+      const status = yield* writer.status(DB);
+      return {
+        stalled: stalled._tag,
+        latestL0: latest.manifest.l0.length,
+        statusL0: status.l0Count,
+        durable: Object.fromEntries((yield* durableValues).values),
+      };
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(manifestStoreTestLayer),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.provide(TestClock.layer()),
+      Effect.runPromise,
+    );
+    expect(outcome).toEqual({
+      stalled: "WriteStalledError",
+      latestL0: 3,
+      // The writer's view is the newest manifest, not the one the reload loaded before the flush.
+      statusL0: 3,
+      durable: { a: "1", b: "2", c: "3" },
+    });
+  });
+});
+
+describe("DbWriter's flush alarm set from two writes at once (D102)", () => {
+  it("a scheduler that read the alarm before another set an earlier one never sets its later time over it", async () => {
+    const outcome = await Effect.gen(function* () {
+      yield* createDatabase();
+      const shared = yield* Effect.context<ManifestStore | ManifestReader | ObjectStore>();
+      const inner = yield* Effect.provide(DurableObjectAlarm, durableObjectAlarmTestLayer);
+      // The first `scheduled` read after arming waits until `release`: the first write's
+      // scheduler has read "no alarm" while the second write's runs.
+      const armed = yield* Ref.make(false);
+      const reading = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const alarm = DurableObjectAlarm.of({
+        ...inner,
+        scheduled: Effect.gen(function* () {
+          const value = yield* inner.scheduled;
+          if (yield* Ref.getAndSet(armed, false)) {
+            yield* Deferred.succeed(reading, undefined);
+            yield* Deferred.await(release);
+          }
+          return value;
+        }),
+      });
+      const context = yield* Layer.build(
+        dbWriterLayerWithoutDependencies.pipe(
+          Layer.provide(sstStoreLayerWithoutDependencies),
+          Layer.provide(
+            memTableLayerWithoutDependencies.pipe(Layer.provide(writerSqlStorageTestLayer)),
+          ),
+          Layer.provide([
+            Layer.succeed(DurableObjectAlarm, alarm),
+            compactionTriggerTestLayer,
+            backgroundWorkTestLayer,
+            lsmConfigurationTestLayer({ l0SstSize: 4_096 }),
+          ]),
+          Layer.provide(Layer.succeedContext(shared)),
+        ),
+      );
+      const writer = Context.get(context, DbWriter);
+      yield* TestClock.adjust("10 seconds");
+      // A small write: its scheduler wants the age limit, and is held after reading the alarm.
+      yield* Ref.set(armed, true);
+      const small = yield* Effect.forkChild(writer.write(DB, put("a", "1")));
+      yield* Deferred.await(reading);
+      // A write that brings the unflushed bytes over l0SstSize: its scheduler wants now. It is
+      // committed before the held scheduler goes on.
+      const large = yield* Effect.forkChild(writer.write(DB, put("b", "x".repeat(8_192))));
+      yield* Effect.repeat(writer.status(DB), {
+        until: (status) => status.unflushedRows === 2,
+      });
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(small);
+      yield* Fiber.join(large);
+      const now = yield* Clock.currentTimeMillis;
+      return { scheduledIn: Option.map(yield* inner.scheduled, (at) => at - now) };
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(manifestStoreTestLayer),
+      Effect.provide(lsmTestRuntimeContextLayer),
+      Effect.provide(TestClock.layer()),
+      Effect.runPromise,
+    );
+    // Due now: the size limit is reached. Without serialized scheduling, the held scheduler set the
+    // age limit (60 s) over it, and the flush waited for that.
+    expect(outcome.scheduledIn).toEqual(Option.some(0));
   });
 });

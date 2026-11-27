@@ -15,7 +15,18 @@ import {
   Timestamp,
 } from "@shaledb/lsm-core";
 import type { RuntimeContext } from "alchemy/RuntimeContext";
-import { Clock, Context, Effect, Layer, Metric, Option, Result, Schema, Semaphore } from "effect";
+import {
+  Cause,
+  Clock,
+  Context,
+  Effect,
+  Layer,
+  Metric,
+  Option,
+  Result,
+  Schema,
+  Semaphore,
+} from "effect";
 
 import { CompactionBudget } from "./compaction-budget.ts";
 import { CompactionLauncher, type CompactionJobProgress } from "./compaction-launcher.ts";
@@ -707,6 +718,26 @@ export const makeCompactor = Effect.gen(function* () {
     yield* pollBy(now);
   });
 
+  /**
+   * The longest a failed compactor alarm waits before it runs again (D102): its running jobs'
+   * leases must be renewed within `compactionLeaseMs`, and a collection waits no longer than
+   * `gcInterval` anyway.
+   */
+  const alarmRetryCeilingMs = Math.min(
+    settings.gcInterval,
+    Math.floor(settings.compactionLeaseMs / 2),
+  );
+
+  /** Sets the alarm again after a failed run: from 1 s, doubling, at most the ceiling (D102). */
+  const retryAlarm = (cause: Cause.Cause<unknown>) =>
+    Effect.gen(function* () {
+      const failures = yield* alarm.retryAfterFailure(alarmRetryCeilingMs);
+      yield* Effect.annotateCurrentSpan({ "alarm.failures": failures });
+      yield* Effect.logWarning("Compactor alarm failed; it retries later.").pipe(
+        Effect.annotateLogs({ "alarm.failures": failures, cause: Cause.pretty(cause) }),
+      );
+    });
+
   const runAlarm = Effect.gen(function* () {
     const stored = yield* cell.get;
     if (Option.isNone(stored)) return;
@@ -722,13 +753,8 @@ export const makeCompactor = Effect.gen(function* () {
           Effect.catchTags({
             DatabaseNotFoundError: () => Effect.succeed(Option.none<CompactorState>()),
             DatabaseIdMismatchError: () => Effect.succeed(Option.none<CompactorState>()),
-            CompactorUnavailableError: () =>
-              Effect.as(
-                Effect.flatMap(Clock.currentTimeMillis, (now) =>
-                  pollBy(now + settings.compactorPollInterval),
-                ),
-                Option.none<CompactorState>(),
-              ),
+            CompactorUnavailableError: (error) =>
+              Effect.as(retryAlarm(Cause.fail(error)), Option.none<CompactorState>()),
           }),
         )
       : stored;
@@ -752,7 +778,7 @@ export const makeCompactor = Effect.gen(function* () {
         }),
       );
     }
-    const again = yield* planLock
+    const polled = yield* planLock
       .withPermits(1)(
         Effect.gen(function* () {
           const state = yield* cell.get;
@@ -760,18 +786,25 @@ export const makeCompactor = Effect.gen(function* () {
           return yield* poll(state.value);
         }),
       )
-      .pipe(
-        Effect.catchTags({ DatabaseNotFoundError: () => Effect.succeed(false) }),
-        // Manifest unreadable now: poll again later.
-        Effect.catchTags({ ManifestReadError: () => Effect.succeed(true) }),
-      );
-    if (again) yield* pollBy((yield* Clock.currentTimeMillis) + settings.compactorPollInterval);
+      .pipe(Effect.catchTags({ DatabaseNotFoundError: () => Effect.succeed(false) }), Effect.exit);
+    if (polled._tag === "Failure") {
+      // Manifest unreadable now: poll again later, backing off while it stays so (D102).
+      yield* retryAlarm(polled.cause);
+    } else {
+      yield* alarm.clearFailures;
+      if (polled.value)
+        yield* pollBy((yield* Clock.currentTimeMillis) + settings.compactorPollInterval);
+    }
     // A collection still due keeps the alarm set even when compaction is idle.
     const after = yield* cell.get;
     if (Option.isSome(after) && Option.isSome(after.value.collectionDueAt)) {
       yield* pollBy(after.value.collectionDueAt.value);
     }
-  }).pipe(Effect.withSpan("Compactor.alarm"));
+  }).pipe(
+    // A defect anywhere above (a bug) is retried like a failure, never thrown to the runtime.
+    Effect.catchCause((cause) => retryAlarm(cause)),
+    Effect.withSpan("Compactor.alarm"),
+  );
 
   const dropSst = Effect.fn("Compactor.dropSst")(function* (
     databaseId: DatabaseId,

@@ -33,6 +33,7 @@ import { Bytes, Clock, Context, Data, Effect, Layer, Option, Schema, Stream } fr
 import { BlockCache, blockCacheLayer, blockCacheLayerWithoutDependencies } from "./block-cache.ts";
 import { blockSourceTestLayer } from "./block-source.ts";
 import { lsmConfigurationLayer, lsmConfigurationTestLayer } from "./lsm-configuration.ts";
+import { MAX_MEMTABLE_PAGE_BYTES } from "./mem-table.ts";
 import { changelogKey } from "./object-keys.ts";
 import { ObjectReader, objectReaderFromObjectStoreLayer } from "./object-reader.ts";
 import { objectStoreLayer, objectStoreTestLayer } from "./object-store.ts";
@@ -176,7 +177,15 @@ export interface IDbReader {
     afterSeq: SeqNum,
     upToSeq: SeqNum,
     limit: number,
-  ) => Effect.Effect<ReadonlyArray<Row>, DbReadError | ChangelogUnavailableError, DbReaderServices>;
+  ) => Effect.Effect<
+    {
+      readonly rows: ReadonlyArray<Row>;
+      /** False when the page stopped at its row limit or byte bound: more changes follow it. */
+      readonly complete: boolean;
+    },
+    DbReadError | ChangelogUnavailableError,
+    DbReaderServices
+  >;
   /**
    * The manifest a `Flushed` read at this moment would use without loading one, if any; no I/O.
    * Lets an `AtLeast` read skip the writer when that manifest already covers its sequence number,
@@ -661,8 +670,15 @@ export const makeDbReader = Effect.gen(function* () {
         ),
       );
     const rows: Array<Row> = [];
-    for (const entry of entries) {
-      if (rows.length >= limit) break;
+    let bytes = 0;
+    // A page holds at most `limit` rows' worth of batches and MAX_MEMTABLE_PAGE_BYTES (D93), and
+    // never splits a batch: a batch that would pass the byte bound is left for the next page,
+    // unless it is the page's first (a batch holds at most 8 MiB, so it fits alone).
+    let lastSeq = Option.none<SeqNum>();
+    let batchStart = 0;
+    let bytesBeforeBatch = 0;
+    let cut = false;
+    entries: for (const entry of entries) {
       const key = changelogKey(databaseId, entry.lastSeq, entry.sst.id);
       const meta = yield* Effect.fromResult(
         decodeSstMeta(
@@ -678,15 +694,40 @@ export const makeDbReader = Effect.gen(function* () {
           }),
         );
         for (const row of block.rows()) {
-          if (row.seq > afterSeq && row.seq <= upToSeq) rows.push(row);
+          if (row.seq <= afterSeq || row.seq > upToSeq) continue;
+          if (!Option.contains(lastSeq, row.seq)) {
+            if (rows.length >= limit) {
+              cut = true;
+              break entries;
+            }
+            batchStart = rows.length;
+            bytesBeforeBatch = bytes;
+            lastSeq = Option.some(row.seq);
+          }
+          bytes +=
+            row.key.length +
+            (row.value._tag === "Value"
+              ? row.value.bytes.length
+              : row.value._tag === "Merge"
+                ? row.value.operand.length
+                : 0);
+          if (bytes > MAX_MEMTABLE_PAGE_BYTES && batchStart > 0) {
+            // This batch would pass the bound: it starts the next page.
+            rows.length = batchStart;
+            bytes = bytesBeforeBatch;
+            cut = true;
+            break entries;
+          }
+          rows.push(row);
         }
       }
     }
     yield* Effect.annotateCurrentSpan({
       "changelog.rows": rows.length,
       "changelog.ssts": entries.length,
+      "changelog.page_cut": cut,
     });
-    return rows;
+    return { rows, complete: !cut };
   });
 
   return DbReader.of({
