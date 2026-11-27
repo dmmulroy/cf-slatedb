@@ -112,6 +112,18 @@ A limit the caller reached is `409` with a code naming the limit, its counts in 
 
 The concrete public `HttpApi` owns each endpoint's exact status and error schemas. Infrastructure such as Cloudflare Access may reject a request before it reaches that application contract.
 
+## Transient storage failures (D134)
+
+An idempotent R2 read (`get`, `getRange`, `getVersioned`, `head`, `list`, `listPrefixes`, and the
+`BlockServer`'s reads) that meets R2's transient failure (codes 10001, 10043, 10054, 10058, or a
+binding failure with no code) is retried twice inside its span, which then ends ok and carries
+`object.read_retried`. A failure that is a fact about the request (a range past the end, a failed
+precondition, authorization) is not retried. After the retries the caller gets the retryable
+`StorageUnavailable` (`ReaderUnavailable` for a read), as before, and its message still says to
+retry: the read is safe to repeat. A hedged block read fails only when both its `BlockServer` read
+and its bucket read failed. Conditional writes and creates are not retried by this rule: a lost
+response there may hide a write that landed, and each caller reads the result (D85, D113).
+
 ## Review Checklist
 
 Before adding or changing an error, verify:
