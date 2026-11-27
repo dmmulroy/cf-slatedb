@@ -192,6 +192,9 @@ export const summarizeHealth = (
   const atLimit = [...backlog].filter(([, l0]) => l0 >= thresholds.l0MaxSsts);
   // Sealed and fenced refusals are routing, not trouble; a stalled write is backpressure.
   const stalled = spans.refusedWrites.filter((span) => exceptionType(span) === "WriteStalledError");
+  const readsOfCorruptSsts = spans.errors.filter(
+    (span) => exceptionType(span) === "SstCorruptedError" && !span.name.startsWith("Compact"),
+  );
   const stalledBy = tally(
     stalled.map((span) => {
       const reason = span.attributes["writer.stall_reason"];
@@ -213,6 +216,13 @@ export const summarizeHealth = (
       ([where, writes]) => `${writes} writes stalled (WriteStalled) on database ${where}`,
     ),
     ...corrupt.map((database) => `database ${database} has corrupted SSTs: see docs/operations.md`),
+    // A read that met a corrupted SST (StoredDataInvalid to its caller, D128) before any
+    // compaction reported it: the error spans carry it, the polls may not yet.
+    ...(readsOfCorruptSsts.length > 0
+      ? [
+          `${readsOfCorruptSsts.length} reads met a corrupted SST (SstCorruptedError), answered StoredDataInvalid: see docs/operations.md, "Corruption runbook"`,
+        ]
+      : []),
     ...atLimit.map(
       ([database, l0]) =>
         `database ${database} has ${l0} L0 SSTs, at its ${thresholds.l0MaxSsts} limit: writes are refused until compaction catches up`,

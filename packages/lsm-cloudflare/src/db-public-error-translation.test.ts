@@ -300,11 +300,10 @@ describe("toPublicError (D128)", () => {
     }
   });
 
-  // Open defect (D128): D53 and the corruption runbook (`docs/operations.md`) promise
-  // StoredDataInvalid for a read of a corrupted SST; the translation answers InternalFailure, because
-  // SstCorruptedError carries no database id for StoredDataInvalid's details. `it.fails` keeps the
-  // promise written down: it turns red when the mapping is fixed, and is then made a plain case above.
-  it.fails("answers a read of a corrupted SST with StoredDataInvalid (D53)", () => {
+  // D53 and the corruption runbook (`docs/operations.md`) promise StoredDataInvalid for a read of a
+  // corrupted SST. The error carries no database id, so the handler passes the one its request
+  // names (D128); without one the answer stays InternalFailure.
+  it("answers a read of a corrupted SST with StoredDataInvalid naming the database (D53, D128)", () => {
     const corrupted = new SstCorruptedError({
       sstId: SST,
       section: "DataBlock",
@@ -312,8 +311,16 @@ describe("toPublicError (D128)", () => {
       offset: 0,
       message,
     });
-    const answer = toPublicError("get", "r")(corrupted);
-    expect([answer.code, answer.retryable]).toEqual(["StoredDataInvalid", false]);
+    for (const operation of ["get", "scan", "transaction", "changes"] as const) {
+      const answer = toPublicError(operation, "r", Option.some(DB))(corrupted);
+      expect([answer.code, answer.retryable, answer.details]).toEqual([
+        "StoredDataInvalid",
+        false,
+        { databaseId: DB },
+      ]);
+      expect(answer.message).toContain(SST);
+    }
+    expect(toPublicError("get", "r")(corrupted).code).toBe("InternalFailure");
   });
 
   it("tells a write whose writer was unreachable that it may have committed, and other operations to retry", () => {

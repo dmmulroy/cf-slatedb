@@ -1,4 +1,10 @@
-import { DEFAULT_DATABASE_OPTIONS, type Row, SstId, sstCreatedAt } from "@shaledb/lsm-core";
+import {
+  type DatabaseId,
+  DEFAULT_DATABASE_OPTIONS,
+  type Row,
+  SstId,
+  sstCreatedAt,
+} from "@shaledb/lsm-core";
 import { Cause, Stream } from "effect";
 import { Effect, Layer, Option } from "effect";
 import { HttpApiBuilder } from "effect/http-api";
@@ -16,13 +22,19 @@ import { DbClient } from "./db-client.ts";
 import { ManifestReader } from "./manifest-reader.ts";
 import { WriterClient } from "./writer-client.ts";
 
-/** Runs a handler body and classifies its failure as the public error for `operation`. */
+/**
+ * Runs a handler body and classifies its failure as the public error for `operation` on
+ * `databaseId`: the database the request names, which errors that carry none (a corrupted SST)
+ * need for their public details (D128).
+ */
 const publicFailures =
-  (operation: DbApiOperation) =>
+  (operation: DbApiOperation, databaseId: DatabaseId) =>
   <A, R>(effect: Effect.Effect<A, DbInternalError, R>) =>
     Effect.gen(function* () {
       const { requestId } = yield* DbHttpRequest;
-      return yield* effect.pipe(Effect.mapError(toPublicError(operation, requestId)));
+      return yield* effect.pipe(
+        Effect.mapError(toPublicError(operation, requestId, Option.some(databaseId))),
+      );
     });
 
 /** Handlers of the public database API (write side; reads are added with the reader). */
@@ -52,16 +64,16 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
               databaseId: created.manifest.databaseId,
               manifestId: created.id,
             })),
-            publicFailures("createDatabase"),
+            publicFailures("createDatabase", payload.databaseId),
           ),
       )
       .handle("write", ({ params, payload }) =>
-        writer.write(params.databaseId, payload).pipe(publicFailures("write")),
+        writer.write(params.databaseId, payload).pipe(publicFailures("write", params.databaseId)),
       )
       .handle("flush", ({ params }) =>
         writer.flush(params.databaseId).pipe(
           Effect.map((flushedSeq) => ({ flushedSeq })),
-          publicFailures("flush"),
+          publicFailures("flush", params.databaseId),
         ),
       )
       .handle("status", ({ params }) =>
@@ -85,15 +97,17 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
             }),
           );
           return { ...status, l0Count: latest.manifest.l0.length };
-        }).pipe(publicFailures("status")),
+        }).pipe(publicFailures("status", params.databaseId)),
       )
       .handle("createCheckpoint", ({ params, payload }) =>
-        lifecycle.createCheckpoint(params.databaseId, payload).pipe(publicFailures("checkpoint")),
+        lifecycle
+          .createCheckpoint(params.databaseId, payload)
+          .pipe(publicFailures("checkpoint", params.databaseId)),
       )
       .handle("pinSnapshot", ({ params, payload }) =>
         lifecycle
           .pinSnapshot(params.databaseId, payload.lifetimeMs)
-          .pipe(publicFailures("checkpoint")),
+          .pipe(publicFailures("checkpoint", params.databaseId)),
       )
       .handle("listCheckpoints", ({ params }) =>
         Effect.gen(function* () {
@@ -117,17 +131,17 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
               (left, right) => left.createdAt - right.createdAt,
             ),
           };
-        }).pipe(publicFailures("checkpoint")),
+        }).pipe(publicFailures("checkpoint", params.databaseId)),
       )
       .handle("deleteCheckpoint", ({ params }) =>
         lifecycle
           .deleteCheckpoint(params.databaseId, params.checkpointId)
-          .pipe(publicFailures("checkpoint")),
+          .pipe(publicFailures("checkpoint", params.databaseId)),
       )
       .handle("seal", ({ params, payload }) =>
         lifecycle.seal(params.databaseId, payload.successors, false).pipe(
           Effect.map((receipt) => ({ flushedSeq: receipt.flushedSeq })),
-          publicFailures("seal"),
+          publicFailures("seal", params.databaseId),
         ),
       )
       .handle("fork", ({ params, payload }) =>
@@ -143,19 +157,21 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
               databaseId: created.manifest.databaseId,
               manifestId: created.id,
             })),
-            publicFailures("fork"),
+            publicFailures("fork", params.databaseId),
           ),
       )
       .handle("removeDatabase", ({ params }) =>
-        lifecycle.remove(params.databaseId).pipe(publicFailures("remove")),
+        lifecycle.remove(params.databaseId).pipe(publicFailures("remove", params.databaseId)),
       )
       .handle("beginTransaction", ({ params }) =>
-        client.beginTransaction(params.databaseId).pipe(publicFailures("transaction")),
+        client
+          .beginTransaction(params.databaseId)
+          .pipe(publicFailures("transaction", params.databaseId)),
       )
       .handle("transactionGet", ({ params, payload }) =>
         client.getAt(params.databaseId, payload.key, payload.readSeq, payload.manifestId).pipe(
           Effect.map((row) => ({ row })),
-          publicFailures("transaction"),
+          publicFailures("transaction", params.databaseId),
         ),
       )
       .handle("transactionScan", ({ params, payload }) =>
@@ -167,10 +183,12 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
             payload.limit,
             payload.manifestId,
           )
-          .pipe(publicFailures("transaction")),
+          .pipe(publicFailures("transaction", params.databaseId)),
       )
       .handle("commitTransaction", ({ params, payload }) =>
-        client.commitTransaction(params.databaseId, payload).pipe(publicFailures("transaction")),
+        client
+          .commitTransaction(params.databaseId, payload)
+          .pipe(publicFailures("transaction", params.databaseId)),
       )
       .handle("compaction", ({ params }) =>
         Effect.gen(function* () {
@@ -209,7 +227,7 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
             }),
             droppedSsts: latest.manifest.droppedSsts,
           };
-        }).pipe(publicFailures("compaction")),
+        }).pipe(publicFailures("compaction", params.databaseId)),
       )
       .handle("dropSst", ({ params, payload }) =>
         lifecycle
@@ -218,7 +236,7 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
             confirm: payload.confirm,
             force: payload.force ?? false,
           })
-          .pipe(Effect.scoped, publicFailures("dropSst")),
+          .pipe(Effect.scoped, publicFailures("dropSst", params.databaseId)),
       )
       .handle("get", ({ params, payload }) =>
         client
@@ -229,7 +247,7 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
           })
           .pipe(
             Effect.map((row) => ({ row })),
-            publicFailures("get"),
+            publicFailures("get", params.databaseId),
           ),
       )
       .handle("scan", ({ params, payload }) =>
@@ -267,15 +285,15 @@ export const dbHttpHandlersLayer = HttpApiBuilder.group(DbHttpApi, "databases", 
             rows: rows.slice(0, payload.limit),
             resumeFrom: next === undefined ? Option.none() : Option.some(next.key),
           };
-        }).pipe(publicFailures("scan")),
+        }).pipe(publicFailures("scan", params.databaseId)),
       )
       .handle("snapshot", ({ params }) =>
-        client.snapshot(params.databaseId).pipe(publicFailures("get")),
+        client.snapshot(params.databaseId).pipe(publicFailures("get", params.databaseId)),
       )
       .handle("changes", ({ params, query }) =>
         client
           .changes(params.databaseId, query.afterSeq, query.limit)
-          .pipe(publicFailures("changes")),
+          .pipe(publicFailures("changes", params.databaseId)),
       );
   }),
 );

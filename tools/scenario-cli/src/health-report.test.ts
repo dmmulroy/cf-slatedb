@@ -229,4 +229,14 @@ describe("summarizeHealth: a writer that cannot flush (D102)", () => {
       "1 flushes failed on database users: its acknowledged writes are not reaching R2",
     ]);
   });
+
+  it("reports reads that met a corrupted SST before a compaction did (D128)", () => {
+    const report = summarizeHealth([], {
+      ...none,
+      errors: [span("DbClient.getRow", {}, { exception: "SstCorruptedError" })],
+    });
+    expect(report.issues).toEqual([
+      '1 reads met a corrupted SST (SstCorruptedError), answered StoredDataInvalid: see docs/operations.md, "Corruption runbook"',
+    ]);
+  });
 });

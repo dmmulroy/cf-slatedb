@@ -230,15 +230,6 @@ importers:
       '@alchemy.run/test':
         specifier: 'catalog:'
         version: 2.0.0-beta.87(@effect/vitest@4.1.4(effect@4.1.4)(vitest@5.0.4))(alchemy@2.0.0-beta.87(@effect/platform-node@4.1.4(effect@4.1.4)(redis@6.4.0))(@types/node@24.19.2)(effect@4.1.4)(jiti@2.7.0)(typescript@7.0.2)(ws@8.23.0))(effect@4.1.4)(vitest@5.0.4)
-      '@shaledb/lsm-cloudflare':
-        specifier: workspace:*
-        version: link:../../packages/lsm-cloudflare
-      '@shaledb/lsm-core':
-        specifier: workspace:*
-        version: link:../../packages/lsm-core
-      '@shaledb/sharding':
-        specifier: workspace:*
-        version: link:../../packages/lsm-sharding
       '@cloudflare/workers-types':
         specifier: 'catalog:'
         version: 5.20261015.1
@@ -251,6 +242,15 @@ importers:
       '@effect/vitest':
         specifier: 'catalog:'
         version: 4.1.4(effect@4.1.4)(vitest@5.0.4)
+      '@shaledb/lsm-cloudflare':
+        specifier: workspace:*
+        version: link:../../packages/lsm-cloudflare
+      '@shaledb/lsm-core':
+        specifier: workspace:*
+        version: link:../../packages/lsm-core
+      '@shaledb/sharding':
+        specifier: workspace:*
+        version: link:../../packages/lsm-sharding
       '@types/node':
         specifier: 'catalog:'
         version: 24.19.2
@@ -335,9 +335,15 @@ importers:
         specifier: 'catalog:'
         version: 4.1.4
     devDependencies:
+      '@alchemy.run/test':
+        specifier: 'catalog:'
+        version: 2.0.0-beta.87(@effect/vitest@4.1.4(effect@4.1.4)(vitest@5.0.4))(alchemy@2.0.0-beta.87(@effect/platform-node@4.1.4(effect@4.1.4)(redis@6.4.0))(@types/node@24.19.2)(effect@4.1.4)(jiti@2.7.0)(typescript@7.0.2)(ws@8.23.0))(effect@4.1.4)(vitest@5.0.4)
       '@cloudflare/workers-types':
         specifier: 'catalog:'
         version: 5.20261015.1
+      '@effect/vitest':
+        specifier: 'catalog:'
+        version: 4.1.4(effect@4.1.4)(vitest@5.0.4)
       '@types/node':
         specifier: 'catalog:'
         version: 24.19.2
@@ -362,12 +368,12 @@ importers:
 
   tools/preview-cli:
     dependencies:
-      '@shaledb/lsm-core':
-        specifier: workspace:*
-        version: link:../../packages/lsm-core
       '@effect/platform-node':
         specifier: 'catalog:'
         version: 4.1.4(effect@4.1.4)(redis@6.4.0)
+      '@shaledb/lsm-core':
+        specifier: workspace:*
+        version: link:../../packages/lsm-core
       effect:
         specifier: 'catalog:'
         version: 4.1.4
@@ -384,6 +390,9 @@ importers:
 
   tools/scenario-cli:
     dependencies:
+      '@effect/platform-node':
+        specifier: 'catalog:'
+        version: 4.1.4(effect@4.1.4)(redis@6.4.0)
       '@shaledb/lsm-cloudflare':
         specifier: workspace:*
         version: link:../../packages/lsm-cloudflare
@@ -393,9 +402,6 @@ importers:
       '@shaledb/sharding':
         specifier: workspace:*
         version: link:../../packages/lsm-sharding
-      '@effect/platform-node':
-        specifier: 'catalog:'
-        version: 4.1.4(effect@4.1.4)(redis@6.4.0)
       effect:
         specifier: 'catalog:'
         version: 4.1.4

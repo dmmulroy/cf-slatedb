@@ -5027,9 +5027,13 @@ regular, transaction, and routed page. A routed page holds one shard's segment a
   - 24,000 keys of 1 KiB, all but one deleted;
   - on the regular and the transaction scan, the first page answers no rows with a `resumeFrom`,
     and following it finds exactly the live key.
-  - The sharded form is not there: no workerd test hosts the shard router. Its router is covered
-    in-process by `shard-scan-bounds.test.ts` and the routed oracle; its HTTP response shape only
-    by the schema. A workerd stack for the shard router is the open item.
+  - The sharded form (round 3): `packages/lsm-sharding/test/router/shard-router.workerd.ts`, on its
+    own stack (`router-stack.ts`). It holds the API Worker, the `BlockServer`, the compactor, and
+    the shard router Worker with its directory objects, on ports 8803–8806 and collector 4322.
+    - A group's one shard holds 24,000 keys, all but two deleted. The first routed page (limit 1)
+      is empty with a non-null `resumeFrom`, and following it reaches both live keys.
+    - A malformed `put` is answered with D79's `InvalidRequest` envelope by the real runtime.
+    - `@shaledb/sharding#test:workerd` runs it; `test` runs it after the unit tests.
 
 ## D128. Mutation sweep of the request edge and the sharding services
 
@@ -5054,8 +5058,21 @@ regular, transaction, and routed page. A routed page holds one shard's segment a
   `StoredDataInvalid` that D53 and the corruption runbook (`docs/operations.md`) promise. It has
   done so since Phase 4. `SstCorruptedError` carries no database id, and `StoredDataInvalid`'s
   details need one, so the fix belongs where the id is known: the handlers' `publicFailures`
-  (`db-http-handlers.ts`) or the reader. It is open; `db-public-error-translation.test.ts` keeps the
-  promise as an `it.fails` case that turns red when it is fixed.
+  (`db-http-handlers.ts`) or the reader.
+  - **Fixed (scan-bounds round 3).** `publicFailures(operation, databaseId)` passes the database
+    the request names to `toPublicError`. With it, `SstCorruptedError` answers `StoredDataInvalid`
+    (500, not retryable), naming the database and the SST. This covers every database API read:
+    get, scan, snapshot, transaction get and scan, and changes. Without an id, the answer stays
+    `InternalFailure`.
+  - **The sharded API** answers `ShardedRequestRefused` with reason `SstCorruptedError` (409, as
+    every non-retryable refusal). Its message names the SST, not the shard.
+  - **The health report** (`measure health`) gains an issue for error spans of reads that met
+    `SstCorruptedError`. A compaction may not have reported the SST yet.
+  - **The soak** does not list `SstCorruptedError` as expected, so one fails the soak.
+  - **Tests:** the `it.fails` case is now a plain case. `db-http-corruption.test.ts` covers a
+    `Flushed` get and scan through the router. `shard-router-worker.test.ts` and
+    `health-report.test.ts` each gain one case. Two mutations caught: the handler passing no id,
+    and the answer marked retryable.
 - **What the new tests pin.**
   - Every internal error's public code, error, `retryable`, and details, one case each
     (`db-public-error-translation.test.ts`). Before, 21 of 32 mutants survived: 20 of them changed

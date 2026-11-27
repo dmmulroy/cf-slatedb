@@ -1,4 +1,4 @@
-import { DatabaseId, DEFAULT_DATABASE_OPTIONS } from "@shaledb/lsm-core";
+import { DatabaseId, DEFAULT_DATABASE_OPTIONS, SstCorruptedError, SstId } from "@shaledb/lsm-core";
 import {
   DatabaseLifecycle,
   dbServicesTestLayer,
@@ -214,5 +214,44 @@ describe("the sharded API's answers to requests it refuses (D79)", () => {
 describe("every sharded request field is bounded (D100)", () => {
   it("has no unbounded string, bytes, array, or record", () => {
     expect(unboundedRequestFields(ShardedHttpApi)).toEqual([]);
+  });
+});
+
+describe("a routed read that meets a corrupted SST (D128)", () => {
+  it("is refused, not retryable, naming the SST and no internal detail", async () => {
+    const corruptLayer = Layer.mergeAll(
+      Layer.succeed(
+        ShardRouter,
+        ShardRouter.of({
+          put: () => Effect.die(new Error("not called")),
+          get: () =>
+            Effect.fail(
+              new SstCorruptedError({
+                sstId: SstId.make("01JD0000000000000000000AAA"),
+                section: "DataBlock",
+                reason: "ChecksumMismatch",
+                offset: 0,
+                message: INTERNAL_DETAIL,
+              }),
+            ),
+          delete: () => Effect.die(new Error("not called")),
+          merge: () => Effect.die(new Error("not called")),
+          write: () => Effect.die(new Error("not called")),
+          scan: () => Stream.die(new Error("not called")),
+          refresh: () => Effect.die(new Error("not called")),
+        }),
+      ),
+      shardSplitLayerWithoutDependencies,
+    ).pipe(Layer.provideMerge(shardDirectoryTestLayer), Layer.provideMerge(databasesLayer));
+    const [answer] = await callAll(corruptLayer, [
+      ["POST", "/v1/groups/orders/get", json(`{"key":"AQ=="}`)],
+    ]);
+    expect(answer?.status).toBe(409);
+    expect(answer?.body).toMatchObject({
+      _tag: "ShardedRequestRefusedError",
+      reason: "SstCorruptedError",
+    });
+    expect(answer?.text).toContain("01JD0000000000000000000AAA");
+    expect(answer?.text).not.toContain("R2");
   });
 });
