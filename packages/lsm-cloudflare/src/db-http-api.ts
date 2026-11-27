@@ -15,6 +15,7 @@ import {
   WriteReceipt,
   SstId,
   Timestamp,
+  TtlMillisSchema,
 } from "@shaledb/lsm-core";
 import { Schema } from "effect";
 import { HttpApi, HttpApiEndpoint, HttpApiGroup, HttpApiSchema, OpenApi } from "effect/http-api";
@@ -102,7 +103,8 @@ export const CheckpointsResponse = Schema.Struct({ checkpoints: Schema.Array(Che
 /** Schema for a checkpoint request: an optional name and lifetime (none: until deleted). */
 export const CreateCheckpointRequest = Schema.Struct({
   name: Schema.OptionFromNullOr(Schema.String),
-  lifetimeMs: Schema.OptionFromNullOr(Schema.Int.check(Schema.isGreaterThan(0))),
+  /** At most 100 years (`MAX_TTL_MILLIS`, D88). */
+  lifetimeMs: Schema.OptionFromNullOr(TtlMillisSchema),
 });
 
 /** Schema for a pinned snapshot request: how long it stays readable, at most 30 days. */

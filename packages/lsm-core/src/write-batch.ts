@@ -17,7 +17,20 @@ export const MAX_BATCH_OPERATIONS = 10_000;
 /** Largest total of keys and values in one batch, in bytes. */
 export const MAX_BATCH_BYTES = 8 * 1024 * 1024;
 
-const TtlMillis = Schema.OptionFromNullOr(Schema.Int.check(Schema.isGreaterThan(0)));
+/**
+ * Longest time to live a put or merge may ask for, and longest checkpoint lifetime: 100 years
+ * (D88). Expiry is stored as `createTs + ttl` and must stay a safe integer (2^53 - 1 ms, about
+ * 285,000 years after 1970); a larger TTL was acknowledged and then made every flush of the
+ * database fail.
+ */
+export const MAX_TTL_MILLIS = 100 * 365 * 24 * 3_600_000;
+
+/** Schema for a time to live or lifetime in milliseconds: from 1 to {@link MAX_TTL_MILLIS}. */
+export const TtlMillisSchema = Schema.Int.check(
+  Schema.isBetween({ minimum: 1, maximum: MAX_TTL_MILLIS }),
+);
+
+const TtlMillis = Schema.OptionFromNullOr(TtlMillisSchema);
 
 /**
  * Schema for one operation in a write batch, with bytes as base64.

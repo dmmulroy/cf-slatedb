@@ -733,8 +733,8 @@
                               "anyOf": [
                                 {
                                   "type": "integer",
-                                  "maximum": 9007199254740991,
-                                  "exclusiveMinimum": 0
+                                  "minimum": 1,
+                                  "maximum": 3153600000000
                                 },
                                 {
                                   "type": "null"
@@ -782,8 +782,8 @@
                               "anyOf": [
                                 {
                                   "type": "integer",
-                                  "maximum": 9007199254740991,
-                                  "exclusiveMinimum": 0
+                                  "minimum": 1,
+                                  "maximum": 3153600000000
                                 },
                                 {
                                   "type": "null"
@@ -2945,8 +2945,8 @@
                     "anyOf": [
                       {
                         "type": "integer",
-                        "maximum": 9007199254740991,
-                        "exclusiveMinimum": 0
+                        "minimum": 1,
+                        "maximum": 3153600000000
                       },
                       {
                         "type": "null"
@@ -5953,8 +5953,8 @@
                                   "anyOf": [
                                     {
                                       "type": "integer",
-                                      "maximum": 9007199254740991,
-                                      "exclusiveMinimum": 0
+                                      "minimum": 1,
+                                      "maximum": 3153600000000
                                     },
                                     {
                                       "type": "null"
@@ -6002,8 +6002,8 @@
                                   "anyOf": [
                                     {
                                       "type": "integer",
-                                      "maximum": 9007199254740991,
-                                      "exclusiveMinimum": 0
+                                      "minimum": 1,
+                                      "maximum": 3153600000000
                                     },
                                     {
                                       "type": "null"
