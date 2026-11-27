@@ -2876,3 +2876,41 @@ at or past the start of the oldest job its compactor records as running. The cut
   launch.
 - Four mutations caught: the cap ignored, the compactor passing none, `startedAt` taken after the
   launch, and the leftover pass collecting a live database.
+
+## D97. A compaction step is bounded by the input it merges
+
+**Found by `audit-limits`.**
+
+- **The defect.** An output step ended only when its output reached `compactionOutputSstSize`.
+  When most input rows are dropped, one step merges every input of the job in one invocation.
+  That happens with deletes at the bottom, values expiring together, or a key rewritten many
+  times. Their failing test (`zz-limits-compaction-step.test.ts`): with 2,000 deleted 10 KB rows,
+  the first step made 13 reads, all of the input, and wrote nothing.
+- **The effect.** D61 measured up to 17.7 s of CPU for a step of 64 MiB in and out, about 0.28 s
+  per input MiB. Against the compactor's 60 s, a step over roughly 0.2 GiB of droppable input
+  fails on every retry. The job never commits, L0 fills, and writes are refused.
+
+**The rule.** A step also ends once it has merged `COMPACTION_STEP_INPUT_FACTOR` (1.5) ×
+`compactionOutputSstSize` of input, counted with the same row-size estimate as the output. It
+ends between keys and returns the key the next step starts at. For 64 MiB outputs that is 96 MiB
+of input, at most 27 s at D61's worst rate: half the limit. No setting is needed: the bound scales
+with the output target.
+
+- **How it counts dropped keys.** lsm-core's `compactKeys` emits every key with what it keeps
+  (possibly nothing), so the bound also counts keys whose versions are all dropped.
+  `compactRowStreams` is that stream without the empty keys.
+- **A step may write no SST.** Its result is then `{ output: none, resumeFrom: key }`.
+  - `runCompactionJob` already adds only present outputs.
+  - The commit accepts no outputs.
+  - The result's size is one key, at most 16 KiB, well inside D86's bound.
+- **More steps.** A job takes up to (its input ÷ 96 MiB) + its outputs steps, far below the 10,000
+  steps a Workflow may take.
+- **A span attribute.** `compaction.step_input_bytes` on `CompactionExecutor.writeOutput`
+  records each step's input.
+
+**Tests.**
+
+- `compaction-executor.test.ts`: 200 deleted rows at the bottom. The first step writes nothing and
+  resumes, the job takes more than 10 steps, commits with no output, and reads find nothing.
+- `audit-limits`' test passes on this code.
+- Two mutations caught: no input bound, and input not counted.

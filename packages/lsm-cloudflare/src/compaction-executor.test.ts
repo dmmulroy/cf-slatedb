@@ -120,6 +120,70 @@ const keyBytes = (key: number) => Uint8Array.of(0x6b, key);
 const WORKFLOW_STEP_RESULT_LIMIT_BYTES = 2 ** 20;
 
 describe("CompactionExecutor", () => {
+  it("bounds a step by the input it merges: a step whose rows are all dropped ends early and writes nothing (D97)", async () => {
+    // 200 values, all deleted: a bottom compaction keeps nothing, so a step bounded only by its
+    // output would merge every input before ending.
+    const keys = 200;
+    const outcome = await Effect.runPromise(
+      provide(
+        Effect.gen(function* () {
+          yield* createDatabase;
+          const client = yield* DbClient;
+          const key = (index: number) => Uint8Array.of(0x6b, index);
+          for (let index = 0; index < keys; index++) {
+            yield* client.put(DB, key(index), new Uint8Array(40).fill(1));
+          }
+          yield* client.flush(DB);
+          for (let index = 0; index < keys; index++) yield* client.delete(DB, key(index));
+          yield* client.flush(DB);
+          const { manifest } = yield* (yield* ManifestReader).loadLatest(DB);
+          const job: CompactionJob = {
+            sources: manifest.l0.map((sst) => ({ _tag: "L0" as const, sstId: sst.id })),
+            destination: SortedRunId.make(0),
+            isBottom: true,
+          };
+          const executor = yield* CompactionExecutor;
+          const prepared = yield* executor.prepare(DB, manifest.compactorEpoch, job);
+          const first = yield* executor.writeOutput(prepared, Option.none());
+          // The whole job, step by step: every step merges a bounded share, the last says done.
+          let steps = 1;
+          let start = first.resumeFrom;
+          const outputs: Array<SstHandle> = [...Option.toArray(first.output)];
+          while (Option.isSome(start)) {
+            const step = yield* executor.writeOutput(prepared, start);
+            outputs.push(...Option.toArray(step.output));
+            start = step.resumeFrom;
+            steps++;
+          }
+          const committed = yield* executor.commit(prepared, outputs);
+          const rows = yield* Stream.runCollect(
+            client.scan(DB, FULL_KEY_RANGE, {
+              consistency: { _tag: "Latest" },
+              snapshot: Option.none(),
+              refuseSealed: false,
+              limit: Option.none(),
+            }),
+          );
+          return {
+            firstWrote: Option.isSome(first.output),
+            firstResumes: Option.isSome(first.resumeFrom),
+            steps,
+            outputs: outputs.length,
+            l0: committed.manifest.l0.length,
+            rows: rows.length,
+          };
+        }),
+      ),
+    );
+    // About 20,000 bytes of input against a 144-byte bound (1.5 x the 96-byte output target).
+    expect(outcome.firstWrote).toBe(false);
+    expect(outcome.firstResumes).toBe(true);
+    expect(outcome.steps).toBeGreaterThan(10);
+    expect(outcome.outputs).toBe(0);
+    expect(outcome.l0).toBe(0);
+    expect(outcome.rows).toBe(0);
+  });
+
   it("prepares the largest merge the scheduler plans with a step result Workflows can store (D86)", async () => {
     // Eight sorted runs of 8 GiB each in 64 MiB SSTs (128 per run), with 1 KiB keys: all eight are
     // within `includeSizeThreshold` of each other, so the scheduler merges them in one job.

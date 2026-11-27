@@ -31,7 +31,8 @@ relative to `packages/` unless they start with `infra/`, `tools/`, or `docs/`.
   wakes share one fence-in, no state write over a newer epoch or a requested collection, a fenced
   compactor fences in again on wake and alarm), `compaction-executor.test.ts`
   (oracle property across flushes and compactions, key-ordered outputs, bottom deletes, inputs
-  changed, fenced; D96: a job running longer than `gcMinAge` keeps its outputs through a
+  changed, fenced; D97: a step whose rows are all dropped ends after a bounded input and
+  writes nothing; D96: a job running longer than `gcMinAge` keeps its outputs through a
   collection and commits, older garbage still goes, a discarded job's outputs go later, and the
   compactor passes the oldest running job's start, taken before its launch; D86: the `prepare` step result of the largest planned merge fits Workflows'
   1 MiB, and a later step of a job whose inputs left the manifest is discarded),
